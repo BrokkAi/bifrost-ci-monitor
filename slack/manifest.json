@@ -1,0 +1,25 @@
+{
+  "display_information": {
+    "name": "Bifrost CI Auto-fixer",
+    "description": "Posts status updates when the Bifrost CI auto-fixer engages."
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "Bifrost CI Auto-fixer",
+      "always_online": false
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "incoming-webhook"
+      ]
+    }
+  },
+  "settings": {
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}
+

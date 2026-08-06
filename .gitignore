@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.slack/
+activity.db
+activity.db-*
+monitor.log
+
