@@ -51,17 +51,17 @@ settings.
 
        export SLACK_SERVICE_TOKEN='paste-the-service-token-locally'
        manifest=$(python3 -c 'import json; print(json.dumps(open("slack/manifest.json").read()))')
-       slack api apps.manifest.create +         --token "$SLACK_SERVICE_TOKEN" +         --json "{\"team_id\":\"T08PB1S0VL2\",\"manifest\":$manifest}"
+       slack api apps.manifest.create --token "$SLACK_SERVICE_TOKEN" --json "{\"team_id\":\"T08PB1S0VL2\",\"manifest\":$manifest}"
 
-   Save the returned app_id locally; never commit the service token.
+   The created app is A0BPC1HK4M6. Never commit the service token.
 
 4. Install the app into brokkworkspace:
 
-       slack app install +         --team T08PB1S0VL2 +         --app AXXXXXXXXXX +         --environment deployed +         --token "$SLACK_SERVICE_TOKEN"
+       slack app install --team T08PB1S0VL2 --app A0BPC1HK4M6 --token "$SLACK_SERVICE_TOKEN"
 
 5. Open settings and add the webhook:
 
-       slack app settings --app AXXXXXXXXXX
+       slack app settings --app A0BPC1HK4M6
 
    In the app settings, choose Incoming Webhooks, add a webhook to
    #github-brokk-desktop, and copy the generated URL. The URL is a secret
