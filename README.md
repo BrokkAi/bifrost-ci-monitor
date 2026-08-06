@@ -33,7 +33,9 @@ SQLite database, cron output, or Codex session data.
 
 The Slack CLI is used to create and install the app. Incoming webhooks are
 channel-bound, so the final channel authorization is performed in Slack app
-settings.
+settings. Slack CLI has no command that creates or returns a channel-bound
+webhook URL; Slack's supported flow is the Incoming Webhooks channel picker,
+or a custom OAuth flow whose response contains incoming_webhook.url.
 
 1. Authenticate the CLI if needed:
 
