@@ -2,7 +2,10 @@
 
 This monitor polls the CI GitHub Actions workflow for BrokkAi/bifrost every
 five minutes. When the latest completed push run for the current master
-commit is red, it launches one Codex repair attempt for that SHA.
+commit is red, it launches one Codex repair attempt associated with that
+failing SHA. If master advances while the repair is starting, Codex may carry
+the repair forward onto the newer HEAD when intervening commits did not fix
+the failure.
 
 The monitor:
 

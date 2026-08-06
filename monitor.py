@@ -383,12 +383,11 @@ def recover_interrupted(conn: sqlite3.Connection, webhook: str) -> None:
 
 
 def build_prompt(run: CiRun) -> str:
-    return f"""You are repairing the CI workflow for {REPO_NAME} at master commit {run.sha}.
-The failing workflow run observed by the monitor is {run.url}.
+    return f"""You are repairing the CI workflow for {REPO_NAME}. The monitor observed the failing workflow run {run.url} for master commit {run.sha}.
 
 If CI is still red, fix it. Use `gh` outside your sandbox to see it. Test your changes locally, then push, then you're done; do not wait for CI to run against your push.
 
-Before editing, verify that {run.sha} is still the current master commit and that its CI workflow is still red. If it is no longer current or no longer red, make no changes and exit successfully. Stay on the existing `{WORKTREE_BRANCH}` branch: do not create or switch branches and do not open a pull request. When a fix is ready, push the current HEAD directly to master with `git push origin HEAD:master`.
+Before editing, inspect the failing run, the commits after {run.sha}, and the latest CI/check results. The original SHA may no longer be current; do not stop merely because newer commits landed. If a subsequent commit clearly addresses this same failure, make no changes and exit successfully. Otherwise, if the failure remains red or reproducible, continue from the current master HEAD and fix it. If the remote master advanced, update the existing worktree to that HEAD before editing. Stay on the existing `{WORKTREE_BRANCH}` branch: do not create or switch branches and do not open a pull request. When a fix is ready, push the current HEAD directly to master with `git push origin HEAD:master`.
 """
 
 
