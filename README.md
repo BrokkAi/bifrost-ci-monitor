@@ -1,21 +1,31 @@
 # Bifrost CI Auto-fixer
 
 This monitor polls the CI GitHub Actions workflow for BrokkAi/bifrost every
-five minutes. When the latest completed push run for the current master
-commit is red, it launches one Codex repair attempt associated with that
-failing SHA. If master advances while the repair is starting, Codex may carry
-the repair forward onto the newer HEAD when intervening commits did not fix
-the failure.
+five minutes. When the most recent completed push run on master is red, it
+launches one Codex repair attempt for that CI run, regardless of whether the
+run's commit is still master HEAD. Codex always works from current master
+HEAD: if an intervening commit already fixed the failure it exits without
+changes, otherwise it fixes forward and pushes HEAD:master.
 
 The monitor:
 
-- claims each SHA atomically in ~/Projects/bifrost-ci/activity.db, so a SHA
-  is never invoked twice;
+- claims each CI run atomically in ~/Projects/bifrost-ci/activity.db, keyed on
+  the workflow run id, so a given run is never invoked twice (a re-run of the
+  same commit is a distinct run and is eligible);
 - serializes runs with a local lock and refuses a dirty or diverged repair
   worktree;
 - fast-forwards ~/Projects/bifrost-ci and asks Codex to push HEAD:master;
 - records combined Codex output and exit status in SQLite;
 - sends Slack engagement and outcome messages without waiting for new CI.
+
+Slack delivery has two transports. If a bot token and channel are configured
+(`--configure-bot`), the monitor posts via `chat.postMessage`: the engagement
+message opens a thread, and Codex's assistant messages (not tool calls) stream
+into that thread live via `codex exec --json`, followed by the outcome. If only
+an incoming webhook is configured (`--configure-slack`), it posts the engagement
+and outcome as plain channel messages with no live feed. The bot transport is
+preferred when present; the webhook is the automatic fallback. See
+[MORNING-SETUP.md](MORNING-SETUP.md) for the one-time bot-token migration.
 
 The monitor is intentionally separate from the Bifrost repository. The
 bifrost-ci checkout is only the clean repair worktree; this repository owns
@@ -84,7 +94,7 @@ or a custom OAuth flow whose response contains incoming_webhook.url.
 
        /home/jonathan/Projects/bifrost-ci-monitor/monitor.py --check
        /home/jonathan/Projects/bifrost-ci-monitor/monitor.py --init-db
-       sqlite3 ~/Projects/bifrost-ci/activity.db +         'select sha,status,exit_code,started_at,finished_at from invocations order by started_at desc;'
+       sqlite3 ~/Projects/bifrost-ci/activity.db +         'select workflow_run_id,sha,status,exit_code,started_at,finished_at from invocations order by started_at desc;'
        crontab -l
 
 The installed cron entry uses absolute paths and a non-overlapping process

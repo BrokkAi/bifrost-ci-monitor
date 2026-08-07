@@ -12,7 +12,8 @@
   "oauth_config": {
     "scopes": {
       "bot": [
-        "incoming-webhook"
+        "incoming-webhook",
+        "chat:write"
       ]
     }
   },
