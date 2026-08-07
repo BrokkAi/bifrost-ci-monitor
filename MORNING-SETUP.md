@@ -76,19 +76,28 @@ entirely your call.
    To watch a real run, wait for (or observe) the next engagement; the thread
    should fill with Codex's messages live.
 
-6. **(Optional, your call — the "go-ahead") Decommission the webhook.** Once
-   you're satisfied threading works, the webhook file is unused (the bot
-   transport is always preferred). Remove it and, if you like, drop the
-   `incoming-webhook` scope from the manifest and reinstall:
+6. **Decommission the webhook (done at the monitor level).** The local webhook
+   file has been removed, so the monitor no longer has (or uses) a fallback —
+   it posts only via the bot transport. Do **not** delete/uninstall app
+   `A0BPC1HK4M6`; it's the same app now doing the threaded posting.
 
-       rm ~/.config/bifrost-ci-monitor/slack-webhook-url
-
-   Do **not** delete/uninstall app `A0BPC1HK4M6` — it's the same app now doing
-   the threaded posting.
+   > **Manifest drift, intentional.** `slack/manifest.json` no longer lists the
+   > `incoming-webhook` scope, so it now describes the desired bot-only app. The
+   > *live* install of `A0BPC1HK4M6` still carries `incoming-webhook` and its
+   > (now dormant, uncalled) webhook URL until the next reinstall applies the
+   > updated manifest — which may be never. That gap is deliberate: the webhook
+   > does nothing, and a reinstall purely to drop it may hit an org-admin
+   > restriction (the app is `org_deploy_enabled`). To actually retire the URL
+   > in Slack, remove `incoming-webhook` from Bot Token Scopes and reinstall.
 
 ## Rollback
 
-If anything misbehaves, just remove the bot credentials and the monitor falls
-straight back to the webhook on the next run:
+The webhook fallback has been retired, so rolling back means either
+reconfiguring the webhook or trusting the bot token. If the bot transport
+misbehaves, restore the webhook fallback:
+
+    ./monitor.py --configure-slack        # re-add the incoming webhook URL
+
+and/or drop the bot credentials so only the webhook remains:
 
     rm ~/.config/bifrost-ci-monitor/bot-token ~/.config/bifrost-ci-monitor/channel-id
