@@ -1040,7 +1040,6 @@ def run_monitor() -> int:
         latch = get_escalation(conn)
         signature = failing_signature(run)
         open_issue_url: str | None = None
-        escalation_thread: str | None = None
         if latch is not None:
             baseline = signature_members(latch["signature"])
             if signature:
@@ -1055,7 +1054,6 @@ def run_monitor() -> int:
                 log("escalation open and no new failing surface; standing down until CI is green")
                 return 0
             open_issue_url = latch["issue_url"]
-            escalation_thread = latch["thread_ts"]
             log(f"escalation open but new failing surface appeared ({sorted(new_surface)}); classifying")
 
         if invocation_exists(conn, run.run_id):
@@ -1081,28 +1079,16 @@ def run_monitor() -> int:
         if not claim_invocation(conn, run):
             return 0
 
-        if latch is not None:
-            # Quiet classification pass: fold it into the existing escalation
-            # thread instead of firing a fresh channel-wide red alert.
-            thread_ts = escalation_thread
-            issue_ref = (
-                f"<{open_issue_url}|the open ticket>" if open_issue_url else "the open ticket"
-            )
-            slack_send(
-                transport,
-                f":repeat: Bifrost CI changed while {issue_ref} is open "
-                f"(now red at "
-                f"<https://github.com/{REPO_NAME}/commit/{run.sha}|`{run.sha[:8]}`>); "
-                f"re-checking whether this is something new. <{run.url}|CI run>",
-                thread_ts=thread_ts,
-            )
-        else:
-            _, thread_ts = slack_send(
-                transport,
-                f":rotating_light: Bifrost CI is red at "
-                f"<https://github.com/{REPO_NAME}/commit/{run.sha}|`{run.sha[:8]}`>. "
-                f"Codex auto-fixer engaged. <{run.url}|Open CI run>",
-            )
+        # Every run that actually engages Codex — including a classification pass
+        # while an escalation is open — gets its own fresh top-level message and
+        # thread. Unchanged-surface polls already stood down silently above, so
+        # anything reaching here is genuine activity worth its own channel entry.
+        _, thread_ts = slack_send(
+            transport,
+            f":rotating_light: Bifrost CI is red at "
+            f"<https://github.com/{REPO_NAME}/commit/{run.sha}|`{run.sha[:8]}`>. "
+            f"Codex auto-fixer engaged. <{run.url}|Open CI run>",
+        )
         with conn:
             conn.execute(
                 "UPDATE invocations SET status = 'running', start_notification_attempted = 1, "
@@ -1193,7 +1179,9 @@ def run_monitor() -> int:
         # must leave the baseline alone so the new surface is retried, not frozen.
         if escalated:
             # New/updated design issue: the current failing set is now the owned
-            # baseline, and the ticket pointer moves to the freshly filed issue.
+            # baseline, the ticket pointer moves to the freshly filed issue, and
+            # the escalation thread becomes this run's own thread (where the new
+            # ping landed), so the eventual green re-arm follows the latest ping.
             open_escalation(conn, run.sha, signature, issue_url, thread_ts)
         elif latch is not None and status == "completed":
             if pushed_sha:
@@ -1203,11 +1191,12 @@ def run_monitor() -> int:
                 pass
             else:
                 # Stood down on the same design issue: absorb the new surface into
-                # the baseline so this now-classified state won't re-trigger.
+                # the baseline so this now-classified state won't re-trigger. Keep
+                # the original escalation thread so the green re-arm lands there.
                 merged = "\n".join(
                     sorted(signature_members(latch["signature"]) | signature_members(signature))
                 )
-                open_escalation(conn, run.sha, merged, latch["issue_url"], thread_ts)
+                open_escalation(conn, run.sha, merged, latch["issue_url"], latch["thread_ts"])
         with conn:
             conn.execute(
                 "UPDATE invocations SET outcome_notification_attempted = 1 "
