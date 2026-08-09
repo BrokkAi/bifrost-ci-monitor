@@ -198,8 +198,13 @@ def connect_db() -> sqlite3.Connection:
         );
         """
     )
-    # Additive migration for databases created before threaded Slack replies.
+    # Additive migrations for databases created before a column existed. The
+    # cron runs monitor.py straight from the working tree, so an escalation_gate
+    # table can predate the signature column (CREATE TABLE IF NOT EXISTS never
+    # adds columns to an existing table); without this, get_escalation would
+    # crash every red poll on "no such column: signature".
     ensure_column(conn, "invocations", "thread_ts", "TEXT")
+    ensure_column(conn, "escalation_gate", "signature", "TEXT NOT NULL DEFAULT ''")
     return conn
 
 
@@ -523,11 +528,19 @@ def get_escalation(conn: sqlite3.Connection) -> sqlite3.Row | None:
     current failing surface is contained in this row's ``signature`` baseline:
     contained means stand down; a new job ▸ step means run one classification
     pass that knows the open issue.
+
+    Fails open: if the row cannot be read (e.g. a schema drift), it logs and
+    returns None so the monitor degrades to normal engagement rather than
+    crashing out of every poll and going silent.
     """
-    return conn.execute(
-        "SELECT sha, signature, issue_url, thread_ts, opened_at "
-        "FROM escalation_gate WHERE id = 1"
-    ).fetchone()
+    try:
+        return conn.execute(
+            "SELECT sha, signature, issue_url, thread_ts, opened_at "
+            "FROM escalation_gate WHERE id = 1"
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        log(f"escalation latch unreadable ({exc}); treating as un-latched")
+        return None
 
 
 def open_escalation(
