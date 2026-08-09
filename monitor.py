@@ -11,6 +11,7 @@ import fcntl
 import getpass
 import json
 import os
+import re
 import select
 import signal
 import socket
@@ -47,6 +48,13 @@ SLACK_TIMEOUT_SECONDS = 10
 SLACK_CHAT_URL = "https://slack.com/api/chat.postMessage"
 SLACK_MESSAGE_LIMIT = 3500
 RED_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required"}
+
+# People Codex pings on Slack when it escalates a design-level CI failure
+# instead of fixing it. These are Slack member IDs (e.g. "U08ABCD1234"), not
+# handles: embedded as <@ID> in Codex's message, they render as real,
+# notifying mentions because the relay forwards that message via
+# chat.postMessage. Replace the placeholders below with the real IDs.
+ESCALATION_SLACK_MEMBER_IDS = ("U08P3FAEU3G", "U093T782RTN")  # Jonathan, Dave
 
 
 def utc_now() -> str:
@@ -573,11 +581,26 @@ def recover_interrupted(conn: sqlite3.Connection, transport: SlackTransport) -> 
 
 
 def build_prompt(run: CiRun) -> str:
-    return f"""You are repairing the CI workflow for {REPO_NAME}. The monitor observed the failing workflow run {run.url} for master commit {run.sha}.
+    mentions = " ".join(f"<@{member_id}>" for member_id in ESCALATION_SLACK_MEMBER_IDS)
+    return f"""You are triaging a red CI run for {REPO_NAME}. The monitor observed the failing workflow run {run.url} for master commit {run.sha}.
 
-If CI is still red, fix it. Use `gh` outside your sandbox to see it. Test your changes locally, then push, then you're done; do not wait for CI to run against your push.
+First, orient. Use `gh` outside your sandbox to read the failing run, the commits after {run.sha}, and the latest CI/check results. The original SHA may no longer be current; do not stop merely because newer commits landed. If a subsequent commit clearly addresses this same failure, make no changes and exit successfully. If the remote master advanced, update the existing worktree to that HEAD before doing anything else. Stay on the existing `{WORKTREE_BRANCH}` branch: never create or switch branches, and never open a pull request.
 
-Before editing, inspect the failing run, the commits after {run.sha}, and the latest CI/check results. The original SHA may no longer be current; do not stop merely because newer commits landed. If a subsequent commit clearly addresses this same failure, make no changes and exit successfully. Otherwise, if the failure remains red or reproducible, continue from the current master HEAD and fix it. If the remote master advanced, update the existing worktree to that HEAD before editing. Stay on the existing `{WORKTREE_BRANCH}` branch: do not create or switch branches and do not open a pull request. When a fix is ready, push the current HEAD directly to master with `git push origin HEAD:master`.
+Your job is NOT to fix every failure. Classify the failure first, then take exactly one of the two paths below.
+
+FIX IT YOURSELF — push directly to master — only when the failure is mechanical and the correct fix is unambiguous:
+- lint or formatting violations (spotless, checkstyle, import order, whitespace, and the like);
+- a test the author plainly forgot to update after an intentional, correct code change — an assertion trailing a renamed symbol, an updated golden value, a signature the production code deliberately changed — where the production code is right and only the test lagged;
+- equally trivial build breakage of that kind (an unused import, a rename applied in one place but not another).
+Test your change locally, then `git push origin HEAD:master`. Do not wait for CI to run against your push, then exit successfully.
+
+ESCALATE — do not touch code, do not push — when the failure is a design-level or judgement call: the correct behavior is unclear, the failing test may be asserting intended behavior, or a fix would change product semantics, cross an architectural boundary, or otherwise require a decision that is not yours to make unilaterally. Flaky, infrastructure, or genuinely ambiguous failures escalate too. When in doubt, escalate rather than guess. To escalate:
+1. Leave master untouched — make no commits and no pushes.
+2. File a GitHub issue on {REPO_NAME} with `gh issue create`. Give it a clear title and a body that includes: the failing run link ({run.url}), the failing job/test, what you found, why this is a design-level call rather than a mechanical fix, and any options you weighed. Note the issue URL that `gh` prints.
+3. As your final assistant message — on its own, nothing after it — post to Slack by writing exactly:
+   {mentions} Design-level CI failure needs a human call — filed <ISSUE_URL>. <one-sentence summary of the problem>
+   Replace <ISSUE_URL> with the URL from step 2 and keep the `{mentions}` tokens verbatim so they render as real mentions. Everything you say streams into the Slack thread, so this message is the ping; do not attempt to call Slack yourself.
+Then exit successfully.
 """
 
 
@@ -783,6 +806,27 @@ def outcome_detail(
     return f"Remote master is now {format_commit(new_sha)}."
 
 
+def detect_escalation(output: str) -> tuple[bool, str | None]:
+    """Recognize a design-level escalation from Codex's captured output.
+
+    Codex escalates by filing a GitHub issue and pinging the humans, so its
+    streamed output carries the ``<@member-id>`` mention tokens — which appear
+    on no other path — and, when issue creation succeeded, the filed issue URL.
+    Returns ``(escalated, issue_url)``; ``issue_url`` is ``None`` if the ping
+    is present but no issue link was found. Callers must gate this on "no push
+    happened" so a mechanical fix that merely references an issue is not
+    misread as an escalation.
+    """
+    text = output or ""
+    escalated = any(f"<@{member_id}>" in text for member_id in ESCALATION_SLACK_MEMBER_IDS)
+    if not escalated:
+        return False, None
+    match = re.search(
+        rf"https://github\.com/{re.escape(REPO_NAME)}/issues/\d+", text
+    )
+    return True, (match.group(0) if match else None)
+
+
 def git_is_ancestor(ancestor: str, ref: str) -> bool:
     """True if ``ancestor`` is an ancestor of (or equal to) ``ref`` in the worktree."""
     result = subprocess.run(
@@ -902,22 +946,38 @@ def run_monitor() -> int:
             )
 
         new_sha, pushed_sha = resolve_master_outcome(base_sha, status)
-        if status == "completed":
-            emoji, outcome = ":white_check_mark:", "finished"
-        elif status == "timed_out":
-            emoji, outcome = ":hourglass_flowing_sand:", "timed out after one hour"
-        elif status == "spawn_failed":
-            emoji, outcome = ":x:", "could not start"
-        else:
-            emoji, outcome = ":x:", f"exited with status {exit_code}"
-        slack_send(
-            transport,
-            f"{emoji} Bifrost CI auto-fixer for "
-            f"<https://github.com/{REPO_NAME}/commit/{run.sha}|`{run.sha[:8]}`> "
-            f"{outcome}. {outcome_detail(status, pushed_sha, base_sha, new_sha)} "
-            f"<{run.url}|Original CI run>",
-            thread_ts=thread_ts,
+        escalated, issue_url = (False, None)
+        if status == "completed" and pushed_sha is None:
+            escalated, issue_url = detect_escalation(output)
+
+        commit_link = (
+            f"<https://github.com/{REPO_NAME}/commit/{run.sha}|`{run.sha[:8]}`>"
         )
+        if escalated:
+            emoji, outcome = ":memo:", "escalated"
+            filed = (
+                f"filed <{issue_url}|a ticket>" if issue_url else "filed a ticket"
+            )
+            outcome_line = (
+                f"{emoji} Bifrost CI auto-fixer for {commit_link} judged this a "
+                f"design-level call and escalated it. No fix pushed; {filed} with "
+                f"its findings and pinged the team above. <{run.url}|Original CI run>"
+            )
+        else:
+            if status == "completed":
+                emoji, outcome = ":white_check_mark:", "finished"
+            elif status == "timed_out":
+                emoji, outcome = ":hourglass_flowing_sand:", "timed out after one hour"
+            elif status == "spawn_failed":
+                emoji, outcome = ":x:", "could not start"
+            else:
+                emoji, outcome = ":x:", f"exited with status {exit_code}"
+            outcome_line = (
+                f"{emoji} Bifrost CI auto-fixer for {commit_link} {outcome}. "
+                f"{outcome_detail(status, pushed_sha, base_sha, new_sha)} "
+                f"<{run.url}|Original CI run>"
+            )
+        slack_send(transport, outcome_line, thread_ts=thread_ts)
         with conn:
             conn.execute(
                 "UPDATE invocations SET outcome_notification_attempted = 1 "
