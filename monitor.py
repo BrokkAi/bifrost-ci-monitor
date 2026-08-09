@@ -205,6 +205,7 @@ def connect_db() -> sqlite3.Connection:
             signature TEXT NOT NULL DEFAULT '',
             issue_url TEXT,
             thread_ts TEXT,
+            last_reported_run_id INTEGER,
             opened_at TEXT NOT NULL
         );
         """
@@ -216,6 +217,7 @@ def connect_db() -> sqlite3.Connection:
     # crash every red poll on "no such column: signature".
     ensure_column(conn, "invocations", "thread_ts", "TEXT")
     ensure_column(conn, "escalation_gate", "signature", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "escalation_gate", "last_reported_run_id", "INTEGER")
     return conn
 
 
@@ -546,7 +548,7 @@ def get_escalation(conn: sqlite3.Connection) -> sqlite3.Row | None:
     """
     try:
         return conn.execute(
-            "SELECT sha, signature, issue_url, thread_ts, opened_at "
+            "SELECT sha, signature, issue_url, thread_ts, last_reported_run_id, opened_at "
             "FROM escalation_gate WHERE id = 1"
         ).fetchone()
     except sqlite3.OperationalError as exc:
@@ -560,6 +562,7 @@ def open_escalation(
     signature: str,
     issue_url: str | None,
     thread_ts: str | None,
+    last_reported_run_id: int | None = None,
 ) -> None:
     """Latch (or re-point) the auto-fixer after a design-level escalation.
 
@@ -568,14 +571,31 @@ def open_escalation(
     baseline is what the superset gate tests against: it is set when a design
     issue is filed and grown as same-issue passes absorb new surfaces, so
     re-engagement is suppressed until a genuinely new job ▸ step fails.
-    ``clear_escalation`` removes it once CI next goes green.
+
+    ``thread_ts`` is the current reporting thread: every engaging run re-points
+    it at that run's own top-level message so later stand-down notes and the
+    green re-arm land in the newest thread and never an abandoned one.
+    ``last_reported_run_id`` is the newest CI run already announced, so a cron
+    tick that re-fires while that same run is still red stays quiet.
+    ``clear_escalation`` removes the row once CI next goes green.
     """
     with conn:
         conn.execute(
             "INSERT OR REPLACE INTO escalation_gate "
-            "(id, sha, signature, issue_url, thread_ts, opened_at) "
-            "VALUES (1, ?, ?, ?, ?, ?)",
-            (sha, signature, issue_url, thread_ts, utc_now()),
+            "(id, sha, signature, issue_url, thread_ts, last_reported_run_id, opened_at) "
+            "VALUES (1, ?, ?, ?, ?, ?, ?)",
+            (sha, signature, issue_url, thread_ts, last_reported_run_id, utc_now()),
+        )
+
+
+def mark_reported(conn: sqlite3.Connection, run_id: int) -> None:
+    """Record the newest CI run the monitor has already announced on the open
+    latch, so a later tick that still sees that same red run most-recent stays
+    quiet instead of re-posting the same failed build."""
+    with conn:
+        conn.execute(
+            "UPDATE escalation_gate SET last_reported_run_id = ? WHERE id = 1",
+            (run_id,),
         )
 
 
@@ -1064,7 +1084,27 @@ def run_monitor() -> int:
                 new_surface = set()
                 stand_down = run.sha == latch["sha"]
             if stand_down:
-                log("escalation open and no new failing surface; standing down until CI is green")
+                if latch["last_reported_run_id"] == run.run_id:
+                    # The same red run is still the most recent; cron just fired
+                    # again over an unchanged failure. Nothing new to report.
+                    return 0
+                # A genuinely new build failed, still inside the surface a human
+                # already owns. Report it as a threaded reply under the current
+                # reporting thread — a fresh top-level message is reserved for a
+                # reset (green, or a surface outside the owned set) — then record
+                # this run so later ticks over it stay quiet.
+                log("escalation open; new failed build within the owned surface; threading a note")
+                issue = latch["issue_url"]
+                ticket = f" (<{issue}|open ticket>)" if issue else ""
+                slack_send(
+                    transport,
+                    f":red_circle: New failed build "
+                    f"<https://github.com/{REPO_NAME}/commit/{run.sha}|`{run.sha[:8]}`> — "
+                    f"still the failing set a human already owns{ticket}; standing down. "
+                    f"<{run.url}|CI run>",
+                    thread_ts=latch["thread_ts"],
+                )
+                mark_reported(conn, run.run_id)
                 return 0
             open_issue_url = latch["issue_url"]
             log(f"escalation open but new failing surface appeared ({sorted(new_surface)}); classifying")
@@ -1193,23 +1233,29 @@ def run_monitor() -> int:
         if escalated:
             # New/updated design issue: the current failing set is now the owned
             # baseline, the ticket pointer moves to the freshly filed issue, and
-            # the escalation thread becomes this run's own thread (where the new
-            # ping landed), so the eventual green re-arm follows the latest ping.
-            open_escalation(conn, run.sha, signature, issue_url, thread_ts)
+            # the reporting thread becomes this run's own thread (where the new
+            # ping landed), so later notes and the green re-arm follow the latest
+            # ping. This run is the newest one announced.
+            open_escalation(conn, run.sha, signature, issue_url, thread_ts, run.run_id)
         elif latch is not None and status == "completed":
+            # Either branch advances the reporting thread to this run's own
+            # top-level message — we never post back into the prior thread — and
+            # records this run as the newest one announced.
             if pushed_sha:
-                # Fixed new mechanical breakage: leave the design baseline as-is
-                # so the fixed surface drops out on its own — and if it recurs, it
-                # reads as new again and gets fixed again.
-                pass
+                # Fixed new mechanical breakage: keep the design baseline and
+                # ticket untouched so the fixed surface drops out on its own — and
+                # if it recurs, it reads as new again and gets fixed again.
+                open_escalation(
+                    conn, latch["sha"], latch["signature"],
+                    latch["issue_url"], thread_ts, run.run_id,
+                )
             else:
                 # Stood down on the same design issue: absorb the new surface into
-                # the baseline so this now-classified state won't re-trigger. Keep
-                # the original escalation thread so the green re-arm lands there.
+                # the baseline so this now-classified state won't re-trigger.
                 merged = "\n".join(
                     sorted(signature_members(latch["signature"]) | signature_members(signature))
                 )
-                open_escalation(conn, run.sha, merged, latch["issue_url"], latch["thread_ts"])
+                open_escalation(conn, run.sha, merged, latch["issue_url"], thread_ts, run.run_id)
         with conn:
             conn.execute(
                 "UPDATE invocations SET outcome_notification_attempted = 1 "
