@@ -44,6 +44,17 @@ CODEX_BIN = Path("/home/jonathan/.nvm/versions/node/v24.15.0/bin/codex")
 GH_BIN = Path("/usr/bin/gh")
 GIT_BIN = Path("/usr/bin/git")
 CODEX_TIMEOUT_SECONDS = 60 * 60
+# Pin the repair model explicitly rather than inheriting ~/.codex/config.toml's
+# default, so the monitor's behavior does not silently change when that file is
+# edited for interactive use. These flags are spliced into every `codex exec`.
+CODEX_MODEL = "gpt-5.6-sol"
+CODEX_REASONING_EFFORT = "medium"
+CODEX_MODEL_ARGS = [
+    "-m",
+    CODEX_MODEL,
+    "-c",
+    f"model_reasoning_effort={CODEX_REASONING_EFFORT}",
+]
 SLACK_TIMEOUT_SECONDS = 10
 SLACK_CHAT_URL = "https://slack.com/api/chat.postMessage"
 SLACK_MESSAGE_LIMIT = 3500
@@ -730,6 +741,7 @@ def invoke_codex(prompt: str) -> tuple[str, int | None, bool, str]:
         "exec",
         "-C",
         str(WORKTREE),
+        *CODEX_MODEL_ARGS,
         "--sandbox",
         "workspace-write",
         "--color",
@@ -808,6 +820,7 @@ def invoke_codex_stream(
         "exec",
         "-C",
         str(WORKTREE),
+        *CODEX_MODEL_ARGS,
         "--json",
         "--sandbox",
         "workspace-write",
