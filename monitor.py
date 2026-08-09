@@ -187,6 +187,15 @@ def connect_db() -> sqlite3.Connection:
             slack_notification_attempted INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (sha, kind)
         );
+
+        CREATE TABLE IF NOT EXISTS escalation_gate (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            sha TEXT NOT NULL,
+            signature TEXT NOT NULL DEFAULT '',
+            issue_url TEXT,
+            thread_ts TEXT,
+            opened_at TEXT NOT NULL
+        );
         """
     )
     # Additive migration for databases created before threaded Slack replies.
@@ -457,6 +466,46 @@ def poll_ci() -> PollResult:
     return PollResult(f"completed:{run.conclusion}", head_sha, run)
 
 
+def failing_signature(run: CiRun) -> str:
+    """A static fingerprint of what is failing in a CI run.
+
+    Returns the newline-joined, sorted set of ``job ▸ step`` names whose step
+    failed (falling back to the job name for a job that failed without a failed
+    step). This is a stable identity for a failure: it survives new commits as
+    long as the same thing breaks, and it changes when a new job/step starts
+    failing — which is exactly the signal the monitor uses to decide whether an
+    already-escalated failure is unchanged or something new has appeared.
+
+    Returns '' if the jobs cannot be read; callers treat an empty signature as
+    "cannot confirm unchanged" rather than risk a false match.
+    """
+    try:
+        raw = run_command(
+            [str(GH_BIN), "run", "view", str(run.run_id), "--repo", REPO_NAME,
+             "--json", "jobs"],
+            timeout=30,
+        )
+        jobs = json.loads(raw).get("jobs", [])
+    except (CommandError, ValueError, json.JSONDecodeError):
+        return ""
+    failed: set[str] = set()
+    for job in jobs:
+        job_name = str(job.get("name", "?"))
+        step_failed = False
+        for step in job.get("steps") or []:
+            if str(step.get("conclusion") or "") in RED_CONCLUSIONS:
+                failed.add(f"{job_name} ▸ {step.get('name', '?')}")
+                step_failed = True
+        if not step_failed and str(job.get("conclusion") or "") in RED_CONCLUSIONS:
+            failed.add(job_name)
+    return "\n".join(sorted(failed))
+
+
+def signature_members(signature: str) -> set[str]:
+    """The set of failing ``job ▸ step`` entries encoded in a signature string."""
+    return {line for line in (signature or "").split("\n") if line}
+
+
 def invocation_exists(conn: sqlite3.Connection, run_id: int) -> bool:
     return (
         conn.execute(
@@ -464,6 +513,56 @@ def invocation_exists(conn: sqlite3.Connection, run_id: int) -> bool:
         ).fetchone()
         is not None
     )
+
+
+def get_escalation(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """The open design-level escalation, or None if the auto-fixer is un-latched.
+
+    While a row exists a human owns an open failure, so the monitor no longer
+    blindly re-runs Codex on every red poll. Instead it checks whether the
+    current failing surface is contained in this row's ``signature`` baseline:
+    contained means stand down; a new job ▸ step means run one classification
+    pass that knows the open issue.
+    """
+    return conn.execute(
+        "SELECT sha, signature, issue_url, thread_ts, opened_at "
+        "FROM escalation_gate WHERE id = 1"
+    ).fetchone()
+
+
+def open_escalation(
+    conn: sqlite3.Connection,
+    sha: str,
+    signature: str,
+    issue_url: str | None,
+    thread_ts: str | None,
+) -> None:
+    """Latch (or re-point) the auto-fixer after a design-level escalation.
+
+    The row records which failure a human owns — its commit and its "job ▸ step"
+    ``signature`` baseline — plus the filed issue and the Slack thread. The
+    baseline is what the superset gate tests against: it is set when a design
+    issue is filed and grown as same-issue passes absorb new surfaces, so
+    re-engagement is suppressed until a genuinely new job ▸ step fails.
+    ``clear_escalation`` removes it once CI next goes green.
+    """
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO escalation_gate "
+            "(id, sha, signature, issue_url, thread_ts, opened_at) "
+            "VALUES (1, ?, ?, ?, ?, ?)",
+            (sha, signature, issue_url, thread_ts, utc_now()),
+        )
+
+
+def clear_escalation(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """Release the escalation latch, returning the row it cleared, else None."""
+    row = get_escalation(conn)
+    if row is None:
+        return None
+    with conn:
+        conn.execute("DELETE FROM escalation_gate WHERE id = 1")
+    return row
 
 
 def preflight_worktree() -> str:
@@ -580,12 +679,20 @@ def recover_interrupted(conn: sqlite3.Connection, transport: SlackTransport) -> 
             )
 
 
-def build_prompt(run: CiRun) -> str:
+def build_prompt(run: CiRun, open_issue_url: str | None = None) -> str:
     mentions = " ".join(f"<@{member_id}>" for member_id in ESCALATION_SLACK_MEMBER_IDS)
+    open_issue_context = ""
+    if open_issue_url:
+        open_issue_context = f"""
+A design-level escalation is ALREADY OPEN for this CI: {open_issue_url}, and a human is handling it. CI has changed since it was filed, so before doing anything, decide which of these the current red state is:
+- The SAME problem already covered by {open_issue_url} (even on a newer commit): make no changes, do not file anything, and do not ping anyone — just exit successfully. Do not re-file or re-notify for a failure a human already owns.
+- A NEW mechanical failure layered on top of it (lint/formatting/forgotten-test as defined below): fix and push just that, following the FIX IT YOURSELF path. Do not attempt to resolve {open_issue_url} itself.
+- A NEW design-level failure distinct from {open_issue_url}: file a SEPARATE issue and ping, following the ESCALATE path.
+"""
     return f"""You are triaging a red CI run for {REPO_NAME}. The monitor observed the failing workflow run {run.url} for master commit {run.sha}.
 
 First, orient. Use `gh` outside your sandbox to read the failing run, the commits after {run.sha}, and the latest CI/check results. The original SHA may no longer be current; do not stop merely because newer commits landed. If a subsequent commit clearly addresses this same failure, make no changes and exit successfully. If the remote master advanced, update the existing worktree to that HEAD before doing anything else. Stay on the existing `{WORKTREE_BRANCH}` branch: never create or switch branches, and never open a pull request.
-
+{open_issue_context}
 Your job is NOT to fix every failure. Classify the failure first, then take exactly one of the two paths below.
 
 FIX IT YOURSELF — push directly to master — only when the failure is mechanical and the correct fix is unambiguous:
@@ -806,7 +913,9 @@ def outcome_detail(
     return f"Remote master is now {format_commit(new_sha)}."
 
 
-def detect_escalation(output: str) -> tuple[bool, str | None]:
+def detect_escalation(
+    output: str, exclude_url: str | None = None
+) -> tuple[bool, str | None]:
     """Recognize a design-level escalation from Codex's captured output.
 
     Codex escalates by filing a GitHub issue and pinging the humans, so its
@@ -816,15 +925,22 @@ def detect_escalation(output: str) -> tuple[bool, str | None]:
     is present but no issue link was found. Callers must gate this on "no push
     happened" so a mechanical fix that merely references an issue is not
     misread as an escalation.
+
+    ``exclude_url`` is the already-open issue a classification pass was told
+    about: it may be echoed in the output, so it is discarded when choosing the
+    newly filed URL. The last remaining match wins, since Codex prints the URL
+    it just created after any it merely referenced.
     """
     text = output or ""
     escalated = any(f"<@{member_id}>" in text for member_id in ESCALATION_SLACK_MEMBER_IDS)
     if not escalated:
         return False, None
-    match = re.search(
+    urls = re.findall(
         rf"https://github\.com/{re.escape(REPO_NAME)}/issues/\d+", text
     )
-    return True, (match.group(0) if match else None)
+    fresh = [url for url in urls if url != exclude_url]
+    candidates = fresh or urls
+    return True, (candidates[-1] if candidates else None)
 
 
 def git_is_ancestor(ancestor: str, ref: str) -> bool:
@@ -886,9 +1002,49 @@ def run_monitor() -> int:
         except (CommandError, ValueError, json.JSONDecodeError) as exc:
             log(f"CI poll failed: {exc}")
             return 3
+        if first.state == "completed:success":
+            cleared = clear_escalation(conn)
+            if cleared is not None:
+                log("CI is green again; re-arming the auto-fixer")
+                slack_send(
+                    transport,
+                    ":white_check_mark: Bifrost CI is green again; the auto-fixer is "
+                    "re-armed after the escalation.",
+                    thread_ts=cleared["thread_ts"],
+                )
+            return 0
         if first.state != "red" or first.run is None:
             return 0
         run = first.run
+
+        # If a design-level escalation is open, re-engage Codex only when a NEW
+        # failing surface appears — a job ▸ step that is not already part of the
+        # escalated baseline. While the current failures stay within that
+        # baseline (the same design failure, even across many new commits), the
+        # human still owns it and we stand down. A new surface triggers one
+        # classification pass that knows the open issue and decides whether this
+        # is that same problem, a new mechanical failure, or a new design one.
+        latch = get_escalation(conn)
+        signature = failing_signature(run)
+        open_issue_url: str | None = None
+        escalation_thread: str | None = None
+        if latch is not None:
+            baseline = signature_members(latch["signature"])
+            if signature:
+                new_surface = signature_members(signature) - baseline
+                stand_down = not new_surface
+            else:
+                # Could not read the failing jobs; fall back to sha so we neither
+                # churn on the same commit nor freeze on a genuinely new one.
+                new_surface = set()
+                stand_down = run.sha == latch["sha"]
+            if stand_down:
+                log("escalation open and no new failing surface; standing down until CI is green")
+                return 0
+            open_issue_url = latch["issue_url"]
+            escalation_thread = latch["thread_ts"]
+            log(f"escalation open but new failing surface appeared ({sorted(new_surface)}); classifying")
+
         if invocation_exists(conn, run.run_id):
             return 0
         try:
@@ -912,12 +1068,28 @@ def run_monitor() -> int:
         if not claim_invocation(conn, run):
             return 0
 
-        _, thread_ts = slack_send(
-            transport,
-            f":rotating_light: Bifrost CI is red at "
-            f"<https://github.com/{REPO_NAME}/commit/{run.sha}|`{run.sha[:8]}`>. "
-            f"Codex auto-fixer engaged. <{run.url}|Open CI run>",
-        )
+        if latch is not None:
+            # Quiet classification pass: fold it into the existing escalation
+            # thread instead of firing a fresh channel-wide red alert.
+            thread_ts = escalation_thread
+            issue_ref = (
+                f"<{open_issue_url}|the open ticket>" if open_issue_url else "the open ticket"
+            )
+            slack_send(
+                transport,
+                f":repeat: Bifrost CI changed while {issue_ref} is open "
+                f"(now red at "
+                f"<https://github.com/{REPO_NAME}/commit/{run.sha}|`{run.sha[:8]}`>); "
+                f"re-checking whether this is something new. <{run.url}|CI run>",
+                thread_ts=thread_ts,
+            )
+        else:
+            _, thread_ts = slack_send(
+                transport,
+                f":rotating_light: Bifrost CI is red at "
+                f"<https://github.com/{REPO_NAME}/commit/{run.sha}|`{run.sha[:8]}`>. "
+                f"Codex auto-fixer engaged. <{run.url}|Open CI run>",
+            )
         with conn:
             conn.execute(
                 "UPDATE invocations SET status = 'running', start_notification_attempted = 1, "
@@ -931,10 +1103,12 @@ def run_monitor() -> int:
                 slack_send(transport, text, thread_ts=_thread_ts)
 
             status, exit_code, timed_out, output = invoke_codex_stream(
-                build_prompt(run), relay
+                build_prompt(run, open_issue_url), relay
             )
         else:
-            status, exit_code, timed_out, output = invoke_codex(build_prompt(run))
+            status, exit_code, timed_out, output = invoke_codex(
+                build_prompt(run, open_issue_url)
+            )
         with conn:
             conn.execute(
                 """
@@ -948,7 +1122,7 @@ def run_monitor() -> int:
         new_sha, pushed_sha = resolve_master_outcome(base_sha, status)
         escalated, issue_url = (False, None)
         if status == "completed" and pushed_sha is None:
-            escalated, issue_url = detect_escalation(output)
+            escalated, issue_url = detect_escalation(output, exclude_url=open_issue_url)
 
         commit_link = (
             f"<https://github.com/{REPO_NAME}/commit/{run.sha}|`{run.sha[:8]}`>"
@@ -958,10 +1132,32 @@ def run_monitor() -> int:
             filed = (
                 f"filed <{issue_url}|a ticket>" if issue_url else "filed a ticket"
             )
+            distinct = (
+                " (a new problem, distinct from the one already open)"
+                if latch is not None
+                else ""
+            )
             outcome_line = (
                 f"{emoji} Bifrost CI auto-fixer for {commit_link} judged this a "
-                f"design-level call and escalated it. No fix pushed; {filed} with "
-                f"its findings and pinged the team above. <{run.url}|Original CI run>"
+                f"design-level call and escalated it{distinct}. No fix pushed; {filed} "
+                f"with its findings and pinged the team above. <{run.url}|Original CI run>"
+            )
+        elif latch is not None and status == "completed":
+            # A classification pass against an already-open escalation that did
+            # not itself escalate: Codex either fixed new mechanical breakage or
+            # found nothing new. The design ticket stays open either way.
+            if pushed_sha:
+                emoji, outcome = ":wrench:", "fixed a new failure"
+                detail = (
+                    f"Fixed a new mechanical failure and pushed "
+                    f"{format_commit(pushed_sha)}; the open design ticket still stands."
+                )
+            else:
+                emoji, outcome = ":repeat:", "re-checked"
+                detail = "No new actionable problem; the open design ticket still stands."
+            outcome_line = (
+                f"{emoji} Bifrost CI auto-fixer for {commit_link}: {detail} "
+                f"<{run.url}|CI run>"
             )
         else:
             if status == "completed":
@@ -978,6 +1174,27 @@ def run_monitor() -> int:
                 f"<{run.url}|Original CI run>"
             )
         slack_send(transport, outcome_line, thread_ts=thread_ts)
+
+        # Latch bookkeeping, so the next poll's superset gate behaves correctly.
+        # Only touch the latch on a completed pass; a transient Codex failure
+        # must leave the baseline alone so the new surface is retried, not frozen.
+        if escalated:
+            # New/updated design issue: the current failing set is now the owned
+            # baseline, and the ticket pointer moves to the freshly filed issue.
+            open_escalation(conn, run.sha, signature, issue_url, thread_ts)
+        elif latch is not None and status == "completed":
+            if pushed_sha:
+                # Fixed new mechanical breakage: leave the design baseline as-is
+                # so the fixed surface drops out on its own — and if it recurs, it
+                # reads as new again and gets fixed again.
+                pass
+            else:
+                # Stood down on the same design issue: absorb the new surface into
+                # the baseline so this now-classified state won't re-trigger.
+                merged = "\n".join(
+                    sorted(signature_members(latch["signature"]) | signature_members(signature))
+                )
+                open_escalation(conn, run.sha, merged, latch["issue_url"], thread_ts)
         with conn:
             conn.execute(
                 "UPDATE invocations SET outcome_notification_attempted = 1 "
