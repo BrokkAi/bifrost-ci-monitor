@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 
-REPO_NAME = "BrokkAi/bifrost"
+REPO_NAME = "BrokkAi/bifrost-dev"
 WORKFLOW_NAME = "CI"
 BRANCH = "master"
 WORKTREE_BRANCH = "bifrost-ci"

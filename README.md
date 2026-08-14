@@ -1,6 +1,6 @@
 # Bifrost CI Auto-fixer
 
-This monitor polls the CI GitHub Actions workflow for BrokkAi/bifrost every
+This monitor polls the CI GitHub Actions workflow for BrokkAi/bifrost-dev every
 five minutes. When the most recent completed push run on master is red, it
 launches one Codex repair attempt for that CI run, regardless of whether the
 run's commit is still master HEAD. Codex always works from current master
