@@ -16,6 +16,9 @@ The monitor:
   worktree;
 - fast-forwards ~/Projects/bifrost-ci and asks Codex to push HEAD:master;
 - records combined Codex output and exit status in SQLite;
+- verifies that a design escalation's GitHub issue is still open before
+  standing down, so closing a ticket re-arms classification even if CI never
+  went green;
 - sends Slack engagement and outcome messages without waiting for new CI.
 
 Slack delivery has two transports. If a bot token and channel are configured

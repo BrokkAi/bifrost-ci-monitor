@@ -59,6 +59,7 @@ SLACK_TIMEOUT_SECONDS = 10
 SLACK_CHAT_URL = "https://slack.com/api/chat.postMessage"
 SLACK_MESSAGE_LIMIT = 3500
 RED_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required"}
+ISSUE_STATE_RETRY_DELAYS = (1, 2)
 
 # People Codex pings on Slack when it escalates a design-level CI failure
 # instead of fixing it. These are Slack member IDs (e.g. "U08ABCD1234"), not
@@ -570,6 +571,79 @@ def get_escalation(conn: sqlite3.Connection) -> sqlite3.Row | None:
     except sqlite3.OperationalError as exc:
         log(f"escalation latch unreadable ({exc}); treating as un-latched")
         return None
+
+
+def github_issue_state(issue_url: str) -> str:
+    """Return OPEN or CLOSED for an escalation issue, retrying transient errors.
+
+    Three total attempts (the initial request plus the two delays above) keep a
+    momentary GitHub failure from either releasing human-owned work or parking
+    the monitor indefinitely. An unexpected response is retried just like a
+    command failure because it cannot safely establish ownership.
+    """
+    attempts = len(ISSUE_STATE_RETRY_DELAYS) + 1
+    last_error: CommandError | None = None
+    for attempt in range(attempts):
+        try:
+            state = run_command(
+                [
+                    str(GH_BIN),
+                    "issue",
+                    "view",
+                    issue_url,
+                    "--json",
+                    "state",
+                    "--jq",
+                    ".state",
+                ],
+                timeout=30,
+            ).strip().upper()
+            if state not in {"OPEN", "CLOSED"}:
+                raise CommandError(
+                    f"GitHub returned unexpected issue state {state!r} for {issue_url}"
+                )
+            return state
+        except CommandError as exc:
+            last_error = exc
+            if attempt == attempts - 1:
+                break
+            delay = ISSUE_STATE_RETRY_DELAYS[attempt]
+            log(
+                f"issue-state lookup failed for {issue_url} "
+                f"(attempt {attempt + 1}/{attempts}): {exc}; retrying in {delay}s"
+            )
+            time.sleep(delay)
+    assert last_error is not None
+    raise last_error
+
+
+def refresh_escalation_ownership(
+    conn: sqlite3.Connection, episode: sqlite3.Row | None
+) -> sqlite3.Row | None:
+    """Keep an escalated episode only while its linked issue is still open.
+
+    A closed issue no longer represents human ownership, even when CI never
+    went green and the next failure occurs in the same broad job and step. A
+    legacy or malformed escalated row without a ticket cannot establish live
+    ownership either, so it is retired and the current red run is classified
+    as a fresh episode.
+
+    Issue lookup failures propagate without changing the database. The caller
+    leaves the run unclaimed so the next cron tick can retry safely.
+    """
+    if episode is None or not episode["escalated"]:
+        return episode
+    issue_url = episode["issue_url"]
+    if not issue_url:
+        log("escalated episode has no issue URL; retiring stale ownership")
+        clear_escalation(conn)
+        return None
+    state = github_issue_state(str(issue_url))
+    if state == "OPEN":
+        return episode
+    log(f"escalation issue {issue_url} is closed; retiring stale ownership")
+    clear_escalation(conn)
+    return None
 
 
 def open_escalation(
@@ -1105,6 +1179,14 @@ def run_monitor() -> int:
         # escalated (human-owned) repeat stands down with a note and no Codex; a
         # non-escalated repeat re-engages Codex in that same thread.
         episode = get_escalation(conn)
+        try:
+            # Human ownership is live only while the linked issue is open. Do
+            # this before same-run reporting deduplication so closing a ticket
+            # re-engages an already-reported red run on the very next poll.
+            episode = refresh_escalation_ownership(conn, episode)
+        except CommandError as exc:
+            log(f"escalation issue-state lookup failed: {exc}; retrying next tick")
+            return 3
         signature = failing_signature(run)
         open_issue_url: str | None = None
         reply_ts: str | None = None  # set => engage in this existing thread
