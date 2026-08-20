@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Brokk AI
-"""Poll Bifrost CI and launch one Codex repair attempt per failing master SHA."""
+"""Poll Bifrost CI workflows and launch one Codex repair attempt per failed run."""
 
 from __future__ import annotations
 
@@ -29,7 +29,11 @@ from typing import Any
 
 
 REPO_NAME = "BrokkAi/bifrost-dev"
-WORKFLOW_NAME = "CI"
+TRACKED_WORKFLOWS: tuple[tuple[str, str | None], ...] = (
+    ("CI", "push"),
+    ("Hourly CI", None),
+    ("Nightly CI", None),
+)
 BRANCH = "master"
 WORKTREE_BRANCH = "bifrost-ci"
 WORKTREE = Path("/home/jonathan/Projects/bifrost-ci")
@@ -440,11 +444,13 @@ def slack_send(
 
 @dataclass(frozen=True)
 class CiRun:
+    workflow: str
     sha: str
     run_id: int
     url: str
     status: str
     conclusion: str
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -454,47 +460,88 @@ class PollResult:
     run: CiRun | None
 
 
-def poll_ci() -> PollResult:
+def poll_ci(excluded_run_ids: set[int] | None = None) -> PollResult:
+    """Poll the latest run in every tracked workflow and select work to handle.
+
+    A red latest run takes precedence over green or in-progress runs in the
+    other workflows. When more than one workflow is red, prefer the newest run
+    that has not already been handled; this prevents a persistent failure in
+    one workflow from hiding a new failure in another. If all red runs have
+    already been handled, still return red so a green workflow cannot
+    incorrectly clear the current failure episode.
+    """
     head_sha = run_command(
         [str(GH_BIN), "api", f"repos/{REPO_NAME}/commits/{BRANCH}", "--jq", ".sha"],
         timeout=30,
     )
-    raw = run_command(
-        [
+    runs: list[CiRun] = []
+    for workflow, event in TRACKED_WORKFLOWS:
+        command = [
             str(GH_BIN),
             "run",
             "list",
             "--repo",
             REPO_NAME,
             "--workflow",
-            WORKFLOW_NAME,
+            workflow,
             "--branch",
             BRANCH,
-            "--event",
-            "push",
             "--limit",
             "1",
             "--json",
-            "databaseId,headSha,status,conclusion,url",
-        ],
-        timeout=30,
-    )
-    runs: list[dict[str, Any]] = json.loads(raw)
+            "databaseId,headSha,status,conclusion,url,createdAt",
+        ]
+        if event is not None:
+            limit_index = command.index("--limit")
+            command[limit_index:limit_index] = ["--event", event]
+        raw = run_command(command, timeout=30)
+        items: list[dict[str, Any]] = json.loads(raw)
+        if not items:
+            continue
+        item = items[0]
+        runs.append(
+            CiRun(
+                workflow=workflow,
+                sha=str(item["headSha"]),
+                run_id=int(item["databaseId"]),
+                url=str(item["url"]),
+                status=str(item["status"]),
+                conclusion=str(item.get("conclusion") or ""),
+                created_at=str(item["createdAt"]),
+            )
+        )
     if not runs:
         return PollResult("no_ci_run", head_sha, None)
-    item = runs[0]
-    run = CiRun(
-        sha=str(item["headSha"]),
-        run_id=int(item["databaseId"]),
-        url=str(item["url"]),
-        status=str(item["status"]),
-        conclusion=str(item.get("conclusion") or ""),
-    )
-    if run.status != "completed":
-        return PollResult(run.status, head_sha, run)
-    if run.conclusion in RED_CONCLUSIONS:
-        return PollResult("red", head_sha, run)
-    return PollResult(f"completed:{run.conclusion}", head_sha, run)
+
+    red_runs = [
+        run
+        for run in runs
+        if run.status == "completed" and run.conclusion in RED_CONCLUSIONS
+    ]
+    if red_runs:
+        excluded = excluded_run_ids or set()
+        unhandled = [run for run in red_runs if run.run_id not in excluded]
+        selected = max(unhandled or red_runs, key=lambda run: run.created_at)
+        return PollResult("red", head_sha, selected)
+
+    # Do not clear an episode while any tracked run is still settling. Once all
+    # three latest runs are terminal and none is red, a successful push CI run
+    # re-arms the monitor. Cancelled scheduled runs are neutral rather than
+    # holding an episode open until the next hourly or nightly tick.
+    active_runs = [run for run in runs if run.status != "completed"]
+    if active_runs:
+        selected = max(active_runs, key=lambda run: run.created_at)
+        return PollResult(selected.status, head_sha, selected)
+    if len(runs) != len(TRACKED_WORKFLOWS):
+        return PollResult("incomplete", head_sha, max(runs, key=lambda run: run.created_at))
+    primary = next((run for run in runs if run.workflow == "CI"), None)
+    if (
+        primary is not None
+        and primary.conclusion == "success"
+    ):
+        return PollResult("completed:success", head_sha, primary)
+    selected = max(runs, key=lambda run: run.created_at)
+    return PollResult(f"completed:{selected.conclusion}", head_sha, selected)
 
 
 def failing_signature(run: CiRun) -> str:
@@ -544,6 +591,18 @@ def invocation_exists(conn: sqlite3.Connection, run_id: int) -> bool:
         ).fetchone()
         is not None
     )
+
+
+def handled_run_ids(conn: sqlite3.Connection) -> set[int]:
+    """Return runs already invoked or reported as human-owned repeats."""
+    run_ids = {
+        int(row[0])
+        for row in conn.execute("SELECT workflow_run_id FROM invocations").fetchall()
+    }
+    episode = get_escalation(conn)
+    if episode is not None and episode["last_reported_run_id"] is not None:
+        run_ids.add(int(episode["last_reported_run_id"]))
+    return run_ids
 
 
 def get_escalation(conn: sqlite3.Connection) -> sqlite3.Row | None:
@@ -1146,8 +1205,9 @@ def run_monitor() -> int:
     conn = connect_db()
     try:
         recover_interrupted(conn, transport)
+        excluded_run_ids = handled_run_ids(conn)
         try:
-            first = poll_ci()
+            first = poll_ci(excluded_run_ids)
         except (CommandError, ValueError, json.JSONDecodeError) as exc:
             log(f"CI poll failed: {exc}")
             return 3
@@ -1219,7 +1279,7 @@ def run_monitor() -> int:
                         f":red_circle: New failed build "
                         f"<https://github.com/{REPO_NAME}/commit/{run.sha}|`{run.sha[:8]}`> — "
                         f"still the failing set a human already owns{ticket}; standing down. "
-                        f"<{run.url}|CI run>",
+                        f"<{run.url}|{run.workflow} run>",
                         thread_ts=episode["thread_ts"],
                     )
                     mark_reported(conn, run.run_id)
@@ -1243,7 +1303,7 @@ def run_monitor() -> int:
             record_preflight_event(conn, transport, run.sha, kind, str(exc))
             return 4
         try:
-            second = poll_ci()
+            second = poll_ci(excluded_run_ids)
         except (CommandError, ValueError, json.JSONDecodeError) as exc:
             log(f"final CI poll failed: {exc}")
             return 3
@@ -1268,14 +1328,14 @@ def run_monitor() -> int:
             slack_send(
                 transport,
                 f":rotating_light: New failed build {commit_link} still red on the "
-                f"same set; Codex re-engaged. <{run.url}|Open CI run>",
+                f"same set; Codex re-engaged. <{run.url}|Open {run.workflow} run>",
                 thread_ts=thread_ts,
             )
         else:
             _, thread_ts = slack_send(
                 transport,
-                f":rotating_light: Bifrost CI is red at {commit_link}. "
-                f"Codex auto-fixer engaged. <{run.url}|Open CI run>",
+                f":rotating_light: Bifrost {run.workflow} is red at {commit_link}. "
+                f"Codex auto-fixer engaged. <{run.url}|Open {run.workflow} run>",
             )
         with conn:
             conn.execute(
@@ -1284,7 +1344,7 @@ def run_monitor() -> int:
                 (thread_ts, run.run_id),
             )
 
-        log(f"launching Codex for red CI at {run.sha[:8]}")
+        log(f"launching Codex for red {run.workflow} at {run.sha[:8]}")
         if transport.kind == "chat" and thread_ts:
             def relay(text: str, _thread_ts: str = thread_ts) -> None:
                 slack_send(transport, text, thread_ts=_thread_ts)
@@ -1413,6 +1473,7 @@ def check_only() -> int:
                 "head_sha": result.head_sha,
                 "run": (
                     {
+                        "workflow": result.run.workflow,
                         "sha": result.run.sha,
                         "id": result.run.run_id,
                         "url": result.run.url,
