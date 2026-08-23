@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import monitor
@@ -89,12 +91,8 @@ class PollCiTests(unittest.TestCase):
     def test_handled_red_does_not_hide_an_unhandled_red(self, run_command):
         run_command.side_effect = [
             "head-sha",
-            workflow_run(
-                "CI", 30, "2026-08-20T12:30:00Z", conclusion="failure"
-            ),
-            workflow_run(
-                "Hourly CI", 20, "2026-08-20T12:00:00Z", conclusion="failure"
-            ),
+            workflow_run("CI", 30, "2026-08-20T12:30:00Z", conclusion="failure"),
+            workflow_run("Hourly CI", 20, "2026-08-20T12:00:00Z", conclusion="failure"),
             workflow_run("Nightly CI", 10, "2026-08-20T08:00:00Z"),
         ]
 
@@ -108,12 +106,8 @@ class PollCiTests(unittest.TestCase):
     def test_all_handled_red_runs_still_prevent_green_reset(self, run_command):
         run_command.side_effect = [
             "head-sha",
-            workflow_run(
-                "CI", 30, "2026-08-20T12:30:00Z", conclusion="failure"
-            ),
-            workflow_run(
-                "Hourly CI", 20, "2026-08-20T12:00:00Z", conclusion="failure"
-            ),
+            workflow_run("CI", 30, "2026-08-20T12:30:00Z", conclusion="failure"),
+            workflow_run("Hourly CI", 20, "2026-08-20T12:00:00Z", conclusion="failure"),
             workflow_run("Nightly CI", 10, "2026-08-20T08:00:00Z"),
         ]
 
@@ -323,6 +317,152 @@ class EscalationOwnershipTests(unittest.TestCase):
         self.assertIsNotNone(remaining)
         self.assertEqual(remaining["issue_url"], ISSUE_URL)
         issue_state.assert_called_once_with(ISSUE_URL)
+
+
+class TimeoutHandoffTests(unittest.TestCase):
+    def test_extracts_thread_started_session_id(self):
+        self.assertEqual(
+            monitor.extract_session_id(
+                {"type": "thread.started", "thread_id": "session-123"}
+            ),
+            "session-123",
+        )
+        self.assertIsNone(monitor.extract_session_id({"type": "turn.started"}))
+
+    def test_handoff_prompt_forbids_more_repair_work(self):
+        run = monitor.CiRun(
+            workflow="CI",
+            sha="deadbeef",
+            run_id=42,
+            url="https://github.com/example/actions/runs/42",
+            status="completed",
+            conclusion="failure",
+            created_at="2026-08-23T00:00:00Z",
+        )
+
+        prompt = monitor.build_timeout_handoff_prompt(run)
+
+        self.assertIn("taken over one hour", prompt)
+        self.assertIn("Do not investigate further", prompt)
+        self.assertIn("gh issue create", prompt)
+        self.assertIn(run.url, prompt)
+
+    def test_finds_new_issue_url_in_handoff_output(self):
+        old = "https://github.com/BrokkAi/bifrost-dev/issues/100"
+        new = "https://github.com/BrokkAi/bifrost-dev/issues/101"
+
+        self.assertEqual(
+            monitor.find_issue_url(f"existing {old}\nfiled {new}", exclude_url=old),
+            new,
+        )
+
+    @mock.patch.object(monitor.os, "read")
+    @mock.patch.object(monitor.select, "select")
+    @mock.patch.object(monitor.subprocess, "Popen")
+    def test_resume_uses_exact_session_and_captures_jsonl(
+        self, popen, select_call, os_read
+    ):
+        process = mock.Mock()
+        process.pid = 4321
+        process.returncode = 0
+        process.stdin = mock.Mock()
+        process.stdout = mock.Mock()
+        process.stdout.fileno.return_value = 99
+        process.wait.return_value = 0
+        popen.return_value = process
+        select_call.return_value = ([99], [], [])
+        os_read.side_effect = [
+            b'{"type":"thread.started","thread_id":"session-123"}\n',
+            b'{"type":"item.completed","item":{"type":"agent_message","text":"filed"}}\n',
+            b"",
+        ]
+        sessions = []
+        messages = []
+
+        result = monitor.invoke_codex_stream(
+            "handoff",
+            messages.append,
+            timeout_seconds=600,
+            resume_session_id="session-123",
+            on_session=sessions.append,
+        )
+
+        args = popen.call_args.args[0]
+        self.assertEqual(args[args.index("resume") + 1 :][-2:], ["session-123", "-"])
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.session_id, "session-123")
+        self.assertEqual(messages, ["filed"])
+        self.assertEqual(sessions, ["session-123"])
+        process.stdin.write.assert_called_once_with(b"handoff")
+
+    @mock.patch.object(monitor, "git_is_ancestor")
+    @mock.patch.object(monitor, "run_command")
+    def test_timeout_recovery_stashes_untracked_and_resets(self, run_command, ancestor):
+        def command_result(args, **kwargs):
+            if args[1:3] == ["branch", "--show-current"]:
+                return monitor.WORKTREE_BRANCH
+            if args[1:3] == ["status", "--porcelain"]:
+                command_result.status_calls += 1
+                return " M file\n?? new" if command_result.status_calls == 1 else ""
+            if args[1:3] == ["rev-parse", "HEAD"]:
+                command_result.head_calls += 1
+                return "base" if command_result.head_calls == 1 else "remote"
+            if args[1:3] == ["rev-parse", "origin/master"]:
+                return "remote"
+            return ""
+
+        command_result.status_calls = 0
+        command_result.head_calls = 0
+        run_command.side_effect = command_result
+        ancestor.return_value = True
+
+        ok, detail = monitor.recover_timeout_worktree(42, "deadbeef", "session-123")
+
+        self.assertTrue(ok, detail)
+        calls = [call.args[0] for call in run_command.call_args_list]
+        self.assertTrue(any(call[1:3] == ["stash", "push"] for call in calls))
+        self.assertTrue(any(call[1:3] == ["reset", "--hard"] for call in calls))
+
+    @mock.patch.object(monitor, "run_command")
+    def test_timeout_recovery_never_resets_when_stash_fails(self, run_command):
+        run_command.side_effect = [
+            monitor.WORKTREE_BRANCH,
+            " M file",
+            monitor.CommandError("stash failed"),
+        ]
+
+        ok, detail = monitor.recover_timeout_worktree(42, "deadbeef", "session-123")
+
+        self.assertFalse(ok)
+        self.assertIn("stash failed", detail)
+        calls = [call.args[0] for call in run_command.call_args_list]
+        self.assertFalse(any(call[1:3] == ["reset", "--hard"] for call in calls))
+
+    def test_connect_db_migrates_timeout_handoff_columns_additively(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "activity.db"
+            legacy = sqlite3.connect(db_path)
+            legacy.execute(
+                "CREATE TABLE invocations (workflow_run_id INTEGER PRIMARY KEY)"
+            )
+            legacy.commit()
+            legacy.close()
+            with mock.patch.object(monitor, "DB_PATH", db_path):
+                conn = monitor.connect_db()
+                try:
+                    columns = {
+                        row["name"]
+                        for row in conn.execute(
+                            "PRAGMA table_info(invocations)"
+                        ).fetchall()
+                    }
+                finally:
+                    conn.close()
+
+        self.assertTrue(
+            {"codex_session_id", "issue_url", "timeout_handoff_status", "codex_pid"}
+            <= columns
+        )
 
 
 if __name__ == "__main__":

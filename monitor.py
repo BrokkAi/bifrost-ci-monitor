@@ -48,6 +48,7 @@ CODEX_BIN = Path("/home/jonathan/.nvm/versions/node/v24.15.0/bin/codex")
 GH_BIN = Path("/usr/bin/gh")
 GIT_BIN = Path("/usr/bin/git")
 CODEX_TIMEOUT_SECONDS = 60 * 60
+CODEX_HANDOFF_TIMEOUT_SECONDS = 10 * 60
 # Pin the repair model explicitly rather than inheriting ~/.codex/config.toml's
 # default, so the monitor's behavior does not silently change when that file is
 # edited for interactive use. These flags are spliced into every `codex exec`.
@@ -106,9 +107,7 @@ class PreflightError(RuntimeError):
         self.kind = kind
 
 
-def run_command(
-    args: list[str], *, cwd: Path | None = None, timeout: int = 60
-) -> str:
+def run_command(args: list[str], *, cwd: Path | None = None, timeout: int = 60) -> str:
     try:
         result = subprocess.run(
             args,
@@ -138,9 +137,12 @@ def migrate_invocations(conn: sqlite3.Connection) -> None:
     databases used ``sha`` as the primary key; recreate them only when empty so
     no recorded repair history is silently discarded.
     """
-    if conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'invocations'"
-    ).fetchone() is None:
+    if (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'invocations'"
+        ).fetchone()
+        is None
+    ):
         return
     primary_key = [
         row["name"]
@@ -163,7 +165,9 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) 
 
     ``table`` and ``column`` are trusted internal literals, never user input.
     """
-    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    existing = {
+        row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
     if column not in existing:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
@@ -192,7 +196,11 @@ def connect_db() -> sqlite3.Connection:
             output TEXT NOT NULL DEFAULT '',
             start_notification_attempted INTEGER NOT NULL DEFAULT 0,
             outcome_notification_attempted INTEGER NOT NULL DEFAULT 0,
-            thread_ts TEXT
+            thread_ts TEXT,
+            codex_session_id TEXT,
+            issue_url TEXT,
+            timeout_handoff_status TEXT,
+            codex_pid INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS monitor_events (
@@ -222,6 +230,10 @@ def connect_db() -> sqlite3.Connection:
     # adds columns to an existing table); without this, get_escalation would
     # crash every red poll on "no such column: signature".
     ensure_column(conn, "invocations", "thread_ts", "TEXT")
+    ensure_column(conn, "invocations", "codex_session_id", "TEXT")
+    ensure_column(conn, "invocations", "issue_url", "TEXT")
+    ensure_column(conn, "invocations", "timeout_handoff_status", "TEXT")
+    ensure_column(conn, "invocations", "codex_pid", "INTEGER")
     ensure_column(conn, "escalation_gate", "signature", "TEXT NOT NULL DEFAULT ''")
     ensure_column(conn, "escalation_gate", "last_reported_run_id", "INTEGER")
     ensure_column(conn, "escalation_gate", "escalated", "INTEGER NOT NULL DEFAULT 0")
@@ -312,7 +324,11 @@ def post_slack(webhook: str, text: str) -> bool:
 
 
 def validate_bot_token(token: str) -> None:
-    if not token.startswith("xoxb-") or len(token) < 20 or any(c.isspace() for c in token):
+    if (
+        not token.startswith("xoxb-")
+        or len(token) < 20
+        or any(c.isspace() for c in token)
+    ):
         raise ValueError("expected a Slack bot token beginning with 'xoxb-'")
 
 
@@ -533,12 +549,11 @@ def poll_ci(excluded_run_ids: set[int] | None = None) -> PollResult:
         selected = max(active_runs, key=lambda run: run.created_at)
         return PollResult(selected.status, head_sha, selected)
     if len(runs) != len(TRACKED_WORKFLOWS):
-        return PollResult("incomplete", head_sha, max(runs, key=lambda run: run.created_at))
+        return PollResult(
+            "incomplete", head_sha, max(runs, key=lambda run: run.created_at)
+        )
     primary = next((run for run in runs if run.workflow == "CI"), None)
-    if (
-        primary is not None
-        and primary.conclusion == "success"
-    ):
+    if primary is not None and primary.conclusion == "success":
         return PollResult("completed:success", head_sha, primary)
     selected = max(runs, key=lambda run: run.created_at)
     return PollResult(f"completed:{selected.conclusion}", head_sha, selected)
@@ -559,8 +574,16 @@ def failing_signature(run: CiRun) -> str:
     """
     try:
         raw = run_command(
-            [str(GH_BIN), "run", "view", str(run.run_id), "--repo", REPO_NAME,
-             "--json", "jobs"],
+            [
+                str(GH_BIN),
+                "run",
+                "view",
+                str(run.run_id),
+                "--repo",
+                REPO_NAME,
+                "--json",
+                "jobs",
+            ],
             timeout=30,
         )
         jobs = json.loads(raw).get("jobs", [])
@@ -644,19 +667,23 @@ def github_issue_state(issue_url: str) -> str:
     last_error: CommandError | None = None
     for attempt in range(attempts):
         try:
-            state = run_command(
-                [
-                    str(GH_BIN),
-                    "issue",
-                    "view",
-                    issue_url,
-                    "--json",
-                    "state",
-                    "--jq",
-                    ".state",
-                ],
-                timeout=30,
-            ).strip().upper()
+            state = (
+                run_command(
+                    [
+                        str(GH_BIN),
+                        "issue",
+                        "view",
+                        issue_url,
+                        "--json",
+                        "state",
+                        "--jq",
+                        ".state",
+                    ],
+                    timeout=30,
+                )
+                .strip()
+                .upper()
+            )
             if state not in {"OPEN", "CLOSED"}:
                 raise CommandError(
                     f"GitHub returned unexpected issue state {state!r} for {issue_url}"
@@ -734,8 +761,15 @@ def open_escalation(
             "(id, sha, signature, issue_url, thread_ts, last_reported_run_id, "
             "escalated, opened_at) "
             "VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
-            (sha, signature, issue_url, thread_ts, last_reported_run_id,
-             int(escalated), utc_now()),
+            (
+                sha,
+                signature,
+                issue_url,
+                thread_ts,
+                last_reported_run_id,
+                int(escalated),
+                utc_now(),
+            ),
         )
 
 
@@ -772,35 +806,52 @@ def preflight_worktree() -> str:
         raise PreflightError("worktree_missing", f"{WORKTREE} does not exist")
     branch = run_command([str(GIT_BIN), "branch", "--show-current"], cwd=WORKTREE)
     if branch != WORKTREE_BRANCH:
-        raise PreflightError("wrong_branch", f"expected branch {WORKTREE_BRANCH!r}, found {branch!r}")
+        raise PreflightError(
+            "wrong_branch", f"expected branch {WORKTREE_BRANCH!r}, found {branch!r}"
+        )
     dirty = run_command(
-        [str(GIT_BIN), "status", "--porcelain", "--untracked-files=normal"], cwd=WORKTREE
+        [str(GIT_BIN), "status", "--porcelain", "--untracked-files=normal"],
+        cwd=WORKTREE,
     )
     if dirty:
         raise PreflightError("dirty_worktree", "dedicated worktree is not clean")
     try:
-        run_command([str(GIT_BIN), "fetch", "origin", BRANCH], cwd=WORKTREE, timeout=180)
-        remote_sha = run_command([str(GIT_BIN), "rev-parse", f"origin/{BRANCH}"], cwd=WORKTREE)
         run_command(
-            [str(GIT_BIN), "merge", "--ff-only", f"origin/{BRANCH}"], cwd=WORKTREE, timeout=60
+            [str(GIT_BIN), "fetch", "origin", BRANCH], cwd=WORKTREE, timeout=180
+        )
+        remote_sha = run_command(
+            [str(GIT_BIN), "rev-parse", f"origin/{BRANCH}"], cwd=WORKTREE
+        )
+        run_command(
+            [str(GIT_BIN), "merge", "--ff-only", f"origin/{BRANCH}"],
+            cwd=WORKTREE,
+            timeout=60,
         )
     except CommandError as exc:
         raise PreflightError("sync_failed", str(exc)) from exc
     local_sha = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
     if local_sha != remote_sha:
         raise PreflightError(
-            "diverged_worktree", f"local HEAD is {local_sha}, expected origin/{BRANCH} {remote_sha}"
+            "diverged_worktree",
+            f"local HEAD is {local_sha}, expected origin/{BRANCH} {remote_sha}",
         )
     dirty = run_command(
-        [str(GIT_BIN), "status", "--porcelain", "--untracked-files=normal"], cwd=WORKTREE
+        [str(GIT_BIN), "status", "--porcelain", "--untracked-files=normal"],
+        cwd=WORKTREE,
     )
     if dirty:
-        raise PreflightError("dirty_after_sync", "worktree became dirty while synchronizing")
+        raise PreflightError(
+            "dirty_after_sync", "worktree became dirty while synchronizing"
+        )
     return local_sha
 
 
 def record_preflight_event(
-    conn: sqlite3.Connection, transport: SlackTransport, sha: str, kind: str, details: str
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+    sha: str,
+    kind: str,
+    details: str,
 ) -> None:
     with conn:
         cursor = conn.execute(
@@ -843,14 +894,91 @@ def claim_invocation(conn: sqlite3.Connection, run: CiRun) -> bool:
     return True
 
 
+def terminate_recorded_codex(pid: int | None) -> bool:
+    """Terminate a recorded Codex process group after a monitor restart."""
+    if not pid or pid <= 1:
+        return True
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        log(f"could not inspect interrupted Codex pid {pid}: {exc}")
+        return False
+    if b"codex" not in cmdline:
+        log(f"refusing to signal reused non-Codex pid {pid}")
+        return False
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.1)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    return True
+
+
 def recover_interrupted(conn: sqlite3.Connection, transport: SlackTransport) -> None:
     rows = conn.execute(
-        "SELECT workflow_run_id, sha, workflow_run_url, thread_ts FROM invocations "
-        "WHERE status IN ('claimed', 'running')"
+        "SELECT workflow_run_id, sha, workflow_run_url, thread_ts, status, "
+        "codex_session_id, codex_pid FROM invocations "
+        "WHERE status IN ('claimed', 'running', 'handoff_running')"
     ).fetchall()
     for row in rows:
         run_id = int(row["workflow_run_id"])
         sha = str(row["sha"])
+        if row["status"] == "handoff_running":
+            stopped = terminate_recorded_codex(row["codex_pid"])
+            if stopped:
+                cleanup_ok, cleanup_detail = recover_timeout_worktree(
+                    run_id, sha, row["codex_session_id"]
+                )
+            else:
+                cleanup_ok, cleanup_detail = (
+                    False,
+                    "could not safely stop recorded Codex process",
+                )
+            with conn:
+                conn.execute(
+                    """
+                    UPDATE invocations
+                    SET status = 'timed_out', timeout_handoff_status = 'failed',
+                        codex_pid = NULL, finished_at = ?, output = output || ?
+                    WHERE workflow_run_id = ?
+                    """,
+                    (
+                        utc_now(),
+                        f"\nMonitor restarted during timeout handoff. {cleanup_detail}.\n",
+                        run_id,
+                    ),
+                )
+            mentions = " ".join(
+                f"<@{member_id}>" for member_id in ESCALATION_SLACK_MEMBER_IDS
+            )
+            slack_send(
+                transport,
+                f"{mentions} Bifrost CI timeout handoff for "
+                f"<https://github.com/{REPO_NAME}/commit/{sha}|`{sha[:8]}`> was "
+                f"interrupted. Worktree recovery "
+                f"{'succeeded' if cleanup_ok else 'failed'}: {cleanup_detail}. "
+                f"<{row['workflow_run_url']}|CI run>",
+                thread_ts=row["thread_ts"],
+            )
+            with conn:
+                conn.execute(
+                    "UPDATE invocations SET outcome_notification_attempted = 1 "
+                    "WHERE workflow_run_id = ?",
+                    (run_id,),
+                )
+            continue
         with conn:
             conn.execute(
                 """
@@ -917,51 +1045,25 @@ Then exit successfully.
 """
 
 
-def invoke_codex(prompt: str) -> tuple[str, int | None, bool, str]:
-    args = [
-        str(CODEX_BIN),
-        "exec",
-        "-C",
-        str(WORKTREE),
-        *CODEX_MODEL_ARGS,
-        "--sandbox",
-        "workspace-write",
-        "--color",
-        "never",
-        "-c",
-        "shell_environment_policy.inherit=all",
-        "-",
-    ]
-    try:
-        process = subprocess.Popen(
-            args,
-            cwd=WORKTREE,
-            env=child_environment(),
-            text=True,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        return "spawn_failed", None, False, f"Could not start Codex: {exc}\n"
-    try:
-        output, _ = process.communicate(input=prompt, timeout=CODEX_TIMEOUT_SECONDS)
-        status = "completed" if process.returncode == 0 else "failed"
-        return status, process.returncode, False, output or ""
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGTERM)
-        try:
-            output, _ = process.communicate(timeout=30)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            output, _ = process.communicate()
-        return (
-            "timed_out",
-            process.returncode,
-            True,
-            (output or "") + "\nCodex exceeded the one-hour monitor timeout.\n",
-        )
+def build_timeout_handoff_prompt(run: CiRun) -> str:
+    mentions = " ".join(f"<@{member_id}>" for member_id in ESCALATION_SLACK_MEMBER_IDS)
+    return f"""Since this has taken over one hour, it is time to create a ticket and turn it over to a human for resolution; definitionally this was not as simple as it looked.
+
+Stop the repair now. Do not investigate further, run more tests, edit files, commit, or push. Using only the diagnosis and evidence already present in this session, file a GitHub issue on {REPO_NAME} with `gh issue create`. The issue must include the failing run ({run.url}), the failing jobs and tests, the findings so far, the approach attempted, the unresolved blocker or decision, and a note that the automated attempt timed out with incomplete worktree changes that the monitor will stash. Note the issue URL printed by `gh`.
+
+As your final assistant message, on its own with nothing after it, write exactly:
+{mentions} CI repair exceeded the one-hour automation budget — filed <ISSUE_URL>. <one-sentence summary of the unresolved problem>
+Replace <ISSUE_URL> with the issue URL. Keep the mention tokens verbatim and do not attempt to call Slack yourself. Then exit.
+"""
+
+
+@dataclass(frozen=True)
+class CodexResult:
+    status: str
+    exit_code: int | None
+    timed_out: bool
+    output: str
+    session_id: str | None
 
 
 def extract_agent_text(obj: Any) -> str | None:
@@ -988,30 +1090,63 @@ def extract_agent_text(obj: Any) -> str | None:
     return None
 
 
+def extract_session_id(obj: Any) -> str | None:
+    """Return the saved Codex session id from a JSONL event, if present."""
+    if not isinstance(obj, dict) or obj.get("type") != "thread.started":
+        return None
+    session_id = obj.get("thread_id")
+    return session_id if isinstance(session_id, str) and session_id.strip() else None
+
+
 def invoke_codex_stream(
-    prompt: str, on_message
-) -> tuple[str, int | None, bool, str]:
+    prompt: str,
+    on_message,
+    *,
+    timeout_seconds: int = CODEX_TIMEOUT_SECONDS,
+    resume_session_id: str | None = None,
+    on_session=None,
+    on_process=None,
+) -> CodexResult:
     """Run Codex with --json, invoking ``on_message(text)`` per assistant message.
 
     Reads stdout as JSONL as it arrives so the Slack thread updates live, while
-    still capturing the full transcript for the database and enforcing the same
-    one-hour timeout and SIGTERM/SIGKILL escalation as the batch path.
+    still capturing the full transcript for the database and enforcing the
+    caller's timeout with SIGTERM/SIGKILL escalation.
     """
-    args = [
-        str(CODEX_BIN),
-        "exec",
-        "-C",
-        str(WORKTREE),
-        *CODEX_MODEL_ARGS,
-        "--json",
-        "--sandbox",
-        "workspace-write",
-        "--color",
-        "never",
-        "-c",
-        "shell_environment_policy.inherit=all",
-        "-",
-    ]
+    if resume_session_id:
+        # exec-resume has its own option parser. Put workspace and sandbox
+        # overrides at the CLI root, and pass the follow-up prompt on stdin.
+        args = [
+            str(CODEX_BIN),
+            "-C",
+            str(WORKTREE),
+            "--sandbox",
+            "workspace-write",
+            "exec",
+            "resume",
+            *CODEX_MODEL_ARGS,
+            "--json",
+            "-c",
+            "shell_environment_policy.inherit=all",
+            resume_session_id,
+            "-",
+        ]
+    else:
+        args = [
+            str(CODEX_BIN),
+            "exec",
+            "-C",
+            str(WORKTREE),
+            *CODEX_MODEL_ARGS,
+            "--json",
+            "--sandbox",
+            "workspace-write",
+            "--color",
+            "never",
+            "-c",
+            "shell_environment_policy.inherit=all",
+            "-",
+        ]
     stderr_file = tempfile.TemporaryFile()
     try:
         process = subprocess.Popen(
@@ -1025,7 +1160,18 @@ def invoke_codex_stream(
         )
     except OSError as exc:
         stderr_file.close()
-        return "spawn_failed", None, False, f"Could not start Codex: {exc}\n"
+        return CodexResult(
+            "spawn_failed",
+            None,
+            False,
+            f"Could not start Codex: {exc}\n",
+            resume_session_id,
+        )
+
+    if on_process is not None:
+        on_process(process.pid)
+
+    session_id = resume_session_id
 
     def dispatch(raw_line: bytes) -> None:
         line = raw_line.strip()
@@ -1035,6 +1181,12 @@ def invoke_codex_stream(
             obj = json.loads(line)
         except ValueError:
             return
+        nonlocal session_id
+        found_session_id = extract_session_id(obj)
+        if found_session_id:
+            session_id = found_session_id
+            if on_session is not None:
+                on_session(found_session_id)
         text = extract_agent_text(obj)
         if text:
             try:
@@ -1049,7 +1201,7 @@ def invoke_codex_stream(
         pass
 
     stdout_fd = process.stdout.fileno()
-    deadline = time.monotonic() + CODEX_TIMEOUT_SECONDS
+    deadline = time.monotonic() + timeout_seconds
     chunks: list[bytes] = []
     buffer = b""
     timed_out = False
@@ -1094,10 +1246,10 @@ def invoke_codex_stream(
     stderr_file.close()
     output = b"".join(chunks).decode("utf-8", errors="replace") + stderr_text
     if timed_out:
-        output += "\nCodex exceeded the one-hour monitor timeout.\n"
-        return "timed_out", process.returncode, True, output
+        output += f"\nCodex exceeded the {timeout_seconds}-second monitor timeout.\n"
+        return CodexResult("timed_out", process.returncode, True, output, session_id)
     status = "completed" if process.returncode == 0 else "failed"
-    return status, process.returncode, False, output
+    return CodexResult(status, process.returncode, False, output, session_id)
 
 
 def format_commit(sha: str) -> str:
@@ -1140,15 +1292,22 @@ def detect_escalation(
     it just created after any it merely referenced.
     """
     text = output or ""
-    escalated = any(f"<@{member_id}>" in text for member_id in ESCALATION_SLACK_MEMBER_IDS)
+    escalated = any(
+        f"<@{member_id}>" in text for member_id in ESCALATION_SLACK_MEMBER_IDS
+    )
     if not escalated:
         return False, None
+    return True, find_issue_url(text, exclude_url=exclude_url)
+
+
+def find_issue_url(output: str, exclude_url: str | None = None) -> str | None:
+    """Return the last repository issue URL in output, preferring a new one."""
     urls = re.findall(
-        rf"https://github\.com/{re.escape(REPO_NAME)}/issues/\d+", text
+        rf"https://github\.com/{re.escape(REPO_NAME)}/issues/\d+", output or ""
     )
-    fresh = [url for url in urls if url != exclude_url]
-    candidates = fresh or urls
-    return True, (candidates[-1] if candidates else None)
+    if exclude_url is not None:
+        urls = [url for url in urls if url != exclude_url]
+    return urls[-1] if urls else None
 
 
 def git_is_ancestor(ancestor: str, ref: str) -> bool:
@@ -1164,6 +1323,88 @@ def git_is_ancestor(ancestor: str, ref: str) -> bool:
     return result.returncode == 0
 
 
+def recover_timeout_worktree(
+    run_id: int, sha: str, session_id: str | None
+) -> tuple[bool, str]:
+    """Stash a timed-out attempt and restore the dedicated branch to remote master.
+
+    Refuse the destructive reset unless every piece of unfinished work has a
+    durable Git reference: working-copy changes go into refs/stash, while a
+    clean unpushed commit receives a local timeout tag.
+    """
+    try:
+        branch = run_command([str(GIT_BIN), "branch", "--show-current"], cwd=WORKTREE)
+        if branch != WORKTREE_BRANCH:
+            return False, f"expected branch {WORKTREE_BRANCH!r}, found {branch!r}"
+
+        dirty = run_command(
+            [str(GIT_BIN), "status", "--porcelain", "--untracked-files=normal"],
+            cwd=WORKTREE,
+        )
+        stash_label = (
+            f"bifrost-ci timeout run {run_id} sha {sha[:8]} "
+            f"session {session_id or 'unknown'}"
+        )
+        stashed = False
+        if dirty:
+            run_command(
+                [
+                    str(GIT_BIN),
+                    "stash",
+                    "push",
+                    "--include-untracked",
+                    "--message",
+                    stash_label,
+                ],
+                cwd=WORKTREE,
+                timeout=180,
+            )
+            stashed = True
+            remaining = run_command(
+                [str(GIT_BIN), "status", "--porcelain", "--untracked-files=normal"],
+                cwd=WORKTREE,
+            )
+            if remaining:
+                return False, "git stash left tracked or untracked changes behind"
+
+        run_command(
+            [str(GIT_BIN), "fetch", "origin", BRANCH], cwd=WORKTREE, timeout=180
+        )
+        local_sha = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
+        remote_ref = f"origin/{BRANCH}"
+        remote_sha = run_command([str(GIT_BIN), "rev-parse", remote_ref], cwd=WORKTREE)
+        tagged = False
+        if local_sha != remote_sha and not git_is_ancestor(local_sha, remote_ref):
+            tag = f"bifrost-ci-timeout/{run_id}"
+            try:
+                existing = run_command(
+                    [str(GIT_BIN), "rev-parse", f"refs/tags/{tag}"], cwd=WORKTREE
+                )
+            except CommandError:
+                run_command([str(GIT_BIN), "tag", tag, local_sha], cwd=WORKTREE)
+                tagged = True
+            else:
+                if existing != local_sha:
+                    return False, f"local preservation tag {tag!r} points elsewhere"
+
+        run_command([str(GIT_BIN), "reset", "--hard", remote_ref], cwd=WORKTREE)
+        final_status = run_command(
+            [str(GIT_BIN), "status", "--porcelain", "--untracked-files=normal"],
+            cwd=WORKTREE,
+        )
+        final_sha = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
+        if final_status or final_sha != remote_sha:
+            return False, "worktree was not clean and synchronized after recovery"
+        saved = []
+        if stashed:
+            saved.append("stashed incomplete edits")
+        if tagged:
+            saved.append(f"tagged unpushed commit bifrost-ci-timeout/{run_id}")
+        return True, "; ".join(saved) if saved else "no incomplete edits to stash"
+    except CommandError as exc:
+        return False, str(exc)
+
+
 def resolve_master_outcome(base_sha: str, status: str) -> tuple[str, str | None]:
     """Return (current master SHA or 'unknown', the SHA we pushed or None).
 
@@ -1172,8 +1413,12 @@ def resolve_master_outcome(base_sha: str, status: str) -> tuple[str, str | None]
     rejected push or a no-op exit is never reported as a fix we pushed.
     """
     try:
-        run_command([str(GIT_BIN), "fetch", "origin", BRANCH], cwd=WORKTREE, timeout=180)
-        new_sha = run_command([str(GIT_BIN), "rev-parse", f"origin/{BRANCH}"], cwd=WORKTREE)
+        run_command(
+            [str(GIT_BIN), "fetch", "origin", BRANCH], cwd=WORKTREE, timeout=180
+        )
+        new_sha = run_command(
+            [str(GIT_BIN), "rev-parse", f"origin/{BRANCH}"], cwd=WORKTREE
+        )
     except CommandError:
         return "unknown", None
     pushed: str | None = None
@@ -1218,9 +1463,7 @@ def run_monitor() -> int:
                 # in the closing thread), so the next failure opens its own thread.
                 log("CI is green again; re-arming the auto-fixer")
                 resolved = (
-                    " The open escalation is resolved."
-                    if cleared["escalated"]
-                    else ""
+                    " The open escalation is resolved." if cleared["escalated"] else ""
                 )
                 slack_send(
                     transport,
@@ -1271,7 +1514,9 @@ def run_monitor() -> int:
                 if episode["escalated"]:
                     # A human owns this design failure. Stand down, but report the
                     # new build as a threaded note under the episode's thread.
-                    log("escalation open; new failed build within the owned surface; threading a note")
+                    log(
+                        "escalation open; new failed build within the owned surface; threading a note"
+                    )
                     issue = episode["issue_url"]
                     ticket = f" (<{issue}|open ticket>)" if issue else ""
                     slack_send(
@@ -1286,12 +1531,16 @@ def run_monitor() -> int:
                     return 0
                 # Non-escalated repeat: re-engage Codex, threaded under the episode.
                 reply_ts = episode["thread_ts"]
-                log("new failed build within the current set; re-engaging Codex in-thread")
+                log(
+                    "new failed build within the current set; re-engaging Codex in-thread"
+                )
             else:
                 # Reset: a surface outside the episode baseline. If the episode is
                 # escalated this classification pass knows the open issue.
                 open_issue_url = episode["issue_url"] if episode["escalated"] else None
-                log(f"new failing surface ({sorted(new_surface)}); resetting the thread and classifying")
+                log(
+                    f"new failing surface ({sorted(new_surface)}); resetting the thread and classifying"
+                )
 
         if invocation_exists(conn, run.run_id):
             return 0
@@ -1344,38 +1593,161 @@ def run_monitor() -> int:
                 (thread_ts, run.run_id),
             )
 
-        log(f"launching Codex for red {run.workflow} at {run.sha[:8]}")
-        if transport.kind == "chat" and thread_ts:
-            def relay(text: str, _thread_ts: str = thread_ts) -> None:
+        def relay(text: str, _thread_ts: str | None = thread_ts) -> None:
+            if transport.kind == "chat" and _thread_ts:
                 slack_send(transport, text, thread_ts=_thread_ts)
 
-            status, exit_code, timed_out, output = invoke_codex_stream(
-                build_prompt(run, open_issue_url), relay
+        def record_session(session_id: str) -> None:
+            with conn:
+                conn.execute(
+                    "UPDATE invocations SET codex_session_id = ? WHERE workflow_run_id = ?",
+                    (session_id, run.run_id),
+                )
+
+        def record_process(pid: int) -> None:
+            with conn:
+                conn.execute(
+                    "UPDATE invocations SET codex_pid = ? WHERE workflow_run_id = ?",
+                    (pid, run.run_id),
+                )
+
+        log(f"launching Codex for red {run.workflow} at {run.sha[:8]}")
+        result = invoke_codex_stream(
+            build_prompt(run, open_issue_url),
+            relay,
+            on_session=record_session,
+            on_process=record_process,
+        )
+        status = result.status
+        exit_code = result.exit_code
+        output = result.output
+        issue_url: str | None = None
+        escalated = False
+        cleanup_ok = True
+        cleanup_detail = ""
+
+        if result.timed_out:
+            # The repair budget is exhausted. Preserve its complete context by
+            # resuming the exact saved session for one short, ticket-only turn.
+            with conn:
+                conn.execute(
+                    """
+                    UPDATE invocations
+                    SET status = 'handoff_running', exit_code = ?, timed_out = 1,
+                        output = ?, codex_session_id = ?, timeout_handoff_status = 'running',
+                        codex_pid = NULL
+                    WHERE workflow_run_id = ?
+                    """,
+                    (exit_code, output, result.session_id, run.run_id),
+                )
+            handoff_output = ""
+            if result.session_id:
+                log(
+                    f"repair timed out; resuming Codex session {result.session_id} for handoff"
+                )
+                handoff = invoke_codex_stream(
+                    build_timeout_handoff_prompt(run),
+                    relay,
+                    timeout_seconds=CODEX_HANDOFF_TIMEOUT_SECONDS,
+                    resume_session_id=result.session_id,
+                    on_process=record_process,
+                )
+                handoff_output = handoff.output
+                issue_url = find_issue_url(handoff_output, exclude_url=open_issue_url)
+            else:
+                handoff_output = (
+                    "Could not resume timed-out Codex: no session id was emitted.\n"
+                )
+
+            cleanup_ok, cleanup_detail = recover_timeout_worktree(
+                run.run_id, run.sha, result.session_id
             )
+            output = (
+                output
+                + "\n--- timeout handoff ---\n"
+                + handoff_output
+                + f"\n--- worktree recovery ---\n{cleanup_detail}\n"
+            )
+            escalated = issue_url is not None
+            handoff_status = "completed" if escalated else "failed"
+            with conn:
+                conn.execute(
+                    """
+                    UPDATE invocations
+                    SET status = 'timed_out', output = ?, finished_at = ?, issue_url = ?,
+                        timeout_handoff_status = ?, codex_pid = NULL
+                    WHERE workflow_run_id = ?
+                    """,
+                    (output, utc_now(), issue_url, handoff_status, run.run_id),
+                )
+            if escalated:
+                mention_text = " ".join(
+                    f"<@{member_id}>" for member_id in ESCALATION_SLACK_MEMBER_IDS
+                )
+                if transport.kind != "chat" or not any(
+                    f"<@{member_id}>" in handoff_output
+                    for member_id in ESCALATION_SLACK_MEMBER_IDS
+                ):
+                    slack_send(
+                        transport,
+                        f"{mention_text} CI repair exceeded the one-hour automation budget — "
+                        f"filed <{issue_url}|a ticket> for human resolution.",
+                        thread_ts=thread_ts,
+                    )
+            else:
+                mention_text = " ".join(
+                    f"<@{member_id}>" for member_id in ESCALATION_SLACK_MEMBER_IDS
+                )
+                slack_send(
+                    transport,
+                    f"{mention_text} Bifrost CI repair exceeded one hour, and the "
+                    f"ticket handoff failed. Worktree recovery: {cleanup_detail}.",
+                    thread_ts=thread_ts,
+                )
         else:
-            status, exit_code, timed_out, output = invoke_codex(
-                build_prompt(run, open_issue_url)
-            )
-        with conn:
-            conn.execute(
-                """
-                UPDATE invocations
-                SET status = ?, exit_code = ?, timed_out = ?, output = ?, finished_at = ?
-                WHERE workflow_run_id = ?
-                """,
-                (status, exit_code, int(timed_out), output, utc_now(), run.run_id),
-            )
+            with conn:
+                conn.execute(
+                    """
+                    UPDATE invocations
+                    SET status = ?, exit_code = ?, timed_out = 0, output = ?,
+                        codex_session_id = ?, codex_pid = NULL, finished_at = ?
+                    WHERE workflow_run_id = ?
+                    """,
+                    (
+                        status,
+                        exit_code,
+                        output,
+                        result.session_id,
+                        utc_now(),
+                        run.run_id,
+                    ),
+                )
 
         new_sha, pushed_sha = resolve_master_outcome(base_sha, status)
-        escalated, issue_url = (False, None)
-        if status == "completed" and pushed_sha is None:
+        if not result.timed_out and status == "completed" and pushed_sha is None:
             escalated, issue_url = detect_escalation(output, exclude_url=open_issue_url)
+            if escalated and issue_url:
+                with conn:
+                    conn.execute(
+                        "UPDATE invocations SET issue_url = ? WHERE workflow_run_id = ?",
+                        (issue_url, run.run_id),
+                    )
 
-        if escalated:
-            emoji, outcome = ":memo:", "escalated"
-            filed = (
-                f"filed <{issue_url}|a ticket>" if issue_url else "filed a ticket"
+        if escalated and result.timed_out:
+            outcome = "timed out and escalated"
+            recovery = (
+                f" Worktree recovered: {cleanup_detail}."
+                if cleanup_ok
+                else f" Worktree recovery failed: {cleanup_detail}."
             )
+            outcome_line = (
+                f":memo: Bifrost CI auto-fixer for {commit_link} exceeded its one-hour "
+                f"budget and filed <{issue_url}|a ticket> for human resolution.{recovery} "
+                f"<{run.url}|Original CI run>"
+            )
+        elif escalated:
+            emoji, outcome = ":memo:", "escalated"
+            filed = f"filed <{issue_url}|a ticket>" if issue_url else "filed a ticket"
             distinct = (
                 " (a new problem, distinct from the one already open)"
                 if episode is not None and episode["escalated"]
@@ -1398,7 +1770,9 @@ def run_monitor() -> int:
                 )
             else:
                 emoji, outcome = ":repeat:", "re-checked"
-                detail = "No new actionable problem; the open design ticket still stands."
+                detail = (
+                    "No new actionable problem; the open design ticket still stands."
+                )
             outcome_line = (
                 f"{emoji} Bifrost CI auto-fixer for {commit_link}: {detail} "
                 f"<{run.url}|CI run>"
@@ -1407,7 +1781,10 @@ def run_monitor() -> int:
             if status == "completed":
                 emoji, outcome = ":white_check_mark:", "finished"
             elif status == "timed_out":
-                emoji, outcome = ":hourglass_flowing_sand:", "timed out after one hour"
+                emoji, outcome = (
+                    ":hourglass_flowing_sand:",
+                    "timed out; ticket handoff failed",
+                )
             elif status == "spawn_failed":
                 emoji, outcome = ":x:", "could not start"
             else:
@@ -1427,31 +1804,55 @@ def run_monitor() -> int:
         if escalated:
             # Human now owns it: the current failing set is the owned baseline and
             # the ticket pointer moves to the freshly filed issue.
-            open_escalation(conn, run.sha, signature, issue_url, thread_ts,
-                            run.run_id, escalated=True)
+            open_escalation(
+                conn,
+                run.sha,
+                signature,
+                issue_url,
+                thread_ts,
+                run.run_id,
+                escalated=True,
+            )
         elif status == "completed" and episode is not None and episode["escalated"]:
             # A pass against an already-open escalation that did not re-escalate.
             if pushed_sha:
                 # Fixed new mechanical breakage: keep the design baseline and
                 # ticket untouched so the fixed surface drops out on its own — and
                 # if it recurs, it reads as new again and gets fixed again.
-                open_escalation(conn, episode["sha"], episode["signature"],
-                                episode["issue_url"], thread_ts, run.run_id,
-                                escalated=True)
+                open_escalation(
+                    conn,
+                    episode["sha"],
+                    episode["signature"],
+                    episode["issue_url"],
+                    thread_ts,
+                    run.run_id,
+                    escalated=True,
+                )
             else:
                 # Stood down on the same design issue: absorb the new surface into
                 # the baseline so this now-classified state won't re-trigger.
                 merged = "\n".join(
-                    sorted(signature_members(episode["signature"]) | signature_members(signature))
+                    sorted(
+                        signature_members(episode["signature"])
+                        | signature_members(signature)
+                    )
                 )
-                open_escalation(conn, run.sha, merged, episode["issue_url"],
-                                thread_ts, run.run_id, escalated=True)
+                open_escalation(
+                    conn,
+                    run.sha,
+                    merged,
+                    episode["issue_url"],
+                    thread_ts,
+                    run.run_id,
+                    escalated=True,
+                )
         elif status == "completed":
             # Routine (non-escalated) episode, new or continuing: record the
             # current failing set as the baseline so a repeat threads and a new
             # surface resets. No ticket; a green next poll clears it.
-            open_escalation(conn, run.sha, signature, None, thread_ts,
-                            run.run_id, escalated=False)
+            open_escalation(
+                conn, run.sha, signature, None, thread_ts, run.run_id, escalated=False
+            )
         with conn:
             conn.execute(
                 "UPDATE invocations SET outcome_notification_attempted = 1 "
@@ -1459,7 +1860,7 @@ def run_monitor() -> int:
                 (run.run_id,),
             )
         log(f"Codex {outcome} for {run.sha[:8]}")
-        return 0 if status == "completed" else 5
+        return 0 if (status == "completed" or escalated) and cleanup_ok else 5
     finally:
         conn.close()
 
