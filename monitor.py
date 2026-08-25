@@ -64,6 +64,7 @@ SLACK_TIMEOUT_SECONDS = 10
 SLACK_CHAT_URL = "https://slack.com/api/chat.postMessage"
 SLACK_MESSAGE_LIMIT = 3500
 RED_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required"}
+RUN_RETRY_SETTLE_SECONDS = 5 * 60
 ISSUE_STATE_RETRY_DELAYS = (1, 2)
 
 # People Codex pings on Slack when it escalates a design-level CI failure
@@ -467,6 +468,8 @@ class CiRun:
     status: str
     conclusion: str
     created_at: str
+    attempt: int
+    updated_at: str
 
 
 @dataclass(frozen=True)
@@ -476,15 +479,24 @@ class PollResult:
     run: CiRun | None
 
 
-def poll_ci(excluded_run_ids: set[int] | None = None) -> PollResult:
+def poll_ci(
+    excluded_run_ids: set[int] | None = None,
+    *,
+    now: dt.datetime | None = None,
+) -> PollResult:
     """Poll the latest run in every tracked workflow and select work to handle.
 
     A red latest run takes precedence over green or in-progress runs in the
-    other workflows. When more than one workflow is red, prefer the newest run
-    that has not already been handled; this prevents a persistent failure in
-    one workflow from hiding a new failure in another. If all red runs have
-    already been handled, still return red so a green workflow cannot
-    incorrectly clear the current failure episode.
+    other workflows after a short settling window. GitHub briefly exposes a
+    failed attempt as terminal before RunsOn requests the replacement attempt,
+    and both attempts share one workflow run id. Waiting prevents that expected
+    recovery gap from launching Codex and filing an infrastructure issue.
+
+    When more than one workflow is red, prefer the newest run that has not
+    already been handled; this prevents a persistent failure in one workflow
+    from hiding a new failure in another. If all red runs have already been
+    handled, still return red so a green workflow cannot incorrectly clear the
+    current failure episode.
     """
     head_sha = run_command(
         [str(GH_BIN), "api", f"repos/{REPO_NAME}/commits/{BRANCH}", "--jq", ".sha"],
@@ -505,7 +517,7 @@ def poll_ci(excluded_run_ids: set[int] | None = None) -> PollResult:
             "--limit",
             "1",
             "--json",
-            "databaseId,headSha,status,conclusion,url,createdAt",
+            "databaseId,headSha,status,conclusion,url,createdAt,attempt,updatedAt",
         ]
         if event is not None:
             limit_index = command.index("--limit")
@@ -524,6 +536,8 @@ def poll_ci(excluded_run_ids: set[int] | None = None) -> PollResult:
                 status=str(item["status"]),
                 conclusion=str(item.get("conclusion") or ""),
                 created_at=str(item["createdAt"]),
+                attempt=int(item["attempt"]),
+                updated_at=str(item["updatedAt"]),
             )
         )
     if not runs:
@@ -534,11 +548,32 @@ def poll_ci(excluded_run_ids: set[int] | None = None) -> PollResult:
         for run in runs
         if run.status == "completed" and run.conclusion in RED_CONCLUSIONS
     ]
-    if red_runs:
+    poll_time = now or dt.datetime.now(dt.timezone.utc)
+    settle_cutoff = poll_time - dt.timedelta(seconds=RUN_RETRY_SETTLE_SECONDS)
+    settled_red_runs: list[CiRun] = []
+    settling_red_runs: list[CiRun] = []
+    for run in red_runs:
+        try:
+            updated_at = dt.datetime.fromisoformat(
+                run.updated_at.replace("Z", "+00:00")
+            )
+        except ValueError:
+            # An unreadable timestamp must not suppress a genuine failure.
+            settled_red_runs.append(run)
+            continue
+        if updated_at <= settle_cutoff:
+            settled_red_runs.append(run)
+        else:
+            settling_red_runs.append(run)
+
+    if settled_red_runs:
         excluded = excluded_run_ids or set()
-        unhandled = [run for run in red_runs if run.run_id not in excluded]
-        selected = max(unhandled or red_runs, key=lambda run: run.created_at)
+        unhandled = [run for run in settled_red_runs if run.run_id not in excluded]
+        selected = max(unhandled or settled_red_runs, key=lambda run: run.created_at)
         return PollResult("red", head_sha, selected)
+    if settling_red_runs:
+        selected = max(settling_red_runs, key=lambda run: run.created_at)
+        return PollResult("settling", head_sha, selected)
 
     # Do not clear an episode while any tracked run is still settling. Once all
     # three latest runs are terminal and none is red, a successful push CI run
@@ -1880,6 +1915,8 @@ def check_only() -> int:
                         "url": result.run.url,
                         "status": result.run.status,
                         "conclusion": result.run.conclusion,
+                        "attempt": result.run.attempt,
+                        "updated_at": result.run.updated_at,
                     }
                     if result.run
                     else None

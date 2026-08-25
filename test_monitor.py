@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import sqlite3
 import tempfile
@@ -23,6 +24,8 @@ def workflow_run(
     *,
     status: str = "completed",
     conclusion: str = "success",
+    attempt: int = 1,
+    updated_at: str | None = None,
 ) -> str:
     return json.dumps(
         [
@@ -34,12 +37,90 @@ def workflow_run(
                 "conclusion": conclusion,
                 "url": f"https://github.com/example/actions/runs/{run_id}",
                 "createdAt": created_at,
+                "attempt": attempt,
+                "updatedAt": updated_at or created_at,
             }
         ]
     )
 
 
 class PollCiTests(unittest.TestCase):
+    @mock.patch.object(monitor, "run_command")
+    def test_recent_failure_settles_while_runson_can_request_retry(self, run_command):
+        run_command.side_effect = [
+            "head-sha",
+            workflow_run("CI", 30, "2026-08-25T17:00:00Z"),
+            workflow_run(
+                "Hourly CI",
+                20,
+                "2026-08-25T17:10:00Z",
+                conclusion="failure",
+                updated_at="2026-08-25T17:28:34Z",
+            ),
+            workflow_run("Nightly CI", 10, "2026-08-25T08:00:00Z"),
+        ]
+
+        result = monitor.poll_ci(
+            now=dt.datetime(2026, 8, 25, 17, 30, 10, tzinfo=dt.timezone.utc)
+        )
+
+        self.assertEqual(result.state, "settling")
+        self.assertIsNotNone(result.run)
+        self.assertEqual(result.run.run_id, 20)
+        self.assertEqual(result.run.attempt, 1)
+
+    @mock.patch.object(monitor, "run_command")
+    def test_unchanged_failure_becomes_actionable_after_settle_window(
+        self, run_command
+    ):
+        run_command.side_effect = [
+            "head-sha",
+            workflow_run("CI", 30, "2026-08-25T17:00:00Z"),
+            workflow_run(
+                "Hourly CI",
+                20,
+                "2026-08-25T17:10:00Z",
+                conclusion="failure",
+                attempt=2,
+                updated_at="2026-08-25T17:28:34Z",
+            ),
+            workflow_run("Nightly CI", 10, "2026-08-25T08:00:00Z"),
+        ]
+
+        result = monitor.poll_ci(
+            now=dt.datetime(2026, 8, 25, 17, 33, 34, tzinfo=dt.timezone.utc)
+        )
+
+        self.assertEqual(result.state, "red")
+        self.assertIsNotNone(result.run)
+        self.assertEqual(result.run.run_id, 20)
+        self.assertEqual(result.run.attempt, 2)
+
+    @mock.patch.object(monitor, "run_command")
+    def test_replacement_attempt_in_progress_blocks_repair(self, run_command):
+        run_command.side_effect = [
+            "head-sha",
+            workflow_run("CI", 30, "2026-08-25T17:00:00Z"),
+            workflow_run(
+                "Hourly CI",
+                20,
+                "2026-08-25T17:10:00Z",
+                status="in_progress",
+                conclusion="",
+                attempt=2,
+                updated_at="2026-08-25T17:31:00Z",
+            ),
+            workflow_run("Nightly CI", 10, "2026-08-25T08:00:00Z"),
+        ]
+
+        result = monitor.poll_ci(
+            now=dt.datetime(2026, 8, 25, 17, 35, 0, tzinfo=dt.timezone.utc)
+        )
+
+        self.assertEqual(result.state, "in_progress")
+        self.assertIsNotNone(result.run)
+        self.assertEqual(result.run.attempt, 2)
+
     @mock.patch.object(monitor, "run_command")
     def test_hourly_failure_takes_precedence_over_newer_green_push(self, run_command):
         run_command.side_effect = [
@@ -338,6 +419,8 @@ class TimeoutHandoffTests(unittest.TestCase):
             status="completed",
             conclusion="failure",
             created_at="2026-08-23T00:00:00Z",
+            attempt=1,
+            updated_at="2026-08-23T00:30:00Z",
         )
 
         prompt = monitor.build_timeout_handoff_prompt(run)

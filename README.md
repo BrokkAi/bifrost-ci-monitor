@@ -12,8 +12,11 @@ otherwise it fixes forward and pushes HEAD:master.
 The monitor:
 
 - claims each CI run atomically in ~/Projects/bifrost-ci/activity.db, keyed on
-  the workflow run id, so a given run is never invoked twice (a re-run of the
-  same commit is a distinct run and is eligible);
+  the workflow run id, so a given run is never invoked twice (a new workflow
+  run of the same commit has a distinct id and is eligible);
+- waits five minutes after a workflow attempt first becomes red, allowing
+  RunsOn to replace an interrupted runner before launching Codex or filing an
+  infrastructure issue;
 - serializes runs with a local lock and refuses a dirty or diverged repair
   worktree;
 - fast-forwards ~/Projects/bifrost-ci and asks Codex to push HEAD:master;
