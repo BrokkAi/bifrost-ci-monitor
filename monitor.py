@@ -66,6 +66,12 @@ SLACK_MESSAGE_LIMIT = 3500
 RED_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required"}
 RUN_RETRY_SETTLE_SECONDS = 5 * 60
 ISSUE_STATE_RETRY_DELAYS = (1, 2)
+PUSH_RETRY_DELAYS = (1, 2)
+RETRYABLE_INVOCATION_STATUSES = {
+    "interrupted",
+    "orphaned_candidate",
+    "push_failed",
+}
 
 # People Codex pings on Slack when it escalates a design-level CI failure
 # instead of fixing it. These are Slack member IDs (e.g. "U08ABCD1234"), not
@@ -201,7 +207,11 @@ def connect_db() -> sqlite3.Connection:
             codex_session_id TEXT,
             issue_url TEXT,
             timeout_handoff_status TEXT,
-            codex_pid INTEGER
+            codex_pid INTEGER,
+            base_sha TEXT,
+            candidate_sha TEXT,
+            reconcile_round INTEGER NOT NULL DEFAULT 0,
+            attempt_count INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS monitor_events (
@@ -235,6 +245,10 @@ def connect_db() -> sqlite3.Connection:
     ensure_column(conn, "invocations", "issue_url", "TEXT")
     ensure_column(conn, "invocations", "timeout_handoff_status", "TEXT")
     ensure_column(conn, "invocations", "codex_pid", "INTEGER")
+    ensure_column(conn, "invocations", "base_sha", "TEXT")
+    ensure_column(conn, "invocations", "candidate_sha", "TEXT")
+    ensure_column(conn, "invocations", "reconcile_round", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "invocations", "attempt_count", "INTEGER NOT NULL DEFAULT 1")
     ensure_column(conn, "escalation_gate", "signature", "TEXT NOT NULL DEFAULT ''")
     ensure_column(conn, "escalation_gate", "last_reported_run_id", "INTEGER")
     ensure_column(conn, "escalation_gate", "escalated", "INTEGER NOT NULL DEFAULT 0")
@@ -479,6 +493,13 @@ class PollResult:
     run: CiRun | None
 
 
+@dataclass(frozen=True)
+class PreflightResult:
+    base_sha: str
+    recovered_tag: str | None = None
+    recovered_sha: str | None = None
+
+
 def poll_ci(
     excluded_run_ids: set[int] | None = None,
     *,
@@ -643,9 +664,12 @@ def signature_members(signature: str) -> set[str]:
 
 
 def invocation_exists(conn: sqlite3.Connection, run_id: int) -> bool:
+    placeholders = ", ".join("?" for _ in RETRYABLE_INVOCATION_STATUSES)
     return (
         conn.execute(
-            "SELECT 1 FROM invocations WHERE workflow_run_id = ?", (run_id,)
+            f"SELECT 1 FROM invocations WHERE workflow_run_id = ? "
+            f"AND status NOT IN ({placeholders})",
+            (run_id, *sorted(RETRYABLE_INVOCATION_STATUSES)),
         ).fetchone()
         is not None
     )
@@ -653,9 +677,14 @@ def invocation_exists(conn: sqlite3.Connection, run_id: int) -> bool:
 
 def handled_run_ids(conn: sqlite3.Connection) -> set[int]:
     """Return runs already invoked or reported as human-owned repeats."""
+    placeholders = ", ".join("?" for _ in RETRYABLE_INVOCATION_STATUSES)
     run_ids = {
         int(row[0])
-        for row in conn.execute("SELECT workflow_run_id FROM invocations").fetchall()
+        for row in conn.execute(
+            f"SELECT workflow_run_id FROM invocations "
+            f"WHERE status NOT IN ({placeholders})",
+            tuple(sorted(RETRYABLE_INVOCATION_STATUSES)),
+        ).fetchall()
     }
     episode = get_escalation(conn)
     if episode is not None and episode["last_reported_run_id"] is not None:
@@ -830,12 +859,26 @@ def clear_escalation(conn: sqlite3.Connection) -> sqlite3.Row | None:
     return row
 
 
-def preflight_worktree() -> str:
-    """Fast-forward the repair worktree to current origin/master and return its SHA.
+def preserve_commit(tag: str, sha: str) -> None:
+    """Create an idempotent local preservation tag for an unpushed commit."""
+    try:
+        existing = run_command(
+            [str(GIT_BIN), "rev-parse", f"refs/tags/{tag}"], cwd=WORKTREE
+        )
+    except CommandError:
+        run_command([str(GIT_BIN), "tag", tag, sha], cwd=WORKTREE)
+        return
+    if existing != sha:
+        raise CommandError(f"local preservation tag {tag!r} points elsewhere")
+
+
+def preflight_worktree() -> PreflightResult:
+    """Synchronize the repair worktree to current origin/master.
 
     The repair is no longer pinned to the failing run's commit: Codex works from
-    whatever master is now, so this syncs to the live HEAD instead of refusing
-    when master has advanced. Returns the synced HEAD SHA.
+    whatever master is now. A clean orphaned commit is tagged and retired so a
+    fresh triage can decide whether its change is still needed; dirty state is
+    never moved automatically.
     """
     if not WORKTREE.is_dir():
         raise PreflightError("worktree_missing", f"{WORKTREE} does not exist")
@@ -857,11 +900,27 @@ def preflight_worktree() -> str:
         remote_sha = run_command(
             [str(GIT_BIN), "rev-parse", f"origin/{BRANCH}"], cwd=WORKTREE
         )
-        run_command(
-            [str(GIT_BIN), "merge", "--ff-only", f"origin/{BRANCH}"],
-            cwd=WORKTREE,
-            timeout=60,
-        )
+    except CommandError as exc:
+        raise PreflightError("sync_failed", str(exc)) from exc
+    local_sha = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
+    recovered_tag: str | None = None
+    recovered_sha: str | None = None
+    try:
+        if local_sha != remote_sha:
+            if git_is_ancestor(local_sha, f"origin/{BRANCH}"):
+                run_command(
+                    [str(GIT_BIN), "merge", "--ff-only", f"origin/{BRANCH}"],
+                    cwd=WORKTREE,
+                    timeout=60,
+                )
+            else:
+                recovered_sha = local_sha
+                recovered_tag = f"bifrost-ci-recovery/preflight-{local_sha[:12]}"
+                preserve_commit(recovered_tag, local_sha)
+                run_command(
+                    [str(GIT_BIN), "reset", "--hard", f"origin/{BRANCH}"],
+                    cwd=WORKTREE,
+                )
     except CommandError as exc:
         raise PreflightError("sync_failed", str(exc)) from exc
     local_sha = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
@@ -878,7 +937,7 @@ def preflight_worktree() -> str:
         raise PreflightError(
             "dirty_after_sync", "worktree became dirty while synchronizing"
         )
-    return local_sha
+    return PreflightResult(local_sha, recovered_tag, recovered_sha)
 
 
 def record_preflight_event(
@@ -911,7 +970,49 @@ def record_preflight_event(
         )
 
 
-def claim_invocation(conn: sqlite3.Connection, run: CiRun) -> bool:
+def record_worktree_recovery(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+    sha: str,
+    recovered_sha: str,
+    tag: str,
+) -> None:
+    kind = f"worktree_recovered:{recovered_sha}"
+    details = f"preserved {recovered_sha} as {tag} and reset to origin/{BRANCH}"
+    with conn:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO monitor_events (sha, kind, created_at, details)
+            VALUES (?, ?, ?, ?)
+            """,
+            (sha, kind, utc_now(), details),
+        )
+        conn.execute(
+            """
+            UPDATE invocations
+            SET status = 'orphaned_candidate', finished_at = ?,
+                output = output || ?
+            WHERE candidate_sha = ? AND status IN ('completed', 'reconciling', 'running')
+            """,
+            (utc_now(), f"\nWorktree recovery: {details}.\n", recovered_sha),
+        )
+    if cursor.rowcount != 1:
+        return
+    slack_send(
+        transport,
+        f":warning: Bifrost CI preserved orphaned repair `{recovered_sha[:8]}` "
+        f"as `{tag}`, restored `origin/{BRANCH}`, and is retriaging the current "
+        f"red run on `{socket.gethostname()}`.",
+    )
+    with conn:
+        conn.execute(
+            "UPDATE monitor_events SET slack_notification_attempted = 1 "
+            "WHERE sha = ? AND kind = ?",
+            (sha, kind),
+        )
+
+
+def claim_invocation(conn: sqlite3.Connection, run: CiRun, base_sha: str) -> bool:
     now = utc_now()
     try:
         with conn:
@@ -919,13 +1020,39 @@ def claim_invocation(conn: sqlite3.Connection, run: CiRun) -> bool:
                 """
                 INSERT INTO invocations (
                     workflow_run_id, sha, workflow_run_url, conclusion,
-                    observed_at, started_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, 'claimed')
+                    observed_at, started_at, status, base_sha
+                ) VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)
                 """,
-                (run.run_id, run.sha, run.url, run.conclusion, now, now),
+                (run.run_id, run.sha, run.url, run.conclusion, now, now, base_sha),
             )
     except sqlite3.IntegrityError:
-        return False
+        placeholders = ", ".join("?" for _ in RETRYABLE_INVOCATION_STATUSES)
+        with conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE invocations
+                SET sha = ?, workflow_run_url = ?, conclusion = ?, started_at = ?,
+                    finished_at = NULL, status = 'claimed', exit_code = NULL,
+                    timed_out = 0, output = output || ?,
+                    start_notification_attempted = 0,
+                    outcome_notification_attempted = 0, codex_session_id = NULL,
+                    issue_url = NULL, timeout_handoff_status = NULL, codex_pid = NULL,
+                    base_sha = ?, candidate_sha = NULL, reconcile_round = 0,
+                    attempt_count = attempt_count + 1
+                WHERE workflow_run_id = ? AND status IN ({placeholders})
+                """,
+                (
+                    run.sha,
+                    run.url,
+                    run.conclusion,
+                    now,
+                    f"\n--- retry {now} ---\n",
+                    base_sha,
+                    run.run_id,
+                    *sorted(RETRYABLE_INVOCATION_STATUSES),
+                ),
+            )
+        return cursor.rowcount == 1
     return True
 
 
@@ -964,8 +1091,8 @@ def terminate_recorded_codex(pid: int | None) -> bool:
 def recover_interrupted(conn: sqlite3.Connection, transport: SlackTransport) -> None:
     rows = conn.execute(
         "SELECT workflow_run_id, sha, workflow_run_url, thread_ts, status, "
-        "codex_session_id, codex_pid FROM invocations "
-        "WHERE status IN ('claimed', 'running', 'handoff_running')"
+        "codex_session_id, codex_pid, candidate_sha FROM invocations "
+        "WHERE status IN ('claimed', 'running', 'reconciling', 'handoff_running')"
     ).fetchall()
     for row in rows:
         run_id = int(row["workflow_run_id"])
@@ -1014,20 +1141,72 @@ def recover_interrupted(conn: sqlite3.Connection, transport: SlackTransport) -> 
                     (run_id,),
                 )
             continue
+        stopped = terminate_recorded_codex(row["codex_pid"])
+        candidate_sha = row["candidate_sha"]
+        if stopped and row["status"] == "reconciling" and candidate_sha:
+            try:
+                remote_sha = fetch_remote_sha()
+                clean = not worktree_status()
+            except CommandError:
+                remote_sha = ""
+                clean = False
+            if clean and git_is_ancestor(str(candidate_sha), f"origin/{BRANCH}"):
+                detail = (
+                    f"Monitor restarted after push; verified candidate "
+                    f"{candidate_sha} on origin/{BRANCH} at {remote_sha}."
+                )
+                with conn:
+                    conn.execute(
+                        """
+                        UPDATE invocations
+                        SET status = 'completed', codex_pid = NULL, finished_at = ?,
+                            output = output || ?, outcome_notification_attempted = 1
+                        WHERE workflow_run_id = ?
+                        """,
+                        (utc_now(), f"\n{detail}\n", run_id),
+                    )
+                slack_send(
+                    transport,
+                    f":white_check_mark: Bifrost CI auto-fixer for "
+                    f"<https://github.com/{REPO_NAME}/commit/{sha}|`{sha[:8]}`> "
+                    f"was interrupted after pushing; verified "
+                    f"{format_commit(str(candidate_sha))} on master. "
+                    f"<{row['workflow_run_url']}|CI run>",
+                    thread_ts=row["thread_ts"],
+                )
+                continue
+        if stopped:
+            cleanup_ok, cleanup_detail = recover_timeout_worktree(
+                run_id, sha, row["codex_session_id"]
+            )
+        else:
+            cleanup_ok, cleanup_detail = (
+                False,
+                "could not safely stop recorded Codex process",
+            )
+        retry_status = "orphaned_candidate" if cleanup_ok else "interrupted"
         with conn:
             conn.execute(
                 """
                 UPDATE invocations
-                SET status = 'interrupted', finished_at = ?, output = output || ?
+                SET status = ?, codex_pid = NULL, finished_at = ?, output = output || ?
                 WHERE workflow_run_id = ?
                 """,
-                (utc_now(), "\nMonitor restarted before Codex completed.\n", run_id),
+                (
+                    retry_status,
+                    utc_now(),
+                    f"\nMonitor restarted before repair reconciliation completed. "
+                    f"Worktree recovery: {cleanup_detail}.\n",
+                    run_id,
+                ),
             )
         slack_send(
             transport,
             f":warning: Bifrost CI auto-fixer for "
             f"<https://github.com/{REPO_NAME}/commit/{sha}|`{sha[:8]}`> "
-            f"was interrupted before completion. <{row['workflow_run_url']}|CI run>",
+            f"was interrupted before completion. Worktree recovery "
+            f"{'succeeded; the run will be retriaged' if cleanup_ok else 'failed'}: "
+            f"{cleanup_detail}. <{row['workflow_run_url']}|CI run>",
             thread_ts=row["thread_ts"],
         )
         with conn:
@@ -1045,30 +1224,30 @@ def build_prompt(run: CiRun, open_issue_url: str | None = None) -> str:
         open_issue_context = f"""
 A design-level escalation is ALREADY OPEN for this CI: {open_issue_url}, and a human is handling it. CI has changed since it was filed, so before doing anything, decide which of these the current red state is:
 - The SAME problem already covered by {open_issue_url} (even on a newer commit): make no changes, do not file anything, and do not ping anyone — just exit successfully. Do not re-file or re-notify for a failure a human already owns.
-- A NEW fixable failure layered on top of it (the FIX IT YOURSELF or RESOLVE FROM REPO EVIDENCE categories defined below): fix and push just that. Do not attempt to resolve {open_issue_url} itself.
+- A NEW fixable failure layered on top of it (the FIX IT YOURSELF or RESOLVE FROM REPO EVIDENCE categories defined below): fix and commit just that. Do not attempt to resolve {open_issue_url} itself.
 - A NEW design-level failure distinct from {open_issue_url}: file a SEPARATE issue and ping, following the ESCALATE path.
 """
     return f"""You are triaging a red CI run for {REPO_NAME}. The monitor observed the failing workflow run {run.url} for master commit {run.sha}.
 
-First, orient. Use `gh` outside your sandbox to read the failing run, the commits after {run.sha}, and the latest CI/check results. The original SHA may no longer be current; do not stop merely because newer commits landed. If a subsequent commit clearly addresses this same failure, make no changes and exit successfully. If the remote master advanced, update the existing worktree to that HEAD before doing anything else. Stay on the existing `{WORKTREE_BRANCH}` branch: never create or switch branches, and never open a pull request.
+First, orient. Use `gh` outside your sandbox to read the failing run, the commits after {run.sha}, and the latest CI/check results. The original SHA may no longer be current; do not stop merely because newer commits landed. If a subsequent commit clearly addresses this same failure, make no changes and exit successfully. The monitor synchronized this worktree immediately before launching you and will merge any later master advances after you finish. Stay on the existing `{WORKTREE_BRANCH}` branch: never create or switch branches, never pull or merge remote changes yourself, and never open a pull request.
 {open_issue_context}
 Your job is NOT to fix every failure, but escalation is the last resort, not the default. Classify EACH failing test independently (a red run often bundles unrelated regressions), then pick ONE overall action for this invocation:
-- If ANY failure is fixable under the first two paths below, fix ALL the fixable ones, push once, and exit successfully — do NOT escalate anything in the same invocation, and do NOT emit the Slack mention tokens. Your push triggers a fresh CI run; if the remainder keeps it red, the monitor re-engages you and that later pass escalates with nothing left to fix. If you already diagnosed a remaining design-level failure, summarize the diagnosis in your closing message (plain text, no mentions) so the later pass and the humans can pick it up from the thread.
+- If ANY failure is fixable under the first two paths below, fix ALL the fixable ones, commit once, and exit successfully — do NOT push, do NOT escalate anything in the same invocation, and do NOT emit the Slack mention tokens. The monitor will merge current master and push your clean commit after you exit; that push triggers a fresh CI run. If the remainder keeps it red, the monitor re-engages you and that later pass escalates with nothing left to fix. If you already diagnosed a remaining design-level failure, summarize the diagnosis in your closing message (plain text, no mentions) so the later pass and the humans can pick it up from the thread.
 - Only when NOTHING is fixable, follow the ESCALATE path, covering all the design-level failures in one issue.
 
 Before classifying anything beyond lint/format noise, pin the INTRODUCING commit. The failing run's commit ({run.sha}) is only where CI first observed the failure — the cause usually landed earlier. Run the failing test locally at suspect commits, use `git log -S`/`-p` on the code the test exercises, or bisect with the single failing test (it is cheap: build once per step, run one test). Read the introducing commit's message, diff, and the tests it added or changed — that commit's own intent is the evidence most classifications turn on. Treat "recorded baseline failure" notes in `.agents/plans/` or commit messages as symptoms of an unhandled regression, never as permission to ignore one.
 
-FIX IT YOURSELF — push directly to master — when the failure is mechanical and the correct fix is unambiguous:
+FIX IT YOURSELF — commit for the monitor to push — when the failure is mechanical and the correct fix is unambiguous:
 - lint or formatting violations (spotless, checkstyle, import order, whitespace, and the like);
 - a test the author plainly forgot to update after an intentional, correct code change — an assertion trailing a renamed symbol, an updated golden value, a signature the production code deliberately changed — where the production code is right and only the test lagged;
 - equally trivial build breakage of that kind (an unused import, a rename applied in one place but not another).
 
-RESOLVE FROM REPO EVIDENCE — also push directly to master — when the failure is a contract regression whose resolution the repository already records. Most "behavior-sensitive" failures are this, not design calls. Two patterns cover nearly all of them:
+RESOLVE FROM REPO EVIDENCE — also commit for the monitor to push — when the failure is a contract regression whose resolution the repository already records. Most "behavior-sensitive" failures are this, not design calls. Two patterns cover nearly all of them:
 - The introducing commit DELIBERATELY changed the contract: it re-specified some assertions to the new behavior but missed a sibling test (often the same shape in another language or suite). The decision was already made; bring the lagging test to the same contract the commit's own updated tests express. This is the cross-commit form of the forgotten-test rule above.
 - The introducing commit did NOT intend the regression: its message and its own tests are about a narrower case, and nothing it added conflicts with the failing test. The implementation was over-broad or its blast radius unaudited. Repair the production code at the root cause so the failing test AND the introducing commit's tests all pass together — narrow the over-broad condition, split the conflated concern — following the repo's design philosophy in CLAUDE.md (fix root cause, structured solutions, no fallbacks that hide failures).
 The acceptance bar for this path: the failing test and every test the introducing commit added or touched pass together, the relevant suites pass, and you weakened no assertion — never delete a check, broaden a tolerance, or loosen an expected value to make a test pass. Meeting that bar IS the evidence the two contracts were compatible and no human decision was needed. If you cannot meet it, the conflict is real: escalate.
 
-Test your change locally, then `git push origin HEAD:master`. Do not wait for CI to run against your push, then exit successfully.
+Test your change locally, stage only the files you changed, and create a detailed commit on the existing branch. Leave the worktree clean and exit successfully. Do not push: the monitor owns the pull-and-push reconciliation after you exit.
 
 ESCALATE — do not touch code, do not push — only when nothing is fixable and your completed root-cause investigation shows a decision that is not yours to make: the introducing commit's contract and the failing test's contract genuinely cannot both hold; the fix requires choosing semantics with no evidence in the repository (for example how an analysis reports uncertainty, or a public result's meaning); or the fix crosses a versioned schema or architectural boundary (policy evidence schema, RQL schema version, public API semantics). Flaky and infrastructure failures escalate too. Doubt alone is not a reason: doubt before the introducing commit is pinned means investigate more, and only doubt that survives a finished investigation escalates. To escalate:
 1. Leave master untouched — make no commits and no pushes.
@@ -1077,6 +1256,13 @@ ESCALATE — do not touch code, do not push — only when nothing is fixable and
    {mentions} Design-level CI failure needs a human call — filed <ISSUE_URL>. <one-sentence summary of the problem>
    Replace <ISSUE_URL> with the URL from step 2 and keep the `{mentions}` tokens verbatim so they render as real mentions. Everything you say streams into the Slack thread, so this message is the ping; do not attempt to call Slack yourself.
 Then exit successfully.
+"""
+
+
+def build_merge_conflict_prompt(run: CiRun) -> str:
+    return f"""The monitor tried to merge current origin/{BRANCH} into your committed CI repair for {run.url}, and Git left real content conflicts in the existing `{WORKTREE_BRANCH}` worktree.
+
+Resume the repair using the diagnosis and intent already established in this session. Inspect the incoming commits and every unmerged path, resolve the current merge so both the upstream changes and the intended CI fix are preserved, run the relevant tests for the resolution, and commit the merge on the existing branch. Do not abort merely because master advanced. Do not rebase, cherry-pick, switch branches, open a pull request, or push. Leave the worktree clean with no unmerged paths and exit successfully; the monitor will pull again and push.
 """
 
 
@@ -1361,16 +1547,28 @@ def git_is_ancestor(ancestor: str, ref: str) -> bool:
 def recover_timeout_worktree(
     run_id: int, sha: str, session_id: str | None
 ) -> tuple[bool, str]:
-    """Stash a timed-out attempt and restore the dedicated branch to remote master.
+    """Preserve an unfinished attempt and restore the branch to remote master.
 
     Refuse the destructive reset unless every piece of unfinished work has a
-    durable Git reference: working-copy changes go into refs/stash, while a
-    clean unpushed commit receives a local timeout tag.
+    durable Git reference. An active conflicted merge is aborted only after its
+    candidate HEAD is known; ordinary changes go into refs/stash, while an
+    unpushed commit receives a local recovery tag.
     """
     try:
         branch = run_command([str(GIT_BIN), "branch", "--show-current"], cwd=WORKTREE)
         if branch != WORKTREE_BRANCH:
             return False, f"expected branch {WORKTREE_BRANCH!r}, found {branch!r}"
+
+        merge_aborted = False
+        try:
+            run_command(
+                [str(GIT_BIN), "rev-parse", "--verify", "MERGE_HEAD"], cwd=WORKTREE
+            )
+        except CommandError:
+            pass
+        else:
+            run_command([str(GIT_BIN), "merge", "--abort"], cwd=WORKTREE)
+            merge_aborted = True
 
         dirty = run_command(
             [str(GIT_BIN), "status", "--porcelain", "--untracked-files=normal"],
@@ -1410,17 +1608,9 @@ def recover_timeout_worktree(
         remote_sha = run_command([str(GIT_BIN), "rev-parse", remote_ref], cwd=WORKTREE)
         tagged = False
         if local_sha != remote_sha and not git_is_ancestor(local_sha, remote_ref):
-            tag = f"bifrost-ci-timeout/{run_id}"
-            try:
-                existing = run_command(
-                    [str(GIT_BIN), "rev-parse", f"refs/tags/{tag}"], cwd=WORKTREE
-                )
-            except CommandError:
-                run_command([str(GIT_BIN), "tag", tag, local_sha], cwd=WORKTREE)
-                tagged = True
-            else:
-                if existing != local_sha:
-                    return False, f"local preservation tag {tag!r} points elsewhere"
+            tag = f"bifrost-ci-recovery/{run_id}-{local_sha[:12]}"
+            preserve_commit(tag, local_sha)
+            tagged = True
 
         run_command([str(GIT_BIN), "reset", "--hard", remote_ref], cwd=WORKTREE)
         final_status = run_command(
@@ -1431,29 +1621,266 @@ def recover_timeout_worktree(
         if final_status or final_sha != remote_sha:
             return False, "worktree was not clean and synchronized after recovery"
         saved = []
+        if merge_aborted:
+            saved.append("aborted conflicted merge")
         if stashed:
             saved.append("stashed incomplete edits")
         if tagged:
-            saved.append(f"tagged unpushed commit bifrost-ci-timeout/{run_id}")
+            saved.append(f"tagged unpushed commit {tag}")
         return True, "; ".join(saved) if saved else "no incomplete edits to stash"
     except CommandError as exc:
         return False, str(exc)
 
 
-def resolve_master_outcome(base_sha: str, status: str) -> tuple[str, str | None]:
-    """Return (current master SHA or 'unknown', the SHA we pushed or None).
+def fetch_remote_sha() -> str:
+    """Fetch and return current origin/master."""
+    run_command([str(GIT_BIN), "fetch", "origin", BRANCH], cwd=WORKTREE, timeout=180)
+    return run_command([str(GIT_BIN), "rev-parse", f"origin/{BRANCH}"], cwd=WORKTREE)
 
-    A push is only claimed when Codex completed, the worktree HEAD advanced past
-    the synced base, and that HEAD actually landed on origin/master — so a
-    rejected push or a no-op exit is never reported as a fix we pushed.
+
+def worktree_status() -> str:
+    return run_command(
+        [str(GIT_BIN), "status", "--porcelain", "--untracked-files=normal"],
+        cwd=WORKTREE,
+    )
+
+
+def unmerged_paths() -> str:
+    return run_command(
+        [str(GIT_BIN), "diff", "--name-only", "--diff-filter=U"], cwd=WORKTREE
+    )
+
+
+@dataclass(frozen=True)
+class RepairResolution:
+    result: CodexResult
+    new_sha: str
+    pushed_sha: str | None
+    detail: str = ""
+    failure_kind: str | None = None
+
+
+def reconcile_repair(
+    run: CiRun,
+    base_sha: str,
+    initial: CodexResult,
+    relay,
+    *,
+    deadline: float,
+    on_session=None,
+    on_process=None,
+    on_candidate=None,
+) -> RepairResolution:
+    """Merge current master into a successful Codex commit and push it.
+
+    Conflict-free pulls and push races are handled entirely by the monitor.
+    Only a pull that leaves unmerged paths resumes the exact Codex session.
     """
+    if initial.status != "completed" or initial.timed_out:
+        return RepairResolution(initial, "unknown", None)
+
+    output = initial.output
+    result = initial
+    reconcile_round = 0
+
+    while True:
+        try:
+            branch = run_command(
+                [str(GIT_BIN), "branch", "--show-current"], cwd=WORKTREE
+            )
+            if branch != WORKTREE_BRANCH:
+                raise CommandError(
+                    f"expected branch {WORKTREE_BRANCH!r}, found {branch!r}"
+                )
+            dirty = worktree_status()
+            if dirty:
+                raise CommandError(
+                    "Codex reported success but left a dirty or conflicted worktree"
+                )
+            local_sha = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
+        except CommandError as exc:
+            failed = CodexResult(
+                "failed", result.exit_code, False, output, result.session_id
+            )
+            return RepairResolution(failed, "unknown", None, str(exc), "repair_failed")
+
+        if local_sha == base_sha:
+            try:
+                remote_sha = fetch_remote_sha()
+            except CommandError as exc:
+                failed = CodexResult(
+                    "failed", result.exit_code, False, output, result.session_id
+                )
+                return RepairResolution(
+                    failed, "unknown", None, str(exc), "push_failed"
+                )
+            return RepairResolution(result, remote_sha, None)
+
+        if time.monotonic() >= deadline:
+            timed_output = (
+                output + "\nRepair deadline expired before reconciliation completed.\n"
+            )
+            timed = CodexResult(
+                "timed_out", result.exit_code, True, timed_output, result.session_id
+            )
+            return RepairResolution(
+                timed,
+                "unknown",
+                None,
+                "repair deadline expired before reconciliation completed",
+            )
+
+        if not git_is_ancestor(base_sha, "HEAD"):
+            detail = (
+                f"local HEAD {local_sha} does not descend from repair base {base_sha}"
+            )
+            failed = CodexResult(
+                "failed", result.exit_code, False, output, result.session_id
+            )
+            return RepairResolution(failed, "unknown", None, detail, "repair_failed")
+
+        if on_candidate is not None:
+            on_candidate(local_sha, reconcile_round)
+
+        try:
+            run_command(
+                [
+                    str(GIT_BIN),
+                    "pull",
+                    "--no-rebase",
+                    "--no-edit",
+                    "origin",
+                    BRANCH,
+                ],
+                cwd=WORKTREE,
+                timeout=180,
+            )
+        except CommandError as pull_error:
+            try:
+                conflicts = unmerged_paths()
+            except CommandError:
+                conflicts = ""
+            if not conflicts:
+                failed = CodexResult(
+                    "failed", result.exit_code, False, output, result.session_id
+                )
+                return RepairResolution(
+                    failed, "unknown", None, str(pull_error), "push_failed"
+                )
+            if not result.session_id:
+                detail = "merge conflicts require Codex, but no session id was emitted"
+                failed = CodexResult(
+                    "failed", result.exit_code, False, output, result.session_id
+                )
+                return RepairResolution(
+                    failed, "unknown", None, detail, "repair_failed"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_output = (
+                    output + "\nRepair deadline expired during merge reconciliation.\n"
+                )
+                timed = CodexResult(
+                    "timed_out", result.exit_code, True, timed_output, result.session_id
+                )
+                return RepairResolution(
+                    timed,
+                    "unknown",
+                    None,
+                    "repair deadline expired during merge reconciliation",
+                )
+            reconcile_round += 1
+            if on_candidate is not None:
+                on_candidate(local_sha, reconcile_round)
+            log(
+                f"merge round {reconcile_round} left conflicts; resuming Codex session "
+                f"{result.session_id}"
+            )
+            resumed = invoke_codex_stream(
+                build_merge_conflict_prompt(run),
+                relay,
+                timeout_seconds=max(1, int(remaining)),
+                resume_session_id=result.session_id,
+                on_session=on_session,
+                on_process=on_process,
+            )
+            output += (
+                f"\n--- merge conflict round {reconcile_round} ---\n" + resumed.output
+            )
+            result = CodexResult(
+                resumed.status,
+                resumed.exit_code,
+                resumed.timed_out,
+                output,
+                resumed.session_id or result.session_id,
+            )
+            if result.status != "completed" or result.timed_out:
+                return RepairResolution(result, "unknown", None)
+            continue
+
+        try:
+            if worktree_status():
+                raise CommandError("git pull succeeded but left a dirty worktree")
+            local_sha = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
+        except CommandError as exc:
+            failed = CodexResult(
+                "failed", result.exit_code, False, output, result.session_id
+            )
+            return RepairResolution(failed, "unknown", None, str(exc), "repair_failed")
+        if on_candidate is not None:
+            on_candidate(local_sha, reconcile_round)
+
+        raced = False
+        last_push_error: CommandError | None = None
+        for attempt in range(len(PUSH_RETRY_DELAYS) + 1):
+            try:
+                run_command(
+                    [str(GIT_BIN), "push", "origin", "HEAD:master"],
+                    cwd=WORKTREE,
+                    timeout=180,
+                )
+            except CommandError as exc:
+                last_push_error = exc
+            try:
+                remote_sha = fetch_remote_sha()
+            except CommandError as exc:
+                last_push_error = exc
+                if attempt < len(PUSH_RETRY_DELAYS):
+                    time.sleep(PUSH_RETRY_DELAYS[attempt])
+                    continue
+                failed = CodexResult(
+                    "failed", result.exit_code, False, output, result.session_id
+                )
+                return RepairResolution(
+                    failed, "unknown", None, str(last_push_error), "push_failed"
+                )
+            if git_is_ancestor(local_sha, f"origin/{BRANCH}"):
+                return RepairResolution(result, remote_sha, local_sha)
+            if not git_is_ancestor(remote_sha, "HEAD"):
+                raced = True
+                break
+            if attempt < len(PUSH_RETRY_DELAYS):
+                time.sleep(PUSH_RETRY_DELAYS[attempt])
+                continue
+            failed = CodexResult(
+                "failed", result.exit_code, False, output, result.session_id
+            )
+            return RepairResolution(
+                failed,
+                remote_sha,
+                None,
+                str(last_push_error or "push was not reflected on origin/master"),
+                "push_failed",
+            )
+        if raced:
+            log("origin/master advanced during push; pulling again")
+            continue
+
+
+def resolve_master_outcome(base_sha: str, status: str) -> tuple[str, str | None]:
+    """Compatibility helper for non-reconciled and failed attempts."""
     try:
-        run_command(
-            [str(GIT_BIN), "fetch", "origin", BRANCH], cwd=WORKTREE, timeout=180
-        )
-        new_sha = run_command(
-            [str(GIT_BIN), "rev-parse", f"origin/{BRANCH}"], cwd=WORKTREE
-        )
+        new_sha = fetch_remote_sha()
     except CommandError:
         return "unknown", None
     pushed: str | None = None
@@ -1577,15 +2004,28 @@ def run_monitor() -> int:
                     f"new failing surface ({sorted(new_surface)}); resetting the thread and classifying"
                 )
 
+        retry_row = conn.execute(
+            "SELECT thread_ts, status FROM invocations WHERE workflow_run_id = ?",
+            (run.run_id,),
+        ).fetchone()
         if invocation_exists(conn, run.run_id):
             return 0
         try:
-            base_sha = preflight_worktree()
+            preflight = preflight_worktree()
+            base_sha = preflight.base_sha
         except (CommandError, PreflightError) as exc:
             kind = exc.kind if isinstance(exc, PreflightError) else "preflight_failed"
             log(f"preflight failed for run {run.run_id}: {exc}")
             record_preflight_event(conn, transport, run.sha, kind, str(exc))
             return 4
+        if preflight.recovered_tag and preflight.recovered_sha:
+            record_worktree_recovery(
+                conn,
+                transport,
+                run.sha,
+                preflight.recovered_sha,
+                preflight.recovered_tag,
+            )
         try:
             second = poll_ci(excluded_run_ids)
         except (CommandError, ValueError, json.JSONDecodeError) as exc:
@@ -1597,8 +2037,16 @@ def run_monitor() -> int:
             or second.run.run_id != run.run_id
         ):
             return 0
-        if not claim_invocation(conn, run):
+        if not claim_invocation(conn, run, base_sha):
             return 0
+
+        if (
+            reply_ts is None
+            and retry_row is not None
+            and retry_row["status"] in RETRYABLE_INVOCATION_STATUSES
+            and retry_row["thread_ts"]
+        ):
+            reply_ts = str(retry_row["thread_ts"])
 
         # A reset (new episode or a surface outside the baseline) opens a fresh
         # top-level thread; a non-escalated repeat re-engages in the episode's
@@ -1646,13 +2094,47 @@ def run_monitor() -> int:
                     (pid, run.run_id),
                 )
 
+        def record_candidate(candidate_sha: str, reconcile_round: int) -> None:
+            with conn:
+                conn.execute(
+                    """
+                    UPDATE invocations
+                    SET status = 'reconciling', candidate_sha = ?, reconcile_round = ?,
+                        codex_pid = NULL
+                    WHERE workflow_run_id = ?
+                    """,
+                    (candidate_sha, reconcile_round, run.run_id),
+                )
+
         log(f"launching Codex for red {run.workflow} at {run.sha[:8]}")
+        repair_deadline = time.monotonic() + CODEX_TIMEOUT_SECONDS
         result = invoke_codex_stream(
             build_prompt(run, open_issue_url),
             relay,
+            timeout_seconds=CODEX_TIMEOUT_SECONDS,
             on_session=record_session,
             on_process=record_process,
         )
+        resolution_detail = ""
+        failure_kind: str | None = None
+        if result.status == "completed" and not result.timed_out:
+            resolution = reconcile_repair(
+                run,
+                base_sha,
+                result,
+                relay,
+                deadline=repair_deadline,
+                on_session=record_session,
+                on_process=record_process,
+                on_candidate=record_candidate,
+            )
+            result = resolution.result
+            new_sha = resolution.new_sha
+            pushed_sha = resolution.pushed_sha
+            resolution_detail = resolution.detail
+            failure_kind = resolution.failure_kind
+        else:
+            new_sha, pushed_sha = resolve_master_outcome(base_sha, result.status)
         status = result.status
         exit_code = result.exit_code
         output = result.output
@@ -1660,6 +2142,8 @@ def run_monitor() -> int:
         escalated = False
         cleanup_ok = True
         cleanup_detail = ""
+        if resolution_detail:
+            output += f"\n--- reconciliation ---\n{resolution_detail}\n"
 
         if result.timed_out:
             # The repair budget is exhausted. Preserve its complete context by
@@ -1740,6 +2224,12 @@ def run_monitor() -> int:
                     thread_ts=thread_ts,
                 )
         else:
+            persisted_status = failure_kind or status
+            if status != "completed":
+                cleanup_ok, cleanup_detail = recover_timeout_worktree(
+                    run.run_id, run.sha, result.session_id
+                )
+                output += f"\n--- worktree recovery ---\n{cleanup_detail}\n"
             with conn:
                 conn.execute(
                     """
@@ -1749,7 +2239,7 @@ def run_monitor() -> int:
                     WHERE workflow_run_id = ?
                     """,
                     (
-                        status,
+                        persisted_status,
                         exit_code,
                         output,
                         result.session_id,
@@ -1758,7 +2248,6 @@ def run_monitor() -> int:
                     ),
                 )
 
-        new_sha, pushed_sha = resolve_master_outcome(base_sha, status)
         if not result.timed_out and status == "completed" and pushed_sha is None:
             escalated, issue_url = detect_escalation(output, exclude_url=open_issue_url)
             if escalated and issue_url:
@@ -1792,6 +2281,16 @@ def run_monitor() -> int:
                 f"{emoji} Bifrost CI auto-fixer for {commit_link} judged this a "
                 f"design-level call and escalated it{distinct}. No fix pushed; {filed} "
                 f"with its findings and pinged the team above. <{run.url}|Original CI run>"
+            )
+        elif failure_kind:
+            emoji, outcome = ":x:", "could not publish its repair"
+            recovery = (
+                f" Worktree recovery: {cleanup_detail}." if cleanup_detail else ""
+            )
+            outcome_line = (
+                f"{emoji} Bifrost CI auto-fixer for {commit_link} {outcome}: "
+                f"{resolution_detail or failure_kind}.{recovery} "
+                f"<{run.url}|Original CI run>"
             )
         elif episode is not None and episode["escalated"] and status == "completed":
             # A classification pass against an already-open escalation that did

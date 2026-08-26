@@ -7,20 +7,25 @@ dispatched runs. When the latest run in any tracked workflow is red, it
 launches one Codex repair attempt for that run, regardless of whether the run's
 commit is still master HEAD. Codex always works from current master HEAD: if an
 intervening commit already fixed the failure it exits without changes,
-otherwise it fixes forward and pushes HEAD:master.
+otherwise it fixes forward, tests, and leaves a clean local commit. The monitor
+then merges current origin/master and pushes the verified result.
 
 The monitor:
 
 - claims each CI run atomically in ~/Projects/bifrost-ci/activity.db, keyed on
-  the workflow run id, so a given run is never invoked twice (a new workflow
-  run of the same commit has a distinct id and is eligible);
+  the workflow run id; interrupted or orphaned attempts are preserved and may
+  be retriaged in the same Slack thread;
 - waits five minutes after a workflow attempt first becomes red, allowing
   RunsOn to replace an interrupted runner before launching Codex or filing an
   infrastructure issue;
-- serializes runs with a local lock and refuses a dirty or diverged repair
-  worktree;
-- fast-forwards ~/Projects/bifrost-ci and asks Codex to push HEAD:master;
-- records combined Codex output and exit status in SQLite;
+- serializes runs with a local lock, refuses a dirty repair worktree, and tags
+  a clean orphaned commit before restoring origin/master for fresh triage;
+- asks Codex to commit but never push, then explicitly pulls with merge policy
+  and pushes only after verifying the result on origin/master;
+- handles conflict-free master advances itself and resumes the same Codex
+  session only when a pull leaves actual content conflicts;
+- records combined Codex output, reconciliation state, and verified outcome in
+  SQLite;
 - after one hour, stops the repair and resumes that exact Codex session for a
   ten-minute ticket-only human handoff, then stashes incomplete edits and
   restores the dedicated worktree to origin/master;
