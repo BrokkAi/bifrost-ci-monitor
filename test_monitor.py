@@ -122,6 +122,14 @@ def workflow_run(
     )
 
 
+class ChildEnvironmentTests(unittest.TestCase):
+    def test_mbx_cargo_shim_precedes_system_tools(self):
+        path_entries = monitor.child_environment()["PATH"].split(":")
+
+        self.assertEqual(path_entries[0], str(monitor.MBX_BIN))
+        self.assertEqual(path_entries[1], str(monitor.CODEX_BIN.parent))
+
+
 class PollCiTests(unittest.TestCase):
     @mock.patch.object(monitor, "run_command")
     def test_recent_failure_settles_while_runson_can_request_retry(self, run_command):
