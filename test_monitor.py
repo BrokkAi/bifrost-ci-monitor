@@ -123,6 +123,11 @@ def workflow_run(
 
 
 class ChildEnvironmentTests(unittest.TestCase):
+    def test_codex_uses_codex2_home(self):
+        self.assertEqual(
+            monitor.child_environment()["CODEX_HOME"], str(monitor.CODEX_HOME)
+        )
+
     def test_mbx_cargo_shim_precedes_system_tools(self):
         path_entries = monitor.child_environment()["PATH"].split(":")
 
