@@ -45,6 +45,7 @@ WEBHOOK_PATH = CONFIG_DIR / "slack-webhook-url"
 BOT_TOKEN_PATH = CONFIG_DIR / "bot-token"
 CHANNEL_PATH = CONFIG_DIR / "channel-id"
 CODEX_BIN = Path("/home/jonathan/.nvm/versions/node/v24.15.0/bin/codex")
+CODEX_HOME = Path("/home/jonathan/.codex3")
 MBX_BIN = Path("/home/jonathan/.local/share/mbx/bin")
 GH_BIN = Path("/usr/bin/gh")
 GIT_BIN = Path("/usr/bin/git")
@@ -96,6 +97,7 @@ def child_environment() -> dict[str, str]:
     env.update(
         {
             "HOME": "/home/jonathan",
+            "CODEX_HOME": str(CODEX_HOME),
             "PATH": f"{MBX_BIN}:{node_bin}:/usr/local/bin:/usr/bin:/bin",
             "XDG_RUNTIME_DIR": "/run/user/1000",
             "SSH_AUTH_SOCK": "/run/user/1000/openssh_agent",
