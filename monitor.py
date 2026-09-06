@@ -54,7 +54,7 @@ CODEX_HANDOFF_TIMEOUT_SECONDS = 10 * 60
 # Pin the repair model explicitly rather than inheriting ~/.codex/config.toml's
 # default, so the monitor's behavior does not silently change when that file is
 # edited for interactive use. These flags are spliced into every `codex exec`.
-CODEX_MODEL = "gpt-5.6-sol"
+CODEX_MODEL = "gpt-6-astra"
 CODEX_REASONING_EFFORT = "medium"
 CODEX_MODEL_ARGS = [
     "-m",
