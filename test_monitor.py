@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import shutil
+import shlex
 import sqlite3
 import subprocess
 import tempfile
@@ -13,6 +14,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+from types import SimpleNamespace
 
 import monitor
 
@@ -509,12 +511,17 @@ class TimeoutHandoffTests(unittest.TestCase):
             updated_at="2026-08-23T00:30:00Z",
         )
 
-        prompt = monitor.build_timeout_handoff_prompt(run)
+        prompt = monitor.build_timeout_handoff_prompt(run, "VERIFIED RECOVERY BLOCK")
 
         self.assertIn("taken over one hour", prompt)
         self.assertIn("Do not investigate further", prompt)
         self.assertIn("gh issue create", prompt)
         self.assertIn(run.url, prompt)
+        self.assertIn("VERIFIED RECOVERY BLOCK", prompt)
+        self.assertIn("VERBATIM", prompt)
+        self.assertIn("exact commands/tests", prompt)
+        self.assertIn("next concrete action", prompt)
+        self.assertIn("Do not restore", prompt)
 
     def test_finds_new_issue_url_in_handoff_output(self):
         old = "https://github.com/BrokkAi/bifrost-dev/issues/100"
@@ -564,48 +571,14 @@ class TimeoutHandoffTests(unittest.TestCase):
         self.assertEqual(sessions, ["session-123"])
         process.stdin.write.assert_called_once_with(b"handoff")
 
-    @mock.patch.object(monitor, "git_is_ancestor")
     @mock.patch.object(monitor, "run_command")
-    def test_timeout_recovery_stashes_untracked_and_resets(self, run_command, ancestor):
-        def command_result(args, **kwargs):
-            if args[1:3] == ["branch", "--show-current"]:
-                return monitor.WORKTREE_BRANCH
-            if args[1:3] == ["status", "--porcelain"]:
-                command_result.status_calls += 1
-                return " M file\n?? new" if command_result.status_calls == 1 else ""
-            if args[1:3] == ["rev-parse", "HEAD"]:
-                command_result.head_calls += 1
-                return "base" if command_result.head_calls == 1 else "remote"
-            if args[1:3] == ["rev-parse", "origin/master"]:
-                return "remote"
-            return ""
-
-        command_result.status_calls = 0
-        command_result.head_calls = 0
-        run_command.side_effect = command_result
-        ancestor.return_value = True
-
-        ok, detail = monitor.recover_timeout_worktree(42, "deadbeef", "session-123")
-
-        self.assertTrue(ok, detail)
-        calls = [call.args[0] for call in run_command.call_args_list]
-        self.assertTrue(any(call[1:3] == ["stash", "push"] for call in calls))
-        self.assertTrue(any(call[1:3] == ["reset", "--hard"] for call in calls))
-
-    @mock.patch.object(monitor, "run_command")
-    def test_timeout_recovery_never_resets_when_stash_fails(self, run_command):
-        run_command.side_effect = [
-            monitor.WORKTREE_BRANCH,
-            " M file",
-            monitor.CommandError("stash failed"),
-        ]
-
-        ok, detail = monitor.recover_timeout_worktree(42, "deadbeef", "session-123")
-
-        self.assertFalse(ok)
-        self.assertIn("stash failed", detail)
-        calls = [call.args[0] for call in run_command.call_args_list]
-        self.assertFalse(any(call[1:3] == ["reset", "--hard"] for call in calls))
+    @mock.patch.object(monitor.recovery, "preserve")
+    def test_timeout_recovery_never_cleans_when_preservation_fails(self, preserve, command):
+        failed = SimpleNamespace(preservation_status="failed", cleanup_status="pending")
+        preserve.return_value = failed
+        result = monitor.recover_timeout_worktree(42, "deadbeef", "session-123")
+        self.assertIs(result, failed)
+        command.assert_not_called()
 
     def test_connect_db_migrates_timeout_handoff_columns_additively(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -633,6 +606,8 @@ class TimeoutHandoffTests(unittest.TestCase):
                 "codex_session_id",
                 "issue_url",
                 "timeout_handoff_status",
+                "recovery_manifest_path",
+                "recovery_status",
                 "codex_pid",
                 "base_sha",
                 "candidate_sha",
@@ -824,19 +799,18 @@ class MergeReconciliationIntegrationTests(unittest.TestCase):
                     monitor, "GIT_BIN", Path(shutil.which("git") or "/usr/bin/git")
                 ),
             ):
-                ok, detail = monitor.recover_timeout_worktree(
-                    42, "deadbeef", "session-123"
-                )
+                with mock.patch.object(monitor, "STATE_DIR", Path(temp_dir) / "state"):
+                    saved = monitor.recover_timeout_worktree(42, "deadbeef", "session-123")
 
-            self.assertTrue(ok, detail)
-            self.assertIn("aborted conflicted merge", detail)
-            self.assertIn("tagged unpushed commit", detail)
+            self.assertEqual(saved.preservation_status, "complete", saved.detail)
+            self.assertEqual(saved.cleanup_status, "complete", saved.detail)
+            self.assertIsNotNone(saved.conflict_snapshot)
             self.assertEqual(git(fixture.repair, "rev-parse", "HEAD"), remote_advance)
             self.assertEqual(
                 git(
                     fixture.repair,
                     "rev-parse",
-                    f"bifrost-ci-recovery/42-{candidate[:12]}",
+                    "bifrost-ci-recovery/42/1/head",
                 ),
                 candidate,
             )
@@ -913,6 +887,179 @@ class RetryableInvocationTests(unittest.TestCase):
             self.assertEqual(row["base_sha"], "base-2")
             self.assertIn("first attempt", row["output"])
             self.assertIn("--- retry", row["output"])
+
+class TimeoutPackageIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.fixture = GitFixture(self.root)
+        for name, value in {
+            "WORKTREE": self.fixture.repair,
+            "STATE_DIR": self.root / "state",
+            "DB_PATH": self.root / "activity.db",
+            "GIT_BIN": Path(shutil.which("git") or "/usr/bin/git"),
+        }.items():
+            patch = mock.patch.object(monitor, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.conn = monitor.connect_db()
+        self.addCleanup(self.conn.close)
+        self.run = make_run()
+        self.assertTrue(monitor.claim_invocation(self.conn, self.run, "base"))
+        self.base, self.candidate = self.fixture.commit_local()
+        (self.fixture.repair / "local.txt").write_text("unfinished edits\n")
+        (self.fixture.repair / "new.txt").write_text("untracked\n")
+        self.result = monitor.CodexResult("timed_out", -15, True, "diagnosis transcript", "session-123")
+
+    def handoff(self):
+        return monitor.timeout_ticket_handoff(
+            self.conn, self.run, self.result, mock.Mock(), mock.Mock(),
+            transcript=self.result.output,
+        )
+
+    def test_package_and_cleanup_exist_before_ticket_session_resumes(self):
+        def resume(prompt, *args, **kwargs):
+            self.assertEqual(git(self.fixture.repair, "status", "--porcelain"), "")
+            self.assertEqual(git(self.fixture.repair, "rev-parse", "HEAD"), self.base)
+            self.assertIn(self.candidate, prompt)
+            self.assertIn("session-123", prompt)
+            self.assertIn(str(self.fixture.repair), prompt)
+            self.assertNotIn("stash@{", prompt)
+            package = self.root / "state/recovery/42/1"
+            self.assertTrue((package / "manifest.json").is_file())
+            self.assertTrue((package / "recovery.md").is_file())
+            row = self.conn.execute("SELECT * FROM invocations").fetchone()
+            self.assertEqual(row["recovery_status"], "complete")
+            return monitor.CodexResult("completed", 0, False, ISSUE_URL, "session-123")
+
+        with mock.patch.object(monitor, "invoke_codex_stream", side_effect=resume) as invoke:
+            output, issue, saved = self.handoff()
+        self.assertEqual(issue, ISSUE_URL)
+        self.assertEqual(output, ISSUE_URL)
+        self.assertEqual(invoke.call_args.kwargs["resume_session_id"], "session-123")
+        restored = self.root / "continued"
+        monitor.recovery.restore(Path(saved.manifest_path), restored)
+        self.assertEqual(git(restored, "rev-parse", "HEAD"), self.candidate)
+        self.assertEqual((restored / "local.txt").read_text(), "unfinished edits\n")
+        self.assertEqual((restored / "new.txt").read_text(), "untracked\n")
+
+    def test_ticket_restore_command_runs_the_helper(self):
+        with mock.patch.object(monitor, "invoke_codex_stream", return_value=
+                               monitor.CodexResult("completed", 0, False, ISSUE_URL, "session-123")):
+            _, _, saved = self.handoff()
+        block = monitor.recovery.render_markdown(saved, Path(monitor.recovery.__file__))
+        command = block.split("```sh\n")[-1].split("\n```")[0]
+        completed = subprocess.run(shlex.split(command), capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        restored = Path(shlex.split(command)[-1])
+        self.assertEqual((restored / "local.txt").read_text(), "unfinished edits\n")
+        self.assertEqual((restored / "new.txt").read_text(), "untracked\n")
+
+    def test_missing_session_retains_package_and_does_not_claim_ticket(self):
+        self.result = monitor.CodexResult("timed_out", -15, True, "diagnosis", None)
+        with mock.patch.object(monitor, "invoke_codex_stream") as invoke:
+            output, issue, saved = self.handoff()
+        invoke.assert_not_called()
+        self.assertIsNone(issue)
+        self.assertIn("no session id", output)
+        self.assertTrue(Path(saved.manifest_path).is_file())
+        self.assertTrue(Path(saved.manifest_path).with_name("recovery.md").is_file())
+
+    def test_preservation_failure_is_reported_to_ticket_agent(self):
+        missing = self.root / "missing-worktree"
+        with mock.patch.object(monitor, "WORKTREE", missing), \
+             mock.patch.object(monitor, "invoke_codex_stream", return_value=
+                               monitor.CodexResult("completed", 0, False, ISSUE_URL, "session-123")) as invoke:
+            output, issue, saved = self.handoff()
+        self.assertEqual(saved.preservation_status, "failed")
+        self.assertNotEqual(saved.cleanup_status, "complete")
+        self.assertEqual(issue, ISSUE_URL)
+        self.assertIn("failed", invoke.call_args.args[0])
+        self.assertIn("Do not claim preservation", invoke.call_args.args[0])
+        row = self.conn.execute("SELECT * FROM invocations").fetchone()
+        self.assertEqual(row["recovery_status"], "failed")
+
+    def test_failed_issue_creation_retains_verified_package(self):
+        with mock.patch.object(monitor, "invoke_codex_stream", return_value=
+                               monitor.CodexResult("failed", 1, False, "gh failed", "session-123")):
+            output, issue, saved = self.handoff()
+        self.assertIsNone(issue)
+        self.assertEqual(output, "gh failed")
+        self.assertEqual(saved.preservation_status, "complete")
+        self.assertEqual(saved.cleanup_status, "complete")
+
+    def test_restart_during_handoff_keeps_original_artifacts(self):
+        with mock.patch.object(monitor, "invoke_codex_stream", side_effect=RuntimeError("restart")):
+            with self.assertRaisesRegex(RuntimeError, "restart"):
+                self.handoff()
+        package = self.root / "state/recovery/42/1"
+        before = monitor.recovery.load(package)
+        with mock.patch.object(monitor, "slack_send"):
+            monitor.recover_interrupted(self.conn, monitor.SlackTransport("webhook", webhook="unused"))
+        after = monitor.recovery.load(package)
+        self.assertEqual(after.head_sha, before.head_sha)
+        self.assertEqual(after.stash_sha, before.stash_sha)
+        row = self.conn.execute("SELECT * FROM invocations").fetchone()
+        self.assertEqual(row["status"], "timed_out")
+        self.assertEqual(row["recovery_status"], "complete")
+        self.assertIn(str(package), row["output"])
+
+    def test_cleanup_failure_retains_source_and_retries_original_package(self):
+        original = monitor.run_command
+
+        def fail_fetch(args, **kwargs):
+            if args[1] == "fetch":
+                raise monitor.CommandError("network unavailable")
+            return original(args, **kwargs)
+
+        with mock.patch.object(monitor, "run_command", side_effect=fail_fetch):
+            saved = monitor.recover_invocation_worktree(
+                self.conn, 42, self.run.sha, "session-123", transcript="diagnosis")
+        self.assertEqual(saved.preservation_status, "complete", saved.detail)
+        self.assertEqual(saved.cleanup_status, "failed")
+        self.assertEqual((self.fixture.repair / "local.txt").read_text(), "unfinished edits\n")
+        self.assertTrue((self.fixture.repair / "new.txt").exists())
+        self.conn.execute("UPDATE invocations SET status = 'timed_out'")
+        self.conn.commit()
+        monitor.retry_pending_recoveries(self.conn)
+        retried = monitor.recovery.load(Path(saved.manifest_path).parent)
+        self.assertEqual(retried.stash_sha, saved.stash_sha)
+        self.assertEqual(retried.cleanup_status, "complete", retried.detail)
+        self.assertEqual(git(self.fixture.repair, "status", "--porcelain"), "")
+
+    def test_pending_recovery_blocks_poll_and_preflight(self):
+        self.conn.execute("UPDATE invocations SET recovery_status = 'failed'")
+        self.conn.commit()
+        monitor.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(monitor, "LOCK_PATH", self.root / "monitor.lock"), \
+             mock.patch.object(monitor, "load_slack_transport", return_value=monitor.SlackTransport("webhook", webhook="unused")), \
+             mock.patch.object(monitor, "recover_interrupted"), \
+             mock.patch.object(monitor, "retry_pending_recoveries"), \
+             mock.patch.object(monitor, "poll_ci") as poll, \
+             mock.patch.object(monitor, "preflight_worktree") as preflight:
+            self.assertEqual(monitor.run_monitor(), 4)
+        poll.assert_not_called()
+        preflight.assert_not_called()
+
+    def test_missing_process_leader_does_not_hide_surviving_children(self):
+        with mock.patch.object(Path, "read_bytes", side_effect=FileNotFoundError), \
+             mock.patch.object(monitor.os, "killpg") as kill:
+            self.assertFalse(monitor.terminate_recorded_codex(123))
+        kill.assert_called_once_with(123, 0)
+
+    def test_unstoppable_restarted_process_blocks_recovery_and_retains_pid(self):
+        self.conn.execute("UPDATE invocations SET status = 'handoff_running', codex_pid = 123")
+        self.conn.commit()
+        with mock.patch.object(monitor, "terminate_recorded_codex", return_value=False), \
+             mock.patch.object(monitor, "recover_invocation_worktree") as recover:
+            monitor.recover_interrupted(self.conn, monitor.SlackTransport("webhook", webhook="unused"))
+        recover.assert_not_called()
+        row = self.conn.execute("SELECT * FROM invocations").fetchone()
+        self.assertEqual(row["codex_pid"], 123)
+        self.assertEqual(row["status"], "handoff_running")
+        self.assertEqual(row["recovery_status"], "failed")
+
 
 
 if __name__ == "__main__":

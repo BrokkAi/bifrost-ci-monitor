@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import recovery
+
 
 REPO_NAME = "BrokkAi/bifrost-dev"
 TRACKED_WORKFLOWS: tuple[tuple[str, str | None], ...] = (
@@ -210,6 +212,8 @@ def connect_db() -> sqlite3.Connection:
             codex_session_id TEXT,
             issue_url TEXT,
             timeout_handoff_status TEXT,
+            recovery_manifest_path TEXT,
+            recovery_status TEXT,
             codex_pid INTEGER,
             base_sha TEXT,
             candidate_sha TEXT,
@@ -247,6 +251,8 @@ def connect_db() -> sqlite3.Connection:
     ensure_column(conn, "invocations", "codex_session_id", "TEXT")
     ensure_column(conn, "invocations", "issue_url", "TEXT")
     ensure_column(conn, "invocations", "timeout_handoff_status", "TEXT")
+    ensure_column(conn, "invocations", "recovery_manifest_path", "TEXT")
+    ensure_column(conn, "invocations", "recovery_status", "TEXT")
     ensure_column(conn, "invocations", "codex_pid", "INTEGER")
     ensure_column(conn, "invocations", "base_sha", "TEXT")
     ensure_column(conn, "invocations", "candidate_sha", "TEXT")
@@ -1041,6 +1047,7 @@ def claim_invocation(conn: sqlite3.Connection, run: CiRun, base_sha: str) -> boo
                     outcome_notification_attempted = 0, codex_session_id = NULL,
                     issue_url = NULL, timeout_handoff_status = NULL, codex_pid = NULL,
                     base_sha = ?, candidate_sha = NULL, reconcile_round = 0,
+                    recovery_manifest_path = NULL, recovery_status = NULL,
                     attempt_count = attempt_count + 1
                 WHERE workflow_run_id = ? AND status IN ({placeholders})
                 """,
@@ -1066,7 +1073,15 @@ def terminate_recorded_codex(pid: int | None) -> bool:
     try:
         cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
     except FileNotFoundError:
-        return True
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError as exc:
+            log(f"could not inspect orphaned Codex process group {pid}: {exc}")
+            return False
+        log(f"Codex leader {pid} disappeared but its process group remains; recovery blocked")
+        return False
     except OSError as exc:
         log(f"could not inspect interrupted Codex pid {pid}: {exc}")
         return False
@@ -1100,17 +1115,17 @@ def recover_interrupted(conn: sqlite3.Connection, transport: SlackTransport) -> 
     for row in rows:
         run_id = int(row["workflow_run_id"])
         sha = str(row["sha"])
+        if not terminate_recorded_codex(row["codex_pid"]):
+            with conn:
+                conn.execute(
+                    "UPDATE invocations SET recovery_status = 'failed' WHERE workflow_run_id = ?",
+                    (run_id,),
+                )
+            log(f"cannot safely stop recorded Codex for run {run_id}; recovery blocked")
+            continue
         if row["status"] == "handoff_running":
-            stopped = terminate_recorded_codex(row["codex_pid"])
-            if stopped:
-                cleanup_ok, cleanup_detail = recover_timeout_worktree(
-                    run_id, sha, row["codex_session_id"]
-                )
-            else:
-                cleanup_ok, cleanup_detail = (
-                    False,
-                    "could not safely stop recorded Codex process",
-                )
+            saved = recover_invocation_worktree(conn, run_id, sha, row["codex_session_id"])
+            cleanup_ok, cleanup_detail = recovery_complete(saved), saved.detail
             with conn:
                 conn.execute(
                     """
@@ -1144,9 +1159,8 @@ def recover_interrupted(conn: sqlite3.Connection, transport: SlackTransport) -> 
                     (run_id,),
                 )
             continue
-        stopped = terminate_recorded_codex(row["codex_pid"])
         candidate_sha = row["candidate_sha"]
-        if stopped and row["status"] == "reconciling" and candidate_sha:
+        if row["status"] == "reconciling" and candidate_sha:
             try:
                 remote_sha = fetch_remote_sha()
                 clean = not worktree_status()
@@ -1178,15 +1192,8 @@ def recover_interrupted(conn: sqlite3.Connection, transport: SlackTransport) -> 
                     thread_ts=row["thread_ts"],
                 )
                 continue
-        if stopped:
-            cleanup_ok, cleanup_detail = recover_timeout_worktree(
-                run_id, sha, row["codex_session_id"]
-            )
-        else:
-            cleanup_ok, cleanup_detail = (
-                False,
-                "could not safely stop recorded Codex process",
-            )
+        saved = recover_invocation_worktree(conn, run_id, sha, row["codex_session_id"])
+        cleanup_ok, cleanup_detail = recovery_complete(saved), saved.detail
         retry_status = "orphaned_candidate" if cleanup_ok else "interrupted"
         with conn:
             conn.execute(
@@ -1269,13 +1276,22 @@ Resume the repair using the diagnosis and intent already established in this ses
 """
 
 
-def build_timeout_handoff_prompt(run: CiRun) -> str:
+def build_timeout_handoff_prompt(run: CiRun, recovery_block: str) -> str:
     mentions = " ".join(f"<@{member_id}>" for member_id in ESCALATION_SLACK_MEMBER_IDS)
     return f"""Since this has taken over one hour, it is time to create a ticket and turn it over to a human for resolution; definitionally this was not as simple as it looked.
 
-Stop the repair now. Do not investigate further, run more tests, edit files, commit, or push. Using only the diagnosis and evidence already present in this session, file a GitHub issue on {REPO_NAME} with `gh issue create`. The issue must include the failing run ({run.url}), the failing jobs and tests, the findings so far, the approach attempted, the unresolved blocker or decision, and a note that the automated attempt timed out with incomplete worktree changes that the monitor will stash. Note the issue URL printed by `gh`.
+Stop the repair now. Do not investigate further, run more tests, edit files, commit, or push. The monitor has already attempted preservation and cleanup; their actual results are recorded below. Do not assume the current worktree still contains your repair. Do not restore the saved work during this handoff.
 
-As your final assistant message, on its own with nothing after it, write exactly:
+Using only the diagnosis and evidence already present in this session, file a GitHub issue on {REPO_NAME} with `gh issue create`. Include the failing run ({run.url}), failing jobs and tests, and these continuation sections:
+- Diagnosis and evidence: findings, relevant commits, files and lines, and what is still uncertain.
+- Work attempted: files changed, why each change was made, and unfinished work.
+- Validation so far: exact commands/tests already run and their observed results. Label unrun tests and unknown results explicitly; do not invent outcomes.
+- Continue here: the unresolved blocker or decision, and the next concrete action for the next agent. Explain which saved changes it should review or finish.
+- Recovery pointers: copy the entire monitor-generated block below VERBATIM into the issue. Keep full object IDs, local paths, commands, session ID, and failure details. These artifacts are local to the named host, not available from GitHub. Do not claim preservation or cleanup succeeded unless this block says so.
+
+{recovery_block}
+
+Note the issue URL printed by `gh`. As your final assistant message, on its own with nothing after it, write exactly:
 {mentions} CI repair exceeded the one-hour automation budget — filed <ISSUE_URL>. <one-sentence summary of the unresolved problem>
 Replace <ISSUE_URL> with the issue URL. Keep the mention tokens verbatim and do not attempt to call Slack yourself. Then exit.
 """
@@ -1461,6 +1477,10 @@ def invoke_codex_stream(
             except ProcessLookupError:
                 pass
             process.wait()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     else:
         process.wait()
 
@@ -1547,92 +1567,156 @@ def git_is_ancestor(ancestor: str, ref: str) -> bool:
     return result.returncode == 0
 
 
-def recover_timeout_worktree(
-    run_id: int, sha: str, session_id: str | None
-) -> tuple[bool, str]:
-    """Preserve an unfinished attempt and restore the branch to remote master.
+def recovery_complete(saved: recovery.RecoveryResult) -> bool:
+    return saved.preservation_status == "complete" and saved.cleanup_status == "complete"
 
-    Refuse the destructive reset unless every piece of unfinished work has a
-    durable Git reference. An active conflicted merge is aborted only after its
-    candidate HEAD is known; ordinary changes go into refs/stash, while an
-    unpushed commit receives a local recovery tag.
-    """
+
+def record_recovery_cleanup(
+    saved: recovery.RecoveryResult, status: str, error: str = "",
+) -> recovery.RecoveryResult:
+    try:
+        return recovery.mark_cleanup(saved, status, error)
+    except OSError as exc:
+        saved.cleanup_status = "failed"
+        saved.error = f"{error} Failed to persist cleanup result ({status}): {exc}".strip()
+        return saved
+
+
+def recover_timeout_worktree(
+    run_id: int, sha: str, session_id: str | None, *, attempt: int = 1,
+    transcript: str = "",
+) -> recovery.RecoveryResult:
+    """Verify a durable continuation package before touching unfinished work."""
+    package_dir = STATE_DIR / "recovery" / str(run_id) / str(attempt)
+    saved = recovery.preserve(
+        WORKTREE, package_dir, run_id=run_id, attempt=attempt, sha=sha,
+        session_id=session_id, transcript=transcript, git_bin=str(GIT_BIN),
+    )
+    if saved.preservation_status != "complete" or saved.cleanup_status == "complete":
+        return saved
     try:
         branch = run_command([str(GIT_BIN), "branch", "--show-current"], cwd=WORKTREE)
         if branch != WORKTREE_BRANCH:
-            return False, f"expected branch {WORKTREE_BRANCH!r}, found {branch!r}"
-
-        merge_aborted = False
+            raise CommandError(f"expected branch {WORKTREE_BRANCH!r}, found {branch!r}")
+        # Fetch before changing the worktree so a network failure leaves it intact.
+        run_command([str(GIT_BIN), "fetch", "origin", BRANCH], cwd=WORKTREE, timeout=180)
+        remote_ref = f"origin/{BRANCH}"
+        remote_sha = run_command([str(GIT_BIN), "rev-parse", remote_ref], cwd=WORKTREE)
+        if saved.head_sha:
+            saved.extra["unpushed_commits"] = not git_is_ancestor(saved.head_sha, remote_ref)
         try:
-            run_command(
-                [str(GIT_BIN), "rev-parse", "--verify", "MERGE_HEAD"], cwd=WORKTREE
-            )
+            run_command([str(GIT_BIN), "rev-parse", "--verify", "MERGE_HEAD"], cwd=WORKTREE)
         except CommandError:
             pass
         else:
+            # The package includes partial resolutions and the unmerged index.
             run_command([str(GIT_BIN), "merge", "--abort"], cwd=WORKTREE)
-            merge_aborted = True
-
-        dirty = run_command(
-            [str(GIT_BIN), "status", "--porcelain", "--untracked-files=normal"],
-            cwd=WORKTREE,
-        )
-        stash_label = (
-            f"bifrost-ci timeout run {run_id} sha {sha[:8]} "
-            f"session {session_id or 'unknown'}"
-        )
-        stashed = False
-        if dirty:
+        if worktree_status():
+            # Native stash safely clears tracked and untracked files only after
+            # the original WIP already has immutable, verified package pointers.
             run_command(
-                [
-                    str(GIT_BIN),
-                    "stash",
-                    "push",
-                    "--include-untracked",
-                    "--message",
-                    stash_label,
-                ],
-                cwd=WORKTREE,
-                timeout=180,
+                [str(GIT_BIN), "stash", "push", "--include-untracked", "--message",
+                 f"bifrost-ci cleanup run {run_id} attempt {attempt}; {saved.manifest_path}"],
+                cwd=WORKTREE, timeout=180,
             )
-            stashed = True
-            remaining = run_command(
-                [str(GIT_BIN), "status", "--porcelain", "--untracked-files=normal"],
-                cwd=WORKTREE,
-            )
-            if remaining:
-                return False, "git stash left tracked or untracked changes behind"
-
-        run_command(
-            [str(GIT_BIN), "fetch", "origin", BRANCH], cwd=WORKTREE, timeout=180
-        )
-        local_sha = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
-        remote_ref = f"origin/{BRANCH}"
-        remote_sha = run_command([str(GIT_BIN), "rev-parse", remote_ref], cwd=WORKTREE)
-        tagged = False
-        if local_sha != remote_sha and not git_is_ancestor(local_sha, remote_ref):
-            tag = f"bifrost-ci-recovery/{run_id}-{local_sha[:12]}"
-            preserve_commit(tag, local_sha)
-            tagged = True
-
+            if worktree_status():
+                raise CommandError("git stash left tracked or untracked changes behind")
         run_command([str(GIT_BIN), "reset", "--hard", remote_ref], cwd=WORKTREE)
-        final_status = run_command(
-            [str(GIT_BIN), "status", "--porcelain", "--untracked-files=normal"],
-            cwd=WORKTREE,
+        if worktree_status() or run_command(
+            [str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE
+        ) != remote_sha:
+            raise CommandError("worktree was not clean and synchronized after recovery")
+    except (CommandError, OSError) as exc:
+        return record_recovery_cleanup(saved, "failed", str(exc))
+    return record_recovery_cleanup(saved, "complete")
+
+
+def recover_invocation_worktree(
+    conn: sqlite3.Connection, run_id: int, sha: str, session_id: str | None,
+    *, transcript: str | None = None,
+) -> recovery.RecoveryResult:
+    row = conn.execute(
+        "SELECT attempt_count, output FROM invocations WHERE workflow_run_id = ?",
+        (run_id,),
+    ).fetchone()
+    attempt = int(row["attempt_count"])
+    manifest = STATE_DIR / "recovery" / str(run_id) / str(attempt) / "manifest.json"
+    # Persist intent before filesystem operations. A restart cannot skip an
+    # unfinished package and let preflight discard its only remaining source.
+    with conn:
+        conn.execute(
+            "UPDATE invocations SET recovery_manifest_path = ?, recovery_status = 'preserving' "
+            "WHERE workflow_run_id = ?", (str(manifest), run_id),
         )
-        final_sha = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
-        if final_status or final_sha != remote_sha:
-            return False, "worktree was not clean and synchronized after recovery"
-        saved = []
-        if merge_aborted:
-            saved.append("aborted conflicted merge")
-        if stashed:
-            saved.append("stashed incomplete edits")
-        if tagged:
-            saved.append(f"tagged unpushed commit {tag}")
-        return True, "; ".join(saved) if saved else "no incomplete edits to stash"
-    except CommandError as exc:
-        return False, str(exc)
+    saved = recover_timeout_worktree(
+        run_id, sha, session_id, attempt=attempt,
+        transcript=str(row["output"] or "") if transcript is None else transcript,
+    )
+    with conn:
+        conn.execute(
+            "UPDATE invocations SET recovery_manifest_path = ?, recovery_status = ? "
+            "WHERE workflow_run_id = ?",
+            (saved.manifest_path,
+             "complete" if recovery_complete(saved) else "failed", run_id),
+        )
+    return saved
+
+
+def retry_pending_recoveries(conn: sqlite3.Connection) -> None:
+    """Retry preservation/cleanup failures without starting another repair."""
+    rows = conn.execute(
+        "SELECT workflow_run_id, sha, codex_session_id, codex_pid FROM invocations "
+        "WHERE recovery_status IS NOT NULL AND recovery_status != 'complete' "
+        "AND status NOT IN ('claimed', 'running', 'reconciling', 'handoff_running')"
+    ).fetchall()
+    for row in rows:
+        if not terminate_recorded_codex(row["codex_pid"]):
+            continue
+        saved = recover_invocation_worktree(
+            conn, row["workflow_run_id"], row["sha"], row["codex_session_id"],
+        )
+        log(f"pending worktree recovery: {saved.detail}")
+
+
+def timeout_ticket_handoff(
+    conn: sqlite3.Connection, run: CiRun, result: CodexResult, relay: Any,
+    record_process: Any, *, transcript: str, exclude_url: str | None = None,
+) -> tuple[str, str | None, recovery.RecoveryResult]:
+    """Preserve first, then give the exact resumed session verified pointers."""
+    with conn:
+        conn.execute(
+            "UPDATE invocations SET status = 'handoff_running', exit_code = ?, timed_out = 1, "
+            "output = ?, codex_session_id = ?, timeout_handoff_status = 'running', "
+            "codex_pid = NULL WHERE workflow_run_id = ?",
+            (result.exit_code, transcript, result.session_id, run.run_id),
+        )
+    saved = recover_invocation_worktree(
+        conn, run.run_id, run.sha, result.session_id, transcript=transcript,
+    )
+    block = recovery.render_markdown(saved, Path(__file__).resolve().with_name("recovery.py"))
+    # The block remains available even if session resumption or issue creation fails.
+    block_path = Path(saved.manifest_path).parent / "recovery.md"
+    try:
+        recovery.write_text_atomic(block_path, block)
+    except OSError as exc:
+        block += f"\nRecovery instructions could not be saved locally: {exc}\n"
+    with conn:
+        conn.execute(
+            "UPDATE invocations SET output = output || ? WHERE workflow_run_id = ?",
+            (f"\n--- recovery pointers ---\n{block}\n", run.run_id),
+        )
+    handoff_output = "Could not resume timed-out Codex: no session id was emitted.\n"
+    issue_url = None
+    if result.session_id:
+        log(f"repair timed out; resuming Codex session {result.session_id} for handoff")
+        handoff = invoke_codex_stream(
+            build_timeout_handoff_prompt(run, block), relay,
+            timeout_seconds=CODEX_HANDOFF_TIMEOUT_SECONDS,
+            resume_session_id=result.session_id, on_process=record_process,
+        )
+        handoff_output = handoff.output
+        issue_url = find_issue_url(handoff_output, exclude_url=exclude_url)
+    return handoff_output, issue_url, saved
 
 
 def fetch_remote_sha() -> str:
@@ -1915,6 +1999,16 @@ def run_monitor() -> int:
     conn = connect_db()
     try:
         recover_interrupted(conn, transport)
+        retry_pending_recoveries(conn)
+        pending_recovery = conn.execute(
+            "SELECT workflow_run_id, recovery_manifest_path FROM invocations "
+            "WHERE recovery_status IS NOT NULL AND recovery_status != 'complete' LIMIT 1"
+        ).fetchone()
+        if pending_recovery is not None:
+            log(f"repair blocked by incomplete recovery for run "
+                f"{pending_recovery['workflow_run_id']}: "
+                f"{pending_recovery['recovery_manifest_path']}")
+            return 4
         excluded_run_ids = handled_run_ids(conn)
         try:
             first = poll_ci(excluded_run_ids)
@@ -2149,41 +2243,14 @@ def run_monitor() -> int:
             output += f"\n--- reconciliation ---\n{resolution_detail}\n"
 
         if result.timed_out:
-            # The repair budget is exhausted. Preserve its complete context by
-            # resuming the exact saved session for one short, ticket-only turn.
-            with conn:
-                conn.execute(
-                    """
-                    UPDATE invocations
-                    SET status = 'handoff_running', exit_code = ?, timed_out = 1,
-                        output = ?, codex_session_id = ?, timeout_handoff_status = 'running',
-                        codex_pid = NULL
-                    WHERE workflow_run_id = ?
-                    """,
-                    (exit_code, output, result.session_id, run.run_id),
-                )
-            handoff_output = ""
-            if result.session_id:
-                log(
-                    f"repair timed out; resuming Codex session {result.session_id} for handoff"
-                )
-                handoff = invoke_codex_stream(
-                    build_timeout_handoff_prompt(run),
-                    relay,
-                    timeout_seconds=CODEX_HANDOFF_TIMEOUT_SECONDS,
-                    resume_session_id=result.session_id,
-                    on_process=record_process,
-                )
-                handoff_output = handoff.output
-                issue_url = find_issue_url(handoff_output, exclude_url=open_issue_url)
-            else:
-                handoff_output = (
-                    "Could not resume timed-out Codex: no session id was emitted.\n"
-                )
-
-            cleanup_ok, cleanup_detail = recover_timeout_worktree(
-                run.run_id, run.sha, result.session_id
+            handoff_output, issue_url, saved = timeout_ticket_handoff(
+                conn, run, result, relay, record_process,
+                transcript=output, exclude_url=open_issue_url,
             )
+            cleanup_ok, cleanup_detail = recovery_complete(saved), saved.detail
+            output = conn.execute(
+                "SELECT output FROM invocations WHERE workflow_run_id = ?", (run.run_id,),
+            ).fetchone()["output"]
             output = (
                 output
                 + "\n--- timeout handoff ---\n"
@@ -2229,9 +2296,10 @@ def run_monitor() -> int:
         else:
             persisted_status = failure_kind or status
             if status != "completed":
-                cleanup_ok, cleanup_detail = recover_timeout_worktree(
-                    run.run_id, run.sha, result.session_id
+                saved = recover_invocation_worktree(
+                    conn, run.run_id, run.sha, result.session_id, transcript=output,
                 )
+                cleanup_ok, cleanup_detail = recovery_complete(saved), saved.detail
                 output += f"\n--- worktree recovery ---\n{cleanup_detail}\n"
             with conn:
                 conn.execute(

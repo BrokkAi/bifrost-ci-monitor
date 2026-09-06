@@ -26,9 +26,9 @@ The monitor:
   session only when a pull leaves actual content conflicts;
 - records combined Codex output, reconciliation state, and verified outcome in
   SQLite;
-- after one hour, stops the repair and resumes that exact Codex session for a
-  ten-minute ticket-only human handoff, then stashes incomplete edits and
-  restores the dedicated worktree to origin/master;
+- after one hour, stops the repair, preserves a verified local recovery package,
+  and restores the dedicated worktree to origin/master before resuming that exact
+  Codex session for a ten-minute ticket-only handoff with recovery pointers;
 - verifies that a design escalation's GitHub issue is still open before
   standing down, so closing a ticket re-arms classification even if CI never
   went green;
@@ -57,6 +57,44 @@ the scheduler, database schema, Slack integration, and tests.
 
 Secrets and runtime state are local-only. Do not commit the Slack webhook,
 SQLite database, cron output, or Codex session data.
+
+## Recovering an unfinished repair
+
+Timeout tickets include a monitor-generated recovery block and a continuation
+note describing the diagnosis, attempted changes, observed test results, and next
+step. Preservation happens **before** the ticket session resumes. A ticket reports
+preservation and cleanup separately; a failed cleanup does not imply that a
+verified backup is unavailable.
+
+Each attempt keeps its manifest, repair transcript, and recovery instructions in
+`~/.local/state/bifrost-ci-monitor/recovery/<run-id>/<attempt>/`. Local Git refs
+under `refs/tags/bifrost-ci-recovery/<run-id>/<attempt>/` pin the original HEAD and
+any stash object. Tickets include full object IDs, the host and repository path,
+and the Codex session ID. These refs and files are **local only**, are not pushed
+to GitHub, and have no automatic expiration. Later stashes do not change them.
+
+On the host named in the ticket, use its exact restore command. The general form
+is:
+
+```sh
+python3 /home/jonathan/Projects/bifrost-ci-monitor/recovery.py \
+  /home/jonathan/.local/state/bifrost-ci-monitor/recovery/<run-id>/<attempt>/manifest.json \
+  /path/to/a/new/recovery-worktree
+```
+
+The destination must not exist. The helper creates a detached worktree at the
+saved HEAD, restores staged and unstaged edits and nonignored untracked files,
+and leaves the cron repair worktree alone. If the deadline interrupted a merge,
+the package also preserves partial resolutions, index stages, and merge metadata;
+restoration reconstructs that unfinished merge. Ignored build outputs are excluded.
+Review the ticket's continuation note and validate the saved changes before
+finishing the repair.
+
+If preservation fails, the monitor leaves the original worktree intact and blocks
+new repairs. It retries pending recovery on later ticks using the same attempt's
+package. A restart or failed ticket handoff retains existing verified artifacts;
+it never substitutes the cleaned worktree for the original WIP. The database and
+monitor outcome identify the package even when no ticket could be created.
 
 ## Slack setup with the Slack CLI
 
