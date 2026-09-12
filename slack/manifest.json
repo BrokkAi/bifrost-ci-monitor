@@ -1,11 +1,11 @@
 {
   "display_information": {
-    "name": "Bifrost CI Auto-fixer",
-    "description": "Posts status updates when the Bifrost CI auto-fixer engages."
+    "name": "BrokkBot",
+    "description": "Brokk CI notifications and relevant social-media conversations."
   },
   "features": {
     "bot_user": {
-      "display_name": "Bifrost CI Auto-fixer",
+      "display_name": "BrokkBot",
       "always_online": false
     }
   },
