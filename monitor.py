@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Brokk AI
-"""Poll Bifrost CI workflows and launch one Codex repair attempt per failed run."""
+"""Poll Bifrost CI workflows and launch one agent repair attempt per failed run."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ WEBHOOK_PATH = CONFIG_DIR / "slack-webhook-url"
 BOT_TOKEN_PATH = CONFIG_DIR / "bot-token"
 CHANNEL_PATH = CONFIG_DIR / "channel-id"
 CODEX_BIN = Path("/home/jonathan/.nvm/versions/node/v24.15.0/bin/codex")
-CODEX_HOME = Path("/home/jonathan/.codex3")
+CODEX_HOME = Path("/home/jonathan/.codex4")
 MBX_BIN = Path("/home/jonathan/.local/share/mbx/bin")
 GH_BIN = Path("/usr/bin/gh")
 GIT_BIN = Path("/usr/bin/git")
@@ -64,6 +64,19 @@ CODEX_MODEL_ARGS = [
     "-c",
     f"model_reasoning_effort={CODEX_REASONING_EFFORT}",
 ]
+# Which coding agent performs the repair. Flipping this constant is the whole
+# switch: argv, JSONL event parsing, and the process guard all key off it, and
+# nothing else in the monitor is agent-specific.
+AGENT = "claude"  # "claude" | "codex"
+# Both markers are accepted when deciding whether a recorded pid is still our
+# agent, so a pid recorded under the previous agent stays reclaimable across a
+# switch instead of blocking recovery forever.
+AGENT_PROCESS_MARKERS = (b"codex", b"claude")
+CLAUDE_BIN = Path("/home/jonathan/.local/bin/claude")
+# Pinned for the same reason CODEX_MODEL is: the monitor must not silently
+# change behavior when ~/.claude/settings.json is edited for interactive use.
+CLAUDE_MODEL = "claude-opus-5"
+CLAUDE_EFFORT = "high"
 SLACK_TIMEOUT_SECONDS = 10
 SLACK_CHAT_URL = "https://slack.com/api/chat.postMessage"
 SLACK_MESSAGE_LIMIT = 3500
@@ -96,11 +109,16 @@ def log(message: str) -> None:
 def child_environment() -> dict[str, str]:
     env = os.environ.copy()
     node_bin = str(CODEX_BIN.parent)
+    claude_bin = str(CLAUDE_BIN.parent)
+    # CODEX_HOME is inert under the Claude agent but must stay set so flipping
+    # AGENT back to "codex" needs no other change. HOME is what lets Claude
+    # Code find its credentials and its ~/.claude/projects/<cwd>/ session store,
+    # which --resume reads; deliberately no CLAUDE_CONFIG_DIR override.
     env.update(
         {
             "HOME": "/home/jonathan",
             "CODEX_HOME": str(CODEX_HOME),
-            "PATH": f"{MBX_BIN}:{node_bin}:/usr/local/bin:/usr/bin:/bin",
+            "PATH": f"{MBX_BIN}:{claude_bin}:{node_bin}:/usr/local/bin:/usr/bin:/bin",
             "XDG_RUNTIME_DIR": "/run/user/1000",
             "SSH_AUTH_SOCK": "/run/user/1000/openssh_agent",
             "GIT_SSH_COMMAND": "/usr/bin/ssh -o BatchMode=yes",
@@ -248,6 +266,9 @@ def connect_db() -> sqlite3.Connection:
     # adds columns to an existing table); without this, get_escalation would
     # crash every red poll on "no such column: signature".
     ensure_column(conn, "invocations", "thread_ts", "TEXT")
+    # The codex_-prefixed columns are agent-independent: they hold whichever
+    # agent AGENT selects. Renaming them would mean a migration on a database
+    # cron is actively writing, which buys nothing.
     ensure_column(conn, "invocations", "codex_session_id", "TEXT")
     ensure_column(conn, "invocations", "issue_url", "TEXT")
     ensure_column(conn, "invocations", "timeout_handoff_status", "TEXT")
@@ -1067,7 +1088,13 @@ def claim_invocation(conn: sqlite3.Connection, run: CiRun, base_sha: str) -> boo
 
 
 def terminate_recorded_codex(pid: int | None) -> bool:
-    """Terminate a recorded Codex process group after a monitor restart."""
+    """Terminate a recorded agent process group after a monitor restart.
+
+    Any marker in AGENT_PROCESS_MARKERS is accepted, not just the active
+    agent's: a pid recorded before an AGENT switch must still be reclaimable,
+    or recovery blocks on that row forever. The guard still does its real job
+    of refusing a pid the kernel has since handed to something unrelated.
+    """
     if not pid or pid <= 1:
         return True
     try:
@@ -1078,15 +1105,15 @@ def terminate_recorded_codex(pid: int | None) -> bool:
         except ProcessLookupError:
             return True
         except OSError as exc:
-            log(f"could not inspect orphaned Codex process group {pid}: {exc}")
+            log(f"could not inspect orphaned {AGENT} process group {pid}: {exc}")
             return False
-        log(f"Codex leader {pid} disappeared but its process group remains; recovery blocked")
+        log(f"{AGENT} leader {pid} disappeared but its process group remains; recovery blocked")
         return False
     except OSError as exc:
-        log(f"could not inspect interrupted Codex pid {pid}: {exc}")
+        log(f"could not inspect interrupted {AGENT} pid {pid}: {exc}")
         return False
-    if b"codex" not in cmdline:
-        log(f"refusing to signal reused non-Codex pid {pid}")
+    if not any(marker in cmdline for marker in AGENT_PROCESS_MARKERS):
+        log(f"refusing to signal reused non-agent pid {pid}")
         return False
     try:
         os.killpg(pid, signal.SIGTERM)
@@ -1121,7 +1148,7 @@ def recover_interrupted(conn: sqlite3.Connection, transport: SlackTransport) -> 
                     "UPDATE invocations SET recovery_status = 'failed' WHERE workflow_run_id = ?",
                     (run_id,),
                 )
-            log(f"cannot safely stop recorded Codex for run {run_id}; recovery blocked")
+            log(f"cannot safely stop recorded {AGENT} for run {run_id}; recovery blocked")
             continue
         if row["status"] == "handoff_running":
             saved = recover_invocation_worktree(conn, run_id, sha, row["codex_session_id"])
@@ -1307,12 +1334,17 @@ class CodexResult:
 
 
 def extract_agent_text(obj: Any) -> str | None:
-    """Return the assistant message text from one codex JSONL event, else None.
+    """Return the assistant message text from one agent JSONL event, else None.
 
-    Only assistant messages are surfaced; tool calls, reasoning, and command
-    output carry other item types and are deliberately ignored. Tolerant of the
-    current ``item.completed`` thread-event schema and older envelopes so a Codex
-    upgrade does not silently drop the feed.
+    Handles both agents. The two schemas share no discriminating key — Codex
+    keys on ``item.completed``/``msg``/``payload`` carrying ``agent_message``,
+    Claude on ``type: "assistant"`` carrying ``message.content`` blocks — so one
+    tolerant parser can accept either with no risk of reading one agent's event
+    as the other's, and no need to branch on AGENT.
+
+    Only assistant prose is surfaced; tool calls, reasoning, and command output
+    carry other types and are deliberately ignored. Codex's older envelopes are
+    still accepted so an upgrade does not silently drop the feed.
     """
     if not isinstance(obj, dict):
         return None
@@ -1324,39 +1356,75 @@ def extract_agent_text(obj: Any) -> str | None:
     for envelope in (obj.get("msg"), obj.get("payload")):
         if isinstance(envelope, dict) and envelope.get("type") == "agent_message":
             candidates.append(envelope.get("message") or envelope.get("text"))
+    # Claude: main-thread assistant turns only. A set parent_tool_use_id marks
+    # subagent output, which must never reach the Slack thread.
+    if (
+        obj.get("type") == "assistant"
+        and not obj.get("parent_tool_use_id")
+        and isinstance(obj.get("message"), dict)
+    ):
+        blocks = obj["message"].get("content")
+        if isinstance(blocks, list):
+            candidates.append(
+                "\n\n".join(
+                    block["text"]
+                    for block in blocks
+                    if isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                )
+            )
     for text in candidates:
         if isinstance(text, str) and text.strip():
             return text.strip()
     return None
 
 
-def extract_session_id(obj: Any) -> str | None:
-    """Return the saved Codex session id from a JSONL event, if present."""
-    if not isinstance(obj, dict) or obj.get("type") != "thread.started":
+def extract_permission_denials(obj: Any) -> list[str] | None:
+    """Return tool names Claude refused to run, from its terminal result event.
+
+    Under ``--permission-prompts none`` a repair that stalls most often stalled
+    on a denied command, so the denials belong in the stored transcript rather
+    than being left to infer from raw JSONL. Codex emits no such event.
+    """
+    if not isinstance(obj, dict) or obj.get("type") != "result":
         return None
-    session_id = obj.get("thread_id")
+    denials = obj.get("permission_denials")
+    if not isinstance(denials, list) or not denials:
+        return None
+    names = []
+    for denial in denials:
+        if isinstance(denial, dict):
+            names.append(str(denial.get("tool_name") or denial.get("tool") or denial))
+        else:
+            names.append(str(denial))
+    return names
+
+
+def extract_session_id(obj: Any) -> str | None:
+    """Return the agent's saved session id from a JSONL event, if present.
+
+    Codex announces it as ``thread.started``/``thread_id``, Claude as the
+    ``system``/``init`` event's ``session_id``. Both are the token the resume
+    paths later pass back, so both land in ``invocations.codex_session_id``.
+    """
+    if not isinstance(obj, dict):
+        return None
+    if obj.get("type") == "thread.started":
+        session_id = obj.get("thread_id")
+    elif obj.get("type") == "system" and obj.get("subtype") == "init":
+        session_id = obj.get("session_id")
+    else:
+        return None
     return session_id if isinstance(session_id, str) and session_id.strip() else None
 
 
-def invoke_codex_stream(
-    prompt: str,
-    on_message,
-    *,
-    timeout_seconds: int = CODEX_TIMEOUT_SECONDS,
-    resume_session_id: str | None = None,
-    on_session=None,
-    on_process=None,
-) -> CodexResult:
-    """Run Codex with --json, invoking ``on_message(text)`` per assistant message.
-
-    Reads stdout as JSONL as it arrives so the Slack thread updates live, while
-    still capturing the full transcript for the database and enforcing the
-    caller's timeout with SIGTERM/SIGKILL escalation.
-    """
+def codex_args(resume_session_id: str | None) -> list[str]:
+    """Build the ``codex exec`` argv, fresh or resuming an existing thread."""
     if resume_session_id:
         # exec-resume has its own option parser. Put workspace and sandbox
         # overrides at the CLI root, and pass the follow-up prompt on stdin.
-        args = [
+        return [
             str(CODEX_BIN),
             "-C",
             str(WORKTREE),
@@ -1371,22 +1439,88 @@ def invoke_codex_stream(
             resume_session_id,
             "-",
         ]
-    else:
-        args = [
-            str(CODEX_BIN),
-            "exec",
-            "-C",
-            str(WORKTREE),
-            *CODEX_MODEL_ARGS,
-            "--json",
-            "--sandbox",
-            "workspace-write",
-            "--color",
-            "never",
-            "-c",
-            "shell_environment_policy.inherit=all",
-            "-",
-        ]
+    return [
+        str(CODEX_BIN),
+        "exec",
+        "-C",
+        str(WORKTREE),
+        *CODEX_MODEL_ARGS,
+        "--json",
+        "--sandbox",
+        "workspace-write",
+        "--color",
+        "never",
+        "-c",
+        "shell_environment_policy.inherit=all",
+        "-",
+    ]
+
+
+def claude_args(resume_session_id: str | None) -> list[str]:
+    """Build the ``claude -p`` argv, fresh or resuming an existing session.
+
+    The prompt always arrives on stdin, so no prompt argument is passed. The
+    working directory is set on the Popen itself, which is what replaces Codex's
+    ``-C``. Three flags are deliberately absent: ``--fork-session`` would change
+    the session id on resume, ``--no-session-persistence`` would leave nothing
+    to resume, and ``--bare`` would cost the agent CLAUDE.md discovery inside
+    the Bifrost worktree.
+
+    ``--permission-prompts none`` does not narrow auto mode; auto still decides
+    everything it can. It only settles the indeterminate residue auto mode would
+    otherwise pause on. Under cron nobody can answer such a pause, so the real
+    choice is between denying and hanging until the deadline.
+
+    The pinned output style is the same argument as the pinned model: without it
+    the repair agent inherits whatever style ~/.claude/settings.json currently
+    carries for interactive use, and that prose goes straight to Slack. This
+    overrides only that one key, so the Bifrost worktree's own CLAUDE.md and
+    project settings still load.
+    """
+    args = [
+        str(CLAUDE_BIN),
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",  # required alongside -p with stream-json output
+        "--model",
+        CLAUDE_MODEL,
+        "--effort",
+        CLAUDE_EFFORT,
+        "--permission-mode",
+        "auto",
+        "--permission-prompts",
+        "none",
+        "--settings",
+        json.dumps({"outputStyle": "default"}),
+    ]
+    if resume_session_id:
+        args += ["--resume", resume_session_id]
+    return args
+
+
+def agent_args(resume_session_id: str | None) -> list[str]:
+    """Build the configured agent's argv. See ``AGENT``."""
+    return (claude_args if AGENT == "claude" else codex_args)(resume_session_id)
+
+
+def invoke_codex_stream(
+    prompt: str,
+    on_message,
+    *,
+    timeout_seconds: int = CODEX_TIMEOUT_SECONDS,
+    resume_session_id: str | None = None,
+    on_session=None,
+    on_process=None,
+) -> CodexResult:
+    """Run the configured agent, invoking ``on_message(text)`` per assistant message.
+
+    Reads stdout as JSONL as it arrives so the Slack thread updates live, while
+    still capturing the full transcript for the database and enforcing the
+    caller's timeout with SIGTERM/SIGKILL escalation. Everything here except the
+    argv (see ``agent_args``) and the event parsers is agent-independent.
+    """
+    args = agent_args(resume_session_id)
     stderr_file = tempfile.TemporaryFile()
     try:
         process = subprocess.Popen(
@@ -1404,7 +1538,7 @@ def invoke_codex_stream(
             "spawn_failed",
             None,
             False,
-            f"Could not start Codex: {exc}\n",
+            f"Could not start {AGENT}: {exc}\n",
             resume_session_id,
         )
 
@@ -1412,6 +1546,7 @@ def invoke_codex_stream(
         on_process(process.pid)
 
     session_id = resume_session_id
+    denials: list[str] = []
 
     def dispatch(raw_line: bytes) -> None:
         line = raw_line.strip()
@@ -1422,6 +1557,9 @@ def invoke_codex_stream(
         except ValueError:
             return
         nonlocal session_id
+        found_denials = extract_permission_denials(obj)
+        if found_denials:
+            denials.extend(found_denials)
         found_session_id = extract_session_id(obj)
         if found_session_id:
             session_id = found_session_id
@@ -1455,7 +1593,7 @@ def invoke_codex_stream(
             continue
         data = os.read(stdout_fd, 65536)
         if not data:
-            break  # EOF: Codex closed stdout
+            break  # EOF: the agent closed stdout
         chunks.append(data)
         buffer += data
         while b"\n" in buffer:
@@ -1489,8 +1627,10 @@ def invoke_codex_stream(
     stderr_text = stderr_file.read().decode("utf-8", errors="replace")
     stderr_file.close()
     output = b"".join(chunks).decode("utf-8", errors="replace") + stderr_text
+    if denials:
+        output += f"\nDenied tool calls: {', '.join(sorted(set(denials)))}.\n"
     if timed_out:
-        output += f"\nCodex exceeded the {timeout_seconds}-second monitor timeout.\n"
+        output += f"\n{AGENT} exceeded the {timeout_seconds}-second monitor timeout.\n"
         return CodexResult("timed_out", process.returncode, True, output, session_id)
     status = "completed" if process.returncode == 0 else "failed"
     return CodexResult(status, process.returncode, False, output, session_id)
@@ -1510,9 +1650,9 @@ def outcome_detail(
         return f"Pushed {format_commit(pushed_sha)} to fix the problem."
     if status == "completed":
         if new_sha == "unknown":
-            return "Codex made no changes; could not read master state."
+            return f"{AGENT} made no changes; could not read master state."
         if new_sha == base_sha:
-            return f"Codex made no changes; master is unchanged at {format_commit(new_sha)}."
+            return f"{AGENT} made no changes; master is unchanged at {format_commit(new_sha)}."
         return f"Looks like {format_commit(new_sha)} fixes the problem."
     return f"Remote master is now {format_commit(new_sha)}."
 
@@ -1705,10 +1845,10 @@ def timeout_ticket_handoff(
             "UPDATE invocations SET output = output || ? WHERE workflow_run_id = ?",
             (f"\n--- recovery pointers ---\n{block}\n", run.run_id),
         )
-    handoff_output = "Could not resume timed-out Codex: no session id was emitted.\n"
+    handoff_output = f"Could not resume timed-out {AGENT}: no session id was emitted.\n"
     issue_url = None
     if result.session_id:
-        log(f"repair timed out; resuming Codex session {result.session_id} for handoff")
+        log(f"repair timed out; resuming {AGENT} session {result.session_id} for handoff")
         handoff = invoke_codex_stream(
             build_timeout_handoff_prompt(run, block), relay,
             timeout_seconds=CODEX_HANDOFF_TIMEOUT_SECONDS,
@@ -1782,7 +1922,7 @@ def reconcile_repair(
             dirty = worktree_status()
             if dirty:
                 raise CommandError(
-                    "Codex reported success but left a dirty or conflicted worktree"
+                    f"{AGENT} reported success but left a dirty or conflicted worktree"
                 )
             local_sha = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
         except CommandError as exc:
@@ -1855,7 +1995,7 @@ def reconcile_repair(
                     failed, "unknown", None, str(pull_error), "push_failed"
                 )
             if not result.session_id:
-                detail = "merge conflicts require Codex, but no session id was emitted"
+                detail = f"merge conflicts require {AGENT}, but no session id was emitted"
                 failed = CodexResult(
                     "failed", result.exit_code, False, output, result.session_id
                 )
@@ -1880,7 +2020,7 @@ def reconcile_repair(
             if on_candidate is not None:
                 on_candidate(local_sha, reconcile_round)
             log(
-                f"merge round {reconcile_round} left conflicts; resuming Codex session "
+                f"merge round {reconcile_round} left conflicts; resuming {AGENT} session "
                 f"{result.session_id}"
             )
             resumed = invoke_codex_stream(
@@ -2088,10 +2228,10 @@ def run_monitor() -> int:
                     )
                     mark_reported(conn, run.run_id)
                     return 0
-                # Non-escalated repeat: re-engage Codex, threaded under the episode.
+                # Non-escalated repeat: re-engage the agent, threaded under the episode.
                 reply_ts = episode["thread_ts"]
                 log(
-                    "new failed build within the current set; re-engaging Codex in-thread"
+                    f"new failed build within the current set; re-engaging {AGENT} in-thread"
                 )
             else:
                 # Reset: a surface outside the episode baseline. If the episode is
@@ -2157,14 +2297,14 @@ def run_monitor() -> int:
             slack_send(
                 transport,
                 f":rotating_light: New failed build {commit_link} still red on the "
-                f"same set; Codex re-engaged. <{run.url}|Open {run.workflow} run>",
+                f"same set; {AGENT} re-engaged. <{run.url}|Open {run.workflow} run>",
                 thread_ts=thread_ts,
             )
         else:
             _, thread_ts = slack_send(
                 transport,
                 f":rotating_light: Bifrost {run.workflow} is red at {commit_link}. "
-                f"Codex auto-fixer engaged. <{run.url}|Open {run.workflow} run>",
+                f"{AGENT} auto-fixer engaged. <{run.url}|Open {run.workflow} run>",
             )
         with conn:
             conn.execute(
@@ -2203,7 +2343,7 @@ def run_monitor() -> int:
                     (candidate_sha, reconcile_round, run.run_id),
                 )
 
-        log(f"launching Codex for red {run.workflow} at {run.sha[:8]}")
+        log(f"launching {AGENT} for red {run.workflow} at {run.sha[:8]}")
         repair_deadline = time.monotonic() + CODEX_TIMEOUT_SECONDS
         result = invoke_codex_stream(
             build_prompt(run, open_issue_url),
@@ -2464,7 +2604,7 @@ def run_monitor() -> int:
                 "WHERE workflow_run_id = ?",
                 (run.run_id,),
             )
-        log(f"Codex {outcome} for {run.sha[:8]}")
+        log(f"{AGENT} {outcome} for {run.sha[:8]}")
         return 0 if (status == "completed" or escalated) and cleanup_ok else 5
     finally:
         conn.close()
@@ -2520,7 +2660,7 @@ def test_slack() -> int:
     if transport.kind == "chat" and ts:
         slack_send(
             transport,
-            "Threaded reply test — the live Codex feed will appear in replies like this.",
+            f"Threaded reply test — the live {AGENT} feed will appear in replies like this.",
             thread_ts=ts,
         )
         print("Sent a threaded test message via chat.postMessage.")

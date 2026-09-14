@@ -129,7 +129,10 @@ class ChildEnvironmentTests(unittest.TestCase):
         path_entries = monitor.child_environment()["PATH"].split(":")
 
         self.assertEqual(path_entries[0], str(monitor.MBX_BIN))
-        self.assertEqual(path_entries[1], str(monitor.CODEX_BIN.parent))
+        for agent_bin in (monitor.CLAUDE_BIN.parent, monitor.CODEX_BIN.parent):
+            self.assertLess(
+                path_entries.index(str(agent_bin)), path_entries.index("/usr/bin")
+            )
 
 
 class PollCiTests(unittest.TestCase):
@@ -532,12 +535,8 @@ class TimeoutHandoffTests(unittest.TestCase):
             new,
         )
 
-    @mock.patch.object(monitor.os, "read")
-    @mock.patch.object(monitor.select, "select")
-    @mock.patch.object(monitor.subprocess, "Popen")
-    def test_resume_uses_exact_session_and_captures_jsonl(
-        self, popen, select_call, os_read
-    ):
+    def run_streamed_agent(self, popen, select_call, os_read, lines, **kwargs):
+        """Drive invoke_codex_stream over a scripted JSONL stdout stream."""
         process = mock.Mock()
         process.pid = 4321
         process.returncode = 0
@@ -547,11 +546,7 @@ class TimeoutHandoffTests(unittest.TestCase):
         process.wait.return_value = 0
         popen.return_value = process
         select_call.return_value = ([99], [], [])
-        os_read.side_effect = [
-            b'{"type":"thread.started","thread_id":"session-123"}\n',
-            b'{"type":"item.completed","item":{"type":"agent_message","text":"filed"}}\n',
-            b"",
-        ]
+        os_read.side_effect = [*lines, b""]
         sessions = []
         messages = []
 
@@ -559,17 +554,147 @@ class TimeoutHandoffTests(unittest.TestCase):
             "handoff",
             messages.append,
             timeout_seconds=600,
-            resume_session_id="session-123",
             on_session=sessions.append,
+            **kwargs,
         )
+        return result, messages, sessions, process, popen.call_args.args[0]
 
-        args = popen.call_args.args[0]
+    @mock.patch.object(monitor.os, "read")
+    @mock.patch.object(monitor.select, "select")
+    @mock.patch.object(monitor.subprocess, "Popen")
+    def test_resume_uses_exact_session_and_captures_jsonl(
+        self, popen, select_call, os_read
+    ):
+        with mock.patch.object(monitor, "AGENT", "codex"):
+            result, messages, sessions, process, args = self.run_streamed_agent(
+                popen,
+                select_call,
+                os_read,
+                [
+                    b'{"type":"thread.started","thread_id":"session-123"}\n',
+                    b'{"type":"item.completed","item":'
+                    b'{"type":"agent_message","text":"filed"}}\n',
+                ],
+                resume_session_id="session-123",
+            )
+
         self.assertEqual(args[args.index("resume") + 1 :][-2:], ["session-123", "-"])
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.session_id, "session-123")
         self.assertEqual(messages, ["filed"])
         self.assertEqual(sessions, ["session-123"])
         process.stdin.write.assert_called_once_with(b"handoff")
+
+    @mock.patch.object(monitor.os, "read")
+    @mock.patch.object(monitor.select, "select")
+    @mock.patch.object(monitor.subprocess, "Popen")
+    def test_claude_resume_uses_exact_session_and_captures_jsonl(
+        self, popen, select_call, os_read
+    ):
+        with mock.patch.object(monitor, "AGENT", "claude"):
+            result, messages, sessions, process, args = self.run_streamed_agent(
+                popen,
+                select_call,
+                os_read,
+                [
+                    b'{"type":"system","subtype":"init","session_id":"session-123"}\n',
+                    b'{"type":"assistant","message":{"content":'
+                    b'[{"type":"text","text":"filed"}]}}\n',
+                ],
+                resume_session_id="session-123",
+            )
+
+        self.assertEqual(args[-2:], ["--resume", "session-123"])
+        self.assertNotIn("--fork-session", args)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.session_id, "session-123")
+        self.assertEqual(messages, ["filed"])
+        self.assertEqual(sessions, ["session-123"])
+        process.stdin.write.assert_called_once_with(b"handoff")
+
+    @mock.patch.object(monitor.os, "read")
+    @mock.patch.object(monitor.select, "select")
+    @mock.patch.object(monitor.subprocess, "Popen")
+    def test_claude_records_denied_tool_calls_in_the_transcript(
+        self, popen, select_call, os_read
+    ):
+        with mock.patch.object(monitor, "AGENT", "claude"):
+            result, _, _, _, _ = self.run_streamed_agent(
+                popen,
+                select_call,
+                os_read,
+                [
+                    b'{"type":"result","subtype":"success",'
+                    b'"permission_denials":[{"tool_name":"Bash"}]}\n',
+                ],
+            )
+
+        self.assertIn("Denied tool calls: Bash.", result.output)
+
+    def test_fresh_argv_pins_model_and_autonomy_flags(self):
+        with mock.patch.object(monitor, "AGENT", "claude"):
+            args = monitor.agent_args(None)
+        self.assertEqual(args[0], str(monitor.CLAUDE_BIN))
+        for flag, value in (
+            ("--model", monitor.CLAUDE_MODEL),
+            ("--effort", monitor.CLAUDE_EFFORT),
+            ("--permission-mode", "auto"),
+            ("--permission-prompts", "none"),
+            ("--output-format", "stream-json"),
+        ):
+            self.assertEqual(args[args.index(flag) + 1], value)
+        self.assertIn("--verbose", args)
+        self.assertEqual(
+            json.loads(args[args.index("--settings") + 1]), {"outputStyle": "default"}
+        )
+        self.assertNotIn("--resume", args)
+        self.assertNotIn("--no-session-persistence", args)
+
+        with mock.patch.object(monitor, "AGENT", "codex"):
+            args = monitor.agent_args(None)
+        self.assertEqual(args[0], str(monitor.CODEX_BIN))
+        for flag in monitor.CODEX_MODEL_ARGS:
+            self.assertIn(flag, args)
+        self.assertEqual(args[args.index("--sandbox") + 1], "workspace-write")
+        self.assertEqual(args[-1], "-")
+
+    def test_extracts_claude_main_thread_text_only(self):
+        def assistant(blocks, **extra):
+            return {"type": "assistant", "message": {"content": blocks}, **extra}
+
+        self.assertEqual(
+            monitor.extract_agent_text(
+                assistant(
+                    [
+                        {"type": "thinking", "thinking": "hidden"},
+                        {"type": "text", "text": "visible"},
+                        {"type": "tool_use", "name": "Bash"},
+                    ]
+                )
+            ),
+            "visible",
+        )
+        self.assertIsNone(
+            monitor.extract_agent_text(
+                assistant([{"type": "text", "text": "sub"}], parent_tool_use_id="t1")
+            )
+        )
+        self.assertIsNone(
+            monitor.extract_agent_text(assistant([{"type": "tool_use", "name": "Bash"}]))
+        )
+
+    def test_extracts_claude_init_session_id(self):
+        self.assertEqual(
+            monitor.extract_session_id(
+                {"type": "system", "subtype": "init", "session_id": "session-123"}
+            ),
+            "session-123",
+        )
+        self.assertIsNone(
+            monitor.extract_session_id(
+                {"type": "system", "subtype": "compact", "session_id": "session-123"}
+            )
+        )
 
     @mock.patch.object(monitor, "run_command")
     @mock.patch.object(monitor.recovery, "preserve")
