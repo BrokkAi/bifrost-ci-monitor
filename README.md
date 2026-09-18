@@ -4,11 +4,12 @@ This monitor polls the CI, Hourly CI, and Nightly CI GitHub Actions workflows
 for BrokkAi/bifrost-dev every five minutes. CI is restricted to push runs on
 master; Hourly CI and Nightly CI include their scheduled and manually
 dispatched runs. When the latest run in any tracked workflow is red, it
-launches one Codex repair attempt for that run, regardless of whether the run's
-commit is still master HEAD. Codex always works from current master HEAD: if an
-intervening commit already fixed the failure it exits without changes,
-otherwise it fixes forward, tests, and leaves a clean local commit. The monitor
-then merges current origin/master and pushes the verified result.
+launches one agent repair attempt (Claude or Codex, per the profile) for that
+run, regardless of whether the run's commit is still master HEAD. The agent
+always works from current master HEAD: if an intervening commit already fixed
+the failure it exits without changes, otherwise it fixes forward, tests, and
+leaves a clean local commit. The monitor then merges current origin/master and
+pushes the verified result.
 
 The monitor:
 
@@ -54,6 +55,16 @@ the scheduler, database schema, Slack integration, and tests.
     ~/Projects/bifrost-ci/activity.db
     ~/.local/state/bifrost-ci-monitor/
     ~/.config/bifrost-ci-monitor/
+    ~/.config/anvil/anvil.toml     which repair agent to use
+
+The repair agent is selected by `inference_profile` in
+`~/.config/anvil/anvil.toml`, which sm-watch shares. The value is a profile home
+directory: a path containing "claude" runs Claude via `claude -p` with that path
+as `CLAUDE_CONFIG_DIR`, and a path containing "codex" runs Codex via
+`codex exec` with that path as `CODEX_HOME`. If the file is missing or the value
+contains neither "codex" nor "claude", the monitor logs `fatal:` and exits 1 on
+every tick instead of falling back to a default. Changes take effect on the next
+five-minute tick.
 
 Secrets and runtime state are local-only. Do not commit the Slack webhook,
 SQLite database, cron output, or Codex session data.

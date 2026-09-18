@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +29,62 @@ from pathlib import Path
 from typing import Any
 
 import recovery
+
+
+# The agent used for CI repair is configured once, outside this repository, in
+# a small TOML file shared with sm-watch. ``inference_profile`` names a profile
+# home directory: a path containing "codex" selects the Codex agent and becomes
+# its CODEX_HOME, a path containing "claude" selects the Claude agent and
+# becomes its CLAUDE_CONFIG_DIR.
+ANVIL_CONFIG_PATH = Path.home() / ".config/anvil/anvil.toml"
+
+
+@dataclass(frozen=True)
+class Profile:
+    """A resolved ``inference_profile`` value."""
+
+    name: str
+    kind: str
+    home: Path
+    model: str
+
+
+def profile_from_name(name: str, source: str) -> Profile:
+    """Map an ``inference_profile`` value onto the agent it selects.
+
+    "codex" is tested before "claude" so a path that happens to contain both
+    resolves the same way every time.
+    """
+    home = Path(name).expanduser()
+    if "codex" in name:
+        return Profile(name=name, kind="codex", home=home, model="gpt-5.6-sol")
+    if "claude" in name:
+        return Profile(name=name, kind="claude", home=home, model="claude-opus-5")
+    raise RuntimeError(
+        f"{source}: inference_profile {name!r} names neither a codex nor a "
+        "claude profile home"
+    )
+
+
+def load_profile(path: Path | None = None) -> Profile:
+    """Read the selected profile from anvil.toml.
+
+    The ANVIL_CONFIG environment variable overrides the default path. Every
+    failure raises RuntimeError naming the file that has to be fixed.
+    """
+    config_path = Path(path or os.environ.get("ANVIL_CONFIG") or ANVIL_CONFIG_PATH)
+    try:
+        raw = config_path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"{config_path}: cannot read anvil config: {exc}") from exc
+    try:
+        data = tomllib.loads(raw.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"{config_path}: invalid TOML: {exc}") from exc
+    name = data.get("inference_profile")
+    if not isinstance(name, str) or not name.strip():
+        raise RuntimeError(f"{config_path}: inference_profile is missing or blank")
+    return profile_from_name(name.strip(), str(config_path))
 
 
 REPO_NAME = "BrokkAi/bifrost-dev"
@@ -47,7 +104,22 @@ WEBHOOK_PATH = CONFIG_DIR / "slack-webhook-url"
 BOT_TOKEN_PATH = CONFIG_DIR / "bot-token"
 CHANNEL_PATH = CONFIG_DIR / "channel-id"
 CODEX_BIN = Path("/home/jonathan/.nvm/versions/node/v24.15.0/bin/codex")
-CODEX_HOME = Path("/home/jonathan/.codex4")
+# Which agent performs the repair, and the profile home it runs out of, both
+# come from anvil.toml. That single value is the whole switch: argv, JSONL
+# event parsing, and the process guard all key off AGENT, and nothing else in
+# the monitor is agent-specific. Loading must never raise at import time,
+# because the tests import this module; main() reports the error instead.
+try:
+    PROFILE, PROFILE_ERROR = load_profile(), None
+except RuntimeError as exc:
+    PROFILE, PROFILE_ERROR = None, str(exc)
+AGENT = PROFILE.kind if PROFILE else "claude"  # "claude" | "codex"
+CODEX_HOME = (
+    PROFILE.home
+    if PROFILE and PROFILE.kind == "codex"
+    else Path("/home/jonathan/.codex4")
+)
+CLAUDE_CONFIG_DIR = PROFILE.home if PROFILE and PROFILE.kind == "claude" else None
 MBX_BIN = Path("/home/jonathan/.local/share/mbx/bin")
 GH_BIN = Path("/usr/bin/gh")
 GIT_BIN = Path("/usr/bin/git")
@@ -57,17 +129,13 @@ CODEX_HANDOFF_TIMEOUT_SECONDS = 10 * 60
 # default, so the monitor's behavior does not silently change when that file is
 # edited for interactive use. These flags are spliced into every `codex exec`.
 CODEX_MODEL = "gpt-5.6-sol"
-CODEX_REASONING_EFFORT = "high"
+CODEX_REASONING_EFFORT = "xhigh"
 CODEX_MODEL_ARGS = [
     "-m",
     CODEX_MODEL,
     "-c",
     f"model_reasoning_effort={CODEX_REASONING_EFFORT}",
 ]
-# Which coding agent performs the repair. Flipping this constant is the whole
-# switch: argv, JSONL event parsing, and the process guard all key off it, and
-# nothing else in the monitor is agent-specific.
-AGENT = "claude"  # "claude" | "codex"
 # Both markers are accepted when deciding whether a recorded pid is still our
 # agent, so a pid recorded under the previous agent stays reclaimable across a
 # switch instead of blocking recovery forever.
@@ -76,7 +144,7 @@ CLAUDE_BIN = Path("/home/jonathan/.local/bin/claude")
 # Pinned for the same reason CODEX_MODEL is: the monitor must not silently
 # change behavior when ~/.claude/settings.json is edited for interactive use.
 CLAUDE_MODEL = "claude-opus-5"
-CLAUDE_EFFORT = "high"
+CLAUDE_EFFORT = "xhigh"
 SLACK_TIMEOUT_SECONDS = 10
 SLACK_CHAT_URL = "https://slack.com/api/chat.postMessage"
 SLACK_MESSAGE_LIMIT = 3500
@@ -110,10 +178,12 @@ def child_environment() -> dict[str, str]:
     env = os.environ.copy()
     node_bin = str(CODEX_BIN.parent)
     claude_bin = str(CLAUDE_BIN.parent)
-    # CODEX_HOME is inert under the Claude agent but must stay set so flipping
-    # AGENT back to "codex" needs no other change. HOME is what lets Claude
-    # Code find its credentials and its ~/.claude/projects/<cwd>/ session store,
-    # which --resume reads; deliberately no CLAUDE_CONFIG_DIR override.
+    # CODEX_HOME is inert under the Claude agent but must stay set so selecting
+    # a codex profile needs no other change. HOME is what lets Claude Code find
+    # its credentials. CLAUDE_CONFIG_DIR is set from the profile when a claude
+    # profile is selected: with the default ~/.claude the ~/.claude/projects/
+    # <cwd>/ session store that --resume reads is unchanged, and a different
+    # claude home moves that store with it.
     env.update(
         {
             "HOME": "/home/jonathan",
@@ -124,6 +194,12 @@ def child_environment() -> dict[str, str]:
             "GIT_SSH_COMMAND": "/usr/bin/ssh -o BatchMode=yes",
         }
     )
+    if CLAUDE_CONFIG_DIR is not None:
+        env["CLAUDE_CONFIG_DIR"] = str(CLAUDE_CONFIG_DIR)
+    else:
+        # Under a codex profile the child must not inherit a CLAUDE_CONFIG_DIR
+        # that happens to be set in the monitor's own environment.
+        env.pop("CLAUDE_CONFIG_DIR", None)
     return env
 
 
@@ -2615,6 +2691,9 @@ def check_only() -> int:
     print(
         json.dumps(
             {
+                "agent": AGENT,
+                "model": CLAUDE_MODEL if AGENT == "claude" else CODEX_MODEL,
+                "profile_home": str(PROFILE.home) if PROFILE else None,
                 "state": result.state,
                 "head_sha": result.head_sha,
                 "run": (
@@ -2670,6 +2749,10 @@ def test_slack() -> int:
 
 
 def main() -> int:
+    if PROFILE_ERROR:
+        # Report on every cron tick rather than silently using a default agent.
+        log(f"fatal: {PROFILE_ERROR}")
+        return 1
     args = parse_args()
     try:
         if args.configure_slack:

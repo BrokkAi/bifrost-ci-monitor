@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import shutil
 import shlex
 import sqlite3
@@ -133,6 +134,65 @@ class ChildEnvironmentTests(unittest.TestCase):
             self.assertLess(
                 path_entries.index(str(agent_bin)), path_entries.index("/usr/bin")
             )
+
+    def test_claude_config_dir_follows_the_selected_profile(self):
+        with mock.patch.object(monitor, "CLAUDE_CONFIG_DIR", Path("/tmp/claude-home")):
+            self.assertEqual(
+                monitor.child_environment()["CLAUDE_CONFIG_DIR"], "/tmp/claude-home"
+            )
+
+    def test_claude_config_dir_is_omitted_under_a_codex_profile(self):
+        with mock.patch.object(monitor, "CLAUDE_CONFIG_DIR", None):
+            self.assertNotIn("CLAUDE_CONFIG_DIR", monitor.child_environment())
+
+
+class ProfileLoaderTests(unittest.TestCase):
+    def load(self, text):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "anvil.toml"
+            if text is not None:
+                config.write_text(text)
+            with mock.patch.dict(os.environ, {"ANVIL_CONFIG": str(config)}):
+                return monitor.load_profile(), config
+
+    def test_codex_profile_selects_codex_home_and_model(self):
+        profile, _ = self.load('inference_profile = "~/.codex4"\n')
+        self.assertEqual(profile.kind, "codex")
+        self.assertEqual(profile.home, Path.home() / ".codex4")
+        self.assertEqual(profile.model, "gpt-5.6-sol")
+
+    def test_claude_profile_selects_claude_home_and_model(self):
+        profile, _ = self.load('inference_profile = "~/.claude"\n')
+        self.assertEqual(profile.kind, "claude")
+        self.assertEqual(profile.home, Path.home() / ".claude")
+        self.assertEqual(profile.model, "claude-opus-5")
+
+    def test_missing_file_names_the_path(self):
+        with self.assertRaises(RuntimeError) as caught:
+            self.load(None)
+        self.assertIn("anvil.toml", str(caught.exception))
+
+    def test_blank_value_names_the_path(self):
+        with self.assertRaises(RuntimeError) as caught:
+            self.load('inference_profile = "   "\n')
+        self.assertIn("anvil.toml", str(caught.exception))
+
+    def test_unknown_agent_names_the_path(self):
+        with self.assertRaises(RuntimeError) as caught:
+            self.load('inference_profile = "gemini"\n')
+        message = str(caught.exception)
+        self.assertIn("anvil.toml", message)
+        self.assertIn("gemini", message)
+
+    def test_main_reports_a_misconfigured_profile_on_every_tick(self):
+        with mock.patch.object(monitor, "PROFILE_ERROR", "anvil.toml: broken"), \
+             mock.patch.object(monitor, "log") as logged, \
+             mock.patch.object(monitor, "run_monitor") as run_monitor:
+            self.assertEqual(monitor.main(), 1)
+        run_monitor.assert_not_called()
+        message = logged.call_args[0][0]
+        self.assertTrue(message.startswith("fatal: "), message)
+        self.assertIn("anvil.toml: broken", message)
 
 
 class PollCiTests(unittest.TestCase):
@@ -638,6 +698,7 @@ class TimeoutHandoffTests(unittest.TestCase):
         for flag, value in (
             ("--model", monitor.CLAUDE_MODEL),
             ("--effort", monitor.CLAUDE_EFFORT),
+            ("--effort", "xhigh"),
             ("--permission-mode", "auto"),
             ("--permission-prompts", "none"),
             ("--output-format", "stream-json"),
@@ -653,6 +714,7 @@ class TimeoutHandoffTests(unittest.TestCase):
         with mock.patch.object(monitor, "AGENT", "codex"):
             args = monitor.agent_args(None)
         self.assertEqual(args[0], str(monitor.CODEX_BIN))
+        self.assertIn("model_reasoning_effort=xhigh", monitor.CODEX_MODEL_ARGS)
         for flag in monitor.CODEX_MODEL_ARGS:
             self.assertIn(flag, args)
         self.assertEqual(args[args.index("--sandbox") + 1], "workspace-write")
