@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Brokk AI
-"""Poll Bifrost CI workflows and launch one agent repair attempt per failed run."""
+"""Poll Bifrost CI workflows and launch one agent diagnosis per failed run."""
 
 from __future__ import annotations
 
@@ -57,9 +57,9 @@ def profile_from_name(name: str, source: str) -> Profile:
     """
     home = Path(name).expanduser()
     if "codex" in name:
-        return Profile(name=name, kind="codex", home=home, model="gpt-5.6-sol")
+        return Profile(name=name, kind="codex", home=home, model="gpt-6-sol")
     if "claude" in name:
-        return Profile(name=name, kind="claude", home=home, model="claude-opus-5")
+        return Profile(name=name, kind="claude", home=home, model="opus")
     raise RuntimeError(
         f"{source}: inference_profile {name!r} names neither a codex nor a "
         "claude profile home"
@@ -128,8 +128,8 @@ CODEX_HANDOFF_TIMEOUT_SECONDS = 10 * 60
 # Pin the repair model explicitly rather than inheriting ~/.codex/config.toml's
 # default, so the monitor's behavior does not silently change when that file is
 # edited for interactive use. These flags are spliced into every `codex exec`.
-CODEX_MODEL = "gpt-5.6-sol"
-CODEX_REASONING_EFFORT = "xhigh"
+CODEX_MODEL = "gpt-6-sol"
+CODEX_REASONING_EFFORT = "high"
 CODEX_MODEL_ARGS = [
     "-m",
     CODEX_MODEL,
@@ -143,19 +143,18 @@ AGENT_PROCESS_MARKERS = (b"codex", b"claude")
 CLAUDE_BIN = Path("/home/jonathan/.local/bin/claude")
 # Pinned for the same reason CODEX_MODEL is: the monitor must not silently
 # change behavior when ~/.claude/settings.json is edited for interactive use.
-CLAUDE_MODEL = "claude-opus-5"
-CLAUDE_EFFORT = "xhigh"
+# The "opus" alias deliberately tracks the latest Opus release.
+CLAUDE_MODEL = "opus"
+CLAUDE_EFFORT = "high"
 SLACK_TIMEOUT_SECONDS = 10
 SLACK_CHAT_URL = "https://slack.com/api/chat.postMessage"
 SLACK_MESSAGE_LIMIT = 3500
 RED_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required"}
 RUN_RETRY_SETTLE_SECONDS = 5 * 60
 ISSUE_STATE_RETRY_DELAYS = (1, 2)
-PUSH_RETRY_DELAYS = (1, 2)
 RETRYABLE_INVOCATION_STATUSES = {
     "interrupted",
     "orphaned_candidate",
-    "push_failed",
 }
 
 # People Codex pings on Slack when it escalates a design-level CI failure
@@ -1064,7 +1063,7 @@ def record_preflight_event(
     if cursor.rowcount != 1:
         return
     text = (
-        f":warning: Bifrost CI auto-fixer could not engage for "
+        f":warning: Bifrost CI monitor could not engage for "
         f"<https://github.com/{REPO_NAME}/commit/{sha}|`{sha[:8]}`> "
         f"on `{socket.gethostname()}`: {details}"
     )
@@ -1212,7 +1211,7 @@ def terminate_recorded_codex(pid: int | None) -> bool:
 def recover_interrupted(conn: sqlite3.Connection, transport: SlackTransport) -> None:
     rows = conn.execute(
         "SELECT workflow_run_id, sha, workflow_run_url, thread_ts, status, "
-        "codex_session_id, codex_pid, candidate_sha FROM invocations "
+        "codex_session_id, codex_pid FROM invocations "
         "WHERE status IN ('claimed', 'running', 'reconciling', 'handoff_running')"
     ).fetchall()
     for row in rows:
@@ -1262,39 +1261,6 @@ def recover_interrupted(conn: sqlite3.Connection, transport: SlackTransport) -> 
                     (run_id,),
                 )
             continue
-        candidate_sha = row["candidate_sha"]
-        if row["status"] == "reconciling" and candidate_sha:
-            try:
-                remote_sha = fetch_remote_sha()
-                clean = not worktree_status()
-            except CommandError:
-                remote_sha = ""
-                clean = False
-            if clean and git_is_ancestor(str(candidate_sha), f"origin/{BRANCH}"):
-                detail = (
-                    f"Monitor restarted after push; verified candidate "
-                    f"{candidate_sha} on origin/{BRANCH} at {remote_sha}."
-                )
-                with conn:
-                    conn.execute(
-                        """
-                        UPDATE invocations
-                        SET status = 'completed', codex_pid = NULL, finished_at = ?,
-                            output = output || ?, outcome_notification_attempted = 1
-                        WHERE workflow_run_id = ?
-                        """,
-                        (utc_now(), f"\n{detail}\n", run_id),
-                    )
-                slack_send(
-                    transport,
-                    f":white_check_mark: Bifrost CI auto-fixer for "
-                    f"<https://github.com/{REPO_NAME}/commit/{sha}|`{sha[:8]}`> "
-                    f"was interrupted after pushing; verified "
-                    f"{format_commit(str(candidate_sha))} on master. "
-                    f"<{row['workflow_run_url']}|CI run>",
-                    thread_ts=row["thread_ts"],
-                )
-                continue
         saved = recover_invocation_worktree(conn, run_id, sha, row["codex_session_id"])
         cleanup_ok, cleanup_detail = recovery_complete(saved), saved.detail
         retry_status = "orphaned_candidate" if cleanup_ok else "interrupted"
@@ -1308,14 +1274,14 @@ def recover_interrupted(conn: sqlite3.Connection, transport: SlackTransport) -> 
                 (
                     retry_status,
                     utc_now(),
-                    f"\nMonitor restarted before repair reconciliation completed. "
+                    f"\nMonitor restarted before the diagnosis completed. "
                     f"Worktree recovery: {cleanup_detail}.\n",
                     run_id,
                 ),
             )
         slack_send(
             transport,
-            f":warning: Bifrost CI auto-fixer for "
+            f":warning: Bifrost CI diagnosis for "
             f"<https://github.com/{REPO_NAME}/commit/{sha}|`{sha[:8]}`> "
             f"was interrupted before completion. Worktree recovery "
             f"{'succeeded; the run will be retriaged' if cleanup_ok else 'failed'}: "
@@ -1335,67 +1301,49 @@ def build_prompt(run: CiRun, open_issue_url: str | None = None) -> str:
     open_issue_context = ""
     if open_issue_url:
         open_issue_context = f"""
-A design-level escalation is ALREADY OPEN for this CI: {open_issue_url}, and a human is handling it. CI has changed since it was filed, so before doing anything, decide which of these the current red state is:
-- The SAME problem already covered by {open_issue_url} (even on a newer commit): make no changes, do not file anything, and do not ping anyone — just exit successfully. Do not re-file or re-notify for a failure a human already owns.
-- A NEW fixable failure layered on top of it (the FIX IT YOURSELF or RESOLVE FROM REPO EVIDENCE categories defined below): fix and commit just that. Do not attempt to resolve {open_issue_url} itself.
-- A NEW design-level failure distinct from {open_issue_url}: file a SEPARATE issue and ping, following the ESCALATE path.
+An issue is ALREADY OPEN for this CI: {open_issue_url}, and a human is handling it. CI has changed since it was filed, so first decide which of these the current red state is:
+- The SAME problem already covered by {open_issue_url} (even on a newer commit): file nothing, ping no one, and exit successfully.
+- A NEW failure distinct from {open_issue_url}: diagnose it and file a SEPARATE issue that covers only the new failure.
 """
-    return f"""You are triaging a red CI run for {REPO_NAME}. The monitor observed the failing workflow run {run.url} for master commit {run.sha}.
+    return f"""You are diagnosing a red CI run for {REPO_NAME}. The monitor observed the failing workflow run {run.url} for master commit {run.sha}.
 
-First, orient. Use `gh` outside your sandbox to read the failing run, the commits after {run.sha}, and the latest CI/check results. The original SHA may no longer be current; do not stop merely because newer commits landed. If a subsequent commit clearly addresses this same failure, make no changes and exit successfully. The monitor synchronized this worktree immediately before launching you and will merge any later master advances after you finish. Stay on the existing `{WORKTREE_BRANCH}` branch: never create or switch branches, never pull or merge remote changes yourself, and never open a pull request.
+Your job is to diagnose the failure and file a GitHub issue. You must NOT fix it. Never edit tracked files, never commit, never push, never create or switch branches, and never open a pull request. You may build and run tests in this worktree, and you may use scratch files outside it. Leave the worktree exactly as you found it: clean, on the `{WORKTREE_BRANCH}` branch, at the commit where you started. If you check out other commits to bisect, return to that commit before you exit. The monitor treats any leftover change or commit as a failed run.
+
+First, orient. Use `gh` outside your sandbox to read the failing run, the commits after {run.sha}, and the latest CI/check results. The original SHA may no longer be current. If a later commit clearly addresses this same failure, file nothing and exit successfully.
 {open_issue_context}
-Your job is NOT to fix every failure, but escalation is the last resort, not the default. Classify EACH failing test independently (a red run often bundles unrelated regressions), then pick ONE overall action for this invocation:
-- If ANY failure is fixable under the first two paths below, fix ALL the fixable ones, commit once, and exit successfully — do NOT push, do NOT escalate anything in the same invocation, and do NOT emit the Slack mention tokens. The monitor will merge current master and push your clean commit after you exit; that push triggers a fresh CI run. If the remainder keeps it red, the monitor re-engages you and that later pass escalates with nothing left to fix. If you already diagnosed a remaining design-level failure, summarize the diagnosis in your closing message (plain text, no mentions) so the later pass and the humans can pick it up from the thread.
-- Only when NOTHING is fixable, follow the ESCALATE path, covering all the design-level failures in one issue.
+Classify EACH failing test independently, because a red run often bundles unrelated regressions. Then pin the INTRODUCING commit for each one. The failing run's commit ({run.sha}) is only where CI first observed the failure; the cause usually landed earlier. Run the failing test locally at suspect commits, use `git log -S`/`-p` on the code the test exercises, or bisect with the single failing test (build once per step, run one test). Read the introducing commit's message, diff, and the tests it added or changed. Treat "recorded baseline failure" notes in `.agents/plans/` or commit messages as symptoms of an unhandled regression, never as permission to ignore one. Flaky and infrastructure failures also get an issue; say which one it is and give the evidence.
 
-Before classifying anything beyond lint/format noise, pin the INTRODUCING commit. The failing run's commit ({run.sha}) is only where CI first observed the failure — the cause usually landed earlier. Run the failing test locally at suspect commits, use `git log -S`/`-p` on the code the test exercises, or bisect with the single failing test (it is cheap: build once per step, run one test). Read the introducing commit's message, diff, and the tests it added or changed — that commit's own intent is the evidence most classifications turn on. Treat "recorded baseline failure" notes in `.agents/plans/` or commit messages as symptoms of an unhandled regression, never as permission to ignore one.
+Then file ONE GitHub issue on {REPO_NAME} with `gh issue create` that covers all the failures in this run. Give it a clear title. The body must include:
+- the failing run link ({run.url}) and the failing jobs and tests;
+- for each failure, the introducing commit, with pass/fail confirmed on both sides, or an explicit statement that you could not pin it and why;
+- the mechanism: what changed in the code, with files and lines;
+- the recommended fix, as concrete as you can make it. If the fix is mechanical (lint or formatting, a test that lagged behind an intentional change, a missed rename), say so and describe the exact change. If a human has to decide something, state the decision and the options you weighed, with their consequences;
+- what is still uncertain.
+The issue must deliver a finished diagnosis, not a symptom report. Note the issue URL that `gh` prints.
 
-FIX IT YOURSELF — commit for the monitor to push — when the failure is mechanical and the correct fix is unambiguous:
-- lint or formatting violations (spotless, checkstyle, import order, whitespace, and the like);
-- a test the author plainly forgot to update after an intentional, correct code change — an assertion trailing a renamed symbol, an updated golden value, a signature the production code deliberately changed — where the production code is right and only the test lagged;
-- equally trivial build breakage of that kind (an unused import, a rename applied in one place but not another).
-
-RESOLVE FROM REPO EVIDENCE — also commit for the monitor to push — when the failure is a contract regression whose resolution the repository already records. Most "behavior-sensitive" failures are this, not design calls. Two patterns cover nearly all of them:
-- The introducing commit DELIBERATELY changed the contract: it re-specified some assertions to the new behavior but missed a sibling test (often the same shape in another language or suite). The decision was already made; bring the lagging test to the same contract the commit's own updated tests express. This is the cross-commit form of the forgotten-test rule above.
-- The introducing commit did NOT intend the regression: its message and its own tests are about a narrower case, and nothing it added conflicts with the failing test. The implementation was over-broad or its blast radius unaudited. Repair the production code at the root cause so the failing test AND the introducing commit's tests all pass together — narrow the over-broad condition, split the conflated concern — following the repo's design philosophy in CLAUDE.md (fix root cause, structured solutions, no fallbacks that hide failures).
-The acceptance bar for this path: the failing test and every test the introducing commit added or touched pass together, the relevant suites pass, and you weakened no assertion — never delete a check, broaden a tolerance, or loosen an expected value to make a test pass. Meeting that bar IS the evidence the two contracts were compatible and no human decision was needed. If you cannot meet it, the conflict is real: escalate.
-
-Test your change locally, stage only the files you changed, and create a detailed commit on the existing branch. Leave the worktree clean and exit successfully. Do not push: the monitor owns the pull-and-push reconciliation after you exit.
-
-ESCALATE — do not touch code, do not push — only when nothing is fixable and your completed root-cause investigation shows a decision that is not yours to make: the introducing commit's contract and the failing test's contract genuinely cannot both hold; the fix requires choosing semantics with no evidence in the repository (for example how an analysis reports uncertainty, or a public result's meaning); or the fix crosses a versioned schema or architectural boundary (policy evidence schema, RQL schema version, public API semantics). Flaky and infrastructure failures escalate too. Doubt alone is not a reason: doubt before the introducing commit is pinned means investigate more, and only doubt that survives a finished investigation escalates. To escalate:
-1. Leave master untouched — make no commits and no pushes.
-2. File a GitHub issue on {REPO_NAME} with `gh issue create`. Give it a clear title and a body that includes: the failing run link ({run.url}), the failing job/test, the introducing commit pinned by your bisect with pass/fail confirmed on both sides, the mechanism (what changed in the code, with files and lines), the specific decision a human must make, and the concrete repair options you weighed with their consequences. An escalation must deliver a finished diagnosis, not a symptom report. Note the issue URL that `gh` prints.
-3. As your final assistant message — on its own, nothing after it — post to Slack by writing exactly:
-   {mentions} Design-level CI failure needs a human call — filed <ISSUE_URL>. <one-sentence summary of the problem>
-   Replace <ISSUE_URL> with the URL from step 2 and keep the `{mentions}` tokens verbatim so they render as real mentions. Everything you say streams into the Slack thread, so this message is the ping; do not attempt to call Slack yourself.
-Then exit successfully.
-"""
-
-
-def build_merge_conflict_prompt(run: CiRun) -> str:
-    return f"""The monitor tried to merge current origin/{BRANCH} into your committed CI repair for {run.url}, and Git left real content conflicts in the existing `{WORKTREE_BRANCH}` worktree.
-
-Resume the repair using the diagnosis and intent already established in this session. Inspect the incoming commits and every unmerged path, resolve the current merge so both the upstream changes and the intended CI fix are preserved, run the relevant tests for the resolution, and commit the merge on the existing branch. Do not abort merely because master advanced. Do not rebase, cherry-pick, switch branches, open a pull request, or push. Leave the worktree clean with no unmerged paths and exit successfully; the monitor will pull again and push.
+As your final assistant message, on its own with nothing after it, write exactly:
+   {mentions} CI failure diagnosed — filed <ISSUE_URL>. <one-sentence summary of the problem>
+Replace <ISSUE_URL> with the issue URL and keep the `{mentions}` tokens verbatim so they render as real mentions. Everything you say streams into the Slack thread, so this message is the ping; do not call Slack yourself. Then exit successfully.
 """
 
 
 def build_timeout_handoff_prompt(run: CiRun, recovery_block: str) -> str:
     mentions = " ".join(f"<@{member_id}>" for member_id in ESCALATION_SLACK_MEMBER_IDS)
-    return f"""Since this has taken over one hour, it is time to create a ticket and turn it over to a human for resolution; definitionally this was not as simple as it looked.
+    return f"""This diagnosis has taken over one hour. Stop now and file a ticket with what you have, so a human can continue.
 
-Stop the repair now. Do not investigate further, run more tests, edit files, commit, or push. The monitor has already attempted preservation and cleanup; their actual results are recorded below. Do not assume the current worktree still contains your repair. Do not restore the saved work during this handoff.
+Do not investigate further, run more tests, edit files, commit, or push. The monitor has already attempted preservation and cleanup of the worktree; the actual results are recorded below. Do not restore the saved work during this handoff.
 
 Using only the diagnosis and evidence already present in this session, file a GitHub issue on {REPO_NAME} with `gh issue create`. Include the failing run ({run.url}), failing jobs and tests, and these continuation sections:
 - Diagnosis and evidence: findings, relevant commits, files and lines, and what is still uncertain.
-- Work attempted: files changed, why each change was made, and unfinished work.
+- Work attempted: the investigation steps you took and what is unfinished.
 - Validation so far: exact commands/tests already run and their observed results. Label unrun tests and unknown results explicitly; do not invent outcomes.
-- Continue here: the unresolved blocker or decision, and the next concrete action for the next agent. Explain which saved changes it should review or finish.
+- Continue here: the unresolved blocker or decision, and the next concrete action for the next agent. 
 - Recovery pointers: copy the entire monitor-generated block below VERBATIM into the issue. Keep full object IDs, local paths, commands, session ID, and failure details. These artifacts are local to the named host, not available from GitHub. Do not claim preservation or cleanup succeeded unless this block says so.
 
 {recovery_block}
 
 Note the issue URL printed by `gh`. As your final assistant message, on its own with nothing after it, write exactly:
-{mentions} CI repair exceeded the one-hour automation budget — filed <ISSUE_URL>. <one-sentence summary of the unresolved problem>
+{mentions} CI diagnosis exceeded the one-hour automation budget — filed <ISSUE_URL>. <one-sentence summary of the unresolved problem>
 Replace <ISSUE_URL> with the issue URL. Keep the mention tokens verbatim and do not attempt to call Slack yourself. Then exit.
 """
 
@@ -1712,27 +1660,6 @@ def invoke_codex_stream(
     return CodexResult(status, process.returncode, False, output, session_id)
 
 
-def format_commit(sha: str) -> str:
-    if sha and sha != "unknown":
-        return f"<https://github.com/{REPO_NAME}/commit/{sha}|`{sha[:8]}`>"
-    return "`unknown`"
-
-
-def outcome_detail(
-    status: str, pushed_sha: str | None, base_sha: str, new_sha: str
-) -> str:
-    """One sentence describing what happened to master after the repair attempt."""
-    if status == "completed" and pushed_sha:
-        return f"Pushed {format_commit(pushed_sha)} to fix the problem."
-    if status == "completed":
-        if new_sha == "unknown":
-            return f"{AGENT} made no changes; could not read master state."
-        if new_sha == base_sha:
-            return f"{AGENT} made no changes; master is unchanged at {format_commit(new_sha)}."
-        return f"Looks like {format_commit(new_sha)} fixes the problem."
-    return f"Remote master is now {format_commit(new_sha)}."
-
-
 def detect_escalation(
     output: str, exclude_url: str | None = None
 ) -> tuple[bool, str | None]:
@@ -1935,12 +1862,6 @@ def timeout_ticket_handoff(
     return handoff_output, issue_url, saved
 
 
-def fetch_remote_sha() -> str:
-    """Fetch and return current origin/master."""
-    run_command([str(GIT_BIN), "fetch", "origin", BRANCH], cwd=WORKTREE, timeout=180)
-    return run_command([str(GIT_BIN), "rev-parse", f"origin/{BRANCH}"], cwd=WORKTREE)
-
-
 def worktree_status() -> str:
     return run_command(
         [str(GIT_BIN), "status", "--porcelain", "--untracked-files=normal"],
@@ -1948,253 +1869,25 @@ def worktree_status() -> str:
     )
 
 
-def unmerged_paths() -> str:
-    return run_command(
-        [str(GIT_BIN), "diff", "--name-only", "--diff-filter=U"], cwd=WORKTREE
-    )
+def diagnosis_violation(base_sha: str) -> str:
+    """Describe how a finished diagnosis changed the worktree, or return "".
 
-
-@dataclass(frozen=True)
-class RepairResolution:
-    result: CodexResult
-    new_sha: str
-    pushed_sha: str | None
-    detail: str = ""
-    failure_kind: str | None = None
-
-
-def reconcile_repair(
-    run: CiRun,
-    base_sha: str,
-    initial: CodexResult,
-    relay,
-    *,
-    deadline: float,
-    on_session=None,
-    on_process=None,
-    on_candidate=None,
-) -> RepairResolution:
-    """Merge current master into a successful Codex commit and push it.
-
-    Conflict-free pulls and push races are handled entirely by the monitor.
-    Only a pull that leaves unmerged paths resumes the exact Codex session.
+    The agent must only diagnose and file a ticket. A new commit, a different
+    branch, or a dirty worktree means it went beyond that; the caller then
+    preserves the work and resets the worktree instead of publishing anything.
     """
-    if initial.status != "completed" or initial.timed_out:
-        return RepairResolution(initial, "unknown", None)
-
-    output = initial.output
-    result = initial
-    reconcile_round = 0
-
-    while True:
-        try:
-            branch = run_command(
-                [str(GIT_BIN), "branch", "--show-current"], cwd=WORKTREE
-            )
-            if branch != WORKTREE_BRANCH:
-                raise CommandError(
-                    f"expected branch {WORKTREE_BRANCH!r}, found {branch!r}"
-                )
-            dirty = worktree_status()
-            if dirty:
-                raise CommandError(
-                    f"{AGENT} reported success but left a dirty or conflicted worktree"
-                )
-            local_sha = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
-        except CommandError as exc:
-            failed = CodexResult(
-                "failed", result.exit_code, False, output, result.session_id
-            )
-            return RepairResolution(failed, "unknown", None, str(exc), "repair_failed")
-
-        if local_sha == base_sha:
-            try:
-                remote_sha = fetch_remote_sha()
-            except CommandError as exc:
-                failed = CodexResult(
-                    "failed", result.exit_code, False, output, result.session_id
-                )
-                return RepairResolution(
-                    failed, "unknown", None, str(exc), "push_failed"
-                )
-            return RepairResolution(result, remote_sha, None)
-
-        if time.monotonic() >= deadline:
-            timed_output = (
-                output + "\nRepair deadline expired before reconciliation completed.\n"
-            )
-            timed = CodexResult(
-                "timed_out", result.exit_code, True, timed_output, result.session_id
-            )
-            return RepairResolution(
-                timed,
-                "unknown",
-                None,
-                "repair deadline expired before reconciliation completed",
-            )
-
-        if not git_is_ancestor(base_sha, "HEAD"):
-            detail = (
-                f"local HEAD {local_sha} does not descend from repair base {base_sha}"
-            )
-            failed = CodexResult(
-                "failed", result.exit_code, False, output, result.session_id
-            )
-            return RepairResolution(failed, "unknown", None, detail, "repair_failed")
-
-        if on_candidate is not None:
-            on_candidate(local_sha, reconcile_round)
-
-        try:
-            run_command(
-                [
-                    str(GIT_BIN),
-                    "pull",
-                    "--no-rebase",
-                    "--no-edit",
-                    "origin",
-                    BRANCH,
-                ],
-                cwd=WORKTREE,
-                timeout=180,
-            )
-        except CommandError as pull_error:
-            try:
-                conflicts = unmerged_paths()
-            except CommandError:
-                conflicts = ""
-            if not conflicts:
-                failed = CodexResult(
-                    "failed", result.exit_code, False, output, result.session_id
-                )
-                return RepairResolution(
-                    failed, "unknown", None, str(pull_error), "push_failed"
-                )
-            if not result.session_id:
-                detail = f"merge conflicts require {AGENT}, but no session id was emitted"
-                failed = CodexResult(
-                    "failed", result.exit_code, False, output, result.session_id
-                )
-                return RepairResolution(
-                    failed, "unknown", None, detail, "repair_failed"
-                )
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                timed_output = (
-                    output + "\nRepair deadline expired during merge reconciliation.\n"
-                )
-                timed = CodexResult(
-                    "timed_out", result.exit_code, True, timed_output, result.session_id
-                )
-                return RepairResolution(
-                    timed,
-                    "unknown",
-                    None,
-                    "repair deadline expired during merge reconciliation",
-                )
-            reconcile_round += 1
-            if on_candidate is not None:
-                on_candidate(local_sha, reconcile_round)
-            log(
-                f"merge round {reconcile_round} left conflicts; resuming {AGENT} session "
-                f"{result.session_id}"
-            )
-            resumed = invoke_codex_stream(
-                build_merge_conflict_prompt(run),
-                relay,
-                timeout_seconds=max(1, int(remaining)),
-                resume_session_id=result.session_id,
-                on_session=on_session,
-                on_process=on_process,
-            )
-            output += (
-                f"\n--- merge conflict round {reconcile_round} ---\n" + resumed.output
-            )
-            result = CodexResult(
-                resumed.status,
-                resumed.exit_code,
-                resumed.timed_out,
-                output,
-                resumed.session_id or result.session_id,
-            )
-            if result.status != "completed" or result.timed_out:
-                return RepairResolution(result, "unknown", None)
-            continue
-
-        try:
-            if worktree_status():
-                raise CommandError("git pull succeeded but left a dirty worktree")
-            local_sha = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
-        except CommandError as exc:
-            failed = CodexResult(
-                "failed", result.exit_code, False, output, result.session_id
-            )
-            return RepairResolution(failed, "unknown", None, str(exc), "repair_failed")
-        if on_candidate is not None:
-            on_candidate(local_sha, reconcile_round)
-
-        raced = False
-        last_push_error: CommandError | None = None
-        for attempt in range(len(PUSH_RETRY_DELAYS) + 1):
-            try:
-                run_command(
-                    [str(GIT_BIN), "push", "origin", "HEAD:master"],
-                    cwd=WORKTREE,
-                    timeout=180,
-                )
-            except CommandError as exc:
-                last_push_error = exc
-            try:
-                remote_sha = fetch_remote_sha()
-            except CommandError as exc:
-                last_push_error = exc
-                if attempt < len(PUSH_RETRY_DELAYS):
-                    time.sleep(PUSH_RETRY_DELAYS[attempt])
-                    continue
-                failed = CodexResult(
-                    "failed", result.exit_code, False, output, result.session_id
-                )
-                return RepairResolution(
-                    failed, "unknown", None, str(last_push_error), "push_failed"
-                )
-            if git_is_ancestor(local_sha, f"origin/{BRANCH}"):
-                return RepairResolution(result, remote_sha, local_sha)
-            if not git_is_ancestor(remote_sha, "HEAD"):
-                raced = True
-                break
-            if attempt < len(PUSH_RETRY_DELAYS):
-                time.sleep(PUSH_RETRY_DELAYS[attempt])
-                continue
-            failed = CodexResult(
-                "failed", result.exit_code, False, output, result.session_id
-            )
-            return RepairResolution(
-                failed,
-                remote_sha,
-                None,
-                str(last_push_error or "push was not reflected on origin/master"),
-                "push_failed",
-            )
-        if raced:
-            log("origin/master advanced during push; pulling again")
-            continue
-
-
-def resolve_master_outcome(base_sha: str, status: str) -> tuple[str, str | None]:
-    """Compatibility helper for non-reconciled and failed attempts."""
     try:
-        new_sha = fetch_remote_sha()
-    except CommandError:
-        return "unknown", None
-    pushed: str | None = None
-    if status == "completed":
-        try:
-            local = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
-        except CommandError:
-            local = None
-        if local and local != base_sha and git_is_ancestor(local, f"origin/{BRANCH}"):
-            pushed = local
-    return new_sha, pushed
+        branch = run_command([str(GIT_BIN), "branch", "--show-current"], cwd=WORKTREE)
+        if branch != WORKTREE_BRANCH:
+            return f"expected branch {WORKTREE_BRANCH!r}, found {branch!r}"
+        if worktree_status():
+            return f"{AGENT} left a dirty worktree"
+        head = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
+    except CommandError as exc:
+        return str(exc)
+    if head != base_sha:
+        return f"{AGENT} moved HEAD from {base_sha[:12]} to {head[:12]}"
+    return ""
 
 
 def run_monitor() -> int:
@@ -2236,14 +1929,14 @@ def run_monitor() -> int:
             if cleared is not None:
                 # Green resets the episode: a fresh top-level message (never back
                 # in the closing thread), so the next failure opens its own thread.
-                log("CI is green again; re-arming the auto-fixer")
+                log("CI is green again; re-arming the monitor")
                 resolved = (
                     " The open escalation is resolved." if cleared["escalated"] else ""
                 )
                 slack_send(
                     transport,
                     f":white_check_mark: Bifrost CI is green again.{resolved} "
-                    "The auto-fixer is re-armed.",
+                    "The monitor is re-armed.",
                 )
             return 0
         if first.state != "red" or first.run is None:
@@ -2373,14 +2066,14 @@ def run_monitor() -> int:
             slack_send(
                 transport,
                 f":rotating_light: New failed build {commit_link} still red on the "
-                f"same set; {AGENT} re-engaged. <{run.url}|Open {run.workflow} run>",
+                f"same set; {AGENT} is diagnosing again. <{run.url}|Open {run.workflow} run>",
                 thread_ts=thread_ts,
             )
         else:
             _, thread_ts = slack_send(
                 transport,
                 f":rotating_light: Bifrost {run.workflow} is red at {commit_link}. "
-                f"{AGENT} auto-fixer engaged. <{run.url}|Open {run.workflow} run>",
+                f"{AGENT} is diagnosing. <{run.url}|Open {run.workflow} run>",
             )
         with conn:
             conn.execute(
@@ -2407,20 +2100,7 @@ def run_monitor() -> int:
                     (pid, run.run_id),
                 )
 
-        def record_candidate(candidate_sha: str, reconcile_round: int) -> None:
-            with conn:
-                conn.execute(
-                    """
-                    UPDATE invocations
-                    SET status = 'reconciling', candidate_sha = ?, reconcile_round = ?,
-                        codex_pid = NULL
-                    WHERE workflow_run_id = ?
-                    """,
-                    (candidate_sha, reconcile_round, run.run_id),
-                )
-
         log(f"launching {AGENT} for red {run.workflow} at {run.sha[:8]}")
-        repair_deadline = time.monotonic() + CODEX_TIMEOUT_SECONDS
         result = invoke_codex_stream(
             build_prompt(run, open_issue_url),
             relay,
@@ -2428,26 +2108,15 @@ def run_monitor() -> int:
             on_session=record_session,
             on_process=record_process,
         )
-        resolution_detail = ""
         failure_kind: str | None = None
+        violation = ""
         if result.status == "completed" and not result.timed_out:
-            resolution = reconcile_repair(
-                run,
-                base_sha,
-                result,
-                relay,
-                deadline=repair_deadline,
-                on_session=record_session,
-                on_process=record_process,
-                on_candidate=record_candidate,
-            )
-            result = resolution.result
-            new_sha = resolution.new_sha
-            pushed_sha = resolution.pushed_sha
-            resolution_detail = resolution.detail
-            failure_kind = resolution.failure_kind
-        else:
-            new_sha, pushed_sha = resolve_master_outcome(base_sha, result.status)
+            violation = diagnosis_violation(base_sha)
+            if violation:
+                failure_kind = "modified_worktree"
+                result = CodexResult(
+                    "failed", result.exit_code, False, result.output, result.session_id
+                )
         status = result.status
         exit_code = result.exit_code
         output = result.output
@@ -2455,8 +2124,8 @@ def run_monitor() -> int:
         escalated = False
         cleanup_ok = True
         cleanup_detail = ""
-        if resolution_detail:
-            output += f"\n--- reconciliation ---\n{resolution_detail}\n"
+        if violation:
+            output += f"\n--- worktree check ---\n{violation}\n"
 
         if result.timed_out:
             handoff_output, issue_url, saved = timeout_ticket_handoff(
@@ -2495,7 +2164,7 @@ def run_monitor() -> int:
                 ):
                     slack_send(
                         transport,
-                        f"{mention_text} CI repair exceeded the one-hour automation budget — "
+                        f"{mention_text} CI diagnosis exceeded the one-hour automation budget — "
                         f"filed <{issue_url}|a ticket> for human resolution.",
                         thread_ts=thread_ts,
                     )
@@ -2505,7 +2174,7 @@ def run_monitor() -> int:
                 )
                 slack_send(
                     transport,
-                    f"{mention_text} Bifrost CI repair exceeded one hour, and the "
+                    f"{mention_text} Bifrost CI diagnosis exceeded one hour, and the "
                     f"ticket handoff failed. Worktree recovery: {cleanup_detail}.",
                     thread_ts=thread_ts,
                 )
@@ -2535,7 +2204,7 @@ def run_monitor() -> int:
                     ),
                 )
 
-        if not result.timed_out and status == "completed" and pushed_sha is None:
+        if not result.timed_out and status == "completed":
             escalated, issue_url = detect_escalation(output, exclude_url=open_issue_url)
             if escalated and issue_url:
                 with conn:
@@ -2545,19 +2214,19 @@ def run_monitor() -> int:
                     )
 
         if escalated and result.timed_out:
-            outcome = "timed out and escalated"
+            outcome = "timed out and filed a ticket"
             recovery = (
                 f" Worktree recovered: {cleanup_detail}."
                 if cleanup_ok
                 else f" Worktree recovery failed: {cleanup_detail}."
             )
             outcome_line = (
-                f":memo: Bifrost CI auto-fixer for {commit_link} exceeded its one-hour "
+                f":memo: Bifrost CI diagnosis for {commit_link} exceeded its one-hour "
                 f"budget and filed <{issue_url}|a ticket> for human resolution.{recovery} "
                 f"<{run.url}|Original CI run>"
             )
         elif escalated:
-            emoji, outcome = ":memo:", "escalated"
+            emoji, outcome = ":memo:", "filed a ticket"
             filed = f"filed <{issue_url}|a ticket>" if issue_url else "filed a ticket"
             distinct = (
                 " (a new problem, distinct from the one already open)"
@@ -2565,42 +2234,28 @@ def run_monitor() -> int:
                 else ""
             )
             outcome_line = (
-                f"{emoji} Bifrost CI auto-fixer for {commit_link} judged this a "
-                f"design-level call and escalated it{distinct}. No fix pushed; {filed} "
-                f"with its findings and pinged the team above. <{run.url}|Original CI run>"
+                f"{emoji} Bifrost CI diagnosis for {commit_link} {filed}{distinct} "
+                f"and pinged the team above. <{run.url}|Original CI run>"
             )
         elif failure_kind:
-            emoji, outcome = ":x:", "could not publish its repair"
+            emoji, outcome = ":x:", "left changes in the worktree"
             recovery = (
                 f" Worktree recovery: {cleanup_detail}." if cleanup_detail else ""
             )
             outcome_line = (
-                f"{emoji} Bifrost CI auto-fixer for {commit_link} {outcome}: "
-                f"{resolution_detail or failure_kind}.{recovery} "
-                f"<{run.url}|Original CI run>"
+                f"{emoji} Bifrost CI diagnosis for {commit_link} {outcome}: "
+                f"{violation}.{recovery} <{run.url}|Original CI run>"
             )
         elif episode is not None and episode["escalated"] and status == "completed":
-            # A classification pass against an already-open escalation that did
-            # not itself escalate: Codex either fixed new mechanical breakage or
-            # found nothing new. The design ticket stays open either way.
-            if pushed_sha:
-                emoji, outcome = ":wrench:", "fixed a new failure"
-                detail = (
-                    f"Fixed a new mechanical failure and pushed "
-                    f"{format_commit(pushed_sha)}; the open design ticket still stands."
-                )
-            else:
-                emoji, outcome = ":repeat:", "re-checked"
-                detail = (
-                    "No new actionable problem; the open design ticket still stands."
-                )
+            # A pass against an already-open ticket that filed nothing new.
+            emoji, outcome = ":repeat:", "re-checked"
             outcome_line = (
-                f"{emoji} Bifrost CI auto-fixer for {commit_link}: {detail} "
-                f"<{run.url}|CI run>"
+                f"{emoji} Bifrost CI diagnosis for {commit_link}: no new problem; "
+                f"the open ticket still stands. <{run.url}|CI run>"
             )
         else:
             if status == "completed":
-                emoji, outcome = ":white_check_mark:", "finished"
+                emoji, outcome = ":white_check_mark:", "finished without filing a ticket"
             elif status == "timed_out":
                 emoji, outcome = (
                     ":hourglass_flowing_sand:",
@@ -2611,8 +2266,7 @@ def run_monitor() -> int:
             else:
                 emoji, outcome = ":x:", f"exited with status {exit_code}"
             outcome_line = (
-                f"{emoji} Bifrost CI auto-fixer for {commit_link} {outcome}. "
-                f"{outcome_detail(status, pushed_sha, base_sha, new_sha)} "
+                f"{emoji} Bifrost CI diagnosis for {commit_link} {outcome}. "
                 f"<{run.url}|Original CI run>"
             )
         slack_send(transport, outcome_line, thread_ts=thread_ts)
@@ -2635,38 +2289,24 @@ def run_monitor() -> int:
                 escalated=True,
             )
         elif status == "completed" and episode is not None and episode["escalated"]:
-            # A pass against an already-open escalation that did not re-escalate.
-            if pushed_sha:
-                # Fixed new mechanical breakage: keep the design baseline and
-                # ticket untouched so the fixed surface drops out on its own — and
-                # if it recurs, it reads as new again and gets fixed again.
-                open_escalation(
-                    conn,
-                    episode["sha"],
-                    episode["signature"],
-                    episode["issue_url"],
-                    thread_ts,
-                    run.run_id,
-                    escalated=True,
+            # A pass against an already-open ticket that filed nothing new.
+            # Stood down on the same design issue: absorb the new surface into
+            # the baseline so this now-classified state won't re-trigger.
+            merged = "\n".join(
+                sorted(
+                    signature_members(episode["signature"])
+                    | signature_members(signature)
                 )
-            else:
-                # Stood down on the same design issue: absorb the new surface into
-                # the baseline so this now-classified state won't re-trigger.
-                merged = "\n".join(
-                    sorted(
-                        signature_members(episode["signature"])
-                        | signature_members(signature)
-                    )
-                )
-                open_escalation(
-                    conn,
-                    run.sha,
-                    merged,
-                    episode["issue_url"],
-                    thread_ts,
-                    run.run_id,
-                    escalated=True,
-                )
+            )
+            open_escalation(
+                conn,
+                run.sha,
+                merged,
+                episode["issue_url"],
+                thread_ts,
+                run.run_id,
+                escalated=True,
+            )
         elif status == "completed":
             # Routine (non-escalated) episode, new or continuing: record the
             # current failing set as the baseline so a repeat threads and a new
@@ -2732,7 +2372,7 @@ def parse_args() -> argparse.Namespace:
 def test_slack() -> int:
     transport = load_slack_transport()
     ok, ts = slack_send(
-        transport, ":white_check_mark: Bifrost CI auto-fixer Slack integration test."
+        transport, ":white_check_mark: Bifrost CI monitor Slack integration test."
     )
     if not ok:
         return 1

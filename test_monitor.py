@@ -159,13 +159,13 @@ class ProfileLoaderTests(unittest.TestCase):
         profile, _ = self.load('inference_profile = "~/.codex4"\n')
         self.assertEqual(profile.kind, "codex")
         self.assertEqual(profile.home, Path.home() / ".codex4")
-        self.assertEqual(profile.model, "gpt-5.6-sol")
+        self.assertEqual(profile.model, "gpt-6-sol")
 
     def test_claude_profile_selects_claude_home_and_model(self):
         profile, _ = self.load('inference_profile = "~/.claude"\n')
         self.assertEqual(profile.kind, "claude")
         self.assertEqual(profile.home, Path.home() / ".claude")
-        self.assertEqual(profile.model, "claude-opus-5")
+        self.assertEqual(profile.model, "opus")
 
     def test_missing_file_names_the_path(self):
         with self.assertRaises(RuntimeError) as caught:
@@ -698,7 +698,7 @@ class TimeoutHandoffTests(unittest.TestCase):
         for flag, value in (
             ("--model", monitor.CLAUDE_MODEL),
             ("--effort", monitor.CLAUDE_EFFORT),
-            ("--effort", "xhigh"),
+            ("--effort", "high"),
             ("--permission-mode", "auto"),
             ("--permission-prompts", "none"),
             ("--output-format", "stream-json"),
@@ -714,7 +714,7 @@ class TimeoutHandoffTests(unittest.TestCase):
         with mock.patch.object(monitor, "AGENT", "codex"):
             args = monitor.agent_args(None)
         self.assertEqual(args[0], str(monitor.CODEX_BIN))
-        self.assertIn("model_reasoning_effort=xhigh", monitor.CODEX_MODEL_ARGS)
+        self.assertIn("model_reasoning_effort=high", monitor.CODEX_MODEL_ARGS)
         for flag in monitor.CODEX_MODEL_ARGS:
             self.assertIn(flag, args)
         self.assertEqual(args[args.index("--sandbox") + 1], "workspace-write")
@@ -805,139 +805,39 @@ class TimeoutHandoffTests(unittest.TestCase):
         )
 
 
-class MergeReconciliationIntegrationTests(unittest.TestCase):
-    def test_repair_prompt_assigns_pull_and_push_to_monitor(self):
+class WorktreeIntegrationTests(unittest.TestCase):
+    def test_prompt_forbids_changes_and_requires_a_ticket(self):
         prompt = monitor.build_prompt(make_run())
 
-        self.assertIn("Do not push", prompt)
-        self.assertIn("monitor owns the pull-and-push reconciliation", prompt)
-        self.assertIn("never pull or merge remote changes yourself", prompt)
+        self.assertIn("You must NOT fix it", prompt)
+        self.assertIn("never commit, never push", prompt)
+        self.assertIn("gh issue create", prompt)
 
-    def test_conflict_free_pull_merges_and_pushes_without_codex(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            fixture = GitFixture(Path(temp_dir))
-            base, candidate = fixture.commit_local()
-            remote_advance = fixture.push_remote_file()
-            initial = monitor.CodexResult("completed", 0, False, "fixed", "session-123")
-
-            with (
-                mock.patch.object(monitor, "WORKTREE", fixture.repair),
-                mock.patch.object(
-                    monitor, "GIT_BIN", Path(shutil.which("git") or "/usr/bin/git")
-                ),
-                mock.patch.object(monitor, "invoke_codex_stream") as invoke,
-            ):
-                resolution = monitor.reconcile_repair(
-                    make_run(),
-                    base,
-                    initial,
-                    lambda _text: None,
-                    deadline=time.monotonic() + 60,
-                )
-
-            self.assertEqual(resolution.result.status, "completed")
-            self.assertIsNotNone(resolution.pushed_sha)
-            self.assertEqual(git(fixture.repair, "status", "--porcelain"), "")
-            self.assertEqual(
-                git(fixture.repair, "rev-parse", "HEAD"),
-                git(fixture.repair, "rev-parse", "origin/master"),
-            )
-            parents = git(fixture.repair, "show", "-s", "--format=%P", "HEAD").split()
-            self.assertEqual(set(parents), {candidate, remote_advance})
-            invoke.assert_not_called()
-
-    def test_remote_advance_during_push_pulls_again_without_codex(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            fixture = GitFixture(Path(temp_dir))
-            base, candidate = fixture.commit_local()
-            initial = monitor.CodexResult("completed", 0, False, "fixed", "session-123")
-            real_run_command = monitor.run_command
-            raced = False
-            remote_advance = ""
-
-            def run_with_push_race(args, **kwargs):
-                nonlocal raced, remote_advance
-                if args[1:3] == ["push", "origin"] and not raced:
-                    remote_advance = fixture.push_remote_file("race.txt", "race\n")
-                    raced = True
-                return real_run_command(args, **kwargs)
-
-            with (
-                mock.patch.object(monitor, "WORKTREE", fixture.repair),
-                mock.patch.object(
-                    monitor, "GIT_BIN", Path(shutil.which("git") or "/usr/bin/git")
-                ),
-                mock.patch.object(
-                    monitor, "run_command", side_effect=run_with_push_race
-                ),
-                mock.patch.object(monitor, "invoke_codex_stream") as invoke,
-            ):
-                resolution = monitor.reconcile_repair(
-                    make_run(),
-                    base,
-                    initial,
-                    lambda _text: None,
-                    deadline=time.monotonic() + 60,
-                )
-
-            self.assertTrue(raced)
-            self.assertEqual(resolution.result.status, "completed")
-            self.assertIsNotNone(resolution.pushed_sha)
-            parents = git(fixture.repair, "show", "-s", "--format=%P", "HEAD").split()
-            self.assertEqual(set(parents), {candidate, remote_advance})
-            invoke.assert_not_called()
-
-    def test_content_conflict_resumes_same_session_then_pushes_merge(self):
+    def check_violation(self, change) -> str:
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture = GitFixture(Path(temp_dir))
             base = git(fixture.repair, "rev-parse", "HEAD")
-            (fixture.repair / "shared.txt").write_text("local\n", encoding="utf-8")
-            git(fixture.repair, "add", "shared.txt")
-            git(fixture.repair, "commit", "-m", "local repair")
-            candidate = git(fixture.repair, "rev-parse", "HEAD")
-            remote_advance = fixture.push_remote_file("shared.txt", "remote\n")
-            initial = monitor.CodexResult("completed", 0, False, "fixed", "session-123")
-
-            def resolve_conflict(*_args, **kwargs):
-                self.assertEqual(kwargs["resume_session_id"], "session-123")
-                self.assertIn(
-                    "shared.txt",
-                    git(fixture.repair, "diff", "--name-only", "--diff-filter=U"),
-                )
-                (fixture.repair / "shared.txt").write_text(
-                    "local and remote\n", encoding="utf-8"
-                )
-                git(fixture.repair, "add", "shared.txt")
-                git(fixture.repair, "commit", "--no-edit")
-                return monitor.CodexResult(
-                    "completed", 0, False, "resolved", "session-123"
-                )
-
+            change(fixture)
             with (
                 mock.patch.object(monitor, "WORKTREE", fixture.repair),
                 mock.patch.object(
                     monitor, "GIT_BIN", Path(shutil.which("git") or "/usr/bin/git")
                 ),
-                mock.patch.object(
-                    monitor, "invoke_codex_stream", side_effect=resolve_conflict
-                ) as invoke,
             ):
-                resolution = monitor.reconcile_repair(
-                    make_run(),
-                    base,
-                    initial,
-                    lambda _text: None,
-                    deadline=time.monotonic() + 60,
-                )
+                return monitor.diagnosis_violation(base)
 
-            self.assertEqual(resolution.result.status, "completed")
-            self.assertIsNotNone(resolution.pushed_sha)
-            self.assertEqual(
-                (fixture.repair / "shared.txt").read_text(), "local and remote\n"
-            )
-            parents = git(fixture.repair, "show", "-s", "--format=%P", "HEAD").split()
-            self.assertEqual(set(parents), {candidate, remote_advance})
-            self.assertEqual(invoke.call_count, 1)
+    def test_untouched_worktree_is_not_a_violation(self):
+        self.assertEqual(self.check_violation(lambda fixture: None), "")
+
+    def test_agent_commit_is_a_violation(self):
+        detail = self.check_violation(lambda fixture: fixture.commit_local())
+        self.assertIn("moved HEAD", detail)
+
+    def test_dirty_worktree_is_a_violation(self):
+        detail = self.check_violation(
+            lambda fixture: (fixture.repair / "shared.txt").write_text("edit\n")
+        )
+        self.assertIn("dirty worktree", detail)
 
     def test_preflight_preserves_orphan_and_resets_to_remote(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1005,45 +905,6 @@ class MergeReconciliationIntegrationTests(unittest.TestCase):
 
 
 class RetryableInvocationTests(unittest.TestCase):
-    @mock.patch.object(monitor, "slack_send")
-    @mock.patch.object(monitor, "git_is_ancestor", return_value=True)
-    @mock.patch.object(monitor, "worktree_status", return_value="")
-    @mock.patch.object(monitor, "fetch_remote_sha", return_value="remote-sha")
-    @mock.patch.object(monitor, "terminate_recorded_codex", return_value=True)
-    def test_restart_after_successful_push_verifies_instead_of_retriaging(
-        self, terminate, fetch, status, ancestor, slack
-    ):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            db_path = Path(temp_dir) / "activity.db"
-            with mock.patch.object(monitor, "DB_PATH", db_path):
-                conn = monitor.connect_db()
-                try:
-                    run = make_run()
-                    self.assertTrue(monitor.claim_invocation(conn, run, "base"))
-                    conn.execute(
-                        "UPDATE invocations SET status = 'reconciling', "
-                        "candidate_sha = 'candidate', thread_ts = '123.456' "
-                        "WHERE workflow_run_id = ?",
-                        (run.run_id,),
-                    )
-                    conn.commit()
-
-                    monitor.recover_interrupted(
-                        conn, monitor.SlackTransport("webhook", webhook="unused")
-                    )
-                    row = conn.execute(
-                        "SELECT * FROM invocations WHERE workflow_run_id = ?",
-                        (run.run_id,),
-                    ).fetchone()
-                finally:
-                    conn.close()
-
-        self.assertEqual(row["status"], "completed")
-        self.assertEqual(row["outcome_notification_attempted"], 1)
-        self.assertIn("verified candidate candidate", row["output"])
-        ancestor.assert_called_once_with("candidate", "origin/master")
-        slack.assert_called_once()
-
     def test_orphaned_invocation_can_be_claimed_again_without_losing_output(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "activity.db"

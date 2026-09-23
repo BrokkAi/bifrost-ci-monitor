@@ -1,15 +1,15 @@
-# Bifrost CI Auto-fixer
+# Bifrost CI Monitor
 
 This monitor polls the CI, Hourly CI, and Nightly CI GitHub Actions workflows
 for BrokkAi/bifrost-dev every five minutes. CI is restricted to push runs on
 master; Hourly CI and Nightly CI include their scheduled and manually
 dispatched runs. When the latest run in any tracked workflow is red, it
-launches one agent repair attempt (Claude or Codex, per the profile) for that
-run, regardless of whether the run's commit is still master HEAD. The agent
-always works from current master HEAD: if an intervening commit already fixed
-the failure it exits without changes, otherwise it fixes forward, tests, and
-leaves a clean local commit. The monitor then merges current origin/master and
-pushes the verified result.
+launches one agent diagnosis (Claude or Codex, per the profile) for that run,
+regardless of whether the run's commit is still master HEAD. The agent never
+fixes anything. It works from current master HEAD: if an intervening commit
+already fixed the failure it exits without filing anything; otherwise it pins
+the introducing commit, files one GitHub issue with the diagnosis and a
+recommended fix, and pings the team in Slack.
 
 The monitor:
 
@@ -21,13 +21,11 @@ The monitor:
   infrastructure issue;
 - serializes runs with a local lock, refuses a dirty repair worktree, and tags
   a clean orphaned commit before restoring origin/master for fresh triage;
-- asks Codex to commit but never push, then explicitly pulls with merge policy
-  and pushes only after verifying the result on origin/master;
-- handles conflict-free master advances itself and resumes the same Codex
-  session only when a pull leaves actual content conflicts;
-- records combined Codex output, reconciliation state, and verified outcome in
-  SQLite;
-- after one hour, stops the repair, preserves a verified local recovery package,
+- never pushes; if the agent leaves a commit or a dirty worktree anyway, the
+  monitor records the run as failed, preserves that work in a recovery package,
+  and resets the worktree;
+- records combined agent output and outcome in SQLite;
+- after one hour, stops the diagnosis, preserves a verified local recovery package,
   and restores the dedicated worktree to origin/master before resuming that exact
   Codex session for a ten-minute ticket-only handoff with recovery pointers;
 - verifies that a design escalation's GitHub issue is still open before
