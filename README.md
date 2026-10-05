@@ -119,8 +119,10 @@ starting.
 
 ## Agent selection
 
-Messages use the fixed label Claude Opus 5.5 (mj). Mjolnir selects a configured
-profile that offers the opus model using its model-based load balancing. The
+Messages use the fixed label DeepSeek V4 Pro (mj). Sessions use the model
+`deepseek-v4-pro`, through a Codex harness profile with a DeepSeek API key.
+Mjolnir selects a configured profile that offers that model using its
+model-based load balancing. The
 monitor does not pin a profile or reasoning effort. It uses the absolute CLI
 path /home/jonathan/.cargo/bin/mj because cron's PATH does not include
 ~/.cargo/bin.
