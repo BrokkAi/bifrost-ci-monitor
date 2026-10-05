@@ -7,9 +7,22 @@ dispatched runs. When the latest run in any tracked workflow is red, it
 launches one agent repair attempt (Claude or Codex, per the profile) for that
 run, regardless of whether the run's commit is still master HEAD. The agent
 always works from current master HEAD: if an intervening commit already fixed
-the failure it exits without changes, otherwise it fixes forward, tests, and
-leaves a clean local commit. The monitor then merges current origin/master and
-pushes the verified result.
+the failure it exits without changes. Otherwise it pins the commit that
+introduced the failure and takes one of these paths:
+
+- **Fix**: lint, missed test updates, or a straightforward production-code
+  fix. It tests and leaves a clean local commit.
+- **Revert**: anything more involved. It reverts the introducing commit,
+  reopens and comments on the issue the commit references (or files one and
+  tags the commit author), and pings Slack.
+- **Blocked revert**: if later commits build on the introducing commit so it
+  cannot be cleanly reverted, it changes nothing, files an issue labelled
+  `buildfailure`, and pings Slack.
+- **Escalate**: flaky or infrastructure failures, or no single introducing
+  commit can be pinned. It files an issue and pings Slack.
+
+For a fix or revert, the monitor then merges current origin/master and pushes
+the verified result.
 
 The monitor:
 

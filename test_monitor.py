@@ -813,6 +813,21 @@ class MergeReconciliationIntegrationTests(unittest.TestCase):
         self.assertIn("monitor owns the pull-and-push reconciliation", prompt)
         self.assertIn("never pull or merge remote changes yourself", prompt)
 
+    def test_repair_prompt_reverts_involved_fixes_and_reports_blocked_reverts(self):
+        prompt = monitor.build_prompt(make_run())
+        mentions = " ".join(
+            f"<@{member_id}>" for member_id in monitor.ESCALATION_SLACK_MEMBER_IDS
+        )
+
+        self.assertIn("git revert <introducing-sha>", prompt)
+        self.assertIn("gh issue reopen", prompt)
+        self.assertIn("tags the commit author", prompt)
+        self.assertIn(f"{mentions} Reverted <SHORT_SHA>", prompt)
+        self.assertIn("gh issue create --label buildfailure", prompt)
+        self.assertIn(f"{mentions} CI broken by <SHORT_SHA>", prompt)
+        self.assertNotIn("RESOLVE FROM REPO EVIDENCE", prompt)
+        self.assertNotIn("{", prompt.replace(mentions, ""))
+
     def test_conflict_free_pull_merges_and_pushes_without_codex(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture = GitFixture(Path(temp_dir))
