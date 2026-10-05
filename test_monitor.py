@@ -5,9 +5,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import os
-import shutil
-import shlex
 import sqlite3
 import subprocess
 import tempfile
@@ -23,18 +20,6 @@ import monitor
 ISSUE_URL = "https://github.com/BrokkAi/bifrost-dev/issues/2304"
 
 
-def git(cwd: Path, *args: str) -> str:
-    result = subprocess.run(
-        [shutil.which("git") or "/usr/bin/git", *args],
-        cwd=cwd,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=True,
-    )
-    return result.stdout.strip()
-
-
 def make_run(run_id: int = 42) -> monitor.CiRun:
     return monitor.CiRun(
         workflow="CI",
@@ -47,55 +32,6 @@ def make_run(run_id: int = 42) -> monitor.CiRun:
         attempt=1,
         updated_at="2026-08-26T00:10:00Z",
     )
-
-
-class GitFixture:
-    def __init__(self, root: Path):
-        self.remote = root / "remote.git"
-        self.seed = root / "seed"
-        self.repair = root / "repair"
-        self.writer = root / "writer"
-        git(root, "init", "--bare", "--initial-branch=master", str(self.remote))
-        git(root, "init", "--initial-branch=master", str(self.seed))
-        self.configure(self.seed)
-        (self.seed / "shared.txt").write_text("base\n", encoding="utf-8")
-        git(self.seed, "add", "shared.txt")
-        git(self.seed, "commit", "-m", "base")
-        git(self.seed, "remote", "add", "origin", str(self.remote))
-        git(self.seed, "push", "-u", "origin", "master")
-        git(root, "clone", str(self.remote), str(self.repair))
-        git(root, "clone", str(self.remote), str(self.writer))
-        self.configure(self.repair)
-        self.configure(self.writer)
-        git(
-            self.repair,
-            "checkout",
-            "-b",
-            monitor.WORKTREE_BRANCH,
-            "--track",
-            "origin/master",
-        )
-
-    @staticmethod
-    def configure(repo: Path) -> None:
-        git(repo, "config", "user.name", "CI Monitor Test")
-        git(repo, "config", "user.email", "ci-monitor@example.com")
-
-    def commit_local(self, content: str = "local\n") -> tuple[str, str]:
-        base = git(self.repair, "rev-parse", "HEAD")
-        (self.repair / "local.txt").write_text(content, encoding="utf-8")
-        git(self.repair, "add", "local.txt")
-        git(self.repair, "commit", "-m", "local repair")
-        return base, git(self.repair, "rev-parse", "HEAD")
-
-    def push_remote_file(
-        self, name: str = "remote.txt", content: str = "remote\n"
-    ) -> str:
-        (self.writer / name).write_text(content, encoding="utf-8")
-        git(self.writer, "add", name)
-        git(self.writer, "commit", "-m", "remote advance")
-        git(self.writer, "push", "origin", "master")
-        return git(self.writer, "rev-parse", "HEAD")
 
 
 def workflow_run(
@@ -123,76 +59,6 @@ def workflow_run(
             }
         ]
     )
-
-
-class ChildEnvironmentTests(unittest.TestCase):
-    def test_mbx_cargo_shim_precedes_system_tools(self):
-        path_entries = monitor.child_environment()["PATH"].split(":")
-
-        self.assertEqual(path_entries[0], str(monitor.MBX_BIN))
-        for agent_bin in (monitor.CLAUDE_BIN.parent, monitor.CODEX_BIN.parent):
-            self.assertLess(
-                path_entries.index(str(agent_bin)), path_entries.index("/usr/bin")
-            )
-
-    def test_claude_config_dir_follows_the_selected_profile(self):
-        with mock.patch.object(monitor, "CLAUDE_CONFIG_DIR", Path("/tmp/claude-home")):
-            self.assertEqual(
-                monitor.child_environment()["CLAUDE_CONFIG_DIR"], "/tmp/claude-home"
-            )
-
-    def test_claude_config_dir_is_omitted_under_a_codex_profile(self):
-        with mock.patch.object(monitor, "CLAUDE_CONFIG_DIR", None):
-            self.assertNotIn("CLAUDE_CONFIG_DIR", monitor.child_environment())
-
-
-class ProfileLoaderTests(unittest.TestCase):
-    def load(self, text):
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "anvil.toml"
-            if text is not None:
-                config.write_text(text)
-            with mock.patch.dict(os.environ, {"ANVIL_CONFIG": str(config)}):
-                return monitor.load_profile(), config
-
-    def test_codex_profile_selects_codex_home_and_model(self):
-        profile, _ = self.load('inference_profile = "~/.codex4"\n')
-        self.assertEqual(profile.kind, "codex")
-        self.assertEqual(profile.home, Path.home() / ".codex4")
-        self.assertEqual(profile.model, "gpt-5.6-sol")
-
-    def test_claude_profile_selects_claude_home_and_model(self):
-        profile, _ = self.load('inference_profile = "~/.claude"\n')
-        self.assertEqual(profile.kind, "claude")
-        self.assertEqual(profile.home, Path.home() / ".claude")
-        self.assertEqual(profile.model, "claude-opus-5")
-
-    def test_missing_file_names_the_path(self):
-        with self.assertRaises(RuntimeError) as caught:
-            self.load(None)
-        self.assertIn("anvil.toml", str(caught.exception))
-
-    def test_blank_value_names_the_path(self):
-        with self.assertRaises(RuntimeError) as caught:
-            self.load('inference_profile = "   "\n')
-        self.assertIn("anvil.toml", str(caught.exception))
-
-    def test_unknown_agent_names_the_path(self):
-        with self.assertRaises(RuntimeError) as caught:
-            self.load('inference_profile = "gemini"\n')
-        message = str(caught.exception)
-        self.assertIn("anvil.toml", message)
-        self.assertIn("gemini", message)
-
-    def test_main_reports_a_misconfigured_profile_on_every_tick(self):
-        with mock.patch.object(monitor, "PROFILE_ERROR", "anvil.toml: broken"), \
-             mock.patch.object(monitor, "log") as logged, \
-             mock.patch.object(monitor, "run_monitor") as run_monitor:
-            self.assertEqual(monitor.main(), 1)
-        run_monitor.assert_not_called()
-        message = logged.call_args[0][0]
-        self.assertTrue(message.startswith("fatal: "), message)
-        self.assertIn("anvil.toml: broken", message)
 
 
 class PollCiTests(unittest.TestCase):
@@ -551,718 +417,1155 @@ class EscalationOwnershipTests(unittest.TestCase):
         issue_state.assert_called_once_with(ISSUE_URL)
 
 
-class TimeoutHandoffTests(unittest.TestCase):
-    def test_extracts_thread_started_session_id(self):
-        self.assertEqual(
-            monitor.extract_session_id(
-                {"type": "thread.started", "thread_id": "session-123"}
-            ),
-            "session-123",
-        )
-        self.assertIsNone(monitor.extract_session_id({"type": "turn.started"}))
-
-    def test_handoff_prompt_forbids_more_repair_work(self):
-        run = monitor.CiRun(
-            workflow="CI",
-            sha="deadbeef",
-            run_id=42,
-            url="https://github.com/example/actions/runs/42",
-            status="completed",
-            conclusion="failure",
-            created_at="2026-08-23T00:00:00Z",
-            attempt=1,
-            updated_at="2026-08-23T00:30:00Z",
-        )
-
-        prompt = monitor.build_timeout_handoff_prompt(run, "VERIFIED RECOVERY BLOCK")
-
-        self.assertIn("taken over one hour", prompt)
-        self.assertIn("Do not investigate further", prompt)
-        self.assertIn("gh issue create", prompt)
-        self.assertIn(run.url, prompt)
-        self.assertIn("VERIFIED RECOVERY BLOCK", prompt)
-        self.assertIn("VERBATIM", prompt)
-        self.assertIn("exact commands/tests", prompt)
-        self.assertIn("next concrete action", prompt)
-        self.assertIn("Do not restore", prompt)
-
-    def test_finds_new_issue_url_in_handoff_output(self):
-        old = "https://github.com/BrokkAi/bifrost-dev/issues/100"
-        new = "https://github.com/BrokkAi/bifrost-dev/issues/101"
-
-        self.assertEqual(
-            monitor.find_issue_url(f"existing {old}\nfiled {new}", exclude_url=old),
-            new,
-        )
-
-    def run_streamed_agent(self, popen, select_call, os_read, lines, **kwargs):
-        """Drive invoke_codex_stream over a scripted JSONL stdout stream."""
-        process = mock.Mock()
-        process.pid = 4321
-        process.returncode = 0
-        process.stdin = mock.Mock()
-        process.stdout = mock.Mock()
-        process.stdout.fileno.return_value = 99
-        process.wait.return_value = 0
-        popen.return_value = process
-        select_call.return_value = ([99], [], [])
-        os_read.side_effect = [*lines, b""]
-        sessions = []
-        messages = []
-
-        result = monitor.invoke_codex_stream(
-            "handoff",
-            messages.append,
-            timeout_seconds=600,
-            on_session=sessions.append,
-            **kwargs,
-        )
-        return result, messages, sessions, process, popen.call_args.args[0]
-
-    @mock.patch.object(monitor.os, "read")
-    @mock.patch.object(monitor.select, "select")
-    @mock.patch.object(monitor.subprocess, "Popen")
-    def test_resume_uses_exact_session_and_captures_jsonl(
-        self, popen, select_call, os_read
-    ):
-        with mock.patch.object(monitor, "AGENT", "codex"):
-            result, messages, sessions, process, args = self.run_streamed_agent(
-                popen,
-                select_call,
-                os_read,
-                [
-                    b'{"type":"thread.started","thread_id":"session-123"}\n',
-                    b'{"type":"item.completed","item":'
-                    b'{"type":"agent_message","text":"filed"}}\n',
-                ],
-                resume_session_id="session-123",
-            )
-
-        self.assertEqual(args[args.index("resume") + 1 :][-2:], ["session-123", "-"])
-        self.assertEqual(result.status, "completed")
-        self.assertEqual(result.session_id, "session-123")
-        self.assertEqual(messages, ["filed"])
-        self.assertEqual(sessions, ["session-123"])
-        process.stdin.write.assert_called_once_with(b"handoff")
-
-    @mock.patch.object(monitor.os, "read")
-    @mock.patch.object(monitor.select, "select")
-    @mock.patch.object(monitor.subprocess, "Popen")
-    def test_claude_resume_uses_exact_session_and_captures_jsonl(
-        self, popen, select_call, os_read
-    ):
-        with mock.patch.object(monitor, "AGENT", "claude"):
-            result, messages, sessions, process, args = self.run_streamed_agent(
-                popen,
-                select_call,
-                os_read,
-                [
-                    b'{"type":"system","subtype":"init","session_id":"session-123"}\n',
-                    b'{"type":"assistant","message":{"content":'
-                    b'[{"type":"text","text":"filed"}]}}\n',
-                ],
-                resume_session_id="session-123",
-            )
-
-        self.assertEqual(args[-2:], ["--resume", "session-123"])
-        self.assertNotIn("--fork-session", args)
-        self.assertEqual(result.status, "completed")
-        self.assertEqual(result.session_id, "session-123")
-        self.assertEqual(messages, ["filed"])
-        self.assertEqual(sessions, ["session-123"])
-        process.stdin.write.assert_called_once_with(b"handoff")
-
-    @mock.patch.object(monitor.os, "read")
-    @mock.patch.object(monitor.select, "select")
-    @mock.patch.object(monitor.subprocess, "Popen")
-    def test_claude_records_denied_tool_calls_in_the_transcript(
-        self, popen, select_call, os_read
-    ):
-        with mock.patch.object(monitor, "AGENT", "claude"):
-            result, _, _, _, _ = self.run_streamed_agent(
-                popen,
-                select_call,
-                os_read,
-                [
-                    b'{"type":"result","subtype":"success",'
-                    b'"permission_denials":[{"tool_name":"Bash"}]}\n',
-                ],
-            )
-
-        self.assertIn("Denied tool calls: Bash.", result.output)
-
-    def test_fresh_argv_pins_model_and_autonomy_flags(self):
-        with mock.patch.object(monitor, "AGENT", "claude"):
-            args = monitor.agent_args(None)
-        self.assertEqual(args[0], str(monitor.CLAUDE_BIN))
-        for flag, value in (
-            ("--model", monitor.CLAUDE_MODEL),
-            ("--effort", monitor.CLAUDE_EFFORT),
-            ("--effort", "xhigh"),
-            ("--permission-mode", "auto"),
-            ("--permission-prompts", "none"),
-            ("--output-format", "stream-json"),
-        ):
-            self.assertEqual(args[args.index(flag) + 1], value)
-        self.assertIn("--verbose", args)
-        self.assertEqual(
-            json.loads(args[args.index("--settings") + 1]), {"outputStyle": "default"}
-        )
-        self.assertNotIn("--resume", args)
-        self.assertNotIn("--no-session-persistence", args)
-
-        with mock.patch.object(monitor, "AGENT", "codex"):
-            args = monitor.agent_args(None)
-        self.assertEqual(args[0], str(monitor.CODEX_BIN))
-        self.assertIn("model_reasoning_effort=xhigh", monitor.CODEX_MODEL_ARGS)
-        for flag in monitor.CODEX_MODEL_ARGS:
-            self.assertIn(flag, args)
-        self.assertEqual(args[args.index("--sandbox") + 1], "workspace-write")
-        self.assertEqual(args[-1], "-")
-
-    def test_extracts_claude_main_thread_text_only(self):
-        def assistant(blocks, **extra):
-            return {"type": "assistant", "message": {"content": blocks}, **extra}
-
-        self.assertEqual(
-            monitor.extract_agent_text(
-                assistant(
-                    [
-                        {"type": "thinking", "thinking": "hidden"},
-                        {"type": "text", "text": "visible"},
-                        {"type": "tool_use", "name": "Bash"},
-                    ]
-                )
-            ),
-            "visible",
-        )
-        self.assertIsNone(
-            monitor.extract_agent_text(
-                assistant([{"type": "text", "text": "sub"}], parent_tool_use_id="t1")
-            )
-        )
-        self.assertIsNone(
-            monitor.extract_agent_text(assistant([{"type": "tool_use", "name": "Bash"}]))
-        )
-
-    def test_extracts_claude_init_session_id(self):
-        self.assertEqual(
-            monitor.extract_session_id(
-                {"type": "system", "subtype": "init", "session_id": "session-123"}
-            ),
-            "session-123",
-        )
-        self.assertIsNone(
-            monitor.extract_session_id(
-                {"type": "system", "subtype": "compact", "session_id": "session-123"}
-            )
-        )
-
-    @mock.patch.object(monitor, "run_command")
-    @mock.patch.object(monitor.recovery, "preserve")
-    def test_timeout_recovery_never_cleans_when_preservation_fails(self, preserve, command):
-        failed = SimpleNamespace(preservation_status="failed", cleanup_status="pending")
-        preserve.return_value = failed
-        result = monitor.recover_timeout_worktree(42, "deadbeef", "session-123")
-        self.assertIs(result, failed)
-        command.assert_not_called()
-
-    def test_connect_db_migrates_timeout_handoff_columns_additively(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            db_path = Path(temp_dir) / "activity.db"
-            legacy = sqlite3.connect(db_path)
-            legacy.execute(
-                "CREATE TABLE invocations (workflow_run_id INTEGER PRIMARY KEY)"
-            )
-            legacy.commit()
-            legacy.close()
-            with mock.patch.object(monitor, "DB_PATH", db_path):
-                conn = monitor.connect_db()
-                try:
-                    columns = {
-                        row["name"]
-                        for row in conn.execute(
-                            "PRAGMA table_info(invocations)"
-                        ).fetchall()
-                    }
-                finally:
-                    conn.close()
-
-        self.assertTrue(
-            {
-                "codex_session_id",
-                "issue_url",
-                "timeout_handoff_status",
-                "recovery_manifest_path",
-                "recovery_status",
-                "codex_pid",
-                "base_sha",
-                "candidate_sha",
-                "reconcile_round",
-                "attempt_count",
-            }
-            <= columns
-        )
 
 
-class MergeReconciliationIntegrationTests(unittest.TestCase):
-    def test_repair_prompt_assigns_pull_and_push_to_monitor(self):
-        prompt = monitor.build_prompt(make_run())
-
-        self.assertIn("Do not push", prompt)
-        self.assertIn("monitor owns the pull-and-push reconciliation", prompt)
-        self.assertIn("never pull or merge remote changes yourself", prompt)
-
-    def test_repair_prompt_reverts_involved_fixes_and_reports_blocked_reverts(self):
-        prompt = monitor.build_prompt(make_run())
-        mentions = " ".join(
-            f"<@{member_id}>" for member_id in monitor.ESCALATION_SLACK_MEMBER_IDS
-        )
-
-        self.assertIn("git revert <introducing-sha>", prompt)
-        self.assertIn("gh issue reopen", prompt)
-        self.assertIn("tags the commit author", prompt)
-        self.assertIn(f"{mentions} Reverted <SHORT_SHA>", prompt)
-        self.assertIn("gh issue create --label buildfailure", prompt)
-        self.assertIn(f"{mentions} CI broken by <SHORT_SHA>", prompt)
-        self.assertNotIn("RESOLVE FROM REPO EVIDENCE", prompt)
-        self.assertNotIn("{", prompt.replace(mentions, ""))
-
-    def test_conflict_free_pull_merges_and_pushes_without_codex(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            fixture = GitFixture(Path(temp_dir))
-            base, candidate = fixture.commit_local()
-            remote_advance = fixture.push_remote_file()
-            initial = monitor.CodexResult("completed", 0, False, "fixed", "session-123")
-
-            with (
-                mock.patch.object(monitor, "WORKTREE", fixture.repair),
-                mock.patch.object(
-                    monitor, "GIT_BIN", Path(shutil.which("git") or "/usr/bin/git")
-                ),
-                mock.patch.object(monitor, "invoke_codex_stream") as invoke,
-            ):
-                resolution = monitor.reconcile_repair(
-                    make_run(),
-                    base,
-                    initial,
-                    lambda _text: None,
-                    deadline=time.monotonic() + 60,
-                )
-
-            self.assertEqual(resolution.result.status, "completed")
-            self.assertIsNotNone(resolution.pushed_sha)
-            self.assertEqual(git(fixture.repair, "status", "--porcelain"), "")
-            self.assertEqual(
-                git(fixture.repair, "rev-parse", "HEAD"),
-                git(fixture.repair, "rev-parse", "origin/master"),
-            )
-            parents = git(fixture.repair, "show", "-s", "--format=%P", "HEAD").split()
-            self.assertEqual(set(parents), {candidate, remote_advance})
-            invoke.assert_not_called()
-
-    def test_remote_advance_during_push_pulls_again_without_codex(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            fixture = GitFixture(Path(temp_dir))
-            base, candidate = fixture.commit_local()
-            initial = monitor.CodexResult("completed", 0, False, "fixed", "session-123")
-            real_run_command = monitor.run_command
-            raced = False
-            remote_advance = ""
-
-            def run_with_push_race(args, **kwargs):
-                nonlocal raced, remote_advance
-                if args[1:3] == ["push", "origin"] and not raced:
-                    remote_advance = fixture.push_remote_file("race.txt", "race\n")
-                    raced = True
-                return real_run_command(args, **kwargs)
-
-            with (
-                mock.patch.object(monitor, "WORKTREE", fixture.repair),
-                mock.patch.object(
-                    monitor, "GIT_BIN", Path(shutil.which("git") or "/usr/bin/git")
-                ),
-                mock.patch.object(
-                    monitor, "run_command", side_effect=run_with_push_race
-                ),
-                mock.patch.object(monitor, "invoke_codex_stream") as invoke,
-            ):
-                resolution = monitor.reconcile_repair(
-                    make_run(),
-                    base,
-                    initial,
-                    lambda _text: None,
-                    deadline=time.monotonic() + 60,
-                )
-
-            self.assertTrue(raced)
-            self.assertEqual(resolution.result.status, "completed")
-            self.assertIsNotNone(resolution.pushed_sha)
-            parents = git(fixture.repair, "show", "-s", "--format=%P", "HEAD").split()
-            self.assertEqual(set(parents), {candidate, remote_advance})
-            invoke.assert_not_called()
-
-    def test_content_conflict_resumes_same_session_then_pushes_merge(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            fixture = GitFixture(Path(temp_dir))
-            base = git(fixture.repair, "rev-parse", "HEAD")
-            (fixture.repair / "shared.txt").write_text("local\n", encoding="utf-8")
-            git(fixture.repair, "add", "shared.txt")
-            git(fixture.repair, "commit", "-m", "local repair")
-            candidate = git(fixture.repair, "rev-parse", "HEAD")
-            remote_advance = fixture.push_remote_file("shared.txt", "remote\n")
-            initial = monitor.CodexResult("completed", 0, False, "fixed", "session-123")
-
-            def resolve_conflict(*_args, **kwargs):
-                self.assertEqual(kwargs["resume_session_id"], "session-123")
-                self.assertIn(
-                    "shared.txt",
-                    git(fixture.repair, "diff", "--name-only", "--diff-filter=U"),
-                )
-                (fixture.repair / "shared.txt").write_text(
-                    "local and remote\n", encoding="utf-8"
-                )
-                git(fixture.repair, "add", "shared.txt")
-                git(fixture.repair, "commit", "--no-edit")
-                return monitor.CodexResult(
-                    "completed", 0, False, "resolved", "session-123"
-                )
-
-            with (
-                mock.patch.object(monitor, "WORKTREE", fixture.repair),
-                mock.patch.object(
-                    monitor, "GIT_BIN", Path(shutil.which("git") or "/usr/bin/git")
-                ),
-                mock.patch.object(
-                    monitor, "invoke_codex_stream", side_effect=resolve_conflict
-                ) as invoke,
-            ):
-                resolution = monitor.reconcile_repair(
-                    make_run(),
-                    base,
-                    initial,
-                    lambda _text: None,
-                    deadline=time.monotonic() + 60,
-                )
-
-            self.assertEqual(resolution.result.status, "completed")
-            self.assertIsNotNone(resolution.pushed_sha)
-            self.assertEqual(
-                (fixture.repair / "shared.txt").read_text(), "local and remote\n"
-            )
-            parents = git(fixture.repair, "show", "-s", "--format=%P", "HEAD").split()
-            self.assertEqual(set(parents), {candidate, remote_advance})
-            self.assertEqual(invoke.call_count, 1)
-
-    def test_preflight_preserves_orphan_and_resets_to_remote(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            fixture = GitFixture(Path(temp_dir))
-            _base, candidate = fixture.commit_local()
-            remote_advance = fixture.push_remote_file()
-
-            with (
-                mock.patch.object(monitor, "WORKTREE", fixture.repair),
-                mock.patch.object(
-                    monitor, "GIT_BIN", Path(shutil.which("git") or "/usr/bin/git")
-                ),
-            ):
-                preflight = monitor.preflight_worktree()
-
-            self.assertEqual(preflight.base_sha, remote_advance)
-            self.assertEqual(preflight.recovered_sha, candidate)
-            self.assertIsNotNone(preflight.recovered_tag)
-            self.assertEqual(
-                git(fixture.repair, "rev-parse", preflight.recovered_tag or ""),
-                candidate,
-            )
-            self.assertEqual(git(fixture.repair, "status", "--porcelain"), "")
-
-    def test_recovery_aborts_conflict_preserves_candidate_and_resets(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            fixture = GitFixture(Path(temp_dir))
-            (fixture.repair / "shared.txt").write_text("local\n", encoding="utf-8")
-            git(fixture.repair, "add", "shared.txt")
-            git(fixture.repair, "commit", "-m", "local repair")
-            candidate = git(fixture.repair, "rev-parse", "HEAD")
-            remote_advance = fixture.push_remote_file("shared.txt", "remote\n")
-            with self.assertRaises(subprocess.CalledProcessError):
-                git(
-                    fixture.repair,
-                    "pull",
-                    "--no-rebase",
-                    "--no-edit",
-                    "origin",
-                    "master",
-                )
-
-            with (
-                mock.patch.object(monitor, "WORKTREE", fixture.repair),
-                mock.patch.object(
-                    monitor, "GIT_BIN", Path(shutil.which("git") or "/usr/bin/git")
-                ),
-            ):
-                with mock.patch.object(monitor, "STATE_DIR", Path(temp_dir) / "state"):
-                    saved = monitor.recover_timeout_worktree(42, "deadbeef", "session-123")
-
-            self.assertEqual(saved.preservation_status, "complete", saved.detail)
-            self.assertEqual(saved.cleanup_status, "complete", saved.detail)
-            self.assertIsNotNone(saved.conflict_snapshot)
-            self.assertEqual(git(fixture.repair, "rev-parse", "HEAD"), remote_advance)
-            self.assertEqual(
-                git(
-                    fixture.repair,
-                    "rev-parse",
-                    "bifrost-ci-recovery/42/1/head",
-                ),
-                candidate,
-            )
-            self.assertEqual(git(fixture.repair, "status", "--porcelain"), "")
+def completed(stdout="", returncode=0, stderr=""):
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
 
 
-class RetryableInvocationTests(unittest.TestCase):
-    @mock.patch.object(monitor, "slack_send")
-    @mock.patch.object(monitor, "git_is_ancestor", return_value=True)
-    @mock.patch.object(monitor, "worktree_status", return_value="")
-    @mock.patch.object(monitor, "fetch_remote_sha", return_value="remote-sha")
-    @mock.patch.object(monitor, "terminate_recorded_codex", return_value=True)
-    def test_restart_after_successful_push_verifies_instead_of_retriaging(
-        self, terminate, fetch, status, ancestor, slack
-    ):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            db_path = Path(temp_dir) / "activity.db"
-            with mock.patch.object(monitor, "DB_PATH", db_path):
-                conn = monitor.connect_db()
-                try:
-                    run = make_run()
-                    self.assertTrue(monitor.claim_invocation(conn, run, "base"))
-                    conn.execute(
-                        "UPDATE invocations SET status = 'reconciling', "
-                        "candidate_sha = 'candidate', thread_ts = '123.456' "
-                        "WHERE workflow_run_id = ?",
-                        (run.run_id,),
-                    )
-                    conn.commit()
+def insert_invocation(
+    conn,
+    *,
+    run_id=42,
+    status="claimed",
+    session_id=None,
+    cursor=0,
+    output="",
+    started_at=None,
+    base_sha="base-sha",
+    workflow="CI",
+):
+    now = started_at or monitor.utc_now()
+    conn.execute(
+        """
+        INSERT INTO invocations (
+            workflow_run_id, sha, workflow_run_url, conclusion, observed_at,
+            started_at, status, base_sha, workflow, codex_session_id,
+            mj_transcript_after_seq, output, thread_ts
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            "deadbeef",
+            f"https://github.com/example/actions/runs/{run_id}",
+            "failure",
+            now,
+            now,
+            status,
+            base_sha,
+            workflow,
+            session_id,
+            cursor,
+            output,
+            "thread-1",
+        ),
+    )
+    conn.commit()
 
-                    monitor.recover_interrupted(
-                        conn, monitor.SlackTransport("webhook", webhook="unused")
-                    )
-                    row = conn.execute(
-                        "SELECT * FROM invocations WHERE workflow_run_id = ?",
-                        (run.run_id,),
-                    ).fetchone()
-                finally:
-                    conn.close()
 
-        self.assertEqual(row["status"], "completed")
-        self.assertEqual(row["outcome_notification_attempted"], 1)
-        self.assertIn("verified candidate candidate", row["output"])
-        ancestor.assert_called_once_with("candidate", "origin/master")
-        slack.assert_called_once()
-
-    def test_orphaned_invocation_can_be_claimed_again_without_losing_output(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            db_path = Path(temp_dir) / "activity.db"
-            with mock.patch.object(monitor, "DB_PATH", db_path):
-                conn = monitor.connect_db()
-                try:
-                    run = make_run()
-                    self.assertTrue(monitor.claim_invocation(conn, run, "base-1"))
-                    conn.execute(
-                        "UPDATE invocations SET status = 'orphaned_candidate', "
-                        "output = 'first attempt', thread_ts = '123.456' "
-                        "WHERE workflow_run_id = ?",
-                        (run.run_id,),
-                    )
-                    conn.commit()
-
-                    self.assertNotIn(run.run_id, monitor.handled_run_ids(conn))
-                    self.assertTrue(monitor.claim_invocation(conn, run, "base-2"))
-                    row = conn.execute(
-                        "SELECT * FROM invocations WHERE workflow_run_id = ?",
-                        (run.run_id,),
-                    ).fetchone()
-                finally:
-                    conn.close()
-
-            self.assertEqual(row["status"], "claimed")
-            self.assertEqual(row["attempt_count"], 2)
-            self.assertEqual(row["base_sha"], "base-2")
-            self.assertIn("first attempt", row["output"])
-            self.assertIn("--- retry", row["output"])
-
-class TimeoutPackageIntegrationTests(unittest.TestCase):
+class MjRunnerTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        self.fixture = GitFixture(self.root)
-        for name, value in {
-            "WORKTREE": self.fixture.repair,
-            "STATE_DIR": self.root / "state",
-            "DB_PATH": self.root / "activity.db",
-            "GIT_BIN": Path(shutil.which("git") or "/usr/bin/git"),
-        }.items():
-            patch = mock.patch.object(monitor, name, value)
-            patch.start()
-            self.addCleanup(patch.stop)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.db_patch = mock.patch.object(
+            monitor, "DB_PATH", Path(self.temp.name) / "activity.db"
+        )
+        self.db_patch.start()
+        self.addCleanup(self.db_patch.stop)
         self.conn = monitor.connect_db()
         self.addCleanup(self.conn.close)
-        self.run = make_run()
-        self.assertTrue(monitor.claim_invocation(self.conn, self.run, "base"))
-        self.base, self.candidate = self.fixture.commit_local()
-        (self.fixture.repair / "local.txt").write_text("unfinished edits\n")
-        (self.fixture.repair / "new.txt").write_text("untracked\n")
-        self.result = monitor.CodexResult("timed_out", -15, True, "diagnosis transcript", "session-123")
-
-    def handoff(self):
-        return monitor.timeout_ticket_handoff(
-            self.conn, self.run, self.result, mock.Mock(), mock.Mock(),
-            transcript=self.result.output,
+        self.transport = monitor.SlackTransport(
+            "chat", token="xoxb-test", channel="C0123456789"
         )
 
-    def test_package_and_cleanup_exist_before_ticket_session_resumes(self):
-        def resume(prompt, *args, **kwargs):
-            self.assertEqual(git(self.fixture.repair, "status", "--porcelain"), "")
-            self.assertEqual(git(self.fixture.repair, "rev-parse", "HEAD"), self.base)
-            self.assertIn(self.candidate, prompt)
-            self.assertIn("session-123", prompt)
-            self.assertIn(str(self.fixture.repair), prompt)
-            self.assertNotIn("stash@{", prompt)
-            package = self.root / "state/recovery/42/1"
-            self.assertTrue((package / "manifest.json").is_file())
-            self.assertTrue((package / "recovery.md").is_file())
-            row = self.conn.execute("SELECT * FROM invocations").fetchone()
-            self.assertEqual(row["recovery_status"], "complete")
-            return monitor.CodexResult("completed", 0, False, ISSUE_URL, "session-123")
+    def test_mj_new_argv_has_required_selectors_and_no_profile(self):
+        run = make_run()
+        argv = monitor.new_session_argv(
+            run, "a" * 40, 3, "/tmp/repair.prompt"
+        )
+        self.assertEqual(
+            argv,
+            [
+                str(monitor.MJ_BIN),
+                "new",
+                "--workspace",
+                "CI",
+                "--target",
+                "podman",
+                "--bundle",
+                "bifrost",
+                "--model",
+                "opus",
+                "--at",
+                "a" * 40,
+                "--branch",
+                "ci-repair/42-3",
+                "--title",
+                "CI deadbeef run 42 attempt 3 CI repair",
+                "--prompt-file",
+                "/tmp/repair.prompt",
+                "--json",
+            ],
+        )
+        self.assertNotIn("--profile", argv)
+        self.assertNotIn("--effort", argv)
 
-        with mock.patch.object(monitor, "invoke_codex_stream", side_effect=resume) as invoke:
-            output, issue, saved = self.handoff()
-        self.assertEqual(issue, ISSUE_URL)
-        self.assertEqual(output, ISSUE_URL)
-        self.assertEqual(invoke.call_args.kwargs["resume_session_id"], "session-123")
-        restored = self.root / "continued"
-        monitor.recovery.restore(Path(saved.manifest_path), restored)
-        self.assertEqual(git(restored, "rev-parse", "HEAD"), self.candidate)
-        self.assertEqual((restored / "local.txt").read_text(), "unfinished edits\n")
-        self.assertEqual((restored / "new.txt").read_text(), "untracked\n")
+    def test_launch_parses_session_id_through_fake_mj_seam(self):
+        run = make_run()
+        def fake_mj(args, *, timeout=60):
+            if args[0] == "sessions":
+                return completed('{"sessions":[]}')
+            return completed('{"session_id":"s-42"}')
 
-    def test_ticket_restore_command_runs_the_helper(self):
-        with mock.patch.object(monitor, "invoke_codex_stream", return_value=
-                               monitor.CodexResult("completed", 0, False, ISSUE_URL, "session-123")):
-            _, _, saved = self.handoff()
-        block = monitor.recovery.render_markdown(saved, Path(monitor.recovery.__file__))
-        command = block.split("```sh\n")[-1].split("\n```")[0]
-        completed = subprocess.run(shlex.split(command), capture_output=True, text=True)
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        restored = Path(shlex.split(command)[-1])
-        self.assertEqual((restored / "local.txt").read_text(), "unfinished edits\n")
-        self.assertEqual((restored / "new.txt").read_text(), "untracked\n")
+        with mock.patch.object(monitor, "mj_command", side_effect=fake_mj) as command:
+            session_id, branch = monitor.launch_mj_session(run, "b" * 40, 1, None)
+        self.assertEqual((session_id, branch), ("s-42", "ci-repair/42-1"))
+        argv = command.call_args_list[-1].args[0]
+        self.assertEqual(
+            argv[:11],
+            [
+                "new",
+                "--workspace",
+                "CI",
+                "--target",
+                "podman",
+                "--bundle",
+                "bifrost",
+                "--model",
+                "opus",
+                "--at",
+                "b" * 40,
+            ],
+        )
+        self.assertNotIn("--profile", argv)
 
-    def test_missing_session_retains_package_and_does_not_claim_ticket(self):
-        self.result = monitor.CodexResult("timed_out", -15, True, "diagnosis", None)
-        with mock.patch.object(monitor, "invoke_codex_stream") as invoke:
-            output, issue, saved = self.handoff()
-        invoke.assert_not_called()
-        self.assertIsNone(issue)
-        self.assertIn("no session id", output)
-        self.assertTrue(Path(saved.manifest_path).is_file())
-        self.assertTrue(Path(saved.manifest_path).with_name("recovery.md").is_file())
+    def test_ambiguous_new_adopts_matching_workspace_session(self):
+        run = make_run()
+        title = monitor.launch_title(run, 2)
+        calls = []
 
-    def test_preservation_failure_is_reported_to_ticket_agent(self):
-        missing = self.root / "missing-worktree"
-        with mock.patch.object(monitor, "WORKTREE", missing), \
-             mock.patch.object(monitor, "invoke_codex_stream", return_value=
-                               monitor.CodexResult("completed", 0, False, ISSUE_URL, "session-123")) as invoke:
-            output, issue, saved = self.handoff()
-        self.assertEqual(saved.preservation_status, "failed")
-        self.assertNotEqual(saved.cleanup_status, "complete")
-        self.assertEqual(issue, ISSUE_URL)
-        self.assertIn("failed", invoke.call_args.args[0])
-        self.assertIn("Do not claim preservation", invoke.call_args.args[0])
-        row = self.conn.execute("SELECT * FROM invocations").fetchone()
-        self.assertEqual(row["recovery_status"], "failed")
+        def fake_mj(args, *, timeout=60):
+            calls.append(args[0])
+            if args[0] == "sessions":
+                sessions_call = calls.count("sessions")
+                sessions = [] if sessions_call == 1 else [
+                    {
+                        "id": "adopted-session",
+                        "title": title,
+                        "state": "running",
+                        "active": True,
+                    }
+                ]
+                return completed(json.dumps({"sessions": sessions}))
+            return completed("", 1, "connection closed after request")
 
-    def test_failed_issue_creation_retains_verified_package(self):
-        with mock.patch.object(monitor, "invoke_codex_stream", return_value=
-                               monitor.CodexResult("failed", 1, False, "gh failed", "session-123")):
-            output, issue, saved = self.handoff()
-        self.assertIsNone(issue)
-        self.assertEqual(output, "gh failed")
-        self.assertEqual(saved.preservation_status, "complete")
-        self.assertEqual(saved.cleanup_status, "complete")
+        with mock.patch.object(monitor, "mj_command", side_effect=fake_mj):
+            session_id, branch = monitor.launch_mj_session(run, "b" * 40, 2, None)
+        self.assertEqual(session_id, "adopted-session")
+        self.assertEqual(branch, "ci-repair/42-2")
+        self.assertEqual(calls, ["sessions", "new", "sessions"])
 
-    def test_restart_during_handoff_keeps_original_artifacts(self):
-        with mock.patch.object(monitor, "invoke_codex_stream", side_effect=RuntimeError("restart")):
-            with self.assertRaisesRegex(RuntimeError, "restart"):
-                self.handoff()
-        package = self.root / "state/recovery/42/1"
-        before = monitor.recovery.load(package)
-        with mock.patch.object(monitor, "slack_send"):
-            monitor.recover_interrupted(self.conn, monitor.SlackTransport("webhook", webhook="unused"))
-        after = monitor.recovery.load(package)
-        self.assertEqual(after.head_sha, before.head_sha)
-        self.assertEqual(after.stash_sha, before.stash_sha)
-        row = self.conn.execute("SELECT * FROM invocations").fetchone()
+    def test_launch_recovery_adopts_before_retrying_the_attempt(self):
+        insert_invocation(self.conn, status="launching", session_id=None)
+        run = make_run()
+        title = monitor.launch_title(run, 1)
+        with mock.patch.object(
+            monitor,
+            "mj_command",
+            return_value=completed(
+                json.dumps(
+                    {"sessions": [{"id": "recovered-session", "title": title,
+                                   "state": "running", "active": True}]}
+                )
+            ),
+        ) as command:
+            monitor.recover_launching_invocations(self.conn, self.transport)
+        row = self.conn.execute(
+            "SELECT status, codex_session_id, attempt_count FROM invocations "
+            "WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["codex_session_id"], "recovered-session")
+        self.assertEqual(row["attempt_count"], 1)
+        command.assert_called_once_with(
+            ["sessions", "--workspace", "CI", "--json"], timeout=30
+        )
+
+    def test_ambiguous_launch_without_visible_session_stays_unresolved_until_adopted(self):
+        insert_invocation(self.conn, status="launching", session_id=None)
+        run = make_run()
+        title = monitor.launch_title(run, 1)
+        responses = [
+            {"sessions": []},
+            {"sessions": [{"id": "late-session", "title": title, "state": "running"}]},
+        ]
+
+        def fake_mj(args, *, timeout=60):
+            self.assertEqual(args, ["sessions", "--workspace", "CI", "--json"])
+            return completed(json.dumps(responses.pop(0)))
+
+        with mock.patch.object(monitor, "mj_command", side_effect=fake_mj), mock.patch.object(
+            monitor, "slack_send", return_value=(True, "reply")
+        ):
+            monitor.recover_launching_invocations(self.conn, self.transport)
+            row = self.conn.execute(
+                "SELECT status, attempt_count, codex_session_id FROM invocations "
+                "WHERE workflow_run_id = 42"
+            ).fetchone()
+            self.assertEqual((row["status"], row["attempt_count"], row["codex_session_id"]),
+                             ("launching", 1, None))
+            self.assertFalse(monitor.claim_invocation(self.conn, run, "base-sha"))
+            monitor.recover_launching_invocations(self.conn, self.transport)
+
+        row = self.conn.execute(
+            "SELECT status, attempt_count, codex_session_id FROM invocations "
+            "WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual((row["status"], row["attempt_count"], row["codex_session_id"]),
+                         ("running", 1, "late-session"))
+        blocked = self.conn.execute(
+            "SELECT slack_notification_attempted FROM blocked_notifications "
+            "WHERE workflow_run_id = 42 AND reason = 'mj_launch_ambiguous'"
+        ).fetchone()
+        self.assertEqual(blocked["slack_notification_attempted"], 1)
+
+    def test_transcript_relay_persists_cursor_and_never_reposts_page(self):
+        insert_invocation(self.conn, session_id="s-42")
+        pages = [
+            completed(
+                json.dumps(
+                    {
+                        "items": [
+                            {"seq": 4, "role": "agent", "text": "First finished update"},
+                            {"seq": 5, "role": "agent", "text": "Second finished update"},
+                        ],
+                        "next_after_seq": 8,
+                    }
+                )
+            ),
+            completed(json.dumps({"items": [], "next_after_seq": 10})),
+        ]
+        with mock.patch.object(monitor, "mj_command", side_effect=pages) as command, mock.patch.object(
+            monitor, "slack_send", return_value=(True, "reply-ts")
+        ) as slack:
+            self.assertEqual(
+                monitor.drain_transcript(self.conn, self.transport, 42, "s-42"),
+                ["First finished update", "Second finished update"],
+            )
+            self.assertEqual(
+                monitor.drain_transcript(self.conn, self.transport, 42, "s-42"), []
+            )
+        row = self.conn.execute(
+            "SELECT mj_transcript_after_seq, output FROM invocations WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(row["mj_transcript_after_seq"], 10)
+        self.assertEqual(
+            row["output"], "First finished update\n\nSecond finished update\n\n"
+        )
+        self.assertEqual(slack.call_count, 2)
+        self.assertEqual(
+            command.call_args_list[0].args[0][-4:],
+            ["--finished-only", "--after-seq", "0", "--json"],
+        )
+        self.assertEqual(
+            command.call_args_list[1].args[0][-4:],
+            ["--finished-only", "--after-seq", "8", "--json"],
+        )
+
+    def test_transcript_post_failure_does_not_advance_cursor(self):
+        insert_invocation(self.conn, session_id="s-42")
+        page = completed(
+            json.dumps(
+                {
+                    "items": [
+                        {"seq": 4, "stable_id": "m4", "text": "Retry me"},
+                        {"seq": 5, "stable_id": "m5", "text": "Then me"},
+                    ],
+                    "next_after_seq": 7,
+                }
+            )
+        )
+        posts = [(False, None), (True, "reply-1"), (True, "reply-2")]
+        with mock.patch.object(monitor, "mj_command", return_value=page), mock.patch.object(
+            monitor, "slack_send", side_effect=posts
+        ) as slack:
+            self.assertEqual(
+                monitor.drain_transcript(self.conn, self.transport, 42, "s-42"), []
+            )
+            row = self.conn.execute(
+                "SELECT mj_transcript_after_seq, output FROM invocations "
+                "WHERE workflow_run_id = 42"
+            ).fetchone()
+            self.assertEqual((row["mj_transcript_after_seq"], row["output"]), (0, ""))
+            self.assertEqual(
+                monitor.drain_transcript(self.conn, self.transport, 42, "s-42"),
+                ["Retry me", "Then me"],
+            )
+        self.assertEqual(slack.call_count, 3)
+        row = self.conn.execute(
+            "SELECT mj_transcript_after_seq, output FROM invocations "
+            "WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(row["mj_transcript_after_seq"], 7)
+        self.assertEqual(row["output"], "Retry me\n\nThen me\n\n")
+
+    def test_transcript_same_sequence_sibling_replays_after_second_post_fails(self):
+        insert_invocation(self.conn, session_id="s-42")
+        page = completed(
+            json.dumps(
+                {
+                    "items": [
+                        {"seq": 4, "stable_id": "sibling-a", "text": "First"},
+                        {"seq": 4, "stable_id": "sibling-b", "text": "Second"},
+                    ],
+                    "next_after_seq": 4,
+                }
+            )
+        )
+        with mock.patch.object(monitor, "mj_command", return_value=page), mock.patch.object(
+            monitor,
+            "slack_send",
+            side_effect=[(True, "reply-a"), (False, None), (True, "reply-b")],
+        ) as slack:
+            self.assertEqual(
+                monitor.drain_transcript(self.conn, self.transport, 42, "s-42"),
+                ["First"],
+            )
+            row = self.conn.execute(
+                "SELECT mj_transcript_after_seq FROM invocations WHERE workflow_run_id = 42"
+            ).fetchone()
+            self.assertEqual(row["mj_transcript_after_seq"], 3)
+            self.assertEqual(
+                monitor.drain_transcript(self.conn, self.transport, 42, "s-42"),
+                ["Second"],
+            )
+        self.assertEqual(slack.call_count, 3)
+        row = self.conn.execute(
+            "SELECT mj_transcript_after_seq, output FROM invocations "
+            "WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(row["mj_transcript_after_seq"], 4)
+        self.assertEqual(row["output"], "First\n\nSecond\n\n")
+
+    def test_transcript_stable_id_dedupes_post_close_revision(self):
+        insert_invocation(self.conn, session_id="s-42")
+        pages = [
+            completed(
+                json.dumps(
+                    {
+                        "items": [
+                            {"seq": 4, "stable_id": "stable-4", "text": "Original"}
+                        ],
+                        "next_after_seq": 4,
+                    }
+                )
+            ),
+            completed(
+                json.dumps(
+                    {
+                        "items": [
+                            {"seq": 6, "stable_id": "stable-4", "text": "Late revision"}
+                        ],
+                        "next_after_seq": 6,
+                    }
+                )
+            ),
+        ]
+        with mock.patch.object(monitor, "mj_command", side_effect=pages), mock.patch.object(
+            monitor, "slack_send", return_value=(True, "reply")
+        ) as slack:
+            self.assertEqual(
+                monitor.drain_transcript(self.conn, self.transport, 42, "s-42"),
+                ["Original"],
+            )
+            self.assertEqual(
+                monitor.drain_transcript(self.conn, self.transport, 42, "s-42"), []
+            )
+        self.assertEqual(slack.call_count, 1)
+        row = self.conn.execute(
+            "SELECT mj_transcript_after_seq, output FROM invocations "
+            "WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(row["mj_transcript_after_seq"], 6)
+        self.assertEqual(row["output"], "Original\n\n")
+
+    def test_complete_agent_transcript_reads_every_page(self):
+        pages = [
+            completed(
+                json.dumps(
+                    {
+                        "items": [{"seq": 2, "stable_id": "m2", "text": "First"}],
+                        "next_after_seq": 2,
+                        "latest_seq": 4,
+                    }
+                )
+            ),
+            completed(
+                json.dumps(
+                    {
+                        "items": [{"seq": 4, "stable_id": "m4", "text": "Last"}],
+                        "next_after_seq": 4,
+                        "latest_seq": 4,
+                    }
+                )
+            ),
+        ]
+        with mock.patch.object(monitor, "mj_command", side_effect=pages) as command:
+            output = monitor.read_complete_agent_transcript("s-42")
+        self.assertEqual(output, "First\n\nLast")
+        self.assertEqual(
+            [call.args[0][call.args[0].index("--after-seq") + 1]
+             for call in command.call_args_list],
+            ["0", "2"],
+        )
+
+    def test_restart_reattaches_at_saved_cursor_without_reposting(self):
+        insert_invocation(
+            self.conn,
+            status="running",
+            session_id="session-live",
+            cursor=12,
+            output="Already relayed\n\n",
+        )
+
+        def fake_mj(args, *, timeout=60):
+            if args[0] == "sessions":
+                return completed(
+                    json.dumps(
+                        {
+                            "id": "session-live",
+                            "state": "running",
+                            "chat_phase": "running",
+                            "is_idle": False,
+                        }
+                    )
+                )
+            if args[0] == "wait":
+                return completed(json.dumps({"outcome": "finished"}))
+            if args[0] == "transcript":
+                if "--role" in args:
+                    return completed(
+                        json.dumps(
+                            {
+                                "items": [{"seq": 13, "stable_id": "full", "text": "Complete text"}],
+                                "next_after_seq": 13,
+                                "latest_seq": 13,
+                            }
+                        )
+                    )
+                self.assertIn("--after-seq", args)
+                self.assertEqual(args[args.index("--after-seq") + 1], "12")
+                return completed(json.dumps({"items": [], "next_after_seq": 12}))
+            if args[0] == "suspend":
+                return completed("{}")
+            self.fail(f"unexpected fake mj command: {args}")
+
+        with mock.patch.object(monitor, "mj_command", side_effect=fake_mj), mock.patch.object(
+            monitor,
+            "run_command",
+            return_value=json.dumps(
+                [{"sha": "base-sha", "commit": {"message": "launch base"}}]
+            ),
+        ), mock.patch.object(monitor, "failing_signature", return_value=""), mock.patch.object(
+            monitor, "slack_send", return_value=(True, "reply-ts")
+        ) as slack:
+            monitor.reattach_running_invocations(self.conn, self.transport)
+        row = self.conn.execute(
+            "SELECT status, output, mj_transcript_after_seq FROM invocations "
+            "WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["output"], "Complete text")
+        self.assertEqual(row["mj_transcript_after_seq"], 12)
+        # Only the invocation outcome was sent; the existing transcript item was not.
+        self.assertEqual(slack.call_count, 1)
+
+    def test_restart_finalizes_an_ended_session_from_its_saved_outcome(self):
+        insert_invocation(
+            self.conn,
+            status="running",
+            session_id="session-ended",
+            cursor=6,
+            output="Captured before restart\n\n",
+        )
+        commands = []
+
+        def fake_mj(args, *, timeout=60):
+            commands.append(args[0])
+            if args[0] == "sessions":
+                return completed(
+                    json.dumps(
+                        {
+                            "id": "session-ended",
+                            "state": "suspended",
+                            "chat_phase": "closed",
+                            "is_idle": True,
+                            "last_turn_outcome": {
+                                "outcome": {
+                                    "kind": "completed",
+                                    "stop_reason": "EndTurn",
+                                }
+                            },
+                        }
+                    )
+                )
+            if args[0] == "transcript":
+                if "--role" in args:
+                    return completed(
+                        json.dumps(
+                            {
+                                "items": [{"seq": 7, "stable_id": "full", "text": "Captured before restart"}],
+                                "next_after_seq": 7,
+                                "latest_seq": 7,
+                            }
+                        )
+                    )
+                self.assertEqual(args[args.index("--after-seq") + 1], "6")
+                return completed(json.dumps({"items": [], "next_after_seq": 6}))
+            if args[0] == "wait":
+                return completed(json.dumps({"outcome": "finished"}))
+            if args[0] == "suspend":
+                return completed("{}")
+            self.fail(f"unexpected fake mj command: {args}")
+
+        with mock.patch.object(monitor, "mj_command", side_effect=fake_mj), mock.patch.object(
+            monitor,
+            "run_command",
+            return_value=json.dumps(
+                [{"sha": "base-sha", "commit": {"message": "launch base"}}]
+            ),
+        ), mock.patch.object(monitor, "failing_signature", return_value=""), mock.patch.object(
+            monitor, "slack_send", return_value=(True, "reply-ts")
+        ):
+            monitor.reattach_running_invocations(self.conn, self.transport)
+        row = self.conn.execute(
+            "SELECT status, output FROM invocations WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["output"], "Captured before restart")
+        self.assertIn("wait", commands)
+
+    def test_restart_uses_normalized_wait_outcome_for_completed_failure(self):
+        insert_invocation(
+            self.conn,
+            status="running",
+            session_id="session-failed",
+        )
+
+        def fake_mj(args, *, timeout=60):
+            if args[0] == "sessions":
+                return completed(
+                    json.dumps(
+                        {
+                            "id": "session-failed",
+                            "state": "suspended",
+                            "chat_phase": "closed",
+                            "is_idle": True,
+                            "last_turn_outcome": {
+                                "outcome": {
+                                    "kind": "completed",
+                                    "stop_reason": "harness_failed",
+                                }
+                            },
+                        }
+                    )
+                )
+            if args[0] == "wait":
+                return completed(
+                    json.dumps(
+                        {"outcome": "error", "stop_reason": "harness_failed"}
+                    ),
+                    1,
+                )
+            if args[0] == "transcript":
+                return completed(json.dumps({"items": [], "next_after_seq": 0}))
+            if args[0] == "suspend":
+                return completed("{}")
+            self.fail(f"unexpected fake mj command: {args}")
+
+        with mock.patch.object(monitor, "mj_command", side_effect=fake_mj), mock.patch.object(
+            monitor,
+            "run_command",
+            return_value=json.dumps(
+                [{"sha": "base-sha", "commit": {"message": "launch base"}}]
+            ),
+        ), mock.patch.object(monitor, "failing_signature", return_value=""), mock.patch.object(
+            monitor, "slack_send", return_value=(True, "reply-ts")
+        ):
+            monitor.reattach_running_invocations(self.conn, self.transport)
+        row = self.conn.execute(
+            "SELECT status FROM invocations WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(row["status"], "error")
+
+    def test_slack_outage_does_not_hide_escalation_in_complete_agent_transcript(self):
+        insert_invocation(
+            self.conn, status="running", session_id="session-slack-down"
+        )
+        issue_url = "https://github.com/BrokkAi/bifrost-dev/issues/99"
+
+        def fake_mj(args, *, timeout=60):
+            if args[0] == "transcript":
+                if "--role" in args:
+                    return completed(
+                        json.dumps(
+                            {
+                                "items": [
+                                    {
+                                        "seq": 2,
+                                        "stable_id": "final-agent-message",
+                                        "text": f"<@U08P3FAEU3G> filed {issue_url}",
+                                    }
+                                ],
+                                "next_after_seq": 2,
+                                "latest_seq": 2,
+                            }
+                        )
+                    )
+                return completed(
+                    json.dumps(
+                        {
+                            "items": [
+                                {"seq": 1, "stable_id": "relay-item", "text": "Working"}
+                            ],
+                            "next_after_seq": 1,
+                            "latest_seq": 1,
+                        }
+                    )
+                )
+            if args[0] == "suspend":
+                return completed("{}")
+            self.fail(f"unexpected fake mj command: {args}")
+
+        def finish_after_relay_attempt(conn, transport, run_id, session_id, timeout):
+            monitor.drain_transcript(conn, transport, run_id, session_id)
+            return monitor.TurnResult("completed", "finished")
+
+        with mock.patch.object(
+            monitor, "mj_command", side_effect=fake_mj
+        ), mock.patch.object(
+            monitor, "supervise_turn", side_effect=finish_after_relay_attempt
+        ), mock.patch.object(
+            monitor, "slack_send", return_value=(False, None)
+        ), mock.patch.object(
+            monitor, "failing_signature", return_value=""
+        ):
+            result = monitor.run_session_lifecycle(
+                self.conn,
+                self.transport,
+                make_run(),
+                "session-slack-down",
+                "ci-repair/42-1",
+                3600,
+            )
+            self.assertIn(issue_url, result.output)
+            monitor.finalize_invocation(
+                self.conn, self.transport, make_run(), result, "master-head", None
+            )
+
+        self.assertIn(issue_url, result.output)
+        row = self.conn.execute(
+            "SELECT status, issue_url FROM invocations WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["issue_url"], issue_url)
+        cursor = self.conn.execute(
+            "SELECT mj_transcript_after_seq FROM invocations WHERE workflow_run_id = 42"
+        ).fetchone()[0]
+        self.assertEqual(cursor, 0)
+        episode = monitor.get_escalation(self.conn)
+        self.assertIsNotNone(episode)
+        self.assertTrue(episode["escalated"])
+
+    def test_restart_reattaches_to_active_timeout_handoff(self):
+        insert_invocation(
+            self.conn,
+            status="running",
+            session_id="session-handoff",
+        )
+        self.conn.execute(
+            "UPDATE invocations SET timed_out = 1, timeout_handoff_status = 'running' "
+            "WHERE workflow_run_id = 42"
+        )
+        self.conn.commit()
+
+        def fake_mj(args, *, timeout=60):
+            if args[0] == "sessions":
+                return completed(
+                    json.dumps(
+                        {
+                            "id": "session-handoff",
+                            "state": "running",
+                            "chat_phase": "running",
+                            "is_idle": False,
+                        }
+                    )
+                )
+            if args[0] == "transcript":
+                return completed(json.dumps({"items": [], "next_after_seq": 0}))
+            if args[0] == "suspend":
+                return completed("{}")
+            self.fail(f"unexpected fake mj command: {args}")
+
+        with mock.patch.object(
+            monitor, "mj_command", side_effect=fake_mj
+        ), mock.patch.object(
+            monitor,
+            "supervise_turn",
+            return_value=monitor.TurnResult("completed", "finished"),
+        ) as supervise, mock.patch.object(
+            monitor,
+            "run_command",
+            return_value=json.dumps(
+                [{"sha": "base-sha", "commit": {"message": "launch base"}}]
+            ),
+        ), mock.patch.object(
+            monitor, "failing_signature", return_value=""
+        ), mock.patch.object(
+            monitor, "slack_send", return_value=(True, "reply-ts")
+        ):
+            monitor.reattach_running_invocations(self.conn, self.transport)
+
+        self.assertEqual(
+            supervise.call_args.args[-1], monitor.MJ_HANDOFF_TIMEOUT_SECONDS
+        )
+        row = self.conn.execute(
+            "SELECT status, timeout_handoff_status FROM invocations "
+            "WHERE workflow_run_id = 42"
+        ).fetchone()
         self.assertEqual(row["status"], "timed_out")
-        self.assertEqual(row["recovery_status"], "complete")
-        self.assertIn(str(package), row["output"])
+        self.assertEqual(row["timeout_handoff_status"], "completed")
 
-    def test_cleanup_failure_retains_source_and_retries_original_package(self):
-        original = monitor.run_command
+    def test_timeout_interrupts_hands_off_in_session_and_suspends(self):
+        insert_invocation(self.conn, session_id="session-timeout")
+        commands = []
+        prompts = []
 
-        def fail_fetch(args, **kwargs):
-            if args[1] == "fetch":
-                raise monitor.CommandError("network unavailable")
-            return original(args, **kwargs)
+        def fake_mj(args, *, timeout=60):
+            commands.append(args[0])
+            if args[0] == "interrupt-turn":
+                return completed("{}")
+            if args[0] == "wait":
+                return completed(json.dumps({"outcome": "cancelled"}))
+            if args[0] == "transcript":
+                return completed(json.dumps({"items": [], "next_after_seq": 0}))
+            if args[0] == "prompt":
+                prompt_path = Path(args[args.index("--prompt-file") + 1])
+                prompts.append(prompt_path.read_text())
+                return completed(json.dumps({"session_id": "session-timeout", "turn_id": 2}))
+            if args[0] == "suspend":
+                if "--acknowledge-unpublished-work" not in args:
+                    return completed(
+                        "",
+                        1,
+                        "unpublished work; retry with --acknowledge-unpublished-work",
+                    )
+                return completed("{}")
+            self.fail(f"unexpected fake mj command: {args}")
 
-        with mock.patch.object(monitor, "run_command", side_effect=fail_fetch):
-            saved = monitor.recover_invocation_worktree(
-                self.conn, 42, self.run.sha, "session-123", transcript="diagnosis")
-        self.assertEqual(saved.preservation_status, "complete", saved.detail)
-        self.assertEqual(saved.cleanup_status, "failed")
-        self.assertEqual((self.fixture.repair / "local.txt").read_text(), "unfinished edits\n")
-        self.assertTrue((self.fixture.repair / "new.txt").exists())
-        self.conn.execute("UPDATE invocations SET status = 'timed_out'")
+        timeout = monitor.TurnResult("running", "timeout", timed_out=True)
+        finished = monitor.TurnResult("completed", "finished")
+        with mock.patch.object(
+            monitor, "supervise_turn", side_effect=[timeout, finished]
+        ), mock.patch.object(monitor, "mj_command", side_effect=fake_mj):
+            result = monitor.run_session_lifecycle(
+                self.conn,
+                self.transport,
+                make_run(),
+                "session-timeout",
+                "ci-repair/42-1",
+                3600,
+            )
+        self.assertTrue(result.timed_out)
+        self.assertTrue(result.handoff_completed)
+        self.assertIn("mj resume --session session-timeout", prompts[0])
+        self.assertIn("ci-repair/42-1", prompts[0])
+        self.assertIn("List any unpushed commits", prompts[0])
+        self.assertIn("Do not push any commit", prompts[0])
+        self.assertLess(commands.index("interrupt-turn"), commands.index("prompt"))
+        self.assertEqual(commands.count("suspend"), 2)
+
+    def test_session_is_suspended_after_success_and_supervision_failure(self):
+        insert_invocation(self.conn, session_id="session-outcome")
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                self.conn.execute(
+                    "UPDATE invocations SET mj_transcript_after_seq = 0 WHERE workflow_run_id = 42"
+                )
+                self.conn.commit()
+                calls = []
+
+                def fake_mj(args, *, timeout=60):
+                    calls.append(args[0])
+                    if args[0] == "transcript":
+                        return completed(json.dumps({"items": [], "next_after_seq": 0}))
+                    if args[0] == "suspend":
+                        return completed("{}")
+                    self.fail(f"unexpected fake mj command: {args}")
+
+                wait = mock.Mock(
+                    side_effect=monitor.MjError("daemon unavailable")
+                    if failure
+                    else None,
+                    return_value=monitor.TurnResult("completed", "finished"),
+                )
+                with mock.patch.object(
+                    monitor, "supervise_turn", wait
+                ), mock.patch.object(monitor, "mj_command", side_effect=fake_mj):
+                    if failure:
+                        with self.assertRaises(monitor.MjError):
+                            monitor.run_session_lifecycle(
+                                self.conn, self.transport, make_run(),
+                                "session-outcome", "ci-repair/42-1", 3600,
+                            )
+                    else:
+                        monitor.run_session_lifecycle(
+                            self.conn, self.transport, make_run(),
+                            "session-outcome", "ci-repair/42-1", 3600,
+                        )
+                self.assertIn("suspend", calls)
+
+    def test_suspend_warning_is_logged_and_posted_to_thread(self):
+        insert_invocation(self.conn, session_id="session-warning")
+        response = completed(
+            json.dumps(
+                {
+                    "accepted": True,
+                    "warning": "one sub-agent has not handed back",
+                }
+            )
+        )
+        with mock.patch.object(
+            monitor, "mj_command", return_value=response
+        ), mock.patch.object(
+            monitor, "slack_send", return_value=(True, "reply")
+        ) as slack:
+            self.assertTrue(
+                monitor.suspend_session(
+                    self.conn, self.transport, 42, "session-warning"
+                )
+            )
+        self.assertIn("one sub-agent has not handed back", slack.call_args.args[1])
+        self.assertEqual(slack.call_args.kwargs["thread_ts"], "thread-1")
+
+    def test_pending_suspend_retries_once_then_notifies_once(self):
+        insert_invocation(
+            self.conn,
+            status="completed",
+            session_id="session-still-running",
+        )
+        self.conn.execute(
+            "UPDATE invocations SET suspend_requested = 1 WHERE workflow_run_id = 42"
+        )
         self.conn.commit()
-        monitor.retry_pending_recoveries(self.conn)
-        retried = monitor.recovery.load(Path(saved.manifest_path).parent)
-        self.assertEqual(retried.stash_sha, saved.stash_sha)
-        self.assertEqual(retried.cleanup_status, "complete", retried.detail)
-        self.assertEqual(git(self.fixture.repair, "status", "--porcelain"), "")
+        commands = []
 
-    def test_pending_recovery_blocks_poll_and_preflight(self):
-        self.conn.execute("UPDATE invocations SET recovery_status = 'failed'")
+        def fake_mj(args, *, timeout=60):
+            commands.append(args[0])
+            if args[0] == "sessions":
+                return completed(
+                    json.dumps({"id": "session-still-running", "state": "running"})
+                )
+            if args[0] == "suspend":
+                return completed('{"accepted":true}')
+            self.fail(f"unexpected fake mj command: {args}")
+
+        with mock.patch.object(monitor, "mj_command", side_effect=fake_mj), mock.patch.object(
+            monitor, "slack_send", return_value=(True, "reply")
+        ) as slack:
+            monitor.check_pending_suspensions(self.conn, self.transport)
+            monitor.check_pending_suspensions(self.conn, self.transport)
+            monitor.check_pending_suspensions(self.conn, self.transport)
+        self.assertEqual(commands.count("suspend"), 1)
+        self.assertEqual(slack.call_count, 1)
+        row = self.conn.execute(
+            "SELECT suspend_retry_count, suspend_failure_notified FROM invocations "
+            "WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(row["suspend_retry_count"], 1)
+        self.assertEqual(row["suspend_failure_notified"], 1)
+
+    def test_suspend_verification_failure_notifies_after_three_ticks(self):
+        insert_invocation(
+            self.conn,
+            status="completed",
+            session_id="session-unreachable",
+        )
+        self.conn.execute(
+            "UPDATE invocations SET suspend_requested = 1 WHERE workflow_run_id = 42"
+        )
         self.conn.commit()
-        monitor.STATE_DIR.mkdir(parents=True, exist_ok=True)
-        with mock.patch.object(monitor, "LOCK_PATH", self.root / "monitor.lock"), \
-             mock.patch.object(monitor, "load_slack_transport", return_value=monitor.SlackTransport("webhook", webhook="unused")), \
-             mock.patch.object(monitor, "recover_interrupted"), \
-             mock.patch.object(monitor, "retry_pending_recoveries"), \
-             mock.patch.object(monitor, "poll_ci") as poll, \
-             mock.patch.object(monitor, "preflight_worktree") as preflight:
-            self.assertEqual(monitor.run_monitor(), 4)
-        poll.assert_not_called()
-        preflight.assert_not_called()
+        with mock.patch.object(
+            monitor,
+            "mj_command",
+            return_value=completed("", 1, "daemon unreachable"),
+        ), mock.patch.object(
+            monitor, "slack_send", return_value=(True, "reply")
+        ) as slack:
+            for _ in range(3):
+                monitor.check_pending_suspensions(self.conn, self.transport)
+        self.assertEqual(slack.call_count, 1)
+        self.assertIn("3 consecutive times", slack.call_args.args[1])
+        row = self.conn.execute(
+            "SELECT suspend_verify_failures, suspend_failure_notified FROM invocations "
+            "WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(row["suspend_verify_failures"], 3)
+        self.assertEqual(row["suspend_failure_notified"], 1)
 
-    def test_missing_process_leader_does_not_hide_surviving_children(self):
-        with mock.patch.object(Path, "read_bytes", side_effect=FileNotFoundError), \
-             mock.patch.object(monitor.os, "killpg") as kill:
-            self.assertFalse(monitor.terminate_recorded_codex(123))
-        kill.assert_called_once_with(123, 0)
+    def test_push_detection_uses_run_trailer_and_newest_matching_commit(self):
+        pages = [
+            [
+                {
+                    "sha": "newest",
+                    "commit": {
+                        "message": "merge\n\nReviewed-by: A Person <a@example.com>\nCI-Repair-Run: 42\n",
+                    },
+                },
+                {
+                    "sha": "body-only",
+                    "commit": {
+                        "message": "fix\n\nCI-Repair-Run: 42\n\nLater body paragraph",
+                    },
+                },
+            ],
+            [
+                {
+                    "sha": "older",
+                    "commit": {
+                        "message": "fix\n\nCI-Repair-Run: 42",
+                    },
+                },
+                {
+                    "sha": "other-run",
+                    "commit": {
+                        "message": "fix\n\nCI-Repair-Run: 420",
+                    },
+                },
+            ],
+            [{"sha": "launch-base", "commit": {"message": "launch base"}}],
+        ]
+        with mock.patch.object(monitor, "PUSH_DETECTION_PAGE_SIZE", 2), mock.patch.object(
+            monitor, "run_command", side_effect=[json.dumps(page) for page in pages]
+        ) as command:
+            master_sha, pushed_sha = monitor.read_pushed_commit(
+                "launch-base", 42
+            )
+        self.assertEqual((master_sha, pushed_sha), ("newest", "newest"))
+        self.assertEqual(command.call_count, 3)
+        first_query = monitor.urllib.parse.urlparse(
+            command.call_args_list[0].args[0][-1]
+        ).query
+        later_query = monitor.urllib.parse.urlparse(
+            command.call_args_list[1].args[0][-1]
+        ).query
+        first_params = monitor.urllib.parse.parse_qs(first_query)
+        later_params = monitor.urllib.parse.parse_qs(later_query)
+        self.assertEqual(first_params["sha"], ["master"])
+        self.assertEqual(first_params["per_page"], ["2"])
+        self.assertEqual(first_params["page"], ["1"])
+        self.assertEqual(later_params["sha"], ["newest"])
+        self.assertEqual(later_params["page"], ["2"])
 
-    def test_unstoppable_restarted_process_blocks_recovery_and_retains_pid(self):
-        self.conn.execute("UPDATE invocations SET status = 'handoff_running', codex_pid = 123")
+    def test_push_history_without_launch_base_is_indeterminate(self):
+        pages = [
+            [{"sha": f"new-{n}", "commit": {"message": "unrelated"}} for n in range(2)],
+            [{"sha": f"older-{n}", "commit": {"message": "unrelated"}} for n in range(2)],
+        ]
+        with mock.patch.object(monitor, "PUSH_DETECTION_PAGE_SIZE", 2), mock.patch.object(
+            monitor, "PUSH_DETECTION_MAX_PAGES", 2
+        ), mock.patch.object(
+            monitor, "run_command", side_effect=[json.dumps(page) for page in pages]
+        ) as command:
+            with self.assertRaises(monitor.PushDetectionIndeterminate):
+                monitor.read_pushed_commit("rewritten-away-base", 42)
+        self.assertEqual(command.call_count, 2)
+
+    def test_commit_trailer_parser_requires_git_final_trailer_block(self):
+        self.assertTrue(
+            monitor.has_repair_run_trailer("fix\n\nCI-Repair-Run: 42\n", 42)
+        )
+        self.assertFalse(
+            monitor.has_repair_run_trailer(
+                "fix\n\nCI-Repair-Run: 42\n\nThis is body text", 42
+            )
+        )
+
+    def test_push_detection_failure_finalizes_and_notifies(self):
+        insert_invocation(self.conn, status="running", session_id="session-push-fail")
+        result = monitor.SessionResult("completed", "captured", False, False)
+        with mock.patch.object(
+            monitor, "slack_send", return_value=(True, "reply")
+        ) as slack:
+            monitor.finalize_push_detection_failure(
+                self.conn,
+                self.transport,
+                make_run(),
+                result,
+                monitor.CommandError("GitHub unavailable"),
+            )
+        row = self.conn.execute(
+            "SELECT status, finished_at FROM invocations WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(row["status"], "failed")
+        self.assertIsNotNone(row["finished_at"])
+        self.assertIn("GitHub commit detection failed", slack.call_args.args[1])
+
+    def test_indeterminate_push_finalizes_unknown_without_escalation_detection(self):
+        insert_invocation(self.conn, status="running", session_id="session-push-unknown")
+        result = monitor.SessionResult(
+            "completed",
+            "<@U08P3FAEU3G> https://github.com/BrokkAi/bifrost-dev/issues/99",
+            False,
+            False,
+        )
+        with mock.patch.object(monitor, "detect_escalation") as detect, mock.patch.object(
+            monitor, "slack_send", return_value=(True, "reply")
+        ) as slack:
+            monitor.finalize_push_detection_indeterminate(
+                self.conn,
+                self.transport,
+                make_run(),
+                result,
+                monitor.PushDetectionIndeterminate("launch base is absent"),
+            )
+        detect.assert_not_called()
+        row = self.conn.execute(
+            "SELECT status, issue_url FROM invocations WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(row["status"], "push_unknown")
+        self.assertIsNone(row["issue_url"])
+        self.assertIn("push status is unknown", slack.call_args.args[1])
+
+    def test_escalation_detection_is_gated_after_a_tagged_push(self):
+        insert_invocation(self.conn, status="running", session_id="s-42")
+        result = monitor.SessionResult(
+            "completed",
+            "<@U08P3FAEU3G> filed https://github.com/BrokkAi/bifrost-dev/issues/88",
+            False,
+            False,
+        )
+        with mock.patch.object(monitor, "failing_signature", return_value=""), mock.patch.object(
+            monitor, "detect_escalation"
+        ) as detect, mock.patch.object(
+            monitor, "slack_send", return_value=(True, "reply-ts")
+        ):
+            monitor.finalize_invocation(
+                self.conn, self.transport, make_run(), result, "new-master", "pushed-sha"
+            )
+        detect.assert_not_called()
+        row = self.conn.execute(
+            "SELECT status, issue_url FROM invocations WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(row["status"], "completed")
+        self.assertIsNone(row["issue_url"])
+
+    def test_legacy_rows_are_finished_history_not_recovery_work(self):
+        monitor.ensure_column(
+            self.conn, "invocations", "recovery_manifest_path", "TEXT"
+        )
+        monitor.ensure_column(self.conn, "invocations", "recovery_status", "TEXT")
+        for run_id, old_status in enumerate(
+            ("modified_worktree", "interrupted", "orphaned_candidate"), start=100
+        ):
+            insert_invocation(
+                self.conn,
+                run_id=run_id,
+                status=old_status,
+                session_id="legacy-session",
+            )
+            self.conn.execute(
+                "UPDATE invocations SET recovery_manifest_path = '/old/manifest.json', "
+                "recovery_status = 'failed' WHERE workflow_run_id = ?",
+                (run_id,),
+            )
         self.conn.commit()
-        with mock.patch.object(monitor, "terminate_recorded_codex", return_value=False), \
-             mock.patch.object(monitor, "recover_invocation_worktree") as recover:
-            monitor.recover_interrupted(self.conn, monitor.SlackTransport("webhook", webhook="unused"))
-        recover.assert_not_called()
-        row = self.conn.execute("SELECT * FROM invocations").fetchone()
-        self.assertEqual(row["codex_pid"], 123)
-        self.assertEqual(row["status"], "handoff_running")
-        self.assertEqual(row["recovery_status"], "failed")
+        self.assertTrue(monitor.invocation_exists(self.conn, 100))
+        self.assertTrue({100, 101, 102}.issubset(monitor.handled_run_ids(self.conn)))
+        with mock.patch.object(monitor, "mj_command") as command:
+            monitor.reattach_running_invocations(self.conn, self.transport)
+        command.assert_not_called()
+
+    def test_blocked_notification_is_once_per_run_and_reason(self):
+        run = make_run()
+        with mock.patch.object(
+            monitor,
+            "slack_send",
+            side_effect=[(False, None), (True, "thread"), (True, "thread")],
+        ) as slack:
+            monitor.record_blocked_reason(
+                self.conn, self.transport, run, "daemon_unreachable", "not connected"
+            )
+            monitor.record_blocked_reason(
+                self.conn, self.transport, run, "daemon_unreachable", "still not connected"
+            )
+            monitor.record_blocked_reason(
+                self.conn, self.transport, run, "daemon_unreachable", "delivered now"
+            )
+            monitor.record_blocked_reason(
+                self.conn, self.transport, run, "mj_too_old", "missing transcript option"
+            )
+        rows = self.conn.execute(
+            "SELECT workflow_run_id, reason, slack_notification_attempted "
+            "FROM blocked_notifications ORDER BY reason"
+        ).fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(slack.call_count, 3)
+        self.assertTrue(all(row["slack_notification_attempted"] for row in rows))
+
+    def test_connect_db_adds_cursor_columns_to_existing_invocations(self):
+        self.conn.close()
+        legacy_path = Path(self.temp.name) / "legacy.db"
+        with sqlite3.connect(legacy_path) as legacy:
+            legacy.execute(
+                """
+                CREATE TABLE invocations (
+                    workflow_run_id INTEGER PRIMARY KEY,
+                    sha TEXT NOT NULL,
+                    workflow_run_url TEXT NOT NULL,
+                    conclusion TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    status TEXT NOT NULL
+                )
+                """
+            )
+        with mock.patch.object(monitor, "DB_PATH", legacy_path):
+            migrated = monitor.connect_db()
+        try:
+            columns = {
+                row["name"]
+                for row in migrated.execute("PRAGMA table_info(invocations)")
+            }
+            self.assertIn("mj_transcript_after_seq", columns)
+            self.assertIn("workflow", columns)
+            self.assertIn("suspend_requested", columns)
+            self.assertIn("suspend_retry_count", columns)
+            self.assertIn("suspend_failure_notified", columns)
+            self.assertIn("suspend_verify_failures", columns)
+        finally:
+            migrated.close()
 
 
+class PromptContractTests(unittest.TestCase):
+    def test_repair_prompt_requires_trailer_merge_and_master_push(self):
+        prompt = monitor.build_prompt(make_run())
+        self.assertIn("CI-Repair-Run: 42", prompt)
+        self.assertIn("git fetch origin", prompt)
+        self.assertIn("merge origin/master", prompt)
+        self.assertIn("git push origin HEAD:master", prompt)
+        self.assertIn("Never force-push", prompt)
+        self.assertIn("include the same CI-Repair-Run trailer", prompt)
+        self.assertNotIn("WORKTREE_BRANCH", prompt)
+        self.assertNotIn("monitor owns", prompt.lower())
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_timeout_handoff_keeps_session_and_forbids_push(self):
+        prompt = monitor.build_timeout_handoff_prompt(
+            make_run(), "session-42", "ci-repair/42-1"
+        )
+        self.assertIn("session session-42", prompt)
+        self.assertIn("branch ci-repair/42-1", prompt)
+        self.assertIn("mj resume --session session-42", prompt)
+        self.assertIn("Do not push any commit", prompt)
+        self.assertIn("List any unpushed commits", prompt)
+        self.assertNotIn("recovery block", prompt.lower())

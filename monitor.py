@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Brokk AI
-"""Poll Bifrost CI workflows and launch one agent repair attempt per failed run."""
+"""Poll Bifrost CI workflows and launch one Mjolnir container repair per failed run."""
 
 from __future__ import annotations
 
@@ -12,79 +12,18 @@ import getpass
 import json
 import os
 import re
-import select
-import signal
 import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-import recovery
-
-
-# The agent used for CI repair is configured once, outside this repository, in
-# a small TOML file shared with sm-watch. ``inference_profile`` names a profile
-# home directory: a path containing "codex" selects the Codex agent and becomes
-# its CODEX_HOME, a path containing "claude" selects the Claude agent and
-# becomes its CLAUDE_CONFIG_DIR.
-ANVIL_CONFIG_PATH = Path.home() / ".config/anvil/anvil.toml"
-
-
-@dataclass(frozen=True)
-class Profile:
-    """A resolved ``inference_profile`` value."""
-
-    name: str
-    kind: str
-    home: Path
-    model: str
-
-
-def profile_from_name(name: str, source: str) -> Profile:
-    """Map an ``inference_profile`` value onto the agent it selects.
-
-    "codex" is tested before "claude" so a path that happens to contain both
-    resolves the same way every time.
-    """
-    home = Path(name).expanduser()
-    if "codex" in name:
-        return Profile(name=name, kind="codex", home=home, model="gpt-5.6-sol")
-    if "claude" in name:
-        return Profile(name=name, kind="claude", home=home, model="claude-opus-5")
-    raise RuntimeError(
-        f"{source}: inference_profile {name!r} names neither a codex nor a "
-        "claude profile home"
-    )
-
-
-def load_profile(path: Path | None = None) -> Profile:
-    """Read the selected profile from anvil.toml.
-
-    The ANVIL_CONFIG environment variable overrides the default path. Every
-    failure raises RuntimeError naming the file that has to be fixed.
-    """
-    config_path = Path(path or os.environ.get("ANVIL_CONFIG") or ANVIL_CONFIG_PATH)
-    try:
-        raw = config_path.read_bytes()
-    except OSError as exc:
-        raise RuntimeError(f"{config_path}: cannot read anvil config: {exc}") from exc
-    try:
-        data = tomllib.loads(raw.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
-        raise RuntimeError(f"{config_path}: invalid TOML: {exc}") from exc
-    name = data.get("inference_profile")
-    if not isinstance(name, str) or not name.strip():
-        raise RuntimeError(f"{config_path}: inference_profile is missing or blank")
-    return profile_from_name(name.strip(), str(config_path))
 
 
 REPO_NAME = "BrokkAi/bifrost-dev"
@@ -94,75 +33,40 @@ TRACKED_WORKFLOWS: tuple[tuple[str, str | None], ...] = (
     ("Nightly CI", None),
 )
 BRANCH = "master"
-WORKTREE_BRANCH = "bifrost-ci"
-WORKTREE = Path("/home/jonathan/Projects/bifrost-ci")
-DB_PATH = WORKTREE / "activity.db"
+DB_PATH = Path("/home/jonathan/Projects/bifrost-ci/activity.db")
 STATE_DIR = Path("/home/jonathan/.local/state/bifrost-ci-monitor")
 LOCK_PATH = STATE_DIR / "monitor.lock"
 CONFIG_DIR = Path("/home/jonathan/.config/bifrost-ci-monitor")
 WEBHOOK_PATH = CONFIG_DIR / "slack-webhook-url"
 BOT_TOKEN_PATH = CONFIG_DIR / "bot-token"
 CHANNEL_PATH = CONFIG_DIR / "channel-id"
-CODEX_BIN = Path("/home/jonathan/.nvm/versions/node/v24.15.0/bin/codex")
-# Which agent performs the repair, and the profile home it runs out of, both
-# come from anvil.toml. That single value is the whole switch: argv, JSONL
-# event parsing, and the process guard all key off AGENT, and nothing else in
-# the monitor is agent-specific. Loading must never raise at import time,
-# because the tests import this module; main() reports the error instead.
-try:
-    PROFILE, PROFILE_ERROR = load_profile(), None
-except RuntimeError as exc:
-    PROFILE, PROFILE_ERROR = None, str(exc)
-AGENT = PROFILE.kind if PROFILE else "claude"  # "claude" | "codex"
-CODEX_HOME = (
-    PROFILE.home
-    if PROFILE and PROFILE.kind == "codex"
-    else Path("/home/jonathan/.codex4")
-)
-CLAUDE_CONFIG_DIR = PROFILE.home if PROFILE and PROFILE.kind == "claude" else None
-MBX_BIN = Path("/home/jonathan/.local/share/mbx/bin")
+MJ_BIN = Path("/home/jonathan/.cargo/bin/mj")
 GH_BIN = Path("/usr/bin/gh")
-GIT_BIN = Path("/usr/bin/git")
-CODEX_TIMEOUT_SECONDS = 60 * 60
-CODEX_HANDOFF_TIMEOUT_SECONDS = 10 * 60
-# Pin the repair model explicitly rather than inheriting ~/.codex/config.toml's
-# default, so the monitor's behavior does not silently change when that file is
-# edited for interactive use. These flags are spliced into every `codex exec`.
-CODEX_MODEL = "gpt-5.6-sol"
-CODEX_REASONING_EFFORT = "xhigh"
-CODEX_MODEL_ARGS = [
-    "-m",
-    CODEX_MODEL,
-    "-c",
-    f"model_reasoning_effort={CODEX_REASONING_EFFORT}",
-]
-# Both markers are accepted when deciding whether a recorded pid is still our
-# agent, so a pid recorded under the previous agent stays reclaimable across a
-# switch instead of blocking recovery forever.
-AGENT_PROCESS_MARKERS = (b"codex", b"claude")
-CLAUDE_BIN = Path("/home/jonathan/.local/bin/claude")
-# Pinned for the same reason CODEX_MODEL is: the monitor must not silently
-# change behavior when ~/.claude/settings.json is edited for interactive use.
-CLAUDE_MODEL = "claude-opus-5"
-CLAUDE_EFFORT = "xhigh"
+MJ_WORKSPACE = "CI"
+MJ_TARGET = "podman"
+MJ_BUNDLE = "bifrost"
+MJ_MODEL = "opus"
+AGENT_LABEL = "Claude Opus 5.5 (mj)"
+MJ_TURN_TIMEOUT_SECONDS = 60 * 60
+MJ_HANDOFF_TIMEOUT_SECONDS = 10 * 60
+MJ_WAIT_POLL_SECONDS = 5
+MJ_HANDOFF_INTERRUPTION_GRACE_SECONDS = 60
+PUSH_DETECTION_PAGE_SIZE = 100
+PUSH_DETECTION_MAX_PAGES = 100
+SUSPEND_VERIFY_FAILURE_THRESHOLD = 3
 SLACK_TIMEOUT_SECONDS = 10
 SLACK_CHAT_URL = "https://slack.com/api/chat.postMessage"
 SLACK_MESSAGE_LIMIT = 3500
 RED_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required"}
 RUN_RETRY_SETTLE_SECONDS = 5 * 60
 ISSUE_STATE_RETRY_DELAYS = (1, 2)
-PUSH_RETRY_DELAYS = (1, 2)
 RETRYABLE_INVOCATION_STATUSES = {
-    "interrupted",
-    "orphaned_candidate",
-    "push_failed",
+    "blocked",
+    "launch_failed",
+    "supervision_failed",
 }
 
-# People Codex pings on Slack when it escalates a design-level CI failure
-# instead of fixing it. These are Slack member IDs (e.g. "U08ABCD1234"), not
-# handles: embedded as <@ID> in Codex's message, they render as real,
-# notifying mentions because the relay forwards that message via
-# chat.postMessage. Replace the placeholders below with the real IDs.
+# Mention tokens in agent final messages are forwarded through the bot transport.
 ESCALATION_SLACK_MEMBER_IDS = ("U08P3FAEU3G", "U093T782RTN")  # Jonathan, Dave
 
 
@@ -174,43 +78,18 @@ def log(message: str) -> None:
     print(f"{utc_now()} {message}", file=sys.stderr, flush=True)
 
 
-def child_environment() -> dict[str, str]:
-    env = os.environ.copy()
-    node_bin = str(CODEX_BIN.parent)
-    claude_bin = str(CLAUDE_BIN.parent)
-    # CODEX_HOME is inert under the Claude agent but must stay set so selecting
-    # a codex profile needs no other change. HOME is what lets Claude Code find
-    # its credentials. CLAUDE_CONFIG_DIR is set from the profile when a claude
-    # profile is selected: with the default ~/.claude the ~/.claude/projects/
-    # <cwd>/ session store that --resume reads is unchanged, and a different
-    # claude home moves that store with it.
-    env.update(
-        {
-            "HOME": "/home/jonathan",
-            "CODEX_HOME": str(CODEX_HOME),
-            "PATH": f"{MBX_BIN}:{claude_bin}:{node_bin}:/usr/local/bin:/usr/bin:/bin",
-            "XDG_RUNTIME_DIR": "/run/user/1000",
-            "SSH_AUTH_SOCK": "/run/user/1000/openssh_agent",
-            "GIT_SSH_COMMAND": "/usr/bin/ssh -o BatchMode=yes",
-        }
-    )
-    if CLAUDE_CONFIG_DIR is not None:
-        env["CLAUDE_CONFIG_DIR"] = str(CLAUDE_CONFIG_DIR)
-    else:
-        # Under a codex profile the child must not inherit a CLAUDE_CONFIG_DIR
-        # that happens to be set in the monitor's own environment.
-        env.pop("CLAUDE_CONFIG_DIR", None)
-    return env
-
-
 class CommandError(RuntimeError):
     pass
 
 
-class PreflightError(RuntimeError):
-    def __init__(self, kind: str, message: str) -> None:
+class PushDetectionIndeterminate(CommandError):
+    """Master history did not contain the invocation's launch base."""
+
+
+class MjError(RuntimeError):
+    def __init__(self, message: str, *, reason: str = "mj_supervision_failed") -> None:
         super().__init__(message)
-        self.kind = kind
+        self.reason = reason
 
 
 def run_command(args: list[str], *, cwd: Path | None = None, timeout: int = 60) -> str:
@@ -218,7 +97,6 @@ def run_command(args: list[str], *, cwd: Path | None = None, timeout: int = 60) 
         result = subprocess.run(
             args,
             cwd=cwd,
-            env=child_environment(),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -234,6 +112,56 @@ def run_command(args: list[str], *, cwd: Path | None = None, timeout: int = 60) 
             + (f": {output}" if output else "")
         )
     return result.stdout.strip()
+
+
+def mj_command(args: list[str], *, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    """Run one Mjolnir CLI command; tests replace this subprocess seam."""
+    try:
+        return subprocess.run(
+            [str(MJ_BIN), *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        message = f"{MJ_BIN} {' '.join(args[:2])} failed to run: {exc}"
+        raise MjError(message, reason="mj_missing" if isinstance(exc, FileNotFoundError) else "daemon_unreachable") from exc
+
+
+def mj_output(result: subprocess.CompletedProcess[str]) -> str:
+    return "\n".join(
+        part.strip() for part in (result.stdout, result.stderr) if part and part.strip()
+    )
+
+
+def looks_like_daemon_failure(detail: str) -> bool:
+    lowered = (detail or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "daemon is not running",
+            "cannot connect to daemon",
+            "could not connect to daemon",
+            "connection refused",
+            "daemon unreachable",
+            "failed to connect",
+            "no such file or directory",
+        )
+    )
+
+
+def require_mj_success(args: list[str], *, timeout: int = 60) -> str:
+    result = mj_command(args, timeout=timeout)
+    if result.returncode != 0:
+        detail = mj_output(result)
+        reason = "daemon_unreachable" if looks_like_daemon_failure(detail) else "mj_command_failed"
+        raise MjError(
+            f"mj {' '.join(args[:2])} exited {result.returncode}: {detail}",
+            reason=reason,
+        )
+    return (result.stdout or "").strip()
 
 
 def migrate_invocations(conn: sqlite3.Connection) -> None:
@@ -304,15 +232,17 @@ def connect_db() -> sqlite3.Connection:
             outcome_notification_attempted INTEGER NOT NULL DEFAULT 0,
             thread_ts TEXT,
             codex_session_id TEXT,
+            mj_transcript_after_seq INTEGER NOT NULL DEFAULT 0,
+            workflow TEXT,
             issue_url TEXT,
             timeout_handoff_status TEXT,
-            recovery_manifest_path TEXT,
-            recovery_status TEXT,
             codex_pid INTEGER,
             base_sha TEXT,
-            candidate_sha TEXT,
-            reconcile_round INTEGER NOT NULL DEFAULT 0,
-            attempt_count INTEGER NOT NULL DEFAULT 1
+            attempt_count INTEGER NOT NULL DEFAULT 1,
+            suspend_requested INTEGER NOT NULL DEFAULT 0,
+            suspend_retry_count INTEGER NOT NULL DEFAULT 0,
+            suspend_failure_notified INTEGER NOT NULL DEFAULT 0,
+            suspend_verify_failures INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS monitor_events (
@@ -334,6 +264,22 @@ def connect_db() -> sqlite3.Connection:
             escalated INTEGER NOT NULL DEFAULT 0,
             opened_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS blocked_notifications (
+            workflow_run_id INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            details TEXT NOT NULL,
+            slack_notification_attempted INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (workflow_run_id, reason)
+        );
+
+        CREATE TABLE IF NOT EXISTS relayed_messages (
+            workflow_run_id INTEGER NOT NULL,
+            stable_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            PRIMARY KEY (workflow_run_id, stable_id)
+        );
         """
     )
     # Additive migrations for databases created before a column existed. The
@@ -342,19 +288,24 @@ def connect_db() -> sqlite3.Connection:
     # adds columns to an existing table); without this, get_escalation would
     # crash every red poll on "no such column: signature".
     ensure_column(conn, "invocations", "thread_ts", "TEXT")
-    # The codex_-prefixed columns are agent-independent: they hold whichever
-    # agent AGENT selects. Renaming them would mean a migration on a database
-    # cron is actively writing, which buys nothing.
     ensure_column(conn, "invocations", "codex_session_id", "TEXT")
+    ensure_column(
+        conn, "invocations", "mj_transcript_after_seq", "INTEGER NOT NULL DEFAULT 0"
+    )
+    ensure_column(conn, "invocations", "workflow", "TEXT")
     ensure_column(conn, "invocations", "issue_url", "TEXT")
     ensure_column(conn, "invocations", "timeout_handoff_status", "TEXT")
-    ensure_column(conn, "invocations", "recovery_manifest_path", "TEXT")
-    ensure_column(conn, "invocations", "recovery_status", "TEXT")
     ensure_column(conn, "invocations", "codex_pid", "INTEGER")
     ensure_column(conn, "invocations", "base_sha", "TEXT")
-    ensure_column(conn, "invocations", "candidate_sha", "TEXT")
-    ensure_column(conn, "invocations", "reconcile_round", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "invocations", "attempt_count", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(conn, "invocations", "suspend_requested", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "invocations", "suspend_retry_count", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(
+        conn, "invocations", "suspend_failure_notified", "INTEGER NOT NULL DEFAULT 0"
+    )
+    ensure_column(
+        conn, "invocations", "suspend_verify_failures", "INTEGER NOT NULL DEFAULT 0"
+    )
     ensure_column(conn, "escalation_gate", "signature", "TEXT NOT NULL DEFAULT ''")
     ensure_column(conn, "escalation_gate", "last_reported_run_id", "INTEGER")
     ensure_column(conn, "escalation_gate", "escalated", "INTEGER NOT NULL DEFAULT 0")
@@ -599,13 +550,6 @@ class PollResult:
     run: CiRun | None
 
 
-@dataclass(frozen=True)
-class PreflightResult:
-    base_sha: str
-    recovered_tag: str | None = None
-    recovered_sha: str | None = None
-
-
 def poll_ci(
     excluded_run_ids: set[int] | None = None,
     *,
@@ -617,7 +561,7 @@ def poll_ci(
     other workflows after a short settling window. GitHub briefly exposes a
     failed attempt as terminal before RunsOn requests the replacement attempt,
     and both attempts share one workflow run id. Waiting prevents that expected
-    recovery gap from launching Codex and filing an infrastructure issue.
+    recovery gap before launching a container repair or filing an infrastructure issue.
 
     When more than one workflow is red, prefer the newest run that has not
     already been handled; this prevents a persistent failure in one workflow
@@ -808,7 +752,7 @@ def get_escalation(conn: sqlite3.Connection) -> sqlite3.Row | None:
 
     A poll whose failing surface is contained in the baseline is a repeat: if
     ``escalated`` the monitor stands down with a threaded note; otherwise it
-    re-engages Codex in the same thread. A surface outside the baseline resets
+    re-engages the repair agent in the same thread. A surface outside the baseline resets
     the episode into a fresh top-level thread.
 
     Fails open: if the row cannot be read (e.g. a schema drift), it logs and
@@ -916,7 +860,7 @@ def open_escalation(
     The row records the failing ``signature`` baseline that a repeat is tested
     against, the filed issue (escalations only), and the Slack thread. When
     ``escalated`` a human owns it and repeats stand down; otherwise repeats
-    re-engage Codex. It is grown as same-episode passes absorb new surfaces.
+    re-engage the repair agent. It is grown as same-episode passes absorb new surfaces.
 
     ``thread_ts`` is the current reporting thread: every engaging run re-points
     it at that run's own top-level message so later notes and the green re-arm
@@ -965,159 +909,6 @@ def clear_escalation(conn: sqlite3.Connection) -> sqlite3.Row | None:
     return row
 
 
-def preserve_commit(tag: str, sha: str) -> None:
-    """Create an idempotent local preservation tag for an unpushed commit."""
-    try:
-        existing = run_command(
-            [str(GIT_BIN), "rev-parse", f"refs/tags/{tag}"], cwd=WORKTREE
-        )
-    except CommandError:
-        run_command([str(GIT_BIN), "tag", tag, sha], cwd=WORKTREE)
-        return
-    if existing != sha:
-        raise CommandError(f"local preservation tag {tag!r} points elsewhere")
-
-
-def preflight_worktree() -> PreflightResult:
-    """Synchronize the repair worktree to current origin/master.
-
-    The repair is no longer pinned to the failing run's commit: Codex works from
-    whatever master is now. A clean orphaned commit is tagged and retired so a
-    fresh triage can decide whether its change is still needed; dirty state is
-    never moved automatically.
-    """
-    if not WORKTREE.is_dir():
-        raise PreflightError("worktree_missing", f"{WORKTREE} does not exist")
-    branch = run_command([str(GIT_BIN), "branch", "--show-current"], cwd=WORKTREE)
-    if branch != WORKTREE_BRANCH:
-        raise PreflightError(
-            "wrong_branch", f"expected branch {WORKTREE_BRANCH!r}, found {branch!r}"
-        )
-    dirty = run_command(
-        [str(GIT_BIN), "status", "--porcelain", "--untracked-files=normal"],
-        cwd=WORKTREE,
-    )
-    if dirty:
-        raise PreflightError("dirty_worktree", "dedicated worktree is not clean")
-    try:
-        run_command(
-            [str(GIT_BIN), "fetch", "origin", BRANCH], cwd=WORKTREE, timeout=180
-        )
-        remote_sha = run_command(
-            [str(GIT_BIN), "rev-parse", f"origin/{BRANCH}"], cwd=WORKTREE
-        )
-    except CommandError as exc:
-        raise PreflightError("sync_failed", str(exc)) from exc
-    local_sha = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
-    recovered_tag: str | None = None
-    recovered_sha: str | None = None
-    try:
-        if local_sha != remote_sha:
-            if git_is_ancestor(local_sha, f"origin/{BRANCH}"):
-                run_command(
-                    [str(GIT_BIN), "merge", "--ff-only", f"origin/{BRANCH}"],
-                    cwd=WORKTREE,
-                    timeout=60,
-                )
-            else:
-                recovered_sha = local_sha
-                recovered_tag = f"bifrost-ci-recovery/preflight-{local_sha[:12]}"
-                preserve_commit(recovered_tag, local_sha)
-                run_command(
-                    [str(GIT_BIN), "reset", "--hard", f"origin/{BRANCH}"],
-                    cwd=WORKTREE,
-                )
-    except CommandError as exc:
-        raise PreflightError("sync_failed", str(exc)) from exc
-    local_sha = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
-    if local_sha != remote_sha:
-        raise PreflightError(
-            "diverged_worktree",
-            f"local HEAD is {local_sha}, expected origin/{BRANCH} {remote_sha}",
-        )
-    dirty = run_command(
-        [str(GIT_BIN), "status", "--porcelain", "--untracked-files=normal"],
-        cwd=WORKTREE,
-    )
-    if dirty:
-        raise PreflightError(
-            "dirty_after_sync", "worktree became dirty while synchronizing"
-        )
-    return PreflightResult(local_sha, recovered_tag, recovered_sha)
-
-
-def record_preflight_event(
-    conn: sqlite3.Connection,
-    transport: SlackTransport,
-    sha: str,
-    kind: str,
-    details: str,
-) -> None:
-    with conn:
-        cursor = conn.execute(
-            """
-            INSERT OR IGNORE INTO monitor_events (sha, kind, created_at, details)
-            VALUES (?, ?, ?, ?)
-            """,
-            (sha, kind, utc_now(), details),
-        )
-    if cursor.rowcount != 1:
-        return
-    text = (
-        f":warning: Bifrost CI auto-fixer could not engage for "
-        f"<https://github.com/{REPO_NAME}/commit/{sha}|`{sha[:8]}`> "
-        f"on `{socket.gethostname()}`: {details}"
-    )
-    slack_send(transport, text)
-    with conn:
-        conn.execute(
-            "UPDATE monitor_events SET slack_notification_attempted = 1 WHERE sha = ? AND kind = ?",
-            (sha, kind),
-        )
-
-
-def record_worktree_recovery(
-    conn: sqlite3.Connection,
-    transport: SlackTransport,
-    sha: str,
-    recovered_sha: str,
-    tag: str,
-) -> None:
-    kind = f"worktree_recovered:{recovered_sha}"
-    details = f"preserved {recovered_sha} as {tag} and reset to origin/{BRANCH}"
-    with conn:
-        cursor = conn.execute(
-            """
-            INSERT OR IGNORE INTO monitor_events (sha, kind, created_at, details)
-            VALUES (?, ?, ?, ?)
-            """,
-            (sha, kind, utc_now(), details),
-        )
-        conn.execute(
-            """
-            UPDATE invocations
-            SET status = 'orphaned_candidate', finished_at = ?,
-                output = output || ?
-            WHERE candidate_sha = ? AND status IN ('completed', 'reconciling', 'running')
-            """,
-            (utc_now(), f"\nWorktree recovery: {details}.\n", recovered_sha),
-        )
-    if cursor.rowcount != 1:
-        return
-    slack_send(
-        transport,
-        f":warning: Bifrost CI preserved orphaned repair `{recovered_sha[:8]}` "
-        f"as `{tag}`, restored `origin/{BRANCH}`, and is retriaging the current "
-        f"red run on `{socket.gethostname()}`.",
-    )
-    with conn:
-        conn.execute(
-            "UPDATE monitor_events SET slack_notification_attempted = 1 "
-            "WHERE sha = ? AND kind = ?",
-            (sha, kind),
-        )
-
-
 def claim_invocation(conn: sqlite3.Connection, run: CiRun, base_sha: str) -> bool:
     now = utc_now()
     try:
@@ -1126,10 +917,13 @@ def claim_invocation(conn: sqlite3.Connection, run: CiRun, base_sha: str) -> boo
                 """
                 INSERT INTO invocations (
                     workflow_run_id, sha, workflow_run_url, conclusion,
-                    observed_at, started_at, status, base_sha
-                ) VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)
+                    observed_at, started_at, status, base_sha, workflow
+                ) VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)
                 """,
-                (run.run_id, run.sha, run.url, run.conclusion, now, now, base_sha),
+                (
+                    run.run_id, run.sha, run.url, run.conclusion, now, now,
+                    base_sha, run.workflow,
+                ),
             )
     except sqlite3.IntegrityError:
         placeholders = ", ".join("?" for _ in RETRYABLE_INVOCATION_STATUSES)
@@ -1137,25 +931,22 @@ def claim_invocation(conn: sqlite3.Connection, run: CiRun, base_sha: str) -> boo
             cursor = conn.execute(
                 f"""
                 UPDATE invocations
-                SET sha = ?, workflow_run_url = ?, conclusion = ?, started_at = ?,
-                    finished_at = NULL, status = 'claimed', exit_code = NULL,
-                    timed_out = 0, output = output || ?,
+                SET sha = ?, workflow_run_url = ?, conclusion = ?, workflow = ?,
+                    started_at = ?, finished_at = NULL, status = 'claimed',
+                    exit_code = NULL, timed_out = 0, output = output || ?,
                     start_notification_attempted = 0,
                     outcome_notification_attempted = 0, codex_session_id = NULL,
-                    issue_url = NULL, timeout_handoff_status = NULL, codex_pid = NULL,
-                    base_sha = ?, candidate_sha = NULL, reconcile_round = 0,
-                    recovery_manifest_path = NULL, recovery_status = NULL,
+                    mj_transcript_after_seq = 0, issue_url = NULL,
+                    timeout_handoff_status = NULL,
+                    codex_pid = NULL, base_sha = ?, suspend_requested = 0,
+                    suspend_retry_count = 0, suspend_failure_notified = 0,
+                    suspend_verify_failures = 0,
                     attempt_count = attempt_count + 1
                 WHERE workflow_run_id = ? AND status IN ({placeholders})
                 """,
                 (
-                    run.sha,
-                    run.url,
-                    run.conclusion,
-                    now,
-                    f"\n--- retry {now} ---\n",
-                    base_sha,
-                    run.run_id,
+                    run.sha, run.url, run.conclusion, run.workflow, now,
+                    f"\n--- retry {now} ---\n", base_sha, run.run_id,
                     *sorted(RETRYABLE_INVOCATION_STATUSES),
                 ),
             )
@@ -1163,171 +954,187 @@ def claim_invocation(conn: sqlite3.Connection, run: CiRun, base_sha: str) -> boo
     return True
 
 
-def terminate_recorded_codex(pid: int | None) -> bool:
-    """Terminate a recorded agent process group after a monitor restart.
-
-    Any marker in AGENT_PROCESS_MARKERS is accepted, not just the active
-    agent's: a pid recorded before an AGENT switch must still be reclaimable,
-    or recovery blocks on that row forever. The guard still does its real job
-    of refusing a pid the kernel has since handed to something unrelated.
-    """
-    if not pid or pid <= 1:
-        return True
-    try:
-        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
-    except FileNotFoundError:
-        try:
-            os.killpg(pid, 0)
-        except ProcessLookupError:
-            return True
-        except OSError as exc:
-            log(f"could not inspect orphaned {AGENT} process group {pid}: {exc}")
-            return False
-        log(f"{AGENT} leader {pid} disappeared but its process group remains; recovery blocked")
-        return False
-    except OSError as exc:
-        log(f"could not inspect interrupted {AGENT} pid {pid}: {exc}")
-        return False
-    if not any(marker in cmdline for marker in AGENT_PROCESS_MARKERS):
-        log(f"refusing to signal reused non-agent pid {pid}")
-        return False
-    try:
-        os.killpg(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return True
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        try:
-            os.killpg(pid, 0)
-        except ProcessLookupError:
-            return True
-        time.sleep(0.1)
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    return True
-
-
-def recover_interrupted(conn: sqlite3.Connection, transport: SlackTransport) -> None:
-    rows = conn.execute(
-        "SELECT workflow_run_id, sha, workflow_run_url, thread_ts, status, "
-        "codex_session_id, codex_pid, candidate_sha FROM invocations "
-        "WHERE status IN ('claimed', 'running', 'reconciling', 'handoff_running')"
-    ).fetchall()
-    for row in rows:
-        run_id = int(row["workflow_run_id"])
-        sha = str(row["sha"])
-        if not terminate_recorded_codex(row["codex_pid"]):
-            with conn:
-                conn.execute(
-                    "UPDATE invocations SET recovery_status = 'failed' WHERE workflow_run_id = ?",
-                    (run_id,),
-                )
-            log(f"cannot safely stop recorded {AGENT} for run {run_id}; recovery blocked")
-            continue
-        if row["status"] == "handoff_running":
-            saved = recover_invocation_worktree(conn, run_id, sha, row["codex_session_id"])
-            cleanup_ok, cleanup_detail = recovery_complete(saved), saved.detail
-            with conn:
-                conn.execute(
-                    """
-                    UPDATE invocations
-                    SET status = 'timed_out', timeout_handoff_status = 'failed',
-                        codex_pid = NULL, finished_at = ?, output = output || ?
-                    WHERE workflow_run_id = ?
-                    """,
-                    (
-                        utc_now(),
-                        f"\nMonitor restarted during timeout handoff. {cleanup_detail}.\n",
-                        run_id,
-                    ),
-                )
-            mentions = " ".join(
-                f"<@{member_id}>" for member_id in ESCALATION_SLACK_MEMBER_IDS
-            )
-            slack_send(
-                transport,
-                f"{mentions} Bifrost CI timeout handoff for "
-                f"<https://github.com/{REPO_NAME}/commit/{sha}|`{sha[:8]}`> was "
-                f"interrupted. Worktree recovery "
-                f"{'succeeded' if cleanup_ok else 'failed'}: {cleanup_detail}. "
-                f"<{row['workflow_run_url']}|CI run>",
-                thread_ts=row["thread_ts"],
-            )
-            with conn:
-                conn.execute(
-                    "UPDATE invocations SET outcome_notification_attempted = 1 "
-                    "WHERE workflow_run_id = ?",
-                    (run_id,),
-                )
-            continue
-        candidate_sha = row["candidate_sha"]
-        if row["status"] == "reconciling" and candidate_sha:
-            try:
-                remote_sha = fetch_remote_sha()
-                clean = not worktree_status()
-            except CommandError:
-                remote_sha = ""
-                clean = False
-            if clean and git_is_ancestor(str(candidate_sha), f"origin/{BRANCH}"):
-                detail = (
-                    f"Monitor restarted after push; verified candidate "
-                    f"{candidate_sha} on origin/{BRANCH} at {remote_sha}."
-                )
-                with conn:
-                    conn.execute(
-                        """
-                        UPDATE invocations
-                        SET status = 'completed', codex_pid = NULL, finished_at = ?,
-                            output = output || ?, outcome_notification_attempted = 1
-                        WHERE workflow_run_id = ?
-                        """,
-                        (utc_now(), f"\n{detail}\n", run_id),
-                    )
-                slack_send(
-                    transport,
-                    f":white_check_mark: Bifrost CI auto-fixer for "
-                    f"<https://github.com/{REPO_NAME}/commit/{sha}|`{sha[:8]}`> "
-                    f"was interrupted after pushing; verified "
-                    f"{format_commit(str(candidate_sha))} on master. "
-                    f"<{row['workflow_run_url']}|CI run>",
-                    thread_ts=row["thread_ts"],
-                )
-                continue
-        saved = recover_invocation_worktree(conn, run_id, sha, row["codex_session_id"])
-        cleanup_ok, cleanup_detail = recovery_complete(saved), saved.detail
-        retry_status = "orphaned_candidate" if cleanup_ok else "interrupted"
-        with conn:
-            conn.execute(
-                """
-                UPDATE invocations
-                SET status = ?, codex_pid = NULL, finished_at = ?, output = output || ?
-                WHERE workflow_run_id = ?
-                """,
-                (
-                    retry_status,
-                    utc_now(),
-                    f"\nMonitor restarted before repair reconciliation completed. "
-                    f"Worktree recovery: {cleanup_detail}.\n",
-                    run_id,
-                ),
-            )
-        slack_send(
-            transport,
-            f":warning: Bifrost CI auto-fixer for "
-            f"<https://github.com/{REPO_NAME}/commit/{sha}|`{sha[:8]}`> "
-            f"was interrupted before completion. Worktree recovery "
-            f"{'succeeded; the run will be retriaged' if cleanup_ok else 'failed'}: "
-            f"{cleanup_detail}. <{row['workflow_run_url']}|CI run>",
-            thread_ts=row["thread_ts"],
+def record_blocked_reason(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+    run: CiRun,
+    reason: str,
+    details: str,
+    *,
+    thread_ts: str | None = None,
+) -> None:
+    log(f"repair blocked for run {run.run_id} ({reason}): {details}")
+    with conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO blocked_notifications
+                (workflow_run_id, reason, created_at, details)
+            VALUES (?, ?, ?, ?)
+            """,
+            (run.run_id, reason, utc_now(), details),
         )
-        with conn:
-            conn.execute(
-                "UPDATE invocations SET outcome_notification_attempted = 1 "
-                "WHERE workflow_run_id = ?",
-                (run_id,),
-            )
+        row = conn.execute(
+            "SELECT slack_notification_attempted FROM blocked_notifications "
+            "WHERE workflow_run_id = ? AND reason = ?",
+            (run.run_id, reason),
+        ).fetchone()
+    if row is None or row["slack_notification_attempted"]:
+        return
+    text = (
+        f":warning: {AGENT_LABEL} could not launch or supervise repair for "
+        f"{run.workflow} <{run.url}|run {run.run_id}> at "
+        f"<https://github.com/{REPO_NAME}/commit/{run.sha}|{run.sha[:8]}> "
+        f"on {socket.gethostname()}: {details}"
+    )
+    ok, _ = slack_send(transport, text, thread_ts=thread_ts)
+    with conn:
+        conn.execute(
+            "UPDATE blocked_notifications SET slack_notification_attempted = ? "
+            "WHERE workflow_run_id = ? AND reason = ?",
+            (int(ok), run.run_id, reason),
+        )
+
+
+def repair_branch(run_id: int, attempt: int) -> str:
+    return f"ci-repair/{run_id}-{attempt}"
+
+
+def launch_title(run: CiRun, attempt: int) -> str:
+    return f"{run.workflow} {run.sha[:8]} run {run.run_id} attempt {attempt} CI repair"
+
+
+def new_session_argv(
+    run: CiRun, base_sha: str, attempt: int, prompt_file: str
+) -> list[str]:
+    branch = repair_branch(run.run_id, attempt)
+    title = launch_title(run, attempt)
+    return [
+        str(MJ_BIN), "new",
+        "--workspace", MJ_WORKSPACE,
+        "--target", MJ_TARGET,
+        "--bundle", MJ_BUNDLE,
+        "--model", MJ_MODEL,
+        "--at", base_sha,
+        "--branch", branch,
+        "--title", title,
+        "--prompt-file", prompt_file,
+        "--json",
+    ]
+
+
+def lookup_launch_session(run: CiRun, attempt: int) -> str | None:
+    """Find a session for this durable launch attempt before creating another."""
+    raw = require_mj_success(
+        ["sessions", "--workspace", MJ_WORKSPACE, "--json"], timeout=30
+    )
+    try:
+        payload = json.loads(raw)
+        sessions = payload.get("sessions", []) if isinstance(payload, dict) else payload
+        if not isinstance(sessions, list):
+            raise TypeError("sessions is not a list")
+        matches = [
+            item for item in sessions
+            if isinstance(item, dict) and item.get("title") == launch_title(run, attempt)
+        ]
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise MjError(f"mj sessions returned invalid workspace JSON: {exc}") from exc
+    if not matches:
+        return None
+    matches.sort(
+        key=lambda item: (
+            bool(item.get("active")),
+            str(item.get("updated_at", "")),
+            str(item.get("id", "")),
+        ),
+        reverse=True,
+    )
+    session_id = matches[0].get("id")
+    if not isinstance(session_id, str) or not session_id:
+        raise MjError("matching Mjolnir session has no id")
+    if len(matches) > 1:
+        log(
+            f"multiple Mjolnir sessions match run {run.run_id} attempt {attempt}; "
+            f"adopting {session_id}"
+        )
+    return session_id
+
+
+def launch_mj_session(
+    run: CiRun, base_sha: str, attempt: int, open_issue_url: str | None
+) -> tuple[str, str]:
+    existing = lookup_launch_session(run, attempt)
+    if existing:
+        return existing, repair_branch(run.run_id, attempt)
+    prompt = build_prompt(run, open_issue_url)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", prefix="bifrost-ci-",
+        suffix=".prompt", delete=False,
+    ) as handle:
+        handle.write(prompt)
+        prompt_path = handle.name
+    try:
+        args = new_session_argv(run, base_sha, attempt, prompt_path)[1:]
+        result = mj_command(args, timeout=180)
+    except MjError as launch_error:
+        try:
+            existing = lookup_launch_session(run, attempt)
+        except MjError as lookup_error:
+            raise MjError(
+                f"mj new result is ambiguous and its session could not be looked up: "
+                f"{lookup_error}",
+                reason=lookup_error.reason,
+            ) from launch_error
+        if existing:
+            return existing, repair_branch(run.run_id, attempt)
+        raise MjError(
+            f"mj new result is ambiguous; no matching session is visible yet: {launch_error}",
+            reason=launch_error.reason,
+        ) from launch_error
+    finally:
+        Path(prompt_path).unlink(missing_ok=True)
+    try:
+        response = json.loads(result.stdout or "")
+        session_id = str(response["session_id"])
+    except (ValueError, KeyError, TypeError) as exc:
+        session_id = ""
+    if result.returncode != 0 or not session_id.strip():
+        detail = mj_output(result) or "mj new returned no session_id"
+        try:
+            existing = lookup_launch_session(run, attempt)
+        except MjError as lookup_error:
+            raise MjError(
+                f"mj new result is ambiguous and its session could not be looked up: "
+                f"{lookup_error}",
+                reason=lookup_error.reason,
+            ) from lookup_error
+        if existing:
+            return existing, repair_branch(run.run_id, attempt)
+        reason = "daemon_unreachable" if looks_like_daemon_failure(detail) else "mj_new_failed"
+        raise MjError(
+            f"mj new failed without a visible session: {detail}", reason=reason
+        )
+    return session_id, repair_branch(run.run_id, attempt)
+
+
+def check_mj_support() -> str | None:
+    """Return a stable blocked reason when this mj cannot drive the relay."""
+    try:
+        version_result = mj_command(["--version"], timeout=15)
+    except MjError as exc:
+        return exc.reason
+    if version_result.returncode != 0:
+        return "mj_missing"
+    version = (version_result.stdout or "").strip() or "unknown version"
+    try:
+        help_result = mj_command(["transcript", "--help"], timeout=15)
+    except MjError as exc:
+        return exc.reason
+    if help_result.returncode != 0:
+        return "mj_too_old"
+    if "--finished-only" not in mj_output(help_result):
+        log(f"installed {version} lacks mj transcript --finished-only")
+        return "mj_too_old"
+    return None
 
 
 def build_prompt(run: CiRun, open_issue_url: str | None = None) -> str:
@@ -1340,396 +1147,885 @@ A design-level escalation is ALREADY OPEN for this CI: {open_issue_url}, and a h
 - A NEW failure layered on top of it that the FIX or REVERT path defined below handles: fix or revert just that. Do not attempt to resolve {open_issue_url} itself.
 - A NEW failure distinct from {open_issue_url} that needs the BLOCKED REVERT or ESCALATE path: file a SEPARATE issue and ping, following that path.
 """
-    return f"""You are triaging a red CI run for {REPO_NAME}. The monitor observed the failing workflow run {run.url} for master commit {run.sha}.
+    return f"""You are triaging a red CI run for {REPO_NAME}. The monitor observed workflow run {run.url} for master commit {run.sha}.
 
-First, orient. Use `gh` outside your sandbox to read the failing run, the commits after {run.sha}, and the latest CI/check results. The original SHA may no longer be current; do not stop merely because newer commits landed. If a subsequent commit clearly addresses this same failure, make no changes and exit successfully. The monitor synchronized this worktree immediately before launching you and will merge any later master advances after you finish. Stay on the existing `{WORKTREE_BRANCH}` branch: never create or switch branches, never pull or merge remote changes yourself, and never open a pull request.
+Use gh from inside this container to read the failing run, the commits after {run.sha}, and the latest CI/check results. The original SHA may no longer be current; do not stop merely because newer commits landed. If a subsequent commit clearly addresses this same failure, make no changes and exit successfully. You are on the new branch created for this run; do not create or switch branches and never open a pull request.
 {open_issue_context}
 Your job is to get master green quickly, not to repair every breaking change here. Classify EACH failing test independently (a red run often bundles unrelated regressions) into one of the paths below, then act:
-- FIX and REVERT both end in local commits that the monitor pushes. Handle every failure that falls under them in this invocation: one commit for the fixes and one revert commit per reverted change. Then exit successfully. Do NOT push.
-- If anything remains that needs BLOCKED REVERT or ESCALATE, do not file it in the same invocation as a FIX or REVERT commit. The monitor's push triggers a fresh CI run; if the remainder keeps it red, the monitor re-engages you and that later pass files it with nothing left to fix. Summarize what you already diagnosed in your closing message so the later pass and the humans can pick it up from the thread.
+- FIX and REVERT both end in commits. Handle every failure that falls under them in this invocation: one commit for the fixes and one revert commit per reverted change. Every commit you make must include the trailer CI-Repair-Run: {run.run_id}. Then follow the publication steps below and exit successfully.
+- If anything remains that needs BLOCKED REVERT or ESCALATE, do not file it in the same invocation as a FIX or REVERT commit. The push triggers a fresh CI run; if the remainder keeps it red, the monitor re-engages you and that later pass files it with nothing left to fix. Summarize what you already diagnosed in your closing message so the later pass and the humans can pick it up from the thread.
 - Only when nothing falls under FIX or REVERT, follow BLOCKED REVERT or ESCALATE, covering all remaining failures in one issue.
 
-Before classifying anything beyond lint/format noise, pin the INTRODUCING commit. The failing run's commit ({run.sha}) is only where CI first observed the failure — the cause usually landed earlier. Choose whatever method fits the failure; the evidence that counts is the failing test failing at the introducing commit and passing at its parent. Read the introducing commit's message, diff, and the tests it added or changed — that commit's own intent is the evidence most classifications turn on. Treat "recorded baseline failure" notes in `.agents/plans/` or commit messages as symptoms of an unhandled regression, never as permission to ignore one.
+Publication steps for FIX and REVERT commits: first run git fetch origin, then merge origin/master into your branch. Resolve conflicts preserving both the upstream changes and your intended repair; if the merge touched the affected area, rerun relevant tests. Push with git push origin HEAD:master. If GitHub rejects the push as non-fast-forward, fetch origin, merge origin/master, and retry. Never force-push, push any other branch, or open a pull request.
+If either merge creates a merge commit, include the same CI-Repair-Run trailer in that commit message too.
+
+Before classifying anything beyond lint/format noise, pin the INTRODUCING commit. The failing run's commit ({run.sha}) is only where CI first observed the failure — the cause usually landed earlier. Choose whatever method fits the failure; the evidence that counts is the failing test failing at the introducing commit and passing at its parent. Read the introducing commit's message, diff, and the tests it added or changed — that commit's own intent is the evidence most classifications turn on. Treat recorded baseline failure notes in .agents/plans/ or commit messages as symptoms of an unhandled regression, never as permission to ignore one.
 
 Decide between FIX and REVERT as soon as the introducing commit is pinned. Do not attempt an involved fix first and fall back to reverting once it gets hard: if the fix is not obviously small, revert.
 
-FIX — commit for the monitor to push — only when the fix is straightforward:
+FIX — only when the fix is straightforward:
 - lint or formatting violations (spotless, checkstyle, import order, whitespace, and the like), and equally trivial build breakage (an unused import, a rename applied in one place but not another);
 - tests the introducing commit missed: it deliberately changed a contract and updated some tests, but a test still asserts the old behavior — an assertion trailing a renamed symbol, a golden value, a changed signature, or a sibling test of the same shape in another language or suite. Bring the lagging test to the contract the commit's own updated tests express;
-- a straightforward production-code fix: the introducing commit's change was over-broad or missed a case, and a small, local change (for example narrowing a condition) makes the failing test and the commit's own tests pass together. Follow the repo's design philosophy in CLAUDE.md (fix root cause, no fallbacks that hide failures).
-The acceptance bar: the failing test and every test the introducing commit added or touched pass together, the relevant suites pass, and you weakened no assertion — never delete a check, broaden a tolerance, or loosen an expected value to make a test pass. If a straightforward change cannot meet that bar, REVERT instead.
-Test your change locally, stage only the files you changed, and create a detailed commit on the existing branch. Leave the worktree clean. If you only fixed and did not revert, close with a plain-text summary and do NOT emit the Slack mention tokens.
+- a straightforward production-code fix: the introducing commit's change was over-broad or missed a case, and a small, local change (for example narrowing a condition) makes the failing test and the commit's own tests pass together. Follow the repository's design philosophy: fix root cause, no fallbacks that hide failures.
+The acceptance bar: the failing test and every test the introducing commit added or touched pass together, the relevant suites pass, and you weakened no assertion — never delete a check, broaden a tolerance, or loosen an expected value to make a test pass. If a straightforward fix cannot meet that bar, REVERT instead.
+Test the change locally, stage only your changed files, and create a detailed commit on this branch with the required trailer. If you only fixed and did not revert, close with a plain-text summary and do NOT emit the Slack mention tokens.
 
-REVERT — commit for the monitor to push — when the fix is anything more involved than the FIX cases: a redesign, splitting a conflated concern, changes across several files, choosing semantics the repository does not record, or crossing a versioned schema or architectural boundary. The breaking change goes back to its author instead of being repaired here. To revert:
-1. Check whether the introducing commit's message references an issue on {REPO_NAME} (`#N`, `Fixes #N`, or a full issue URL).
-2. Run `git revert <introducing-sha>` on the existing branch (add `-m 1` if it is a merge commit). In the commit message body, explain the failure and why the fix was not straightforward, and link the referenced issue if there is one.
-3. Confirm that the failing test now passes and the build and relevant suites pass. If the revert conflicts, or reverting breaks something else because later commits build on the introducing commit, the revert is not straightforward: run `git revert --abort` or `git reset --hard` back to the commit you started from, confirm the worktree is clean, and follow BLOCKED REVERT instead.
+REVERT — when the fix is anything more involved than the FIX cases: a redesign, splitting a conflated concern, changes across several files, choosing semantics the repository does not record, or crossing a versioned schema or architectural boundary. The breaking change goes back to its author instead of being repaired here. To revert:
+1. Check whether the introducing commit's message references an issue on {REPO_NAME} (#N, Fixes #N, or a full issue URL).
+2. Run git revert <introducing-sha> on this branch (add -m 1 if it is a merge commit). In the commit message body, explain the failure and why the fix was not straightforward, link the referenced issue if there is one, and include the required CI-Repair-Run trailer.
+3. Confirm that the failing test now passes and the build and relevant suites pass. If the revert conflicts, or reverting breaks something else because later commits build on the introducing commit, the revert is not straightforward: run git revert --abort or reset your branch to the commit you started from, confirm the worktree is clean, and follow BLOCKED REVERT instead.
 4. Record it on GitHub:
-   - If the commit references an issue that is closed, reopen it with `gh issue reopen`, then add a comment with `gh issue comment`.
-   - If the commit references an issue that is open, add a comment with `gh issue comment`.
-   - If the commit references no issue, file one with `gh issue create`, then add a comment with `gh issue comment` that tags the commit author. Find their GitHub login with `gh api repos/{REPO_NAME}/commits/<introducing-sha> --jq .author.login`; if that is null, name the author from the commit instead.
-   The comment must include: the failing run ({run.url}), the failing tests, the introducing commit, the mechanism (what changed, with files and lines), why the fix was not straightforward, and the local revert commit SHA, which the monitor will push to master.
+   - If the commit references an issue that is closed, reopen it with gh issue reopen, then add a comment with gh issue comment.
+   - If the commit references an issue that is open, add a comment with gh issue comment.
+   - If the commit references no issue, file one with gh issue create, then add a comment with gh issue comment that tags the commit author. Find their GitHub login with gh api repos/{REPO_NAME}/commits/<introducing-sha> --jq .author.login; if that is null, name the author from the commit instead.
+   The comment must include: the failing run ({run.url}), failing tests, introducing commit, mechanism (what changed, with files and lines), why the fix was not straightforward, and the revert commit SHA, which you will push to master.
 5. As your final assistant message — on its own, nothing after it — write exactly:
    {mentions} Reverted <SHORT_SHA> (<commit subject>) because the fix was not straightforward — see <ISSUE_URL>. <one-sentence summary of the problem>
-   Replace <SHORT_SHA> with the introducing commit, <ISSUE_URL> with the issue from step 4, and keep the `{mentions}` tokens verbatim so they render as real mentions. Everything you say streams into the Slack thread, so this message is the ping; do not attempt to call Slack yourself.
-Leave the worktree clean and exit successfully. Do not push: the monitor owns the pull-and-push reconciliation after you exit.
+   Replace <SHORT_SHA> with the introducing commit, <ISSUE_URL> with the issue from step 4, and keep the mention tokens verbatim so they render as real mentions. Everything you say streams into the Slack thread; this message is the ping; do not attempt to call Slack yourself.
+Leave the branch clean and exit successfully.
 
-BLOCKED REVERT — do not touch code, do not push — when the fix is not straightforward AND reverting is not straightforward because later commits build on the introducing commit. To report it:
-1. Leave master untouched — make no commits and no pushes.
-2. File a GitHub issue on {REPO_NAME} with `gh issue create --label buildfailure`. The body must include: the failing run ({run.url}), the failing tests, the introducing commit, the mechanism (what changed, with files and lines), which later commits depend on it and how the revert failed, and a link to any issue the introducing commit references. Note the issue URL that `gh` prints.
+BLOCKED REVERT — do not touch code, commit, or push — when the fix is not straightforward AND reverting is not straightforward because later commits build on the introducing commit. To report it:
+1. Make no commits and no pushes.
+2. File a GitHub issue on {REPO_NAME} with gh issue create --label buildfailure. The body must include: the failing run ({run.url}), failing tests, introducing commit, mechanism (what changed, with files and lines), which later commits depend on it and how the revert failed, and a link to any issue the introducing commit references. Note the issue URL that gh prints.
 3. As your final assistant message — on its own, nothing after it — write exactly:
    {mentions} CI broken by <SHORT_SHA>, which cannot be cleanly reverted — filed <ISSUE_URL>. <one-sentence summary of the problem>
-   Replace <SHORT_SHA> with the introducing commit and <ISSUE_URL> with the URL from step 2, and keep the `{mentions}` tokens verbatim. Do not attempt to call Slack yourself.
+   Replace <SHORT_SHA> with the introducing commit and <ISSUE_URL> with the URL from step 2, and keep the mention tokens verbatim. Do not attempt to call Slack yourself.
 Then exit successfully.
 
-ESCALATE — do not touch code, do not push — only for flaky or infrastructure failures, or when a finished investigation cannot pin a single introducing commit. Doubt before the introducing commit is pinned means investigate more. To escalate:
-1. Leave master untouched — make no commits and no pushes.
-2. File a GitHub issue on {REPO_NAME} with `gh issue create`. Give it a clear title and a body that includes: the failing run link ({run.url}), the failing job/test, what your investigation established (with commits, files, and lines), why no single introducing commit could be pinned or why the failure is flaky or infrastructure, and the next concrete step for a human. Note the issue URL that `gh` prints.
-3. As your final assistant message — on its own, nothing after it — post to Slack by writing exactly:
+ESCALATE — do not touch code, commit, or push — only for flaky or infrastructure failures, or when a finished investigation cannot pin a single introducing commit. Doubt before the introducing commit is pinned means investigate more. To escalate:
+1. Make no commits and no pushes.
+2. File a GitHub issue on {REPO_NAME} with gh issue create. Give it a clear title and a body that includes: the failing run link ({run.url}), failing job/test, what your investigation established (with commits, files, and lines), why no single introducing commit could be pinned or why the failure is flaky or infrastructure, and the next concrete step for a human. Note the issue URL that gh prints.
+3. As your final assistant message — on its own, nothing after it — post exactly:
    {mentions} CI failure needs a human — filed <ISSUE_URL>. <one-sentence summary of the problem>
-   Replace <ISSUE_URL> with the URL from step 2 and keep the `{mentions}` tokens verbatim so they render as real mentions. Everything you say streams into the Slack thread, so this message is the ping; do not attempt to call Slack yourself.
+   Replace <ISSUE_URL> with the URL from step 2 and keep the mention tokens verbatim so they render as real mentions. Everything you say streams into the Slack thread; do not attempt to call Slack yourself.
 Then exit successfully.
 """
 
 
-def build_merge_conflict_prompt(run: CiRun) -> str:
-    return f"""The monitor tried to merge current origin/{BRANCH} into your committed CI repair for {run.url}, and Git left real content conflicts in the existing `{WORKTREE_BRANCH}` worktree.
-
-Resume the repair using the diagnosis and intent already established in this session. Inspect the incoming commits and every unmerged path, resolve the current merge so both the upstream changes and the intended CI fix are preserved, run the relevant tests for the resolution, and commit the merge on the existing branch. Do not abort merely because master advanced. Do not rebase, cherry-pick, switch branches, open a pull request, or push. Leave the worktree clean with no unmerged paths and exit successfully; the monitor will pull again and push.
-"""
-
-
-def build_timeout_handoff_prompt(run: CiRun, recovery_block: str) -> str:
+def build_timeout_handoff_prompt(run: CiRun, session_id: str, branch: str) -> str:
     mentions = " ".join(f"<@{member_id}>" for member_id in ESCALATION_SLACK_MEMBER_IDS)
-    return f"""Since this has taken over one hour, it is time to create a ticket and turn it over to a human for resolution; definitionally this was not as simple as it looked.
+    return f"""The one-hour automation budget has expired. Stop repair work now: do not investigate further, run tests, edit files, commit, or push. All work remains in Mjolnir session {session_id} on branch {branch}. A human can continue with mj resume --session {session_id}.
 
-Stop the repair now. Do not investigate further, run more tests, edit files, commit, or push. The monitor has already attempted preservation and cleanup; their actual results are recorded below. Do not assume the current worktree still contains your repair. Do not restore the saved work during this handoff.
+Using only the diagnosis and evidence already in this session, file a GitHub issue on {REPO_NAME} with gh issue create. Include the failing run ({run.url}), failing jobs and tests, findings and uncertainty, files changed, unfinished work, validation already run (label unrun tests explicitly), the unresolved blocker, and the next concrete action for the human. List any unpushed commits by full SHA and subject. Do not push any commit.
 
-Using only the diagnosis and evidence already present in this session, file a GitHub issue on {REPO_NAME} with `gh issue create`. Include the failing run ({run.url}), failing jobs and tests, and these continuation sections:
-- Diagnosis and evidence: findings, relevant commits, files and lines, and what is still uncertain.
-- Work attempted: files changed, why each change was made, and unfinished work.
-- Validation so far: exact commands/tests already run and their observed results. Label unrun tests and unknown results explicitly; do not invent outcomes.
-- Continue here: the unresolved blocker or decision, and the next concrete action for the next agent. Explain which saved changes it should review or finish.
-- Recovery pointers: copy the entire monitor-generated block below VERBATIM into the issue. Keep full object IDs, local paths, commands, session ID, and failure details. These artifacts are local to the named host, not available from GitHub. Do not claim preservation or cleanup succeeded unless this block says so.
-
-{recovery_block}
-
-Note the issue URL printed by `gh`. As your final assistant message, on its own with nothing after it, write exactly:
+Note the issue URL printed by gh. As your final assistant message, on its own with nothing after it, write exactly:
 {mentions} CI repair exceeded the one-hour automation budget — filed <ISSUE_URL>. <one-sentence summary of the unresolved problem>
 Replace <ISSUE_URL> with the issue URL. Keep the mention tokens verbatim and do not attempt to call Slack yourself. Then exit.
 """
 
 
 @dataclass(frozen=True)
-class CodexResult:
+class TurnResult:
     status: str
-    exit_code: int | None
-    timed_out: bool
+    outcome: str
+    timed_out: bool = False
+
+
+@dataclass(frozen=True)
+class SessionResult:
+    status: str
     output: str
-    session_id: str | None
+    timed_out: bool
+    handoff_completed: bool
 
 
-def extract_agent_text(obj: Any) -> str | None:
-    """Return the assistant message text from one agent JSONL event, else None.
-
-    Handles both agents. The two schemas share no discriminating key — Codex
-    keys on ``item.completed``/``msg``/``payload`` carrying ``agent_message``,
-    Claude on ``type: "assistant"`` carrying ``message.content`` blocks — so one
-    tolerant parser can accept either with no risk of reading one agent's event
-    as the other's, and no need to branch on AGENT.
-
-    Only assistant prose is surfaced; tool calls, reasoning, and command output
-    carry other types and are deliberately ignored. Codex's older envelopes are
-    still accepted so an upgrade does not silently drop the feed.
-    """
-    if not isinstance(obj, dict):
-        return None
-    candidates = []
-    if obj.get("type") == "item.completed" and isinstance(obj.get("item"), dict):
-        item = obj["item"]
-        if item.get("type") == "agent_message":
-            candidates.append(item.get("text") or item.get("message"))
-    for envelope in (obj.get("msg"), obj.get("payload")):
-        if isinstance(envelope, dict) and envelope.get("type") == "agent_message":
-            candidates.append(envelope.get("message") or envelope.get("text"))
-    # Claude: main-thread assistant turns only. A set parent_tool_use_id marks
-    # subagent output, which must never reach the Slack thread.
-    if (
-        obj.get("type") == "assistant"
-        and not obj.get("parent_tool_use_id")
-        and isinstance(obj.get("message"), dict)
-    ):
-        blocks = obj["message"].get("content")
-        if isinstance(blocks, list):
-            candidates.append(
-                "\n\n".join(
-                    block["text"]
-                    for block in blocks
-                    if isinstance(block, dict)
-                    and block.get("type") == "text"
-                    and isinstance(block.get("text"), str)
-                )
-            )
-    for text in candidates:
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-    return None
-
-
-def extract_permission_denials(obj: Any) -> list[str] | None:
-    """Return tool names Claude refused to run, from its terminal result event.
-
-    Under ``--permission-prompts none`` a repair that stalls most often stalled
-    on a denied command, so the denials belong in the stored transcript rather
-    than being left to infer from raw JSONL. Codex emits no such event.
-    """
-    if not isinstance(obj, dict) or obj.get("type") != "result":
-        return None
-    denials = obj.get("permission_denials")
-    if not isinstance(denials, list) or not denials:
-        return None
-    names = []
-    for denial in denials:
-        if isinstance(denial, dict):
-            names.append(str(denial.get("tool_name") or denial.get("tool") or denial))
-        else:
-            names.append(str(denial))
-    return names
-
-
-def extract_session_id(obj: Any) -> str | None:
-    """Return the agent's saved session id from a JSONL event, if present.
-
-    Codex announces it as ``thread.started``/``thread_id``, Claude as the
-    ``system``/``init`` event's ``session_id``. Both are the token the resume
-    paths later pass back, so both land in ``invocations.codex_session_id``.
-    """
-    if not isinstance(obj, dict):
-        return None
-    if obj.get("type") == "thread.started":
-        session_id = obj.get("thread_id")
-    elif obj.get("type") == "system" and obj.get("subtype") == "init":
-        session_id = obj.get("session_id")
-    else:
-        return None
-    return session_id if isinstance(session_id, str) and session_id.strip() else None
-
-
-def codex_args(resume_session_id: str | None) -> list[str]:
-    """Build the ``codex exec`` argv, fresh or resuming an existing thread."""
-    if resume_session_id:
-        # exec-resume has its own option parser. Put workspace and sandbox
-        # overrides at the CLI root, and pass the follow-up prompt on stdin.
-        return [
-            str(CODEX_BIN),
-            "-C",
-            str(WORKTREE),
-            "--sandbox",
-            "workspace-write",
-            "exec",
-            "resume",
-            *CODEX_MODEL_ARGS,
-            "--json",
-            "-c",
-            "shell_environment_policy.inherit=all",
-            resume_session_id,
-            "-",
-        ]
-    return [
-        str(CODEX_BIN),
-        "exec",
-        "-C",
-        str(WORKTREE),
-        *CODEX_MODEL_ARGS,
-        "--json",
-        "--sandbox",
-        "workspace-write",
-        "--color",
-        "never",
-        "-c",
-        "shell_environment_policy.inherit=all",
-        "-",
-    ]
-
-
-def claude_args(resume_session_id: str | None) -> list[str]:
-    """Build the ``claude -p`` argv, fresh or resuming an existing session.
-
-    The prompt always arrives on stdin, so no prompt argument is passed. The
-    working directory is set on the Popen itself, which is what replaces Codex's
-    ``-C``. Three flags are deliberately absent: ``--fork-session`` would change
-    the session id on resume, ``--no-session-persistence`` would leave nothing
-    to resume, and ``--bare`` would cost the agent CLAUDE.md discovery inside
-    the Bifrost worktree.
-
-    ``--permission-prompts none`` does not narrow auto mode; auto still decides
-    everything it can. It only settles the indeterminate residue auto mode would
-    otherwise pause on. Under cron nobody can answer such a pause, so the real
-    choice is between denying and hanging until the deadline.
-
-    The pinned output style is the same argument as the pinned model: without it
-    the repair agent inherits whatever style ~/.claude/settings.json currently
-    carries for interactive use, and that prose goes straight to Slack. This
-    overrides only that one key, so the Bifrost worktree's own CLAUDE.md and
-    project settings still load.
-    """
-    args = [
-        str(CLAUDE_BIN),
-        "-p",
-        "--output-format",
-        "stream-json",
-        "--verbose",  # required alongside -p with stream-json output
-        "--model",
-        CLAUDE_MODEL,
-        "--effort",
-        CLAUDE_EFFORT,
-        "--permission-mode",
-        "auto",
-        "--permission-prompts",
-        "none",
-        "--settings",
-        json.dumps({"outputStyle": "default"}),
-    ]
-    if resume_session_id:
-        args += ["--resume", resume_session_id]
-    return args
-
-
-def agent_args(resume_session_id: str | None) -> list[str]:
-    """Build the configured agent's argv. See ``AGENT``."""
-    return (claude_args if AGENT == "claude" else codex_args)(resume_session_id)
-
-
-def invoke_codex_stream(
-    prompt: str,
-    on_message,
-    *,
-    timeout_seconds: int = CODEX_TIMEOUT_SECONDS,
-    resume_session_id: str | None = None,
-    on_session=None,
-    on_process=None,
-) -> CodexResult:
-    """Run the configured agent, invoking ``on_message(text)`` per assistant message.
-
-    Reads stdout as JSONL as it arrives so the Slack thread updates live, while
-    still capturing the full transcript for the database and enforcing the
-    caller's timeout with SIGTERM/SIGKILL escalation. Everything here except the
-    argv (see ``agent_args``) and the event parsers is agent-independent.
-    """
-    args = agent_args(resume_session_id)
-    stderr_file = tempfile.TemporaryFile()
-    try:
-        process = subprocess.Popen(
-            args,
-            cwd=WORKTREE,
-            env=child_environment(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=stderr_file,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        stderr_file.close()
-        return CodexResult(
-            "spawn_failed",
-            None,
-            False,
-            f"Could not start {AGENT}: {exc}\n",
-            resume_session_id,
+def store_session(conn: sqlite3.Connection, run_id: int, session_id: str) -> None:
+    with conn:
+        conn.execute(
+            "UPDATE invocations SET codex_session_id = ?, status = 'running' "
+            "WHERE workflow_run_id = ?",
+            (session_id, run_id),
         )
 
-    if on_process is not None:
-        on_process(process.pid)
 
-    session_id = resume_session_id
-    denials: list[str] = []
-
-    def dispatch(raw_line: bytes) -> None:
-        line = raw_line.strip()
-        if not line:
-            return
+def relay_text(transport: SlackTransport, thread_ts: str | None, text: str) -> bool:
+    if transport.kind == "chat":
+        if not thread_ts:
+            log("streamed Slack post cannot be sent without a thread timestamp")
+            return False
         try:
-            obj = json.loads(line)
-        except ValueError:
-            return
-        nonlocal session_id
-        found_denials = extract_permission_denials(obj)
-        if found_denials:
-            denials.extend(found_denials)
-        found_session_id = extract_session_id(obj)
-        if found_session_id:
-            session_id = found_session_id
-            if on_session is not None:
-                on_session(found_session_id)
-        text = extract_agent_text(obj)
-        if text:
-            try:
-                on_message(text)
-            except Exception as exc:  # never let a Slack hiccup break the read loop
-                log(f"streamed Slack post failed: {exc}")
+            ok, _ = slack_send(transport, text, thread_ts=thread_ts)
+            if not ok:
+                log("streamed Slack post was not accepted")
+            return ok
+        except Exception as exc:
+            log(f"streamed Slack post failed: {exc}")
+            return False
+    return True
 
+
+def drain_transcript(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+    run_id: int,
+    session_id: str,
+) -> list[str]:
+    row = conn.execute(
+        "SELECT mj_transcript_after_seq, output, thread_ts FROM invocations "
+        "WHERE workflow_run_id = ?",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        raise MjError(f"invocation row for run {run_id} disappeared")
+    cursor = int(row["mj_transcript_after_seq"] or 0)
+    result = mj_command(
+        [
+            "transcript", "--session", session_id, "--finished-only",
+            "--after-seq", str(cursor), "--json",
+        ],
+        timeout=60,
+    )
+    if result.returncode != 0:
+        detail = mj_output(result)
+        reason = "daemon_unreachable" if looks_like_daemon_failure(detail) else "mj_supervision_failed"
+        raise MjError(f"mj transcript failed: {detail}", reason=reason)
     try:
-        process.stdin.write(prompt.encode("utf-8"))
-        process.stdin.close()
-    except OSError:
-        pass
+        page = json.loads(result.stdout or "")
+        items = page.get("items", [])
+        next_cursor = int(page.get("next_after_seq", cursor))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise MjError(f"mj transcript returned invalid JSON: {mj_output(result)}") from exc
+    texts: list[str] = []
+    processed_cursor = cursor
+    all_items_processed = True
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            seq = int(item.get("seq", 0))
+        except (TypeError, ValueError):
+            seq = 0
+        text = item.get("text")
+        if seq <= cursor or not isinstance(text, str) or not text.strip():
+            continue
+        stable_id = str(item.get("stable_id") or f"seq:{seq}")
+        already_sent = conn.execute(
+            "SELECT 1 FROM relayed_messages WHERE workflow_run_id = ? AND stable_id = ?",
+            (run_id, stable_id),
+        ).fetchone()
+        if already_sent:
+            processed_cursor = max(processed_cursor, seq)
+            continue
+        item_text = text.strip()
+        if not relay_text(transport, row["thread_ts"], item_text):
+            all_items_processed = False
+            # after-seq is exclusive and several transcript items may share a
+            # sequence. Rewind before the failed sequence so its siblings are
+            # returned again; stable_id dedupes siblings already posted.
+            processed_cursor = min(processed_cursor, seq - 1)
+            break
+        texts.append(item_text)
+        processed_cursor = max(processed_cursor, seq)
+        with conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO relayed_messages (workflow_run_id, stable_id, seq) "
+                "VALUES (?, ?, ?)",
+                (run_id, stable_id, seq),
+            )
+            conn.execute(
+                "UPDATE invocations SET output = output || ? WHERE workflow_run_id = ?",
+                (f"{item_text}\n\n", run_id),
+            )
+    if all_items_processed:
+        processed_cursor = max(processed_cursor, next_cursor)
+    with conn:
+        conn.execute(
+            "UPDATE invocations SET mj_transcript_after_seq = ? "
+            "WHERE workflow_run_id = ?",
+            (processed_cursor, run_id),
+        )
+    return texts
 
-    stdout_fd = process.stdout.fileno()
-    deadline = time.monotonic() + timeout_seconds
-    chunks: list[bytes] = []
-    buffer = b""
-    timed_out = False
+
+def read_complete_agent_transcript(session_id: str) -> str:
+    """Read all agent messages for final outcome detection, independent of Slack."""
+    cursor = 0
+    latest_messages: dict[str, tuple[int, str]] = {}
+    for _ in range(10_000):
+        result = mj_command(
+            [
+                "transcript", "--session", session_id, "--role", "agent",
+                "--after-seq", str(cursor), "--json",
+            ],
+            timeout=60,
+        )
+        if result.returncode != 0:
+            detail = mj_output(result)
+            reason = (
+                "daemon_unreachable"
+                if looks_like_daemon_failure(detail)
+                else "mj_supervision_failed"
+            )
+            raise MjError(f"mj final transcript read failed: {detail}", reason=reason)
+        try:
+            page = json.loads(result.stdout or "")
+            if not isinstance(page, dict) or not isinstance(page.get("items", []), list):
+                raise TypeError("transcript page has no item list")
+            items = page.get("items", [])
+            next_cursor = int(page.get("next_after_seq", cursor))
+            latest_seq = int(page.get("latest_seq", next_cursor))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise MjError(
+                f"mj final transcript returned invalid JSON: {mj_output(result)}"
+            ) from exc
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            try:
+                seq = int(item.get("seq", next_cursor))
+            except (TypeError, ValueError):
+                seq = next_cursor
+            stable_id = str(item.get("stable_id") or f"seq:{seq}")
+            previous = latest_messages.get(stable_id)
+            if previous is None or seq >= previous[0]:
+                latest_messages[stable_id] = (seq, text.strip())
+        if next_cursor >= latest_seq:
+            break
+        if next_cursor <= cursor:
+            raise MjError(
+                f"mj final transcript pagination stopped at sequence {cursor} "
+                f"before latest sequence {latest_seq}"
+            )
+        cursor = next_cursor
+    else:
+        raise MjError("mj final transcript exceeded the 10,000-page safety limit")
+    return "\n\n".join(
+        text for _, text in sorted(latest_messages.values(), key=lambda item: item[0])
+    )
+
+
+def wait_once(session_id: str, timeout_seconds: int) -> TurnResult:
+    result = mj_command(
+        [
+            "wait", "--session", session_id, "--json", "--timeout",
+            str(max(1, timeout_seconds)),
+        ],
+        timeout=max(20, timeout_seconds + 15),
+    )
+    try:
+        data = json.loads(result.stdout or "")
+        outcome = str(data["outcome"]).lower()
+    except (ValueError, KeyError, TypeError) as exc:
+        detail = mj_output(result)
+        reason = "daemon_unreachable" if looks_like_daemon_failure(detail) else "mj_supervision_failed"
+        raise MjError(f"mj wait returned no usable outcome: {detail}", reason=reason) from exc
+    if outcome == "timeout":
+        return TurnResult("running", outcome, timed_out=True)
+    status = "completed" if outcome == "finished" else outcome
+    return TurnResult(status, outcome)
+
+
+def supervise_turn(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+    run_id: int,
+    session_id: str,
+    timeout_seconds: int,
+) -> TurnResult:
+    deadline = time.monotonic() + max(0, timeout_seconds)
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            timed_out = True
-            break
-        ready, _, _ = select.select([stdout_fd], [], [], min(1.0, remaining))
-        if not ready:
+            return TurnResult("running", "timeout", timed_out=True)
+        wait_seconds = min(MJ_WAIT_POLL_SECONDS, max(1, int(remaining)))
+        turn = wait_once(session_id, wait_seconds)
+        drain_transcript(conn, transport, run_id, session_id)
+        if not turn.timed_out:
+            return turn
+
+
+def interrupt_and_wait(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+    run_id: int,
+    session_id: str,
+    *,
+    grace_seconds: int,
+) -> TurnResult:
+    interrupted = mj_command(
+        ["interrupt-turn", "--session", session_id, "--json"], timeout=60
+    )
+    if interrupted.returncode != 0:
+        detail = mj_output(interrupted)
+        lower = detail.lower()
+        already_ended = any(
+            marker in lower
+            for marker in ("no active turn", "nothing is running", "turn is not running")
+        )
+        if not already_ended:
+            reason = (
+                "daemon_unreachable"
+                if looks_like_daemon_failure(detail)
+                else "mj_supervision_failed"
+            )
+            raise MjError(f"mj interrupt-turn failed: {detail}", reason=reason)
+    deadline = time.monotonic() + grace_seconds
+    while True:
+        turn = wait_once(session_id, MJ_WAIT_POLL_SECONDS)
+        drain_transcript(conn, transport, run_id, session_id)
+        if not turn.timed_out:
+            return turn
+        if time.monotonic() >= deadline:
+            raise MjError(
+                f"session {session_id} did not end after interrupt-turn",
+                reason="mj_supervision_failed",
+            )
+
+
+def send_session_prompt(session_id: str, prompt: str) -> None:
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", prefix="bifrost-ci-",
+        suffix=".prompt", delete=False,
+    ) as handle:
+        handle.write(prompt)
+        prompt_path = handle.name
+    try:
+        result = mj_command(
+            [
+                "prompt", "--session", session_id,
+                "--prompt-file", prompt_path, "--json",
+            ],
+            timeout=60,
+        )
+    finally:
+        Path(prompt_path).unlink(missing_ok=True)
+    if result.returncode != 0:
+        detail = mj_output(result)
+        reason = "daemon_unreachable" if looks_like_daemon_failure(detail) else "mj_supervision_failed"
+        raise MjError(f"mj prompt failed: {detail}", reason=reason)
+
+
+def suspend_response_warning(result: subprocess.CompletedProcess[str]) -> str | None:
+    try:
+        payload = json.loads(result.stdout or "")
+    except (ValueError, TypeError):
+        return None
+    warning = payload.get("warning") if isinstance(payload, dict) else None
+    return str(warning).strip() if warning else None
+
+
+def report_suspend_warning(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+    run_id: int,
+    warning: str,
+) -> None:
+    row = conn.execute(
+        "SELECT thread_ts FROM invocations WHERE workflow_run_id = ?",
+        (run_id,),
+    ).fetchone()
+    log(f"mj suspend warning for run {run_id}: {warning}")
+    slack_send(
+        transport,
+        f":warning: Mjolnir suspend warning for run {run_id}: {warning}",
+        thread_ts=row["thread_ts"] if row else None,
+    )
+
+
+def suspend_session(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+    run_id: int,
+    session_id: str,
+    *,
+    retry: bool = False,
+) -> bool:
+    """Request suspend and persist it for later lifecycle verification."""
+    with conn:
+        if retry:
+            conn.execute(
+                "UPDATE invocations SET suspend_requested = 1 "
+                "WHERE workflow_run_id = ?",
+                (run_id,),
+            )
+        else:
+            conn.execute(
+                "UPDATE invocations SET suspend_requested = 1, "
+                "suspend_retry_count = 0, suspend_failure_notified = 0, "
+                "suspend_verify_failures = 0 "
+                "WHERE workflow_run_id = ?",
+                (run_id,),
+            )
+    try:
+        result = mj_command(
+            ["suspend", "--session", session_id, "--json"], timeout=60
+        )
+        warning = suspend_response_warning(result)
+        if warning:
+            report_suspend_warning(conn, transport, run_id, warning)
+        detail = mj_output(result)
+        if result.returncode != 0 and "acknowledge-unpublished-work" in detail:
+            result = mj_command(
+                [
+                    "suspend", "--session", session_id,
+                    "--acknowledge-unpublished-work", "--json",
+                ],
+                timeout=60,
+            )
+            warning = suspend_response_warning(result)
+            if warning:
+                report_suspend_warning(conn, transport, run_id, warning)
+            detail = mj_output(result)
+        if result.returncode != 0:
+            log(f"mj suspend failed for run {run_id} session {session_id}: {detail}")
+            return False
+        return True
+    except MjError as exc:
+        log(f"mj suspend failed for run {run_id} session {session_id}: {exc}")
+        return False
+
+
+def session_is_stopped(session: dict[str, Any]) -> bool:
+    return str(session.get("state", "")).lower() in {"stopped", "suspended"}
+
+
+def notify_suspend_failure_once(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+    row: sqlite3.Row,
+    details: str,
+) -> None:
+    if row["suspend_failure_notified"]:
+        return
+    run = invocation_as_run(row)
+    text = (
+        f":warning: Mjolnir session {row['codex_session_id']} for run {run.run_id} "
+        f"still is not suspended: {details}"
+    )
+    ok, _ = slack_send(transport, text, thread_ts=row["thread_ts"])
+    if ok:
+        with conn:
+            conn.execute(
+                "UPDATE invocations SET suspend_failure_notified = 1 "
+                "WHERE workflow_run_id = ?",
+                (run.run_id,),
+            )
+
+
+def check_pending_suspensions(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+) -> None:
+    rows = conn.execute(
+        "SELECT * FROM invocations WHERE suspend_requested = 1 "
+        "AND codex_session_id IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        session_id = str(row["codex_session_id"])
+        try:
+            raw = require_mj_success(
+                ["sessions", "--session", session_id, "--json"], timeout=30
+            )
+            session = json.loads(raw)
+            if not isinstance(session, dict):
+                raise MjError("mj sessions returned an unexpected response")
+        except (MjError, ValueError) as exc:
+            run_id = int(row["workflow_run_id"])
+            with conn:
+                conn.execute(
+                    "UPDATE invocations SET suspend_verify_failures = "
+                    "suspend_verify_failures + 1 WHERE workflow_run_id = ?",
+                    (run_id,),
+                )
+            failed_row = conn.execute(
+                "SELECT * FROM invocations WHERE workflow_run_id = ?", (run_id,)
+            ).fetchone()
+            failures = int(failed_row["suspend_verify_failures"] or 0)
+            log(f"could not verify suspend for run {run_id} ({failures}): {exc}")
+            if failures >= SUSPEND_VERIFY_FAILURE_THRESHOLD:
+                notify_suspend_failure_once(
+                    conn,
+                    transport,
+                    failed_row,
+                    f"suspend verification failed {failures} consecutive times: {exc}",
+                )
             continue
-        data = os.read(stdout_fd, 65536)
-        if not data:
-            break  # EOF: the agent closed stdout
-        chunks.append(data)
-        buffer += data
-        while b"\n" in buffer:
-            line, buffer = buffer.split(b"\n", 1)
-            dispatch(line)
-    if buffer.strip():
-        dispatch(buffer)
+        if session_is_stopped(session):
+            with conn:
+                conn.execute(
+                    "UPDATE invocations SET suspend_requested = 0, "
+                    "suspend_verify_failures = 0 "
+                    "WHERE workflow_run_id = ?",
+                    (row["workflow_run_id"],),
+                )
+            continue
+        with conn:
+            conn.execute(
+                "UPDATE invocations SET suspend_verify_failures = 0 "
+                "WHERE workflow_run_id = ?",
+                (row["workflow_run_id"],),
+            )
+        if int(row["suspend_retry_count"] or 0) == 0:
+            with conn:
+                conn.execute(
+                    "UPDATE invocations SET suspend_retry_count = 1 "
+                    "WHERE workflow_run_id = ?",
+                    (row["workflow_run_id"],),
+                )
+            if not suspend_session(
+                conn, transport, int(row["workflow_run_id"]), session_id,
+                retry=True,
+            ):
+                notify_suspend_failure_once(
+                    conn, transport, row,
+                    "the retry command was rejected or could not reach Mjolnir",
+                )
+            continue
+        notify_suspend_failure_once(
+            conn, transport, row,
+            f"Mjolnir still reports state {session.get('state', 'unknown')}",
+        )
 
-    if timed_out:
+
+def run_session_lifecycle(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+    run: CiRun,
+    session_id: str,
+    branch: str,
+    timeout_seconds: int,
+    *,
+    first_wait: TurnResult | None = None,
+    resume_timeout_handoff: bool = False,
+    handoff_in_progress: bool = False,
+) -> SessionResult:
+    handoff_completed = False
+    timed_out = False
+    final_status = "failed"
+    try:
+        if handoff_in_progress:
+            timed_out = True
+            handoff = first_wait or supervise_turn(
+                conn, transport, run.run_id, session_id,
+                MJ_HANDOFF_TIMEOUT_SECONDS,
+            )
+            if handoff.timed_out:
+                interrupt_and_wait(
+                    conn, transport, run.run_id, session_id,
+                    grace_seconds=MJ_HANDOFF_INTERRUPTION_GRACE_SECONDS,
+                )
+            handoff_completed = (
+                not handoff.timed_out and handoff.status == "completed"
+            )
+            drain_transcript(conn, transport, run.run_id, session_id)
+            final_status = "timed_out"
+        else:
+            turn = (
+                TurnResult("running", "timeout", timed_out=True)
+                if resume_timeout_handoff
+                else first_wait
+                or supervise_turn(conn, transport, run.run_id, session_id, timeout_seconds)
+            )
+            timed_out = turn.timed_out or resume_timeout_handoff
+            if not timed_out:
+                final_status = turn.status
+                drain_transcript(conn, transport, run.run_id, session_id)
+            else:
+                with conn:
+                    conn.execute(
+                        """
+                        UPDATE invocations
+                        SET timed_out = 1, timeout_handoff_status = 'interrupting'
+                        WHERE workflow_run_id = ?
+                        """,
+                        (run.run_id,),
+                    )
+                if not resume_timeout_handoff or first_wait is None or first_wait.timed_out:
+                    interrupt_and_wait(
+                        conn, transport, run.run_id, session_id,
+                        grace_seconds=MJ_HANDOFF_INTERRUPTION_GRACE_SECONDS,
+                    )
+                drain_transcript(conn, transport, run.run_id, session_id)
+                with conn:
+                    conn.execute(
+                        "UPDATE invocations SET timeout_handoff_status = 'prompting' "
+                        "WHERE workflow_run_id = ?",
+                        (run.run_id,),
+                    )
+                try:
+                    send_session_prompt(
+                        session_id, build_timeout_handoff_prompt(run, session_id, branch)
+                    )
+                    with conn:
+                        conn.execute(
+                            "UPDATE invocations SET timeout_handoff_status = 'running' "
+                            "WHERE workflow_run_id = ?",
+                            (run.run_id,),
+                        )
+                    handoff = supervise_turn(
+                        conn, transport, run.run_id, session_id,
+                        MJ_HANDOFF_TIMEOUT_SECONDS,
+                    )
+                    if handoff.timed_out:
+                        interrupt_and_wait(
+                            conn, transport, run.run_id, session_id,
+                            grace_seconds=MJ_HANDOFF_INTERRUPTION_GRACE_SECONDS,
+                        )
+                    handoff_completed = (
+                        not handoff.timed_out and handoff.status == "completed"
+                    )
+                    drain_transcript(conn, transport, run.run_id, session_id)
+                except MjError as exc:
+                    log(f"timeout handoff failed for run {run.run_id}: {exc}")
+                final_status = "timed_out"
+        output = read_complete_agent_transcript(session_id)
+        with conn:
+            conn.execute(
+                "UPDATE invocations SET output = ? WHERE workflow_run_id = ?",
+                (output, run.run_id),
+            )
+        return SessionResult(
+            final_status,
+            output,
+            timed_out,
+            handoff_completed,
+        )
+    finally:
+        suspend_session(conn, transport, run.run_id, session_id)
+
+
+def invocation_as_run(row: sqlite3.Row) -> CiRun:
+    return CiRun(
+        workflow=str(row["workflow"] or "CI"),
+        sha=str(row["sha"]),
+        run_id=int(row["workflow_run_id"]),
+        url=str(row["workflow_run_url"]),
+        status="completed",
+        conclusion=str(row["conclusion"]),
+        created_at=str(row["started_at"]),
+        attempt=int(row["attempt_count"] or 1),
+        updated_at=str(row["started_at"]),
+    )
+
+
+def elapsed_since(started_at: str) -> int:
+    try:
+        started = dt.datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return MJ_TURN_TIMEOUT_SECONDS
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=dt.timezone.utc)
+    return max(0, int((dt.datetime.now(dt.timezone.utc) - started).total_seconds()))
+
+
+def has_repair_run_trailer(message: str, run_id: int) -> bool:
+    """Use Git's trailer parser so body text cannot impersonate a footer."""
+    try:
+        parsed = subprocess.run(
+            ["/usr/bin/git", "interpret-trailers", "--parse"],
+            input=message,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CommandError(f"git interpret-trailers failed: {exc}") from exc
+    if parsed.returncode != 0:
+        raise CommandError(
+            f"git interpret-trailers failed: {(parsed.stderr or '').strip()}"
+        )
+    for line in parsed.stdout.splitlines():
+        key, separator, value = line.partition(":")
+        if (
+            separator
+            and key.strip().casefold() == "ci-repair-run"
+            and value.strip() == str(run_id)
+        ):
+            return True
+    return False
+
+
+def read_pushed_commit(base_sha: str, run_id: int) -> tuple[str, str | None]:
+    """Walk master back to the launch base, returning its newest tagged commit.
+
+    The first page names ``master``. Later pages pin to the observed head SHA so
+    concurrent pushes cannot shift page boundaries during this scan.
+    """
+    if not base_sha:
+        raise PushDetectionIndeterminate("the invocation has no stored launch base SHA")
+    head_sha: str | None = None
+    pushed_sha: str | None = None
+    query_sha = BRANCH
+    for page_number in range(1, PUSH_DETECTION_MAX_PAGES + 1):
+        query = urllib.parse.urlencode(
+            {
+                "sha": query_sha,
+                "per_page": PUSH_DETECTION_PAGE_SIZE,
+                "page": page_number,
+            }
+        )
+        endpoint = f"repos/{REPO_NAME}/commits?{query}"
+        raw = run_command([str(GH_BIN), "api", endpoint], timeout=60)
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+            commits = json.loads(raw)
+            if not isinstance(commits, list):
+                raise TypeError("commit page is not an array")
+            if any(not isinstance(commit, dict) for commit in commits):
+                raise TypeError("commit page contains a non-object entry")
+        except (ValueError, TypeError) as exc:
+            raise CommandError(f"GitHub commit page returned invalid JSON: {exc}") from exc
+        if head_sha is None:
+            if not commits or not commits[0].get("sha"):
+                raise PushDetectionIndeterminate("master history is empty")
+            head_sha = str(commits[0]["sha"])
+            query_sha = head_sha
+        for commit in commits:
+            sha = str(commit.get("sha") or "")
+            if not sha:
+                continue
+            if sha == base_sha:
+                return head_sha, pushed_sha
+            body = commit.get("commit")
+            body = body if isinstance(body, dict) else {}
+            message = str(body.get("message", ""))
+            if pushed_sha is None and has_repair_run_trailer(message, run_id):
+                # The API order is newest first. Preserve the first match.
+                pushed_sha = sha
+        if len(commits) < PUSH_DETECTION_PAGE_SIZE:
+            break
+    raise PushDetectionIndeterminate(
+        f"launch base {base_sha} was not found in the first "
+        f"{PUSH_DETECTION_MAX_PAGES} pages of master history"
+    )
+
+
+def active_mj_turn(session: dict[str, Any]) -> bool:
+    if str(session.get("chat_phase", "")).lower() == "running":
+        return True
+    return (
+        session.get("is_idle") is False
+        and str(session.get("state", "")).lower() in {"running", "launching"}
+    )
+
+
+def mark_unattached_invocations_retryable(conn: sqlite3.Connection) -> None:
+    """Release claims that were persisted before an attempt was allocated."""
+    with conn:
+        conn.execute(
+            """
+            UPDATE invocations
+            SET status = 'launch_failed', finished_at = ?,
+                codex_pid = NULL, output = output || ?
+            WHERE status = 'claimed'
+              AND codex_session_id IS NULL
+            """,
+            (utc_now(), "\nMonitor restarted before an Mjolnir session id was saved.\n"),
+        )
+
+
+def recover_launching_invocations(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+) -> None:
+    """Resolve persisted launch identities before the red run can be retried."""
+    rows = conn.execute(
+        "SELECT * FROM invocations WHERE status = 'launching' "
+        "AND codex_session_id IS NULL"
+    ).fetchall()
+    for row in rows:
+        run = invocation_as_run(row)
+        attempt = int(row["attempt_count"] or 1)
         try:
-            process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
+            session_id = lookup_launch_session(run, attempt)
+        except MjError as exc:
+            record_blocked_reason(
+                conn, transport, run, exc.reason,
+                f"Could not resolve persisted Mjolnir launch attempt {attempt}: {exc}",
+                thread_ts=row["thread_ts"],
+            )
+            continue
+        if session_id:
+            store_session(conn, run.run_id, session_id)
+            continue
+        # The attempt was persisted before mj new. If the monitor died around
+        # that call, a temporarily empty listing cannot prove that no session
+        # was created. Keep this identity unresolved so claim_invocation cannot
+        # increment the attempt and launch a duplicate on a later tick.
+        record_blocked_reason(
+            conn,
+            transport,
+            run,
+            "mj_launch_ambiguous",
+            f"No Mjolnir session is visible for persisted attempt {attempt}; "
+            "keeping the attempt unresolved and will not launch another session.",
+            thread_ts=row["thread_ts"],
+        )
+
+
+def reattach_running_invocations(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+    *,
+    runner_error: str | None = None,
+) -> None:
+    rows = conn.execute(
+        "SELECT * FROM invocations WHERE status = 'running' "
+        "AND codex_session_id IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        run = invocation_as_run(row)
+        session_id = str(row["codex_session_id"])
+        if runner_error:
+            record_blocked_reason(
+                conn, transport, run, runner_error,
+                "Installed mj cannot relay finished transcript messages.",
+                thread_ts=row["thread_ts"],
+            )
+            continue
+        try:
+            raw = require_mj_success(
+                ["sessions", "--session", session_id, "--json"], timeout=30
+            )
+            session = json.loads(raw)
+            if not isinstance(session, dict):
+                raise MjError("mj sessions returned an unexpected response")
+            first_wait: TurnResult | None = None
+            if not active_mj_turn(session):
+                first_wait = wait_once(session_id, 1)
+                if first_wait.timed_out:
+                    first_wait = None
+            branch = repair_branch(run.run_id, int(row["attempt_count"] or 1))
+            handoff_phase = str(row["timeout_handoff_status"] or "")
+            handoff_in_progress = bool(row["timed_out"]) and handoff_phase == "running"
+            if handoff_phase == "prompting" and active_mj_turn(session):
+                handoff_in_progress = True
+            resume_timeout_handoff = (
+                bool(row["timed_out"]) and not handoff_in_progress
+            )
+            result = run_session_lifecycle(
+                conn, transport, run, session_id, branch,
+                MJ_TURN_TIMEOUT_SECONDS - elapsed_since(row["started_at"]),
+                first_wait=first_wait,
+                resume_timeout_handoff=resume_timeout_handoff,
+                handoff_in_progress=handoff_in_progress,
+            )
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    else:
-        process.wait()
-
-    process.stdout.close()
-    stderr_file.seek(0)
-    stderr_text = stderr_file.read().decode("utf-8", errors="replace")
-    stderr_file.close()
-    output = b"".join(chunks).decode("utf-8", errors="replace") + stderr_text
-    if denials:
-        output += f"\nDenied tool calls: {', '.join(sorted(set(denials)))}.\n"
-    if timed_out:
-        output += f"\n{AGENT} exceeded the {timeout_seconds}-second monitor timeout.\n"
-        return CodexResult("timed_out", process.returncode, True, output, session_id)
-    status = "completed" if process.returncode == 0 else "failed"
-    return CodexResult(status, process.returncode, False, output, session_id)
+                master_sha, pushed_sha = read_pushed_commit(
+                    str(row["base_sha"] or ""), run.run_id
+                )
+            except PushDetectionIndeterminate as exc:
+                finalize_push_detection_indeterminate(
+                    conn, transport, run, result, exc
+                )
+                continue
+            except (CommandError, ValueError, json.JSONDecodeError) as exc:
+                finalize_push_detection_failure(
+                    conn, transport, run, result, exc
+                )
+                continue
+            finalize_invocation(
+                conn, transport, run, result, master_sha, pushed_sha
+            )
+        except (MjError, CommandError, ValueError, sqlite3.Error) as exc:
+            reason = exc.reason if isinstance(exc, MjError) else "github_compare_failed"
+            record_blocked_reason(
+                conn, transport, run, reason, str(exc), thread_ts=row["thread_ts"]
+            )
 
 
 def format_commit(sha: str) -> str:
@@ -1746,20 +2042,102 @@ def outcome_detail(
         return f"Pushed {format_commit(pushed_sha)} to fix the problem."
     if status == "completed":
         if new_sha == "unknown":
-            return f"{AGENT} made no changes; could not read master state."
+            return f"{AGENT_LABEL} made no changes; could not read master state."
         if new_sha == base_sha:
-            return f"{AGENT} made no changes; master is unchanged at {format_commit(new_sha)}."
+            return f"{AGENT_LABEL} made no changes; master is unchanged at {format_commit(new_sha)}."
         return f"Looks like {format_commit(new_sha)} fixes the problem."
     return f"Remote master is now {format_commit(new_sha)}."
+
+
+def finalize_push_detection_failure(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+    run: CiRun,
+    result: SessionResult,
+    error: Exception,
+) -> None:
+    row = conn.execute(
+        "SELECT thread_ts FROM invocations WHERE workflow_run_id = ?",
+        (run.run_id,),
+    ).fetchone()
+    thread_ts = row["thread_ts"] if row else None
+    with conn:
+        conn.execute(
+            "UPDATE invocations SET status = 'failed', timed_out = ?, output = ?, "
+            "issue_url = NULL, timeout_handoff_status = ?, finished_at = ?, "
+            "codex_pid = NULL WHERE workflow_run_id = ?",
+            (
+                int(result.timed_out),
+                result.output,
+                "failed" if result.timed_out else None,
+                utc_now(),
+                run.run_id,
+            ),
+        )
+    text = (
+        f":warning: {AGENT_LABEL} finished for <{run.url}|run {run.run_id}>, but "
+        f"GitHub commit detection failed ({error}). The monitor marked this attempt "
+        "failed and will not launch a duplicate repair."
+    )
+    ok, _ = slack_send(transport, text, thread_ts=thread_ts)
+    with conn:
+        conn.execute(
+            "UPDATE invocations SET outcome_notification_attempted = ? "
+            "WHERE workflow_run_id = ?",
+            (int(ok), run.run_id),
+        )
+    log(f"push detection failed for run {run.run_id}: {error}")
+
+
+def finalize_push_detection_indeterminate(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+    run: CiRun,
+    result: SessionResult,
+    error: PushDetectionIndeterminate,
+) -> None:
+    row = conn.execute(
+        "SELECT thread_ts FROM invocations WHERE workflow_run_id = ?",
+        (run.run_id,),
+    ).fetchone()
+    thread_ts = row["thread_ts"] if row else None
+    with conn:
+        conn.execute(
+            "UPDATE invocations SET status = 'push_unknown', timed_out = ?, "
+            "output = ?, issue_url = NULL, timeout_handoff_status = ?, "
+            "finished_at = ?, codex_pid = NULL WHERE workflow_run_id = ?",
+            (
+                int(result.timed_out),
+                result.output,
+                "completed" if result.handoff_completed else "failed"
+                if result.timed_out else None,
+                utc_now(),
+                run.run_id,
+            ),
+        )
+    text = (
+        f":warning: {AGENT_LABEL} finished for <{run.url}|run {run.run_id}>, but "
+        f"push status is unknown: {error}. The launch base was not found in current "
+        "master history, so escalation detection was skipped. Check master history "
+        "before treating this repair as unpushed."
+    )
+    ok, _ = slack_send(transport, text, thread_ts=thread_ts)
+    with conn:
+        conn.execute(
+            "UPDATE invocations SET outcome_notification_attempted = ? "
+            "WHERE workflow_run_id = ?",
+            (int(ok), run.run_id),
+        )
+    log(f"push detection indeterminate for run {run.run_id}: {error}")
 
 
 def detect_escalation(
     output: str, exclude_url: str | None = None
 ) -> tuple[bool, str | None]:
-    """Recognize a design-level escalation from Codex's captured output.
+    """Recognize an escalation from the captured finished transcript.
 
-    Codex escalates by filing a GitHub issue and pinging the humans, so its
-    streamed output carries the ``<@member-id>`` mention tokens — which appear
+    The repair agent escalates by filing a GitHub issue and pinging the humans, so its
+    transcript carries the ``<@member-id>`` mention tokens — which appear
     on no other path — and, when issue creation succeeded, the filed issue URL.
     Returns ``(escalated, issue_url)``; ``issue_url`` is ``None`` if the ping
     is present but no issue link was found. Callers must gate this on "no push
@@ -1768,7 +2146,7 @@ def detect_escalation(
 
     ``exclude_url`` is the already-open issue a classification pass was told
     about: it may be echoed in the output, so it is discarded when choosing the
-    newly filed URL. The last remaining match wins, since Codex prints the URL
+    newly filed URL. The last remaining match wins, since the agent prints the URL
     it just created after any it merely referenced.
     """
     text = output or ""
@@ -1790,431 +2168,203 @@ def find_issue_url(output: str, exclude_url: str | None = None) -> str | None:
     return urls[-1] if urls else None
 
 
-def git_is_ancestor(ancestor: str, ref: str) -> bool:
-    """True if ``ancestor`` is an ancestor of (or equal to) ``ref`` in the worktree."""
-    result = subprocess.run(
-        [str(GIT_BIN), "merge-base", "--is-ancestor", ancestor, ref],
-        cwd=WORKTREE,
-        env=child_environment(),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    return result.returncode == 0
-
-
-def recovery_complete(saved: recovery.RecoveryResult) -> bool:
-    return saved.preservation_status == "complete" and saved.cleanup_status == "complete"
-
-
-def record_recovery_cleanup(
-    saved: recovery.RecoveryResult, status: str, error: str = "",
-) -> recovery.RecoveryResult:
-    try:
-        return recovery.mark_cleanup(saved, status, error)
-    except OSError as exc:
-        saved.cleanup_status = "failed"
-        saved.error = f"{error} Failed to persist cleanup result ({status}): {exc}".strip()
-        return saved
-
-
-def recover_timeout_worktree(
-    run_id: int, sha: str, session_id: str | None, *, attempt: int = 1,
-    transcript: str = "",
-) -> recovery.RecoveryResult:
-    """Verify a durable continuation package before touching unfinished work."""
-    package_dir = STATE_DIR / "recovery" / str(run_id) / str(attempt)
-    saved = recovery.preserve(
-        WORKTREE, package_dir, run_id=run_id, attempt=attempt, sha=sha,
-        session_id=session_id, transcript=transcript, git_bin=str(GIT_BIN),
-    )
-    if saved.preservation_status != "complete" or saved.cleanup_status == "complete":
-        return saved
-    try:
-        branch = run_command([str(GIT_BIN), "branch", "--show-current"], cwd=WORKTREE)
-        if branch != WORKTREE_BRANCH:
-            raise CommandError(f"expected branch {WORKTREE_BRANCH!r}, found {branch!r}")
-        # Fetch before changing the worktree so a network failure leaves it intact.
-        run_command([str(GIT_BIN), "fetch", "origin", BRANCH], cwd=WORKTREE, timeout=180)
-        remote_ref = f"origin/{BRANCH}"
-        remote_sha = run_command([str(GIT_BIN), "rev-parse", remote_ref], cwd=WORKTREE)
-        if saved.head_sha:
-            saved.extra["unpushed_commits"] = not git_is_ancestor(saved.head_sha, remote_ref)
-        try:
-            run_command([str(GIT_BIN), "rev-parse", "--verify", "MERGE_HEAD"], cwd=WORKTREE)
-        except CommandError:
-            pass
-        else:
-            # The package includes partial resolutions and the unmerged index.
-            run_command([str(GIT_BIN), "merge", "--abort"], cwd=WORKTREE)
-        if worktree_status():
-            # Native stash safely clears tracked and untracked files only after
-            # the original WIP already has immutable, verified package pointers.
-            run_command(
-                [str(GIT_BIN), "stash", "push", "--include-untracked", "--message",
-                 f"bifrost-ci cleanup run {run_id} attempt {attempt}; {saved.manifest_path}"],
-                cwd=WORKTREE, timeout=180,
-            )
-            if worktree_status():
-                raise CommandError("git stash left tracked or untracked changes behind")
-        run_command([str(GIT_BIN), "reset", "--hard", remote_ref], cwd=WORKTREE)
-        if worktree_status() or run_command(
-            [str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE
-        ) != remote_sha:
-            raise CommandError("worktree was not clean and synchronized after recovery")
-    except (CommandError, OSError) as exc:
-        return record_recovery_cleanup(saved, "failed", str(exc))
-    return record_recovery_cleanup(saved, "complete")
-
-
-def recover_invocation_worktree(
-    conn: sqlite3.Connection, run_id: int, sha: str, session_id: str | None,
-    *, transcript: str | None = None,
-) -> recovery.RecoveryResult:
+def finalize_invocation(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+    run: CiRun,
+    result: SessionResult,
+    master_sha: str,
+    pushed_sha: str | None,
+) -> None:
     row = conn.execute(
-        "SELECT attempt_count, output FROM invocations WHERE workflow_run_id = ?",
+        "SELECT base_sha, thread_ts FROM invocations WHERE workflow_run_id = ?",
+        (run.run_id,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(f"invocation row for run {run.run_id} disappeared")
+    base_sha = str(row["base_sha"] or "unknown")
+    thread_ts = row["thread_ts"]
+    episode = get_escalation(conn)
+    try:
+        episode = refresh_escalation_ownership(conn, episode)
+    except CommandError as exc:
+        log(f"could not refresh escalation ownership while finalizing run {run.run_id}: {exc}")
+    open_issue_url = (
+        str(episode["issue_url"])
+        if episode is not None and episode["escalated"] and episode["issue_url"]
+        else None
+    )
+    try:
+        signature = failing_signature(run)
+    except (CommandError, ValueError, json.JSONDecodeError) as exc:
+        log(f"could not refresh failing signature for run {run.run_id}: {exc}")
+        signature = ""
+    escalated = False
+    issue_url: str | None = None
+    if pushed_sha is None:
+        escalated, issue_url = detect_escalation(
+            result.output, exclude_url=open_issue_url
+        )
+    timeout_escalated = bool(result.timed_out and escalated and issue_url)
+    persisted_status = "timed_out" if result.timed_out else result.status
+    with conn:
+        conn.execute(
+            """
+            UPDATE invocations
+            SET status = ?, exit_code = NULL, timed_out = ?, output = ?,
+                issue_url = ?, timeout_handoff_status = ?, finished_at = ?,
+                codex_pid = NULL
+            WHERE workflow_run_id = ?
+            """,
+            (
+                persisted_status,
+                int(result.timed_out),
+                result.output,
+                issue_url,
+                (
+                    "completed" if result.handoff_completed else "failed"
+                    if result.timed_out
+                    else None
+                ),
+                utc_now(),
+                run.run_id,
+            ),
+        )
+
+    commit_link = format_commit(run.sha)
+    mention_text = " ".join(
+        f"<@{member_id}>" for member_id in ESCALATION_SLACK_MEMBER_IDS
+    )
+    if timeout_escalated:
+        outcome_line = (
+            f":memo: Bifrost CI auto-fixer for {commit_link} exceeded its one-hour "
+            f"budget and filed <{issue_url}|a ticket> for human resolution. "
+            f"<{run.url}|Original CI run>"
+        )
+        if transport.kind != "chat" or not any(
+            f"<@{member_id}>" in result.output
+            for member_id in ESCALATION_SLACK_MEMBER_IDS
+        ):
+            slack_send(
+                transport,
+                f"{mention_text} CI repair exceeded the one-hour automation budget — "
+                f"filed <{issue_url}|a ticket> for human resolution.",
+                thread_ts=thread_ts,
+            )
+        outcome = "timed out and escalated"
+    elif escalated:
+        filed = f"filed <{issue_url}|a ticket>" if issue_url else "filed a ticket"
+        distinct = (
+            " (a new problem, distinct from the one already open)"
+            if episode is not None and episode["escalated"]
+            else ""
+        )
+        outcome_line = (
+            f":memo: Bifrost CI auto-fixer for {commit_link} judged this a "
+            f"design-level call and escalated it{distinct}. No fix pushed; {filed} "
+            f"with its findings and pinged the team above. <{run.url}|Original CI run>"
+        )
+        outcome = "escalated"
+    elif result.timed_out:
+        outcome_line = (
+            f"{mention_text} Bifrost CI repair exceeded one hour and its ticket handoff "
+            f"did not complete. Work remains in Mjolnir session "
+            f"{row_session_id(conn, run.run_id)} on "
+            f"{repair_branch(run.run_id, int(run.attempt or 1))}; continue with "
+            f"mj resume --session {row_session_id(conn, run.run_id)}. "
+            f"<{run.url}|Original CI run>"
+        )
+        outcome = "timed out; ticket handoff failed"
+    elif episode is not None and episode["escalated"] and result.status == "completed":
+        if pushed_sha:
+            detail = (
+                f"Fixed a new mechanical failure and pushed {format_commit(pushed_sha)}; "
+                "the open design ticket still stands."
+            )
+            outcome = "fixed a new failure"
+            emoji = ":wrench:"
+        else:
+            detail = "No new actionable problem; the open design ticket still stands."
+            outcome = "re-checked"
+            emoji = ":repeat:"
+        outcome_line = (
+            f"{emoji} Bifrost CI auto-fixer for {commit_link}: {detail} "
+            f"<{run.url}|CI run>"
+        )
+    else:
+        if result.status == "completed":
+            emoji, outcome = ":white_check_mark:", "finished"
+        else:
+            emoji, outcome = ":x:", f"exited with status {result.status}"
+        outcome_line = (
+            f"{emoji} Bifrost CI auto-fixer for {commit_link} {outcome}. "
+            f"{outcome_detail(result.status, pushed_sha, base_sha, master_sha)} "
+            f"<{run.url}|Original CI run>"
+        )
+    slack_send(transport, outcome_line, thread_ts=thread_ts)
+
+    if escalated:
+        open_escalation(
+            conn,
+            run.sha,
+            signature,
+            issue_url,
+            thread_ts,
+            run.run_id,
+            escalated=True,
+        )
+    elif result.status == "completed" and episode is not None and episode["escalated"]:
+        if pushed_sha:
+            open_escalation(
+                conn,
+                episode["sha"],
+                episode["signature"],
+                episode["issue_url"],
+                thread_ts,
+                run.run_id,
+                escalated=True,
+            )
+        else:
+            merged = "\n".join(
+                sorted(
+                    signature_members(episode["signature"])
+                    | signature_members(signature)
+                )
+            )
+            open_escalation(
+                conn,
+                run.sha,
+                merged,
+                episode["issue_url"],
+                thread_ts,
+                run.run_id,
+                escalated=True,
+            )
+    elif result.status == "completed":
+        open_escalation(
+            conn,
+            run.sha,
+            signature,
+            None,
+            thread_ts,
+            run.run_id,
+            escalated=False,
+        )
+    with conn:
+        conn.execute(
+            "UPDATE invocations SET outcome_notification_attempted = 1 "
+            "WHERE workflow_run_id = ?",
+            (run.run_id,),
+        )
+    log(f"{AGENT_LABEL} {outcome} for {run.sha[:8]}")
+
+
+def row_session_id(conn: sqlite3.Connection, run_id: int) -> str:
+    row = conn.execute(
+        "SELECT codex_session_id FROM invocations WHERE workflow_run_id = ?",
         (run_id,),
     ).fetchone()
-    attempt = int(row["attempt_count"])
-    manifest = STATE_DIR / "recovery" / str(run_id) / str(attempt) / "manifest.json"
-    # Persist intent before filesystem operations. A restart cannot skip an
-    # unfinished package and let preflight discard its only remaining source.
-    with conn:
-        conn.execute(
-            "UPDATE invocations SET recovery_manifest_path = ?, recovery_status = 'preserving' "
-            "WHERE workflow_run_id = ?", (str(manifest), run_id),
-        )
-    saved = recover_timeout_worktree(
-        run_id, sha, session_id, attempt=attempt,
-        transcript=str(row["output"] or "") if transcript is None else transcript,
-    )
-    with conn:
-        conn.execute(
-            "UPDATE invocations SET recovery_manifest_path = ?, recovery_status = ? "
-            "WHERE workflow_run_id = ?",
-            (saved.manifest_path,
-             "complete" if recovery_complete(saved) else "failed", run_id),
-        )
-    return saved
-
-
-def retry_pending_recoveries(conn: sqlite3.Connection) -> None:
-    """Retry preservation/cleanup failures without starting another repair."""
-    rows = conn.execute(
-        "SELECT workflow_run_id, sha, codex_session_id, codex_pid FROM invocations "
-        "WHERE recovery_status IS NOT NULL AND recovery_status != 'complete' "
-        "AND status NOT IN ('claimed', 'running', 'reconciling', 'handoff_running')"
-    ).fetchall()
-    for row in rows:
-        if not terminate_recorded_codex(row["codex_pid"]):
-            continue
-        saved = recover_invocation_worktree(
-            conn, row["workflow_run_id"], row["sha"], row["codex_session_id"],
-        )
-        log(f"pending worktree recovery: {saved.detail}")
-
-
-def timeout_ticket_handoff(
-    conn: sqlite3.Connection, run: CiRun, result: CodexResult, relay: Any,
-    record_process: Any, *, transcript: str, exclude_url: str | None = None,
-) -> tuple[str, str | None, recovery.RecoveryResult]:
-    """Preserve first, then give the exact resumed session verified pointers."""
-    with conn:
-        conn.execute(
-            "UPDATE invocations SET status = 'handoff_running', exit_code = ?, timed_out = 1, "
-            "output = ?, codex_session_id = ?, timeout_handoff_status = 'running', "
-            "codex_pid = NULL WHERE workflow_run_id = ?",
-            (result.exit_code, transcript, result.session_id, run.run_id),
-        )
-    saved = recover_invocation_worktree(
-        conn, run.run_id, run.sha, result.session_id, transcript=transcript,
-    )
-    block = recovery.render_markdown(saved, Path(__file__).resolve().with_name("recovery.py"))
-    # The block remains available even if session resumption or issue creation fails.
-    block_path = Path(saved.manifest_path).parent / "recovery.md"
-    try:
-        recovery.write_text_atomic(block_path, block)
-    except OSError as exc:
-        block += f"\nRecovery instructions could not be saved locally: {exc}\n"
-    with conn:
-        conn.execute(
-            "UPDATE invocations SET output = output || ? WHERE workflow_run_id = ?",
-            (f"\n--- recovery pointers ---\n{block}\n", run.run_id),
-        )
-    handoff_output = f"Could not resume timed-out {AGENT}: no session id was emitted.\n"
-    issue_url = None
-    if result.session_id:
-        log(f"repair timed out; resuming {AGENT} session {result.session_id} for handoff")
-        handoff = invoke_codex_stream(
-            build_timeout_handoff_prompt(run, block), relay,
-            timeout_seconds=CODEX_HANDOFF_TIMEOUT_SECONDS,
-            resume_session_id=result.session_id, on_process=record_process,
-        )
-        handoff_output = handoff.output
-        issue_url = find_issue_url(handoff_output, exclude_url=exclude_url)
-    return handoff_output, issue_url, saved
-
-
-def fetch_remote_sha() -> str:
-    """Fetch and return current origin/master."""
-    run_command([str(GIT_BIN), "fetch", "origin", BRANCH], cwd=WORKTREE, timeout=180)
-    return run_command([str(GIT_BIN), "rev-parse", f"origin/{BRANCH}"], cwd=WORKTREE)
-
-
-def worktree_status() -> str:
-    return run_command(
-        [str(GIT_BIN), "status", "--porcelain", "--untracked-files=normal"],
-        cwd=WORKTREE,
-    )
-
-
-def unmerged_paths() -> str:
-    return run_command(
-        [str(GIT_BIN), "diff", "--name-only", "--diff-filter=U"], cwd=WORKTREE
-    )
-
-
-@dataclass(frozen=True)
-class RepairResolution:
-    result: CodexResult
-    new_sha: str
-    pushed_sha: str | None
-    detail: str = ""
-    failure_kind: str | None = None
-
-
-def reconcile_repair(
-    run: CiRun,
-    base_sha: str,
-    initial: CodexResult,
-    relay,
-    *,
-    deadline: float,
-    on_session=None,
-    on_process=None,
-    on_candidate=None,
-) -> RepairResolution:
-    """Merge current master into a successful Codex commit and push it.
-
-    Conflict-free pulls and push races are handled entirely by the monitor.
-    Only a pull that leaves unmerged paths resumes the exact Codex session.
-    """
-    if initial.status != "completed" or initial.timed_out:
-        return RepairResolution(initial, "unknown", None)
-
-    output = initial.output
-    result = initial
-    reconcile_round = 0
-
-    while True:
-        try:
-            branch = run_command(
-                [str(GIT_BIN), "branch", "--show-current"], cwd=WORKTREE
-            )
-            if branch != WORKTREE_BRANCH:
-                raise CommandError(
-                    f"expected branch {WORKTREE_BRANCH!r}, found {branch!r}"
-                )
-            dirty = worktree_status()
-            if dirty:
-                raise CommandError(
-                    f"{AGENT} reported success but left a dirty or conflicted worktree"
-                )
-            local_sha = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
-        except CommandError as exc:
-            failed = CodexResult(
-                "failed", result.exit_code, False, output, result.session_id
-            )
-            return RepairResolution(failed, "unknown", None, str(exc), "repair_failed")
-
-        if local_sha == base_sha:
-            try:
-                remote_sha = fetch_remote_sha()
-            except CommandError as exc:
-                failed = CodexResult(
-                    "failed", result.exit_code, False, output, result.session_id
-                )
-                return RepairResolution(
-                    failed, "unknown", None, str(exc), "push_failed"
-                )
-            return RepairResolution(result, remote_sha, None)
-
-        if time.monotonic() >= deadline:
-            timed_output = (
-                output + "\nRepair deadline expired before reconciliation completed.\n"
-            )
-            timed = CodexResult(
-                "timed_out", result.exit_code, True, timed_output, result.session_id
-            )
-            return RepairResolution(
-                timed,
-                "unknown",
-                None,
-                "repair deadline expired before reconciliation completed",
-            )
-
-        if not git_is_ancestor(base_sha, "HEAD"):
-            detail = (
-                f"local HEAD {local_sha} does not descend from repair base {base_sha}"
-            )
-            failed = CodexResult(
-                "failed", result.exit_code, False, output, result.session_id
-            )
-            return RepairResolution(failed, "unknown", None, detail, "repair_failed")
-
-        if on_candidate is not None:
-            on_candidate(local_sha, reconcile_round)
-
-        try:
-            run_command(
-                [
-                    str(GIT_BIN),
-                    "pull",
-                    "--no-rebase",
-                    "--no-edit",
-                    "origin",
-                    BRANCH,
-                ],
-                cwd=WORKTREE,
-                timeout=180,
-            )
-        except CommandError as pull_error:
-            try:
-                conflicts = unmerged_paths()
-            except CommandError:
-                conflicts = ""
-            if not conflicts:
-                failed = CodexResult(
-                    "failed", result.exit_code, False, output, result.session_id
-                )
-                return RepairResolution(
-                    failed, "unknown", None, str(pull_error), "push_failed"
-                )
-            if not result.session_id:
-                detail = f"merge conflicts require {AGENT}, but no session id was emitted"
-                failed = CodexResult(
-                    "failed", result.exit_code, False, output, result.session_id
-                )
-                return RepairResolution(
-                    failed, "unknown", None, detail, "repair_failed"
-                )
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                timed_output = (
-                    output + "\nRepair deadline expired during merge reconciliation.\n"
-                )
-                timed = CodexResult(
-                    "timed_out", result.exit_code, True, timed_output, result.session_id
-                )
-                return RepairResolution(
-                    timed,
-                    "unknown",
-                    None,
-                    "repair deadline expired during merge reconciliation",
-                )
-            reconcile_round += 1
-            if on_candidate is not None:
-                on_candidate(local_sha, reconcile_round)
-            log(
-                f"merge round {reconcile_round} left conflicts; resuming {AGENT} session "
-                f"{result.session_id}"
-            )
-            resumed = invoke_codex_stream(
-                build_merge_conflict_prompt(run),
-                relay,
-                timeout_seconds=max(1, int(remaining)),
-                resume_session_id=result.session_id,
-                on_session=on_session,
-                on_process=on_process,
-            )
-            output += (
-                f"\n--- merge conflict round {reconcile_round} ---\n" + resumed.output
-            )
-            result = CodexResult(
-                resumed.status,
-                resumed.exit_code,
-                resumed.timed_out,
-                output,
-                resumed.session_id or result.session_id,
-            )
-            if result.status != "completed" or result.timed_out:
-                return RepairResolution(result, "unknown", None)
-            continue
-
-        try:
-            if worktree_status():
-                raise CommandError("git pull succeeded but left a dirty worktree")
-            local_sha = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
-        except CommandError as exc:
-            failed = CodexResult(
-                "failed", result.exit_code, False, output, result.session_id
-            )
-            return RepairResolution(failed, "unknown", None, str(exc), "repair_failed")
-        if on_candidate is not None:
-            on_candidate(local_sha, reconcile_round)
-
-        raced = False
-        last_push_error: CommandError | None = None
-        for attempt in range(len(PUSH_RETRY_DELAYS) + 1):
-            try:
-                run_command(
-                    [str(GIT_BIN), "push", "origin", "HEAD:master"],
-                    cwd=WORKTREE,
-                    timeout=180,
-                )
-            except CommandError as exc:
-                last_push_error = exc
-            try:
-                remote_sha = fetch_remote_sha()
-            except CommandError as exc:
-                last_push_error = exc
-                if attempt < len(PUSH_RETRY_DELAYS):
-                    time.sleep(PUSH_RETRY_DELAYS[attempt])
-                    continue
-                failed = CodexResult(
-                    "failed", result.exit_code, False, output, result.session_id
-                )
-                return RepairResolution(
-                    failed, "unknown", None, str(last_push_error), "push_failed"
-                )
-            if git_is_ancestor(local_sha, f"origin/{BRANCH}"):
-                return RepairResolution(result, remote_sha, local_sha)
-            if not git_is_ancestor(remote_sha, "HEAD"):
-                raced = True
-                break
-            if attempt < len(PUSH_RETRY_DELAYS):
-                time.sleep(PUSH_RETRY_DELAYS[attempt])
-                continue
-            failed = CodexResult(
-                "failed", result.exit_code, False, output, result.session_id
-            )
-            return RepairResolution(
-                failed,
-                remote_sha,
-                None,
-                str(last_push_error or "push was not reflected on origin/master"),
-                "push_failed",
-            )
-        if raced:
-            log("origin/master advanced during push; pulling again")
-            continue
-
-
-def resolve_master_outcome(base_sha: str, status: str) -> tuple[str, str | None]:
-    """Compatibility helper for non-reconciled and failed attempts."""
-    try:
-        new_sha = fetch_remote_sha()
-    except CommandError:
-        return "unknown", None
-    pushed: str | None = None
-    if status == "completed":
-        try:
-            local = run_command([str(GIT_BIN), "rev-parse", "HEAD"], cwd=WORKTREE)
-        except CommandError:
-            local = None
-        if local and local != base_sha and git_is_ancestor(local, f"origin/{BRANCH}"):
-            pushed = local
-    return new_sha, pushed
+    return str(row["codex_session_id"] or "unknown") if row else "unknown"
 
 
 def run_monitor() -> int:
@@ -2234,17 +2384,13 @@ def run_monitor() -> int:
 
     conn = connect_db()
     try:
-        recover_interrupted(conn, transport)
-        retry_pending_recoveries(conn)
-        pending_recovery = conn.execute(
-            "SELECT workflow_run_id, recovery_manifest_path FROM invocations "
-            "WHERE recovery_status IS NOT NULL AND recovery_status != 'complete' LIMIT 1"
-        ).fetchone()
-        if pending_recovery is not None:
-            log(f"repair blocked by incomplete recovery for run "
-                f"{pending_recovery['workflow_run_id']}: "
-                f"{pending_recovery['recovery_manifest_path']}")
-            return 4
+        runner_error = check_mj_support()
+        mark_unattached_invocations_retryable(conn)
+        recover_launching_invocations(conn, transport)
+        check_pending_suspensions(conn, transport)
+        reattach_running_invocations(
+            conn, transport, runner_error=runner_error
+        )
         excluded_run_ids = handled_run_ids(conn)
         try:
             first = poll_ci(excluded_run_ids)
@@ -2254,8 +2400,6 @@ def run_monitor() -> int:
         if first.state == "completed:success":
             cleared = clear_escalation(conn)
             if cleared is not None:
-                # Green resets the episode: a fresh top-level message (never back
-                # in the closing thread), so the next failure opens its own thread.
                 log("CI is green again; re-arming the auto-fixer")
                 resolved = (
                     " The open escalation is resolved." if cleared["escalated"] else ""
@@ -2270,71 +2414,58 @@ def run_monitor() -> int:
             return 0
         run = first.run
 
-        # Classify this red poll against the current episode (if any). A poll
-        # whose failing surface is contained in the episode baseline is a repeat;
-        # a surface outside it, or no episode at all, is a reset that opens a
-        # fresh top-level thread. Repeats stay in the episode's thread: an
-        # escalated (human-owned) repeat stands down with a note and no Codex; a
-        # non-escalated repeat re-engages Codex in that same thread.
         episode = get_escalation(conn)
         try:
-            # Human ownership is live only while the linked issue is open. Do
-            # this before same-run reporting deduplication so closing a ticket
-            # re-engages an already-reported red run on the very next poll.
             episode = refresh_escalation_ownership(conn, episode)
         except CommandError as exc:
             log(f"escalation issue-state lookup failed: {exc}; retrying next tick")
+            record_blocked_reason(
+                conn,
+                transport,
+                first.run,
+                "github_prelaunch_failed",
+                str(exc),
+                thread_ts=episode["thread_ts"] if episode is not None else None,
+            )
             return 3
-        signature = failing_signature(run)
+        try:
+            signature = failing_signature(run)
+        except (CommandError, ValueError, json.JSONDecodeError) as exc:
+            log(f"failing-surface lookup failed for run {run.run_id}: {exc}")
+            signature = ""
         open_issue_url: str | None = None
-        reply_ts: str | None = None  # set => engage in this existing thread
+        reply_ts: str | None = None
         if episode is not None:
             baseline = signature_members(episode["signature"])
             if signature:
                 new_surface = signature_members(signature) - baseline
             elif run.sha == episode["sha"]:
-                # Could not read the failing jobs, but it is the same commit the
-                # episode already covers: treat as the same surface (a repeat).
                 new_surface = set()
             else:
-                # Unreadable surface on a new commit: treat as new so we reset and
-                # re-classify rather than silently fold it into the episode.
                 new_surface = {"<unreadable surface>"}
             if not new_surface:
-                # Repeat: same failing set as the current episode.
                 if episode["last_reported_run_id"] == run.run_id:
-                    # The same red run is still most recent; cron just fired again
-                    # over an unchanged failure. Nothing new to report.
                     return 0
                 if episode["escalated"]:
-                    # A human owns this design failure. Stand down, but report the
-                    # new build as a threaded note under the episode's thread.
-                    log(
-                        "escalation open; new failed build within the owned surface; threading a note"
-                    )
                     issue = episode["issue_url"]
                     ticket = f" (<{issue}|open ticket>)" if issue else ""
                     slack_send(
                         transport,
                         f":red_circle: New failed build "
-                        f"<https://github.com/{REPO_NAME}/commit/{run.sha}|`{run.sha[:8]}`> — "
-                        f"still the failing set a human already owns{ticket}; standing down. "
-                        f"<{run.url}|{run.workflow} run>",
+                        f"{format_commit(run.sha)} — still the failing set a human "
+                        f"already owns{ticket}; standing down. <{run.url}|{run.workflow} run>",
                         thread_ts=episode["thread_ts"],
                     )
                     mark_reported(conn, run.run_id)
                     return 0
-                # Non-escalated repeat: re-engage the agent, threaded under the episode.
                 reply_ts = episode["thread_ts"]
-                log(
-                    f"new failed build within the current set; re-engaging {AGENT} in-thread"
-                )
+                log(f"new failed build within the current set; re-engaging {AGENT_LABEL}")
             else:
-                # Reset: a surface outside the episode baseline. If the episode is
-                # escalated this classification pass knows the open issue.
-                open_issue_url = episode["issue_url"] if episode["escalated"] else None
+                open_issue_url = (
+                    episode["issue_url"] if episode["escalated"] else None
+                )
                 log(
-                    f"new failing surface ({sorted(new_surface)}); resetting the thread and classifying"
+                    f"new failing surface ({sorted(new_surface)}); resetting the thread"
                 )
 
         retry_row = conn.execute(
@@ -2343,35 +2474,40 @@ def run_monitor() -> int:
         ).fetchone()
         if invocation_exists(conn, run.run_id):
             return 0
-        try:
-            preflight = preflight_worktree()
-            base_sha = preflight.base_sha
-        except (CommandError, PreflightError) as exc:
-            kind = exc.kind if isinstance(exc, PreflightError) else "preflight_failed"
-            log(f"preflight failed for run {run.run_id}: {exc}")
-            record_preflight_event(conn, transport, run.sha, kind, str(exc))
-            return 4
-        if preflight.recovered_tag and preflight.recovered_sha:
-            record_worktree_recovery(
-                conn,
-                transport,
-                run.sha,
-                preflight.recovered_sha,
-                preflight.recovered_tag,
+        if runner_error:
+            details = (
+                "Installed mj does not support transcript --finished-only; "
+                "upgrade mj before the monitor can launch or supervise a repair."
+                if runner_error == "mj_too_old"
+                else f"Mjolnir runner unavailable ({runner_error})."
             )
+            record_blocked_reason(
+                conn, transport, run, runner_error, details,
+                thread_ts=retry_row["thread_ts"] if retry_row else None,
+            )
+            return 4
+
         try:
             second = poll_ci(excluded_run_ids)
         except (CommandError, ValueError, json.JSONDecodeError) as exc:
-            log(f"final CI poll failed: {exc}")
-            return 3
+            record_blocked_reason(
+                conn, transport, run, "github_prelaunch_failed", str(exc)
+            )
+            return 4
         if (
             second.state != "red"
             or second.run is None
             or second.run.run_id != run.run_id
         ):
             return 0
+        base_sha = second.head_sha
         if not claim_invocation(conn, run, base_sha):
             return 0
+        invocation = conn.execute(
+            "SELECT attempt_count, started_at FROM invocations WHERE workflow_run_id = ?",
+            (run.run_id,),
+        ).fetchone()
+        attempt = int(invocation["attempt_count"] or 1)
 
         if (
             reply_ts is None
@@ -2380,328 +2516,81 @@ def run_monitor() -> int:
             and retry_row["thread_ts"]
         ):
             reply_ts = str(retry_row["thread_ts"])
-
-        # A reset (new episode or a surface outside the baseline) opens a fresh
-        # top-level thread; a non-escalated repeat re-engages in the episode's
-        # existing thread (reply_ts). Either way we never post into an abandoned
-        # thread, and every same-run re-fire was already dropped above.
-        commit_link = (
-            f"<https://github.com/{REPO_NAME}/commit/{run.sha}|`{run.sha[:8]}`>"
-        )
+        commit_link = format_commit(run.sha)
         if reply_ts:
             thread_ts = reply_ts
             slack_send(
                 transport,
                 f":rotating_light: New failed build {commit_link} still red on the "
-                f"same set; {AGENT} re-engaged. <{run.url}|Open {run.workflow} run>",
+                f"same set; {AGENT_LABEL} re-engaged. <{run.url}|Open {run.workflow} run>",
                 thread_ts=thread_ts,
             )
         else:
             _, thread_ts = slack_send(
                 transport,
                 f":rotating_light: Bifrost {run.workflow} is red at {commit_link}. "
-                f"{AGENT} auto-fixer engaged. <{run.url}|Open {run.workflow} run>",
+                f"{AGENT_LABEL} auto-fixer engaged. <{run.url}|Open {run.workflow} run>",
             )
         with conn:
             conn.execute(
-                "UPDATE invocations SET status = 'running', start_notification_attempted = 1, "
-                "thread_ts = ? WHERE workflow_run_id = ?",
+                "UPDATE invocations SET status = 'launching', "
+                "start_notification_attempted = 1, thread_ts = ? "
+                "WHERE workflow_run_id = ?",
                 (thread_ts, run.run_id),
             )
 
-        def relay(text: str, _thread_ts: str | None = thread_ts) -> None:
-            if transport.kind == "chat" and _thread_ts:
-                slack_send(transport, text, thread_ts=_thread_ts)
-
-        def record_session(session_id: str) -> None:
-            with conn:
-                conn.execute(
-                    "UPDATE invocations SET codex_session_id = ? WHERE workflow_run_id = ?",
-                    (session_id, run.run_id),
-                )
-
-        def record_process(pid: int) -> None:
-            with conn:
-                conn.execute(
-                    "UPDATE invocations SET codex_pid = ? WHERE workflow_run_id = ?",
-                    (pid, run.run_id),
-                )
-
-        def record_candidate(candidate_sha: str, reconcile_round: int) -> None:
-            with conn:
-                conn.execute(
-                    """
-                    UPDATE invocations
-                    SET status = 'reconciling', candidate_sha = ?, reconcile_round = ?,
-                        codex_pid = NULL
-                    WHERE workflow_run_id = ?
-                    """,
-                    (candidate_sha, reconcile_round, run.run_id),
-                )
-
-        log(f"launching {AGENT} for red {run.workflow} at {run.sha[:8]}")
-        repair_deadline = time.monotonic() + CODEX_TIMEOUT_SECONDS
-        result = invoke_codex_stream(
-            build_prompt(run, open_issue_url),
-            relay,
-            timeout_seconds=CODEX_TIMEOUT_SECONDS,
-            on_session=record_session,
-            on_process=record_process,
-        )
-        resolution_detail = ""
-        failure_kind: str | None = None
-        if result.status == "completed" and not result.timed_out:
-            resolution = reconcile_repair(
-                run,
-                base_sha,
-                result,
-                relay,
-                deadline=repair_deadline,
-                on_session=record_session,
-                on_process=record_process,
-                on_candidate=record_candidate,
+        session_id: str | None = None
+        lifecycle_called = False
+        try:
+            log(
+                f"launching {AGENT_LABEL} for red {run.workflow} at "
+                f"{run.sha[:8]} from master {base_sha[:8]}"
             )
-            result = resolution.result
-            new_sha = resolution.new_sha
-            pushed_sha = resolution.pushed_sha
-            resolution_detail = resolution.detail
-            failure_kind = resolution.failure_kind
-        else:
-            new_sha, pushed_sha = resolve_master_outcome(base_sha, result.status)
-        status = result.status
-        exit_code = result.exit_code
-        output = result.output
-        issue_url: str | None = None
-        escalated = False
-        cleanup_ok = True
-        cleanup_detail = ""
-        if resolution_detail:
-            output += f"\n--- reconciliation ---\n{resolution_detail}\n"
-
-        if result.timed_out:
-            handoff_output, issue_url, saved = timeout_ticket_handoff(
-                conn, run, result, relay, record_process,
-                transcript=output, exclude_url=open_issue_url,
+            session_id, branch = launch_mj_session(
+                run, base_sha, attempt, open_issue_url
             )
-            cleanup_ok, cleanup_detail = recovery_complete(saved), saved.detail
-            output = conn.execute(
-                "SELECT output FROM invocations WHERE workflow_run_id = ?", (run.run_id,),
-            ).fetchone()["output"]
-            output = (
-                output
-                + "\n--- timeout handoff ---\n"
-                + handoff_output
-                + f"\n--- worktree recovery ---\n{cleanup_detail}\n"
-            )
-            escalated = issue_url is not None
-            handoff_status = "completed" if escalated else "failed"
-            with conn:
-                conn.execute(
-                    """
-                    UPDATE invocations
-                    SET status = 'timed_out', output = ?, finished_at = ?, issue_url = ?,
-                        timeout_handoff_status = ?, codex_pid = NULL
-                    WHERE workflow_run_id = ?
-                    """,
-                    (output, utc_now(), issue_url, handoff_status, run.run_id),
-                )
-            if escalated:
-                mention_text = " ".join(
-                    f"<@{member_id}>" for member_id in ESCALATION_SLACK_MEMBER_IDS
-                )
-                if transport.kind != "chat" or not any(
-                    f"<@{member_id}>" in handoff_output
-                    for member_id in ESCALATION_SLACK_MEMBER_IDS
-                ):
-                    slack_send(
-                        transport,
-                        f"{mention_text} CI repair exceeded the one-hour automation budget — "
-                        f"filed <{issue_url}|a ticket> for human resolution.",
-                        thread_ts=thread_ts,
-                    )
-            else:
-                mention_text = " ".join(
-                    f"<@{member_id}>" for member_id in ESCALATION_SLACK_MEMBER_IDS
-                )
-                slack_send(
-                    transport,
-                    f"{mention_text} Bifrost CI repair exceeded one hour, and the "
-                    f"ticket handoff failed. Worktree recovery: {cleanup_detail}.",
-                    thread_ts=thread_ts,
-                )
-        else:
-            persisted_status = failure_kind or status
-            if status != "completed":
-                saved = recover_invocation_worktree(
-                    conn, run.run_id, run.sha, result.session_id, transcript=output,
-                )
-                cleanup_ok, cleanup_detail = recovery_complete(saved), saved.detail
-                output += f"\n--- worktree recovery ---\n{cleanup_detail}\n"
-            with conn:
-                conn.execute(
-                    """
-                    UPDATE invocations
-                    SET status = ?, exit_code = ?, timed_out = 0, output = ?,
-                        codex_session_id = ?, codex_pid = NULL, finished_at = ?
-                    WHERE workflow_run_id = ?
-                    """,
-                    (
-                        persisted_status,
-                        exit_code,
-                        output,
-                        result.session_id,
-                        utc_now(),
-                        run.run_id,
-                    ),
-                )
-
-        if not result.timed_out and status == "completed" and pushed_sha is None:
-            escalated, issue_url = detect_escalation(output, exclude_url=open_issue_url)
-            if escalated and issue_url:
-                with conn:
-                    conn.execute(
-                        "UPDATE invocations SET issue_url = ? WHERE workflow_run_id = ?",
-                        (issue_url, run.run_id),
-                    )
-
-        if escalated and result.timed_out:
-            outcome = "timed out and escalated"
-            recovery = (
-                f" Worktree recovered: {cleanup_detail}."
-                if cleanup_ok
-                else f" Worktree recovery failed: {cleanup_detail}."
-            )
-            outcome_line = (
-                f":memo: Bifrost CI auto-fixer for {commit_link} exceeded its one-hour "
-                f"budget and filed <{issue_url}|a ticket> for human resolution.{recovery} "
-                f"<{run.url}|Original CI run>"
-            )
-        elif escalated:
-            emoji, outcome = ":memo:", "escalated"
-            filed = f"filed <{issue_url}|a ticket>" if issue_url else "filed a ticket"
-            distinct = (
-                " (a new problem, distinct from the one already open)"
-                if episode is not None and episode["escalated"]
-                else ""
-            )
-            outcome_line = (
-                f"{emoji} Bifrost CI auto-fixer for {commit_link} judged this a "
-                f"design-level call and escalated it{distinct}. No fix pushed; {filed} "
-                f"with its findings and pinged the team above. <{run.url}|Original CI run>"
-            )
-        elif failure_kind:
-            emoji, outcome = ":x:", "could not publish its repair"
-            recovery = (
-                f" Worktree recovery: {cleanup_detail}." if cleanup_detail else ""
-            )
-            outcome_line = (
-                f"{emoji} Bifrost CI auto-fixer for {commit_link} {outcome}: "
-                f"{resolution_detail or failure_kind}.{recovery} "
-                f"<{run.url}|Original CI run>"
-            )
-        elif episode is not None and episode["escalated"] and status == "completed":
-            # A classification pass against an already-open escalation that did
-            # not itself escalate: Codex either fixed new mechanical breakage or
-            # found nothing new. The design ticket stays open either way.
-            if pushed_sha:
-                emoji, outcome = ":wrench:", "fixed a new failure"
-                detail = (
-                    f"Fixed a new mechanical failure and pushed "
-                    f"{format_commit(pushed_sha)}; the open design ticket still stands."
-                )
-            else:
-                emoji, outcome = ":repeat:", "re-checked"
-                detail = (
-                    "No new actionable problem; the open design ticket still stands."
-                )
-            outcome_line = (
-                f"{emoji} Bifrost CI auto-fixer for {commit_link}: {detail} "
-                f"<{run.url}|CI run>"
-            )
-        else:
-            if status == "completed":
-                emoji, outcome = ":white_check_mark:", "finished"
-            elif status == "timed_out":
-                emoji, outcome = (
-                    ":hourglass_flowing_sand:",
-                    "timed out; ticket handoff failed",
-                )
-            elif status == "spawn_failed":
-                emoji, outcome = ":x:", "could not start"
-            else:
-                emoji, outcome = ":x:", f"exited with status {exit_code}"
-            outcome_line = (
-                f"{emoji} Bifrost CI auto-fixer for {commit_link} {outcome}. "
-                f"{outcome_detail(status, pushed_sha, base_sha, new_sha)} "
-                f"<{run.url}|Original CI run>"
-            )
-        slack_send(transport, outcome_line, thread_ts=thread_ts)
-
-        # Episode bookkeeping. Every completed pass records an episode so the next
-        # poll can tell a repeat (thread) from a new surface (reset); all of them
-        # advance the reporting thread to this run's own message and mark it the
-        # newest announced. A transient Codex failure (not completed) leaves the
-        # episode untouched so the run is retried, not frozen or lost.
-        if escalated:
-            # Human now owns it: the current failing set is the owned baseline and
-            # the ticket pointer moves to the freshly filed issue.
-            open_escalation(
+            store_session(conn, run.run_id, session_id)
+            lifecycle_called = True
+            result = run_session_lifecycle(
                 conn,
-                run.sha,
-                signature,
-                issue_url,
-                thread_ts,
-                run.run_id,
-                escalated=True,
+                transport,
+                run,
+                session_id,
+                branch,
+                MJ_TURN_TIMEOUT_SECONDS,
             )
-        elif status == "completed" and episode is not None and episode["escalated"]:
-            # A pass against an already-open escalation that did not re-escalate.
-            if pushed_sha:
-                # Fixed new mechanical breakage: keep the design baseline and
-                # ticket untouched so the fixed surface drops out on its own — and
-                # if it recurs, it reads as new again and gets fixed again.
-                open_escalation(
-                    conn,
-                    episode["sha"],
-                    episode["signature"],
-                    episode["issue_url"],
-                    thread_ts,
-                    run.run_id,
-                    escalated=True,
+            try:
+                master_sha, pushed_sha = read_pushed_commit(
+                    base_sha, run.run_id
                 )
-            else:
-                # Stood down on the same design issue: absorb the new surface into
-                # the baseline so this now-classified state won't re-trigger.
-                merged = "\n".join(
-                    sorted(
-                        signature_members(episode["signature"])
-                        | signature_members(signature)
-                    )
+            except PushDetectionIndeterminate as exc:
+                finalize_push_detection_indeterminate(
+                    conn, transport, run, result, exc
                 )
-                open_escalation(
-                    conn,
-                    run.sha,
-                    merged,
-                    episode["issue_url"],
-                    thread_ts,
-                    run.run_id,
-                    escalated=True,
+                return 4
+            except (CommandError, ValueError, json.JSONDecodeError) as exc:
+                finalize_push_detection_failure(
+                    conn, transport, run, result, exc
                 )
-        elif status == "completed":
-            # Routine (non-escalated) episode, new or continuing: record the
-            # current failing set as the baseline so a repeat threads and a new
-            # surface resets. No ticket; a green next poll clears it.
-            open_escalation(
-                conn, run.sha, signature, None, thread_ts, run.run_id, escalated=False
+                return 4
+            finalize_invocation(
+                conn, transport, run, result, master_sha, pushed_sha
             )
-        with conn:
-            conn.execute(
-                "UPDATE invocations SET outcome_notification_attempted = 1 "
-                "WHERE workflow_run_id = ?",
-                (run.run_id,),
+            return 0
+        except (MjError, CommandError, ValueError, sqlite3.Error) as exc:
+            if session_id and not lifecycle_called:
+                suspend_session(conn, transport, run.run_id, session_id)
+            reason = (
+                exc.reason
+                if isinstance(exc, MjError)
+                else "github_compare_failed"
+                if lifecycle_called
+                else "mj_new_failed"
             )
-        log(f"{AGENT} {outcome} for {run.sha[:8]}")
-        return 0 if (status == "completed" or escalated) and cleanup_ok else 5
+            record_blocked_reason(
+                conn, transport, run, reason, str(exc), thread_ts=thread_ts
+            )
+            return 4
     finally:
         conn.close()
 
@@ -2711,9 +2600,11 @@ def check_only() -> int:
     print(
         json.dumps(
             {
-                "agent": AGENT,
-                "model": CLAUDE_MODEL if AGENT == "claude" else CODEX_MODEL,
-                "profile_home": str(PROFILE.home) if PROFILE else None,
+                "agent": AGENT_LABEL,
+                "model": MJ_MODEL,
+                "workspace": MJ_WORKSPACE,
+                "target": MJ_TARGET,
+                "bundle": MJ_BUNDLE,
                 "state": result.state,
                 "head_sha": result.head_sha,
                 "run": (
@@ -2759,7 +2650,7 @@ def test_slack() -> int:
     if transport.kind == "chat" and ts:
         slack_send(
             transport,
-            f"Threaded reply test — the live {AGENT} feed will appear in replies like this.",
+            f"Threaded reply test — the live {AGENT_LABEL} feed will appear in replies like this.",
             thread_ts=ts,
         )
         print("Sent a threaded test message via chat.postMessage.")
@@ -2769,10 +2660,6 @@ def test_slack() -> int:
 
 
 def main() -> int:
-    if PROFILE_ERROR:
-        # Report on every cron tick rather than silently using a default agent.
-        log(f"fatal: {PROFILE_ERROR}")
-        return 1
     args = parse_args()
     try:
         if args.configure_slack:

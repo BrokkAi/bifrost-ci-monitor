@@ -1,124 +1,129 @@
 # Bifrost CI Auto-fixer
 
 This monitor polls the CI, Hourly CI, and Nightly CI GitHub Actions workflows
-for BrokkAi/bifrost-dev every five minutes. CI is restricted to push runs on
-master; Hourly CI and Nightly CI include their scheduled and manually
-dispatched runs. When the latest run in any tracked workflow is red, it
-launches one agent repair attempt (Claude or Codex, per the profile) for that
-run, regardless of whether the run's commit is still master HEAD. The agent
-always works from current master HEAD: if an intervening commit already fixed
-the failure it exits without changes. Otherwise it pins the commit that
-introduced the failure and takes one of these paths:
+for BrokkAi/bifrost-dev every five minutes. CI push runs follow master; Hourly
+CI and Nightly CI also include their scheduled and manually dispatched runs.
+When a settled latest run is red, the monitor starts a Mjolnir container session
+at the current master SHA fetched from GitHub.
 
-- **Fix**: lint, missed test updates, or a straightforward production-code
-  fix. It tests and leaves a clean local commit.
-- **Revert**: anything more involved. It reverts the introducing commit,
-  reopens and comments on the issue the commit references (or files one and
-  tags the commit author), and pings Slack.
-- **Blocked revert**: if later commits build on the introducing commit so it
-  cannot be cleanly reverted, it changes nothing, files an issue labelled
-  `buildfailure`, and pings Slack.
-- **Escalate**: flaky or infrastructure failures, or no single introducing
-  commit can be pinned. It files an issue and pings Slack.
+The agent diagnoses each failure independently and follows one of four paths:
 
-For a fix or revert, the monitor then merges current origin/master and pushes
-the verified result.
+- FIX: make a small repair, test it, commit it with the trailer
+  CI-Repair-Run: <run-id>, merge current origin/master, and push the branch head
+  to master.
+- REVERT: revert a change when a direct fix is too involved, document the
+  regression, add the same run trailer, merge current origin/master, and push
+  the revert to master.
+- BLOCKED REVERT: make no changes or commits, file a buildfailure issue, and
+  ping the team when a revert conflicts with later dependent work.
+- ESCALATE: make no changes or commits, file an issue, and ping the team for
+  flaky, infrastructure, or unpinnable failures.
 
-The monitor:
+The agent never force-pushes, pushes another branch, or opens a pull request.
+It owns publication from its container. Each commit message carries the run
+trailer so the monitor can identify the agent's commits in GitHub's comparison
+from the launch SHA to master. The monitor does not pull, merge, or push repair
+work.
 
-- claims each CI run atomically in ~/Projects/bifrost-ci/activity.db, keyed on
-  the workflow run id; interrupted or orphaned attempts are preserved and may
-  be retriaged in the same Slack thread;
-- waits five minutes after a workflow attempt first becomes red, allowing
-  RunsOn to replace an interrupted runner before launching Codex or filing an
-  infrastructure issue;
-- serializes runs with a local lock, refuses a dirty repair worktree, and tags
-  a clean orphaned commit before restoring origin/master for fresh triage;
-- asks Codex to commit but never push, then explicitly pulls with merge policy
-  and pushes only after verifying the result on origin/master;
-- handles conflict-free master advances itself and resumes the same Codex
-  session only when a pull leaves actual content conflicts;
-- records combined Codex output, reconciliation state, and verified outcome in
-  SQLite;
-- after one hour, stops the repair, preserves a verified local recovery package,
-  and restores the dedicated worktree to origin/master before resuming that exact
-  Codex session for a ten-minute ticket-only handoff with recovery pointers;
-- verifies that a design escalation's GitHub issue is still open before
-  standing down, so closing a ticket re-arms classification even if CI never
-  went green;
-- sends Slack engagement and outcome messages without waiting for new CI.
+## Lifecycle
 
-Slack delivery has two transports. If a bot token and channel are configured
-(`--configure-bot`), the monitor posts via `chat.postMessage`: the engagement
-message opens a thread, and Codex's assistant messages (not tool calls) stream
-into that thread live via `codex exec --json`, followed by the outcome. If only
-an incoming webhook is configured (`--configure-slack`), it posts the engagement
-and outcome as plain channel messages with no live feed. The bot transport is
-preferred when present; the webhook is the automatic fallback. See
-[MORNING-SETUP.md](MORNING-SETUP.md) for the one-time bot-token migration.
+The monitor atomically claims each workflow run in
+~/Projects/bifrost-ci/activity.db. It waits five minutes after a failed attempt
+first appears so RunsOn can request a replacement attempt, and serializes
+polls with a local lock. Before launch it confirms that the same run is still
+red and reads the current master SHA from GitHub.
 
-The monitor is intentionally separate from the Bifrost repository. The
-bifrost-ci checkout is only the clean repair worktree; this repository owns
-the scheduler, database schema, Slack integration, and tests.
+A new repair uses the CI workspace, podman target, bifrost bundle, and opus
+model. Mjolnir creates the branch ci-repair/<run-id>-<attempt> at that full
+master SHA and receives the prompt from a temporary file. The container's Git
+and gh commands use the user's injected GitHub token.
 
-## Local layout
+While a turn runs, the monitor polls mj wait and the finished-only transcript
+about every five seconds. The bot transport relays each completed agent message
+into the Slack thread. The transcript cursor and captured text are saved after
+each poll. If the monitor restarts, it looks up the recorded Mjolnir session,
+reattaches to an active turn, and resumes from the saved cursor without
+reposting completed messages. Relay delivery is acknowledged item by item;
+failed Slack posts remain eligible for retry. A post-close transcript revision
+with an already-posted stable ID is deduplicated, so its late update is omitted.
+When the turn ends, the monitor drains the transcript once more and checks
+paginated GitHub master commits for the CI-Repair-Run trailer.
 
-    ~/Projects/bifrost-ci-monitor/  this repository
-    ~/Projects/bifrost-ci/          clean Bifrost repair worktree
-    ~/Projects/bifrost-ci/activity.db
-    ~/.local/state/bifrost-ci-monitor/
-    ~/.config/bifrost-ci-monitor/
-    ~/.config/anvil/anvil.toml     which repair agent to use
+The repair budget is one hour. At expiry the monitor interrupts the turn, then
+asks that same session for a ten-minute issue handoff. The handoff stops all
+repair work and pushing, lists unpushed commits, and gives the session id and
+branch for a human to continue. At the end of every session path, the monitor
+asks Mjolnir to suspend and checkpoint the container without waiting for the
+background suspension to finish. Later ticks verify that requested suspensions
+reached a stopped state, retry once, and report persistent failures in the
+Slack thread.
 
-The repair agent is selected by `inference_profile` in
-`~/.config/anvil/anvil.toml`, which sm-watch shares. The value is a profile home
-directory: a path containing "claude" runs Claude via `claude -p` with that path
-as `CLAUDE_CONFIG_DIR`, and a path containing "codex" runs Codex via
-`codex exec` with that path as `CODEX_HOME`. If the file is missing or the value
-contains neither "codex" nor "claude", the monitor logs `fatal:` and exits 1 on
-every tick instead of falling back to a default. Changes take effect on the next
-five-minute tick.
+An invocation with an active session remains attached across monitor restarts.
+Older worktree recovery statuses and manifests are retained as finished
+history; they do not block current polling. Repair sessions do not use the
+local ~/Projects/bifrost-ci Git worktree or its tags; the monitor's existing
+SQLite database remains at ~/Projects/bifrost-ci/activity.db.
 
-Secrets and runtime state are local-only. Do not commit the Slack webhook,
-SQLite database, cron output, or Codex session data.
+## Slack delivery
 
-## Recovering an unfinished repair
+Slack has two transports. With a bot token and channel configured through
+--configure-bot, engagement opens a thread and finished agent messages stream
+into its replies. An incoming webhook configured through --configure-slack
+receives engagement and outcome messages but cannot receive the live feed.
+The bot transport is preferred when available. See MORNING-SETUP.md for bot
+token setup.
 
-Timeout tickets include a monitor-generated recovery block and a continuation
-note describing the diagnosis, attempted changes, observed test results, and next
-step. Preservation happens **before** the ticket session resumes. A ticket reports
-preservation and cleanup separately; a failed cleanup does not imply that a
-verified backup is unavailable.
+If the monitor cannot launch or supervise a red run because Mjolnir is missing,
+too old, unreachable, or fails to start the session, or GitHub blocks launch,
+it logs each tick and posts one blocked notification for each distinct
+(run, reason).
 
-Each attempt keeps its manifest, repair transcript, and recovery instructions in
-`~/.local/state/bifrost-ci-monitor/recovery/<run-id>/<attempt>/`. Local Git refs
-under `refs/tags/bifrost-ci-recovery/<run-id>/<attempt>/` pin the original HEAD and
-any stash object. Tickets include full object IDs, the host and repository path,
-and the Codex session ID. These refs and files are **local only**, are not pushed
-to GitHub, and have no automatic expiration. Later stashes do not change them.
+### Recover an unresolved launch
 
-On the host named in the ticket, use its exact restore command. The general form
-is:
+An invocation may remain in `launching` when the monitor cannot tell whether
+`mj new` created its session. Before making it retryable, derive its exact title
+from the row and confirm that title is absent from workspace CI:
 
 ```sh
-python3 /home/jonathan/Projects/bifrost-ci-monitor/recovery.py \
-  /home/jonathan/.local/state/bifrost-ci-monitor/recovery/<run-id>/<attempt>/manifest.json \
-  /path/to/a/new/recovery-worktree
+run_id=12345
+sqlite3 ~/Projects/bifrost-ci/activity.db \
+  "SELECT status, attempt_count,
+          workflow || ' ' || substr(sha, 1, 8) || ' run ' || workflow_run_id ||
+          ' attempt ' || attempt_count || ' CI repair' AS title
+   FROM invocations WHERE workflow_run_id = $run_id;"
+mj sessions --workspace CI --json
 ```
 
-The destination must not exist. The helper creates a detached worktree at the
-saved HEAD, restores staged and unstaged edits and nonignored untracked files,
-and leaves the cron repair worktree alone. If the deadline interrupted a merge,
-the package also preserves partial resolutions, index stages, and merge metadata;
-restoration reconstructs that unfinished merge. Ignored build outputs are excluded.
-Review the ticket's continuation note and validate the saved changes before
-finishing the repair.
+Compare the title exactly, including the attempt number. If it is present, leave
+the row alone so the monitor can adopt that session. If the workspace listing
+succeeds and the exact title is absent, mark only that unresolved row retryable:
 
-If preservation fails, the monitor leaves the original worktree intact and blocks
-new repairs. It retries pending recovery on later ticks using the same attempt's
-package. A restart or failed ticket handoff retains existing verified artifacts;
-it never substitutes the cleaned worktree for the original WIP. The database and
-monitor outcome identify the package even when no ticket could be created.
+```sh
+sqlite3 ~/Projects/bifrost-ci/activity.db \
+  "UPDATE invocations SET status = 'launch_failed'
+   WHERE workflow_run_id = $run_id AND status = 'launching'
+     AND codex_session_id IS NULL;"
+```
+
+The next monitor tick increments the attempt and launches again. Do not run the
+update when Mjolnir cannot list workspace CI or the exact session may still be
+starting.
+
+## Agent selection
+
+Messages use the fixed label Claude Opus 5.5 (mj). Mjolnir selects a configured
+profile that offers the opus model using its model-based load balancing. The
+monitor does not pin a profile or reasoning effort. It uses the absolute CLI
+path /home/jonathan/.cargo/bin/mj because cron's PATH does not include
+~/.cargo/bin.
+
+The installed mj must support transcript --finished-only. The monitor checks
+this at startup and reports a blocked reason for a red run when the installed
+CLI is too old. Upgrade Mjolnir from ~/Projects/mjolnir before enabling repair
+launches.
+
+Runtime state and secrets stay local. Do not commit the Slack webhook, bot
+token, SQLite database, cron output, or session data.
 
 ## Slack setup with the Slack CLI
 
@@ -170,14 +175,14 @@ or a custom OAuth flow whose response contains incoming_webhook.url.
 
 ## Running and inspecting
 
-       /home/jonathan/Projects/bifrost-ci-monitor/monitor.py --check
-       /home/jonathan/Projects/bifrost-ci-monitor/monitor.py --init-db
-       sqlite3 ~/Projects/bifrost-ci/activity.db +         'select workflow_run_id,sha,status,exit_code,started_at,finished_at from invocations order by started_at desc;'
-       crontab -l
+    /home/jonathan/Projects/bifrost-ci-monitor/monitor.py --check
+    /home/jonathan/Projects/bifrost-ci-monitor/monitor.py --init-db
+    sqlite3 ~/Projects/bifrost-ci/activity.db 'select workflow_run_id,sha,status,exit_code,started_at,finished_at from invocations order by started_at desc;'
+    crontab -l
 
-The installed cron entry uses absolute paths and a non-overlapping process
-lock. Slack delivery is fail-open after configuration: a Slack outage is
-logged, but it does not prevent the Codex repair attempt.
+The installed cron entry uses absolute paths and a non-overlapping process lock.
+Slack delivery is fail-open after configuration: an outage is logged but does
+not stop session supervision.
 
 ## License
 
