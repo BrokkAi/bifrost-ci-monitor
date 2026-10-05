@@ -181,6 +181,42 @@ or a custom OAuth flow whose response contains incoming_webhook.url.
    The first command hides the URL while reading it and writes a mode-0600
    file under ~/.config/bifrost-ci-monitor/.
 
+## PR automerge
+
+Agents, including the CI repair agent, open pull requests instead of
+pushing to master. `automerge.py` lands them in batches. Run it from cron
+every minute. It has its own non-blocking lock, so a run that finds a batch
+in progress exits, and after a restart it reconnects to the batch's
+recorded Mjolnir session. Its state is in automerge-owned tables in
+`~/Projects/bifrost-ci/activity.db`.
+
+A batch is every open, non-draft pull request that targets `master`,
+except one rejected at its current head commit. Each batch runs in one
+Mjolnir session that starts at the current master commit:
+
+- The agent merges each pull request's head with a merge commit, so GitHub
+  marks it merged when it reaches master. It resolves every conflict
+  itself; a conflict is never a reason to send a pull request back.
+- It runs the full test suite. A test that also fails at the batch's base
+  commit is not evidence against any pull request. If the base cannot be
+  tested and the batch fails, nothing is rejected or pushed, and the batch
+  is reported as blocked.
+- A pull request that breaks tests is removed from the batch and rejected:
+  label `automerge-rejected` plus a comment with the line
+  `automerge-rejected-head: <full sha>`. Only comments from the GitHub
+  account automerge runs as count. A new push to the pull request makes it
+  eligible again, and the label is removed when it is next admitted.
+- Before pushing, the agent checks that every included pull request is
+  still open, not a draft, based on `master`, and at the head that was
+  tested. Any that changed are removed and the batch is retested.
+- It pushes with `git push origin HEAD:master` and never force-pushes.
+
+The session has a two-hour budget, relays finished messages to Slack, and
+is suspended when the batch ends. The outcome is read from GitHub. If
+`mj new` fails or gives no reply, the queue stays held until a session list
+proves that no session with the batch's title exists, so two batches never
+run at once.
+
 ## Running and inspecting
 
     /home/jonathan/Projects/bifrost-ci-monitor/monitor.py --check
