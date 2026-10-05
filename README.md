@@ -9,21 +9,25 @@ at the current master SHA fetched from GitHub.
 The agent diagnoses each failure independently and follows one of four paths:
 
 - FIX: make a small repair, test it, commit it with the trailer
-  CI-Repair-Run: <run-id>, merge current origin/master, and push the branch head
-  to master.
+  CI-Repair-Run: <run-id>, push the session branch, and open a `ci-fix` PR for
+  automerge. The PR body records the failing run and tests, introducing commit,
+  classification, and evidence.
 - REVERT: revert a change when a direct fix is too involved, document the
-  regression, add the same run trailer, merge current origin/master, and push
-  the revert to master.
+  regression, add the same run trailer, and open a `ci-fix` PR. The issue
+  comment and final Slack message link to the revert PR.
 - BLOCKED REVERT: make no changes or commits, file a buildfailure issue, and
   ping the team when a revert conflicts with later dependent work.
 - ESCALATE: make no changes or commits, file an issue, and ping the team for
   flaky, infrastructure, or unpinnable failures.
 
-The agent never force-pushes, pushes another branch, or opens a pull request.
-It owns publication from its container. Each commit message carries the run
-trailer so the monitor can identify the agent's commits in GitHub's comparison
-from the launch SHA to master. The monitor does not pull, merge, or push repair
-work.
+The repair agent publishes only its `ci-repair/<run-id>-<attempt>` branch and
+PR; it never force-pushes, writes directly to master, or merges its own PR. If
+one invocation makes both fixes and reverts, it puts all of its commits in one
+PR. The automerge agent batches open, ready PRs, runs the full test suite, and
+merges passing batches with merge commits; broken PRs are rejected and
+conflicts are resolved by automerge. Each commit keeps the run trailer for
+auditability. The monitor detects publication by looking up the PR for the
+session branch.
 
 ## Lifecycle
 
@@ -46,17 +50,21 @@ reattaches to an active turn, and resumes from the saved cursor without
 reposting completed messages. Relay delivery is acknowledged item by item;
 failed Slack posts remain eligible for retry. A post-close transcript revision
 with an already-posted stable ID is deduplicated, so its late update is omitted.
-When the turn ends, the monitor drains the transcript once more and checks
-paginated GitHub master commits for the CI-Repair-Run trailer.
+When the turn ends, the monitor drains the transcript once more and looks for a
+PR created from that session's exact branch. If it finds one, Slack reports the
+linked PR number and escalation detection is skipped. If none exists, the
+monitor checks the transcript for escalation. GitHub lookup failures retry on
+later ticks; after three consecutive failures the invocation gets the distinct
+`pr_detection_failed` status and a Slack notice.
 
 The repair budget is one hour. At expiry the monitor interrupts the turn, then
 asks that same session for a ten-minute issue handoff. The handoff stops all
-repair work and pushing, lists unpushed commits, and gives the session id and
-branch for a human to continue. At the end of every session path, the monitor
-asks Mjolnir to suspend and checkpoint the container without waiting for the
-background suspension to finish. Later ticks verify that requested suspensions
-reached a stopped state, retry once, and report persistent failures in the
-Slack thread.
+repair work and PR publication, lists any commits not yet published, and gives
+the session id and branch for a human to continue. At the end of every session
+path, the monitor asks Mjolnir to suspend and checkpoint the container without
+waiting for the background suspension to finish. Later ticks verify that
+requested suspensions reached a stopped state, retry once, and report persistent
+failures in the Slack thread.
 
 An invocation with an active session remains attached across monitor restarts.
 Older worktree recovery statuses and manifests are retained as finished

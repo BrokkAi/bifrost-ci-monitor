@@ -863,9 +863,7 @@ class MjRunnerTests(unittest.TestCase):
         with mock.patch.object(monitor, "mj_command", side_effect=fake_mj), mock.patch.object(
             monitor,
             "run_command",
-            return_value=json.dumps(
-                [{"sha": "base-sha", "commit": {"message": "launch base"}}]
-            ),
+            return_value="[]",
         ), mock.patch.object(monitor, "failing_signature", return_value=""), mock.patch.object(
             monitor, "slack_send", return_value=(True, "reply-ts")
         ) as slack:
@@ -931,9 +929,7 @@ class MjRunnerTests(unittest.TestCase):
         with mock.patch.object(monitor, "mj_command", side_effect=fake_mj), mock.patch.object(
             monitor,
             "run_command",
-            return_value=json.dumps(
-                [{"sha": "base-sha", "commit": {"message": "launch base"}}]
-            ),
+            return_value="[]",
         ), mock.patch.object(monitor, "failing_signature", return_value=""), mock.patch.object(
             monitor, "slack_send", return_value=(True, "reply-ts")
         ):
@@ -986,9 +982,7 @@ class MjRunnerTests(unittest.TestCase):
         with mock.patch.object(monitor, "mj_command", side_effect=fake_mj), mock.patch.object(
             monitor,
             "run_command",
-            return_value=json.dumps(
-                [{"sha": "base-sha", "commit": {"message": "launch base"}}]
-            ),
+            return_value="[]",
         ), mock.patch.object(monitor, "failing_signature", return_value=""), mock.patch.object(
             monitor, "slack_send", return_value=(True, "reply-ts")
         ):
@@ -1060,7 +1054,7 @@ class MjRunnerTests(unittest.TestCase):
             )
             self.assertIn(issue_url, result.output)
             monitor.finalize_invocation(
-                self.conn, self.transport, make_run(), result, "master-head", None
+                self.conn, self.transport, make_run(), result, None
             )
 
         self.assertIn(issue_url, result.output)
@@ -1116,9 +1110,7 @@ class MjRunnerTests(unittest.TestCase):
         ) as supervise, mock.patch.object(
             monitor,
             "run_command",
-            return_value=json.dumps(
-                [{"sha": "base-sha", "commit": {"message": "launch base"}}]
-            ),
+            return_value="[]",
         ), mock.patch.object(
             monitor, "failing_signature", return_value=""
         ), mock.patch.object(
@@ -1313,131 +1305,116 @@ class MjRunnerTests(unittest.TestCase):
         self.assertEqual(row["suspend_verify_failures"], 3)
         self.assertEqual(row["suspend_failure_notified"], 1)
 
-    def test_push_detection_uses_run_trailer_and_newest_matching_commit(self):
-        pages = [
-            [
-                {
-                    "sha": "newest",
-                    "commit": {
-                        "message": "merge\n\nReviewed-by: A Person <a@example.com>\nCI-Repair-Run: 42\n",
-                    },
-                },
-                {
-                    "sha": "body-only",
-                    "commit": {
-                        "message": "fix\n\nCI-Repair-Run: 42\n\nLater body paragraph",
-                    },
-                },
-            ],
-            [
-                {
-                    "sha": "older",
-                    "commit": {
-                        "message": "fix\n\nCI-Repair-Run: 42",
-                    },
-                },
-                {
-                    "sha": "other-run",
-                    "commit": {
-                        "message": "fix\n\nCI-Repair-Run: 420",
-                    },
-                },
-            ],
-            [{"sha": "launch-base", "commit": {"message": "launch base"}}],
-        ]
-        with mock.patch.object(monitor, "PUSH_DETECTION_PAGE_SIZE", 2), mock.patch.object(
-            monitor, "run_command", side_effect=[json.dumps(page) for page in pages]
-        ) as command:
-            master_sha, pushed_sha = monitor.read_pushed_commit(
-                "launch-base", 42
-            )
-        self.assertEqual((master_sha, pushed_sha), ("newest", "newest"))
-        self.assertEqual(command.call_count, 3)
-        first_query = monitor.urllib.parse.urlparse(
-            command.call_args_list[0].args[0][-1]
-        ).query
-        later_query = monitor.urllib.parse.urlparse(
-            command.call_args_list[1].args[0][-1]
-        ).query
-        first_params = monitor.urllib.parse.parse_qs(first_query)
-        later_params = monitor.urllib.parse.parse_qs(later_query)
-        self.assertEqual(first_params["sha"], ["master"])
-        self.assertEqual(first_params["per_page"], ["2"])
-        self.assertEqual(first_params["page"], ["1"])
-        self.assertEqual(later_params["sha"], ["newest"])
-        self.assertEqual(later_params["page"], ["2"])
-
-    def test_push_history_without_launch_base_is_indeterminate(self):
-        pages = [
-            [{"sha": f"new-{n}", "commit": {"message": "unrelated"}} for n in range(2)],
-            [{"sha": f"older-{n}", "commit": {"message": "unrelated"}} for n in range(2)],
-        ]
-        with mock.patch.object(monitor, "PUSH_DETECTION_PAGE_SIZE", 2), mock.patch.object(
-            monitor, "PUSH_DETECTION_MAX_PAGES", 2
-        ), mock.patch.object(
-            monitor, "run_command", side_effect=[json.dumps(page) for page in pages]
-        ) as command:
-            with self.assertRaises(monitor.PushDetectionIndeterminate):
-                monitor.read_pushed_commit("rewritten-away-base", 42)
-        self.assertEqual(command.call_count, 2)
-
-    def test_commit_trailer_parser_requires_git_final_trailer_block(self):
-        self.assertTrue(
-            monitor.has_repair_run_trailer("fix\n\nCI-Repair-Run: 42\n", 42)
+    def test_pr_detection_queries_the_exact_repair_branch(self):
+        expected = monitor.RepairPullRequest(
+            151, "https://github.com/BrokkAi/bifrost-dev/pull/151", "OPEN", "head-sha"
         )
-        self.assertFalse(
-            monitor.has_repair_run_trailer(
-                "fix\n\nCI-Repair-Run: 42\n\nThis is body text", 42
-            )
-        )
-
-    def test_push_detection_failure_finalizes_and_notifies(self):
-        insert_invocation(self.conn, status="running", session_id="session-push-fail")
-        result = monitor.SessionResult("completed", "captured", False, False)
         with mock.patch.object(
-            monitor, "slack_send", return_value=(True, "reply")
-        ) as slack:
-            monitor.finalize_push_detection_failure(
-                self.conn,
-                self.transport,
-                make_run(),
-                result,
-                monitor.CommandError("GitHub unavailable"),
+            monitor,
+            "run_command",
+            return_value=json.dumps(
+                [{
+                    "number": expected.number,
+                    "url": expected.url,
+                    "state": expected.state,
+                    "headRefOid": expected.head_ref_oid,
+                }]
+            ),
+        ) as command:
+            self.assertEqual(
+                monitor.find_repair_pr("ci-repair/42-3"), expected
             )
-        row = self.conn.execute(
-            "SELECT status, finished_at FROM invocations WHERE workflow_run_id = 42"
-        ).fetchone()
-        self.assertEqual(row["status"], "failed")
-        self.assertIsNotNone(row["finished_at"])
-        self.assertIn("GitHub commit detection failed", slack.call_args.args[1])
-
-    def test_indeterminate_push_finalizes_unknown_without_escalation_detection(self):
-        insert_invocation(self.conn, status="running", session_id="session-push-unknown")
-        result = monitor.SessionResult(
-            "completed",
-            "<@U08P3FAEU3G> https://github.com/BrokkAi/bifrost-dev/issues/99",
-            False,
-            False,
+        self.assertEqual(
+            command.call_args.args[0],
+            [
+                str(monitor.GH_BIN), "pr", "list", "--repo", monitor.REPO_NAME,
+                "--head", "ci-repair/42-3", "--state", "all", "--json",
+                "number,url,state,headRefOid",
+            ],
         )
-        with mock.patch.object(monitor, "detect_escalation") as detect, mock.patch.object(
-            monitor, "slack_send", return_value=(True, "reply")
-        ) as slack:
-            monitor.finalize_push_detection_indeterminate(
-                self.conn,
-                self.transport,
-                make_run(),
-                result,
-                monitor.PushDetectionIndeterminate("launch base is absent"),
-            )
-        detect.assert_not_called()
-        row = self.conn.execute(
-            "SELECT status, issue_url FROM invocations WHERE workflow_run_id = 42"
-        ).fetchone()
-        self.assertEqual(row["status"], "push_unknown")
-        self.assertIsNone(row["issue_url"])
-        self.assertIn("push status is unknown", slack.call_args.args[1])
 
-    def test_escalation_detection_is_gated_after_a_tagged_push(self):
+    def test_ci_fix_listing_requests_open_pr_context(self):
+        expected = monitor.QueuedRepairPR(
+            301,
+            "https://github.com/BrokkAi/bifrost-dev/pull/301",
+            "Fix allocator failure",
+            "ci-repair/41-1",
+            "Fails in test_allocator; evidence points to commit abc123.",
+        )
+        with mock.patch.object(
+            monitor,
+            "run_command",
+            return_value=json.dumps(
+                [{
+                    "number": expected.number,
+                    "url": expected.url,
+                    "title": expected.title,
+                    "headRefName": expected.head_ref_name,
+                    "body": expected.body,
+                }]
+            ),
+        ) as command:
+            self.assertEqual(monitor.list_open_ci_fix_prs(), [expected])
+        self.assertEqual(
+            command.call_args.args[0],
+            [
+                str(monitor.GH_BIN), "pr", "list", "--repo", monitor.REPO_NAME,
+                "--label", "ci-fix", "--state", "open", "--json",
+                "number,url,title,headRefName,body",
+            ],
+        )
+
+    def test_ci_fix_pr_listing_failure_blocks_before_invocation_claim(self):
+        with mock.patch.object(
+            monitor, "list_open_ci_fix_prs", side_effect=monitor.CommandError("offline")
+        ) as listing, mock.patch.object(
+            monitor, "slack_send", return_value=(True, "reply-ts")
+        ) as slack:
+            for _ in range(2):
+                self.assertIsNone(
+                    monitor.prepare_queued_prs_before_launch(
+                        self.conn, self.transport, make_run(), "thread-1"
+                    )
+                )
+        self.assertEqual(listing.call_count, 2)
+        notification = self.conn.execute(
+            "SELECT reason, details FROM blocked_notifications "
+            "WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(notification["reason"], "github_pr_list_failed")
+        self.assertIn("offline", notification["details"])
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM invocations").fetchone()[0], 0
+        )
+        self.assertEqual(slack.call_count, 1)
+
+    def test_queued_pr_context_is_passed_to_session_prompt(self):
+        run = make_run()
+        queued_prs = [
+            monitor.QueuedRepairPR(
+                301,
+                "https://github.com/BrokkAi/bifrost-dev/pull/301",
+                "Fix allocator failure",
+                "ci-repair/41-1",
+                "Same failing test and evidence.",
+            )
+        ]
+        with mock.patch.object(
+            monitor, "lookup_launch_session", return_value=None
+        ), mock.patch.object(
+            monitor, "build_prompt", return_value="prompt"
+        ) as build_prompt, mock.patch.object(
+            monitor, "mj_command", return_value=completed('{"session_id":"s-42"}')
+        ):
+            session_id, branch = monitor.launch_mj_session_with_queued_prs(
+                run, "b" * 40, 1, None, queued_prs
+            )
+        self.assertEqual((session_id, branch), ("s-42", "ci-repair/42-1"))
+        build_prompt.assert_called_once_with(
+            run, None, "ci-repair/42-1", queued_prs
+        )
+
+    def test_no_pr_runs_escalation_detection(self):
         insert_invocation(self.conn, status="running", session_id="s-42")
         result = monitor.SessionResult(
             "completed",
@@ -1447,18 +1424,115 @@ class MjRunnerTests(unittest.TestCase):
         )
         with mock.patch.object(monitor, "failing_signature", return_value=""), mock.patch.object(
             monitor, "detect_escalation"
-        ) as detect, mock.patch.object(
+        ) as detect, mock.patch.object(monitor, "slack_send", return_value=(True, "reply-ts")):
+            detect.return_value = (True, "https://github.com/BrokkAi/bifrost-dev/issues/88")
+            monitor.finalize_invocation(
+                self.conn, self.transport, make_run(), result, None
+            )
+        detect.assert_called_once()
+        row = self.conn.execute(
+            "SELECT status, issue_url, repair_pr_url FROM invocations "
+            "WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(
+            row["issue_url"], "https://github.com/BrokkAi/bifrost-dev/issues/88"
+        )
+        self.assertIsNone(row["repair_pr_url"])
+
+    def test_pr_lookup_failure_retries_next_tick_then_finalizes(self):
+        insert_invocation(self.conn, status="running", session_id="s-42")
+        result = monitor.SessionResult("completed", "captured", False, False)
+        with mock.patch.object(
+            monitor, "find_repair_pr", side_effect=monitor.CommandError("GitHub unavailable")
+        ), mock.patch.object(
             monitor, "slack_send", return_value=(True, "reply-ts")
         ):
-            monitor.finalize_invocation(
-                self.conn, self.transport, make_run(), result, "new-master", "pushed-sha"
+            found = monitor.detect_and_finalize_pr(
+                self.conn, self.transport, make_run(), result, "ci-repair/42-1"
             )
+        self.assertFalse(found)
+        pending = self.conn.execute(
+            "SELECT status, pr_detection_failures FROM invocations "
+            "WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(pending["status"], "pr_detection_pending")
+        self.assertEqual(pending["pr_detection_failures"], 1)
+        repair_pr = monitor.RepairPullRequest(
+            152, "https://github.com/BrokkAi/bifrost-dev/pull/152", "OPEN", "sha"
+        )
+        with mock.patch.object(
+            monitor, "find_repair_pr", return_value=repair_pr
+        ), mock.patch.object(
+            monitor, "failing_signature", return_value=""
+        ), mock.patch.object(
+            monitor, "detect_escalation"
+        ) as detect, mock.patch.object(
+            monitor, "slack_send", return_value=(True, "reply-ts")
+        ) as slack:
+            monitor.retry_pending_pr_detections(self.conn, self.transport)
         detect.assert_not_called()
+        self.assertIn(
+            f"opened <{repair_pr.url}|PR #152>", slack.call_args.args[1]
+        )
         row = self.conn.execute(
-            "SELECT status, issue_url FROM invocations WHERE workflow_run_id = 42"
+            "SELECT status, issue_url, repair_pr_url FROM invocations "
+            "WHERE workflow_run_id = 42"
         ).fetchone()
         self.assertEqual(row["status"], "completed")
         self.assertIsNone(row["issue_url"])
+        self.assertEqual(row["repair_pr_url"], repair_pr.url)
+
+    def test_repeated_pr_lookup_failures_finalize_distinct_status(self):
+        insert_invocation(self.conn, status="running", session_id="s-42")
+        result = monitor.SessionResult("completed", "captured", False, False)
+        with mock.patch.object(
+            monitor, "slack_send", return_value=(True, "reply-ts")
+        ) as slack:
+            for _ in range(monitor.PR_DETECTION_FAILURE_THRESHOLD):
+                monitor.record_pr_detection_failure(
+                    self.conn, self.transport, make_run(), result,
+                    monitor.CommandError("GitHub unavailable"),
+                )
+        row = self.conn.execute(
+            "SELECT status, pr_detection_failures, finished_at, "
+            "outcome_notification_attempted FROM invocations WHERE workflow_run_id = 42"
+        ).fetchone()
+        self.assertEqual(row["status"], "pr_detection_failed")
+        self.assertEqual(row["pr_detection_failures"], monitor.PR_DETECTION_FAILURE_THRESHOLD)
+        self.assertIsNotNone(row["finished_at"])
+        self.assertEqual(row["outcome_notification_attempted"], 1)
+        self.assertIn("escalation detection was skipped", slack.call_args.args[1])
+
+    def test_no_pr_without_mentions_defers_to_queued_pr(self):
+        insert_invocation(self.conn, status="running", session_id="s-42")
+        queued_pr = monitor.QueuedRepairPR(
+            301,
+            "https://github.com/BrokkAi/bifrost-dev/pull/301",
+            "Fix allocator failure",
+            "ci-repair/41-1",
+            "The same failing test is addressed here.",
+        )
+        with self.conn:
+            self.conn.execute(
+                "UPDATE invocations SET queued_ci_fix_prs_json = ? "
+                "WHERE workflow_run_id = 42",
+                (monitor.serialize_queued_prs([queued_pr]),),
+            )
+        result = monitor.SessionResult("completed", "Already covered by queued PR.", False, False)
+        with mock.patch.object(
+            monitor, "failing_signature", return_value=""
+        ), mock.patch.object(
+            monitor, "slack_send", return_value=(True, "reply-ts")
+        ) as slack:
+            monitor.finalize_invocation(
+                self.conn, self.transport, make_run(), result, None
+            )
+        message = slack.call_args.args[1]
+        self.assertIn("deferred to the queued PR", message)
+        self.assertIn(f"<{queued_pr.url}|PR #301>", message)
+        self.assertIn("No new repair PR was opened", message)
+        self.assertNotIn("<@", message)
 
     def test_legacy_rows_are_finished_history_not_recovery_work(self):
         monitor.ensure_column(
@@ -1543,21 +1617,59 @@ class MjRunnerTests(unittest.TestCase):
             self.assertIn("suspend_retry_count", columns)
             self.assertIn("suspend_failure_notified", columns)
             self.assertIn("suspend_verify_failures", columns)
+            self.assertIn("repair_pr_url", columns)
+            self.assertIn("pr_detection_failures", columns)
+            self.assertIn("pr_detection_error", columns)
+            self.assertIn("session_result_status", columns)
+            self.assertIn("queued_ci_fix_prs_json", columns)
         finally:
             migrated.close()
 
 
 class PromptContractTests(unittest.TestCase):
-    def test_repair_prompt_requires_trailer_merge_and_master_push(self):
-        prompt = monitor.build_prompt(make_run())
+    def test_repair_prompt_requires_trailer_and_pr_publication(self):
+        prompt = monitor.build_prompt(make_run(), branch="ci-repair/42-3")
         self.assertIn("CI-Repair-Run: 42", prompt)
-        self.assertIn("git fetch origin", prompt)
-        self.assertIn("merge origin/master", prompt)
-        self.assertIn("git push origin HEAD:master", prompt)
-        self.assertIn("Never force-push", prompt)
-        self.assertIn("include the same CI-Repair-Run trailer", prompt)
+        self.assertIn(
+            "git push origin HEAD:refs/heads/ci-repair/42-3", prompt
+        )
+        self.assertIn(
+            "gh pr create --base master --head ci-repair/42-3 --label ci-fix",
+            prompt,
+        )
+        self.assertIn("failing run link", prompt)
+        self.assertIn("introducing commit", prompt)
+        self.assertIn("evidence", prompt)
+        self.assertNotIn("git push origin HEAD:master", prompt)
+        self.assertNotIn("merge origin/master", prompt)
+        self.assertIn("Never push to master or force-push", prompt)
+        self.assertIn("Do not merge the PR yourself", prompt)
+        self.assertIn("Every commit you make must include the trailer", prompt)
+        self.assertIn("URL of the revert PR", prompt)
         self.assertNotIn("WORKTREE_BRANCH", prompt)
         self.assertNotIn("monitor owns", prompt.lower())
+
+    def test_queued_ci_fix_pr_context_reaches_prompt_with_noop_rules(self):
+        queued_pr = monitor.QueuedRepairPR(
+            301,
+            "https://github.com/BrokkAi/bifrost-dev/pull/301",
+            "Fix allocator failure",
+            "ci-repair/41-1",
+            "Fails in test_allocator; evidence points to commit abc123.",
+        )
+        prompt = monitor.build_prompt(
+            make_run(),
+            branch="ci-repair/42-1",
+            queued_prs=[queued_pr],
+        )
+        self.assertIn(queued_pr.url, prompt)
+        self.assertIn(queued_pr.title, prompt)
+        self.assertIn(queued_pr.head_ref_name, prompt)
+        self.assertIn(queued_pr.body, prompt)
+        self.assertIn("SAME problem", prompt)
+        self.assertIn("make no changes, open no PR or issue, ping no one", prompt)
+        self.assertIn("NEW failure on top", prompt)
+        self.assertIn("Do not touch, update, close, or merge any queued PR", prompt)
 
     def test_timeout_handoff_keeps_session_and_forbids_push(self):
         prompt = monitor.build_timeout_handoff_prompt(
