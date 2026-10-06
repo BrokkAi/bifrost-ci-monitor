@@ -96,6 +96,25 @@ bifrost --model deepseek-flash --subagents none`).
      conflict-resolution and fix notes;
    - label `mergemarshall-batch`.
 
+## Session lifecycle
+
+An integration session stays live from launch until the batch completes. The
+supervisor reads status and completed messages, and sends follow-up prompts to
+that same environment. It never suspends or restores between turns or while
+waiting for CI. A cron tick polls for at most 50 seconds, then leaves the agent
+running for the next tick to observe. Agent turns have no elapsed-time limit.
+Manual abort and priority preemption still interrupt the session deliberately.
+After a terminal batch result, the supervisor checkpoints the session for the
+existing archive retention policy.
+
+Run checks selected by `ci-impact`, including the full selected scope when it
+selects full. Test the committed candidate and base without temporary source
+edits or validation shims. A reproduced baseline build failure can block
+selected dependent checks; report those checks as blocked and run unaffected
+checks. Ledger entries guide diagnosis and must satisfy the mode's baseline
+requirements. Publication retries reuse existing test evidence for an unchanged
+tested tree and find the integration PR by its bare head branch name.
+
 ## Direct single-PR landing
 
 If selection returns exactly one eligible PR and GitHub compare
@@ -148,7 +167,7 @@ later cron tick. Existing batches migrated without a mode keep `sync` behavior.
 
 - **`sync`** waits for the integration PR's verified `PR verification` check.
   On red CI, the supervisor selects a run for the exact base tree and compares
-  failed jobs, tests, and steps. It resumes the session to fix or remove
+  failed jobs, tests, and steps. It prompts the same live session to fix or remove
   responsible PRs. It lands when green, or when every failure is no worse than
   that baseline. A red master can therefore be handled without blocking a
   batch whose integration failures are all present at the base. Sync batches
@@ -182,8 +201,8 @@ mode.
 The supervisor accepts `PR verification` only from the GitHub Actions run whose
 path is `.github/workflows/ci.yml`, whose head SHA is the tested head, and whose
 event is `pull_request`. It follows the latest attempt and matches the check run
-to that workflow run's check suite. The agent session is suspended while CI
-runs, so no agent time is spent waiting. While CI or a supervisor decision is
+to that workflow run's check suite. The agent ends its turn after publication and stays live and idle while CI
+runs. Follow-up prompts use the same environment without a suspend or restore. While CI or a supervisor decision is
 pending, the supervisor posts `mergemarshall/verdict: pending` on that exact head.
 
 ## Sync mode: when CI is red
@@ -195,7 +214,7 @@ pending, the supervisor posts `mergemarshall/verdict: pending` on that exact hea
    integration batch, use that batch's final integration-PR CI result only
    when GitHub confirms that the base commit and its tested head have the same
    tree. Otherwise use the newest `ci.yml` run on `master` for the exact base
-   commit. A pending run keeps the agent suspended while the supervisor waits.
+   commit. A pending run keeps the agent idle while the supervisor waits.
    If the run is missing or cancelled, first use any matching open CI ledger
    identities whose last-seen SHA equals the base or is an ancestor of it.
    The ledger is parser-derived evidence for this comparison. If no such entry
@@ -215,7 +234,7 @@ pending, the supervisor posts `mergemarshall/verdict: pending` on that exact hea
    failure is always worse. For a failed job with no parseable test identity
    (such as build, lint, or crash failures), its failing step name must still
    match a step that failed in that same baseline job.
-3. It resumes the same session and sends the failures with `mj prompt`.
+3. It sends the failures to the same live session with `mj prompt`.
 4. The agent either:
    - fixes the interaction with a new commit on the branch, or
    - ejects the PR or PRs responsible. Ejecting means rebuilding the branch

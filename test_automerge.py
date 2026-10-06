@@ -459,6 +459,19 @@ class IdentityAndPromptTests(TestCase):
             self.assertIn(expected, prompt)
         self.assertNotIn("CI is red, the supervisor will resume", prompt)
 
+    # Hard-won: fa474db8: a publication retry prohibited the requested PR update.
+    def test_publication_retry_reuses_unchanged_tested_tree_and_allows_publish(self):
+        conn = make_db(phase="fixing", ci_mode="async")
+        automerge._queue_async_gate_retry(
+            conn, row_for(conn), async_local_report(), "no integration PR was found",
+        )
+        prompt = str(row_for(conn)["pending_prompt"])
+        self.assertIn("local targeted-test gate passed", prompt)
+        self.assertIn("No rebuild or test rerun is needed for an unchanged tested tree", prompt)
+        self.assertIn("otherwise open it with the required title and label", prompt)
+        self.assertNotIn("do not open/update", prompt)
+        conn.close()
+
     def test_async_result_requires_tests_and_baseline_summary(self):
         self.assertEqual(automerge._async_local_result(async_local_report()), "pass")
         self.assertIsNone(automerge._async_local_result(
@@ -509,6 +522,7 @@ class IdentityAndPromptTests(TestCase):
         self.assertEqual(updated["ci_round"], 1)
         conn.close()
 
+    # Hard-won: fa474db8: gh pr list --head owner:branch silently misses the PR.
     def test_discovered_integration_pr_gets_required_title_and_existing_label(self):
         conn = make_db(phase="building")
         row = row_for(conn)
@@ -516,11 +530,13 @@ class IdentityAndPromptTests(TestCase):
             mock.patch.object(automerge, "gh_json", return_value=[{
                 "number": 211, "url": "https://github.test/pr/211",
                 "headRefOid": HEAD_ONE, "title": "wrong", "labels": [],
-            }]),
+            }]) as lookup,
             mock.patch.object(automerge, "run_gh") as gh,
         ):
             result = automerge.find_integration_pr(row)
         self.assertEqual(result["number"], 211)
+        lookup_args = lookup.call_args.args[0]
+        self.assertEqual(lookup_args[lookup_args.index("--head") + 1], row["branch"])
         args = gh.call_args.args[0]
         self.assertIn("--title", args)
         self.assertEqual(args[args.index("--title") + 1], "Merge batch: #7")
@@ -601,12 +617,12 @@ class CiSupervisionTests(TestCase):
                 self.assertIn("pulls/211/files?per_page=100", args[1])
                 self.assertIn("--paginate", args)
 
-    def test_ci_wait_keeps_session_suspended_and_pending(self):
+    def test_ci_wait_keeps_live_session_idle_and_pending(self):
         conn = make_db(phase="waiting_ci")
         row = row_for(conn)
         transport = monitor.SlackTransport("webhook", webhook="x")
         with (
-            mock.patch.object(automerge, "_is_session_suspended", return_value=True) as suspended,
+            mock.patch.object(automerge, "_session_is_idle", return_value=True) as idle,
             mock.patch.object(automerge, "integration_pr_view", return_value={
                 "headRefOid": HEAD_ONE, "baseRefOid": BASE_SHA,
             }),
@@ -614,16 +630,16 @@ class CiSupervisionTests(TestCase):
             mock.patch.object(automerge, "post_verdict_status") as post_status,
         ):
             automerge._poll_ci(conn, transport, row)
-        suspended.assert_called_once()
+        idle.assert_called_once()
         check.assert_called_once_with(HEAD_ONE)
         post_status.assert_called_once_with(conn, row, HEAD_ONE, "pending", "CI pending")
         self.assertEqual(row_for(conn)["phase"], "waiting_ci")
         conn.close()
 
-    def test_ci_is_not_polled_until_session_is_suspended(self):
+    def test_ci_is_not_polled_while_agent_turn_is_active(self):
         conn = make_db(phase="waiting_ci")
         with (
-            mock.patch.object(automerge, "_is_session_suspended", return_value=False),
+            mock.patch.object(automerge, "_session_is_idle", return_value=False),
             mock.patch.object(automerge, "integration_pr_view") as view,
         ):
             automerge._poll_ci(conn, monitor.SlackTransport("webhook", webhook="x"), row_for(conn))
@@ -634,7 +650,7 @@ class CiSupervisionTests(TestCase):
         conn = make_db(phase="waiting_ci")
         transport = monitor.SlackTransport("webhook", webhook="x")
         with (
-            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "_session_is_idle", return_value=True),
             mock.patch.object(automerge, "integration_pr_view", return_value={
                 "headRefOid": HEAD_ONE, "baseRefOid": BASE_SHA,
             }),
@@ -736,13 +752,13 @@ class CiSupervisionTests(TestCase):
         collect.assert_called_once_with(51)
         conn.close()
 
-    def test_pending_master_ci_waits_with_the_session_suspended(self):
+    def test_pending_master_ci_waits_with_the_session_idle(self):
         conn = make_db(phase="waiting_ci")
         transport = monitor.SlackTransport("webhook", webhook="x")
         pending = {"id": 46, "head_sha": BASE_SHA, "head_branch": "master", "event": "push",
                    "status": "in_progress", "conclusion": None, "created_at": "2026-10-05T12:00:00Z"}
         with (
-            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "_session_is_idle", return_value=True),
             mock.patch.object(automerge, "integration_pr_view", return_value={
                 "headRefOid": HEAD_ONE, "baseRefOid": BASE_SHA,
             }),
@@ -894,7 +910,7 @@ class CiSupervisionTests(TestCase):
         conn = make_db(phase="waiting_ci")
         transport = monitor.SlackTransport("webhook", webhook="x")
         with (
-            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "_session_is_idle", return_value=True),
             mock.patch.object(automerge, "integration_pr_view", return_value={
                 "headRefOid": HEAD_ONE, "baseRefOid": BASE_SHA,
             }),
@@ -920,22 +936,22 @@ class CiSupervisionTests(TestCase):
         gh.assert_not_called()
         conn.close()
 
-    def test_fix_round_restart_resumes_once_and_delivers_persisted_prompt(self):
+    def test_fix_round_restart_delivers_prompt_without_resuming(self):
         conn = make_db(phase="fixing")
         with conn:
             conn.execute("UPDATE automerge_batches SET pending_prompt=?, prompt_delivered=0 "
                          "WHERE batch_id='batch-test'", ("Investigate the red checks",))
         events: list[str] = []
         with (
-            mock.patch.object(automerge, "_session_status", return_value={"state": "stopped"}),
-            mock.patch.object(monitor, "mj_command", side_effect=lambda args, **kwargs:
-                              events.append("resume") or subprocess.CompletedProcess(args, 0, "{}", "")),
+            mock.patch.object(automerge, "_session_status", return_value={"state": "running", "is_idle": True}),
+            mock.patch.object(monitor, "mj_command") as mj,
             mock.patch.object(monitor, "send_session_prompt",
                               side_effect=lambda sid, prompt: events.append(f"prompt:{prompt}")),
             mock.patch.object(automerge, "_wait_agent_turn", return_value=False),
         ):
             automerge.process_batch(conn, monitor.SlackTransport("webhook", webhook="x"), "batch-test")
-        self.assertEqual(events, ["resume", "prompt:Investigate the red checks"])
+        self.assertEqual(events, ["prompt:Investigate the red checks"])
+        mj.assert_not_called()
         self.assertEqual(row_for(conn)["prompt_delivered"], 1)
         conn.close()
 
@@ -991,7 +1007,7 @@ class CiSupervisionTests(TestCase):
     def test_fourth_ci_round_does_not_advance_to_a_fifth_head(self):
         conn = make_db(phase="waiting_ci", ci_round=4, ci_head_sha=HEAD_ONE)
         with (
-            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "_session_is_idle", return_value=True),
             mock.patch.object(automerge, "integration_pr_view", return_value={"headRefOid": HEAD_TWO}),
             mock.patch.object(automerge, "_terminal") as terminal,
         ):
@@ -1278,7 +1294,7 @@ class PublicationGateTests(TestCase):
                 "number": 211, "url": view["url"], "headRefOid": HEAD_ONE,
             }),
             mock.patch.object(automerge, "integration_pr_view", side_effect=[view, view, merged]),
-            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "_session_is_idle", return_value=True),
             mock.patch.object(automerge, "check_pr_verification",
                               side_effect=AssertionError("async mode queried PR CI")) as check_ci,
             mock.patch.object(automerge, "_latest_completed_ci_run_for_head",
@@ -1341,7 +1357,7 @@ class PublicationGateTests(TestCase):
         view = {"state": "OPEN", "isDraft": False, "baseRefName": "master",
                 "headRefOid": HEAD_ONE, "baseRefOid": BASE_SHA}
         with (
-            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "_session_is_idle", return_value=True),
             mock.patch.object(automerge, "integration_pr_view", return_value=view),
             mock.patch.object(automerge, "check_pr_verification",
                               side_effect=AssertionError("async mode queried CI")) as check_ci,
@@ -1373,7 +1389,7 @@ class PublicationGateTests(TestCase):
         view = {"state": "OPEN", "isDraft": False, "baseRefName": "master",
                 "headRefOid": HEAD_ONE, "baseRefOid": BASE_SHA}
         with (
-            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "_session_is_idle", return_value=True),
             mock.patch.object(automerge, "integration_pr_view", return_value=view),
             mock.patch.object(automerge, "check_pr_verification",
                               side_effect=AssertionError("async mode queried CI")) as check_ci,
@@ -1400,7 +1416,7 @@ class PublicationGateTests(TestCase):
         view = {"state": "OPEN", "isDraft": False, "baseRefName": "master",
                 "headRefOid": HEAD_TWO, "baseRefOid": BASE_SHA}
         with (
-            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "_session_is_idle", return_value=True),
             mock.patch.object(automerge, "integration_pr_view", return_value=view),
             mock.patch.object(automerge, "check_pr_verification",
                               side_effect=AssertionError("async mode queried CI")) as check_ci,
@@ -1421,7 +1437,7 @@ class PublicationGateTests(TestCase):
         view = {"state": "OPEN", "isDraft": False, "baseRefName": "master",
                 "headRefOid": HEAD_ONE, "baseRefOid": BASE_SHA}
         with (
-            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "_session_is_idle", return_value=True),
             mock.patch.object(automerge, "integration_pr_view", return_value=view),
             mock.patch.object(automerge, "check_pr_verification", return_value="success"),
             mock.patch.object(automerge, "current_master_sha", return_value=HEAD_TWO),
@@ -1451,7 +1467,7 @@ class PublicationGateTests(TestCase):
             return "{}"
 
         with (
-            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "_session_is_idle", return_value=True),
             mock.patch.object(automerge, "integration_pr_view", side_effect=[view, view]),
             mock.patch.object(automerge, "check_pr_verification", return_value="success"),
             mock.patch.object(automerge, "current_master_sha", side_effect=[BASE_SHA, HEAD_TWO]),
@@ -1480,7 +1496,7 @@ class PublicationGateTests(TestCase):
         view = {"state": "OPEN", "isDraft": False, "baseRefName": "master",
                 "headRefOid": HEAD_ONE, "baseRefOid": BASE_SHA}
         with (
-            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "_session_is_idle", return_value=True),
             mock.patch.object(automerge, "integration_pr_view", return_value=view),
             mock.patch.object(automerge, "check_pr_verification", return_value="success"),
             mock.patch.object(automerge, "current_master_sha", return_value=BASE_SHA),
@@ -1511,7 +1527,7 @@ class PublicationGateTests(TestCase):
             "body": f"automerge-rejected-head: {HEAD_ONE}\nRegression evidence.",
         }
         with (
-            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "_session_is_idle", return_value=True),
             mock.patch.object(automerge, "integration_pr_view", return_value=view),
             mock.patch.object(automerge, "check_pr_verification", return_value="success"),
             mock.patch.object(automerge, "current_master_sha", return_value=BASE_SHA),
@@ -1543,7 +1559,7 @@ class PublicationGateTests(TestCase):
                 "headRefOid": HEAD_ONE, "baseRefOid": BASE_SHA}
         transport = monitor.SlackTransport("webhook", webhook="x")
         with (
-            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "_session_is_idle", return_value=True),
             mock.patch.object(automerge, "integration_pr_view", return_value=view),
             mock.patch.object(automerge, "check_pr_verification",
                               side_effect=AssertionError("async mode queried CI")) as check_ci,
@@ -1672,7 +1688,7 @@ class PublicationGateTests(TestCase):
                 "headRefOid": HEAD_ONE, "baseRefOid": BASE_SHA}
         outcomes = automerge.BatchOutcome((automerge.PullRequestOutcome(pull(), "merged"),), (), ())
         with (
-            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "_session_is_idle", return_value=True),
             mock.patch.object(automerge, "integration_pr_view", return_value=view),
             mock.patch.object(automerge, "check_pr_verification", return_value="success"),
             mock.patch.object(automerge, "current_master_sha", return_value=BASE_SHA),
@@ -1721,7 +1737,7 @@ class PublicationGateTests(TestCase):
                 "headRefOid": HEAD_ONE, "baseRefOid": BASE_SHA}
         outcomes = automerge.BatchOutcome((automerge.PullRequestOutcome(pull(), "merged"),), (), ())
         with (
-            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "_session_is_idle", return_value=True),
             mock.patch.object(automerge, "integration_pr_view", return_value=view),
             mock.patch.object(automerge, "check_pr_verification", return_value="failure"),
             mock.patch.object(automerge, "_latest_completed_ci_run_for_head",
@@ -1779,7 +1795,7 @@ class PublicationGateTests(TestCase):
         view = {"state": "OPEN", "isDraft": False, "baseRefName": "master",
                 "headRefOid": HEAD_ONE, "baseRefOid": BASE_SHA}
         with (
-            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "_session_is_idle", return_value=True),
             mock.patch.object(automerge, "integration_pr_view", return_value=view),
             mock.patch.object(automerge, "check_pr_verification", return_value="failure"),
             mock.patch.object(automerge, "_latest_completed_ci_run_for_head",
@@ -2589,6 +2605,32 @@ class AbortBatchTests(TestCase):
 
 
 class LaunchAndLifecycleTests(TestCase):
+    def test_session_idle_check_only_observes_explicit_idle_or_stopped_state(self):
+        conn = make_db()
+        for session, idle in (
+            ({"state": "running", "is_idle": True}, True),
+            ({"state": "running", "is_idle": False, "chat_phase": "running"}, False),
+            ({"state": "stopped"}, True),
+            ({}, False),
+        ):
+            with (
+                self.subTest(session=session),
+                mock.patch.object(automerge, "_session_status", return_value=session),
+                mock.patch.object(monitor, "mj_command") as mj,
+            ):
+                self.assertEqual(automerge._session_is_idle(row_for(conn)), idle)
+                mj.assert_not_called()
+        conn.close()
+
+    def test_pending_suspensions_never_stop_an_active_batch(self):
+        conn = make_db(phase="fixing")
+        with conn:
+            conn.execute("UPDATE automerge_batches SET suspend_pending=1, suspend_verify_failures=3")
+        with mock.patch.object(monitor, "require_mj_success") as mj:
+            automerge.check_pending_suspensions(conn, monitor.SlackTransport("webhook", webhook="x"))
+        mj.assert_not_called()
+        conn.close()
+
     def test_phase_and_integration_pr_fields_migrate_additively(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "activity.db"
@@ -2626,6 +2668,8 @@ class LaunchAndLifecycleTests(TestCase):
             self.assertIn("priority", columns)
             self.assertEqual(defaults["priority"], "0")
             self.assertIn("allow_workflow_changes", columns)
+            self.assertIn("suspend_pending", columns)
+            self.assertIn("suspend_verify_failures", columns)
             conn.close()
 
     def test_new_batch_persists_ci_mode_and_ignores_later_setting_change(self):
@@ -2750,22 +2794,35 @@ class LaunchAndLifecycleTests(TestCase):
         self.assertEqual(mj.call_count, 1)
         conn.close()
 
-    def test_agent_turn_timeout_interrupts_notifies_and_suspends(self):
+    # Hard-won: fa474db8: a healthy long-running batch must survive cron polls.
+    def test_old_running_turn_keeps_working_without_timeout(self):
         conn = make_db(phase="fixing")
         with conn:
             conn.execute("UPDATE automerge_batches SET turn_started_at='2000-01-01T00:00:00+00:00' "
                          "WHERE batch_id='batch-test'")
-        events: list[str] = []
         with (
-            mock.patch.object(automerge, "interrupt_and_wait", side_effect=lambda *a, **k: events.append("interrupt")),
-            mock.patch.object(automerge, "notify_blocked_once", side_effect=lambda *a, **k: events.append("notify")),
-            mock.patch.object(automerge, "request_suspend", side_effect=lambda *a, **k: events.append("suspend") or True),
-            mock.patch.object(automerge, "close_integration_pr", side_effect=lambda *a: events.append("close")),
+            mock.patch.object(automerge, "supervise_turn", return_value=monitor.TurnResult(
+                "running", "timeout", timed_out=True,
+            )) as supervise,
+            mock.patch.object(automerge, "interrupt_and_wait") as interrupt,
+            mock.patch.object(automerge, "notify_blocked_once") as notify,
+            mock.patch.object(automerge, "request_suspend") as suspend,
+            mock.patch.object(automerge, "close_integration_pr") as close,
         ):
-            automerge._wait_agent_turn(conn, monitor.SlackTransport("webhook", webhook="x"),
-                                       row_for(conn), "session-existing")
-        self.assertEqual(events, ["notify", "interrupt", "suspend", "close"])
-        self.assertEqual(row_for(conn)["status"], "failed")
+            finished = automerge._wait_agent_turn(
+                conn, monitor.SlackTransport("webhook", webhook="x"),
+                row_for(conn), "session-existing",
+            )
+        self.assertFalse(finished)
+        supervise.assert_called_once_with(
+            conn, mock.ANY, "batch-test", "session-existing", automerge.TURN_TICK_SECONDS,
+        )
+        interrupt.assert_not_called()
+        notify.assert_not_called()
+        suspend.assert_not_called()
+        close.assert_not_called()
+        self.assertEqual(row_for(conn)["status"], "running")
+        self.assertIsNotNone(automerge.active_batch(conn))
         conn.close()
 
     def test_request_suspend_acknowledges_unpublished_work(self):
@@ -2783,24 +2840,21 @@ class LaunchAndLifecycleTests(TestCase):
         ])
         conn.close()
 
-    def test_timeout_holds_queue_if_interrupt_cannot_be_confirmed(self):
+    def test_agent_result_keeps_session_live_for_followup(self):
         conn = make_db(phase="building")
-        with conn:
-            conn.execute("UPDATE automerge_batches SET turn_started_at='2000-01-01T00:00:00+00:00' "
-                         "WHERE batch_id='batch-test'")
         with (
-            mock.patch.object(automerge, "interrupt_and_wait",
-                              side_effect=monitor.MjError("daemon unavailable")),
-            mock.patch.object(automerge, "notify_blocked_once"),
+            mock.patch.object(automerge, "drain_transcript"),
+            mock.patch.object(monitor, "read_complete_agent_transcript", return_value="transcript"),
+            mock.patch.object(automerge, "read_final_agent_message", return_value="final"),
             mock.patch.object(automerge, "request_suspend") as suspend,
-            mock.patch.object(automerge, "close_integration_pr") as close,
         ):
-            automerge._wait_agent_turn(conn, monitor.SlackTransport("webhook", webhook="x"),
-                                       row_for(conn), "session-existing")
+            final = automerge._store_agent_result(
+                conn, monitor.SlackTransport("webhook", webhook="x"),
+                row_for(conn), "session-existing",
+            )
+        self.assertEqual(final, "final")
         suspend.assert_not_called()
-        close.assert_not_called()
-        self.assertEqual(row_for(conn)["status"], "running")
-        self.assertIsNotNone(automerge.active_batch(conn))
+        self.assertEqual(row_for(conn)["agent_final_message"], "final")
         conn.close()
 
     def test_nonblocking_lock_excludes_parallel_run(self):
