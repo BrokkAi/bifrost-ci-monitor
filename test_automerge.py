@@ -1073,6 +1073,8 @@ class RulesetScriptTests(TestCase):
                 "printf '%s\\n' \"$*\" >> \"$GH_CALL_LOG\"\n"
                 "if [[ \"$1\" == api && \"$2\" == *'/rulesets?per_page=100' ]]; then\n"
                 "  cat \"$GH_FIXTURE\"\n"
+                "elif [[ \"$1\" == api && \"$2\" =~ /rulesets/([0-9]+)$ && $# -eq 2 ]]; then\n"
+                "  cat \"$GH_DETAIL_DIR/${BASH_REMATCH[1]}.json\"\n"
                 "elif [[ \"$1\" == api && ( \"${4:-}\" == POST || \"${4:-}\" == PUT ) ]]; then\n"
                 "  cat > \"$GH_BODY_LOG\"\n"
                 "  printf '{}\\n'\n"
@@ -1084,13 +1086,22 @@ class RulesetScriptTests(TestCase):
             )
             gh.chmod(0o755)
             fixture = root / "rulesets.json"
-            fixture.write_text(json.dumps([listing]), encoding="utf-8")
+            summary_keys = ("id", "name", "target", "enforcement", "source")
+            summaries = [{key: item[key] for key in summary_keys if key in item}
+                         for item in listing]
+            fixture.write_text(json.dumps([summaries]), encoding="utf-8")
+            detail_dir = root / "details"
+            detail_dir.mkdir()
+            for item in listing:
+                (detail_dir / f"{item['id']}.json").write_text(
+                    json.dumps(item), encoding="utf-8")
             call_log = root / "gh-calls.txt"
             body_log = root / "request-body.json"
             environment = os.environ.copy()
             environment.update({
                 "PATH": f"{binary_dir}:{environment.get('PATH', '')}",
                 "GH_FIXTURE": str(fixture),
+                "GH_DETAIL_DIR": str(detail_dir),
                 "GH_CALL_LOG": str(call_log),
                 "GH_BODY_LOG": str(body_log),
             })
@@ -1138,8 +1149,25 @@ class RulesetScriptTests(TestCase):
         self.assertEqual(required["required_status_checks"], [{
             "context": "mergemarshall/verdict", "integration_id": 5203169,
         }])
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         self.assertIn("rulesets?per_page=100", calls[0])
+        self.assertTrue(calls[1].endswith("/rulesets/18574277"))
+
+    def test_default_branch_ruleset_is_updated_with_its_targeting_kept(self):
+        existing = self.existing_ruleset()
+        existing["conditions"] = {
+            "ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []},
+        }
+        result, calls, body = self.run_script_with_fake_gh([existing], dry_run=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout)
+        self.assertEqual(plan["action"], "update")
+        self.assertEqual(plan["ruleset_id"], 18574277)
+        self.assertEqual(
+            plan["request_body"]["conditions"]["ref_name"]["include"],
+            ["~DEFAULT_BRANCH"],
+        )
+        self.assertIsNone(body)
 
     def test_ruleset_creation_requires_explicit_confirmation(self):
         result, calls, body = self.run_script_with_fake_gh(
@@ -1156,7 +1184,7 @@ class RulesetScriptTests(TestCase):
         result, calls, body = self.run_script_with_fake_gh([existing], dry_run=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("refusing to create a duplicate", result.stderr)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         self.assertIsNone(body)
 
     def test_ruleset_creation_posts_only_after_explicit_confirmation(self):

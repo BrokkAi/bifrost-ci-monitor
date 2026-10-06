@@ -19,32 +19,49 @@ if ! command -v gh >/dev/null 2>&1; then
     exit 1
 fi
 
-# Listing is read-only. Resolve the existing master ruleset before displaying
-# the plan so dry-run reports the exact object that would be updated.
+# Listing is read-only. The list endpoint returns summaries only, so fetch
+# each ruleset's conditions and rules by id before resolving the master
+# ruleset; dry-run then reports the exact object that would be updated.
 listing="$(gh api "repos/${REPOSITORY}/rulesets?per_page=100" --paginate --slurp)"
-plan="$(python3 - "$CREATE_RULESET_NAME" "$listing" <<'PY'
+ids="$(python3 - "$listing" <<'PY'
 import json
 import sys
 
-create_name, raw_pages = sys.argv[1:]
-pages = json.loads(raw_pages)
+pages = json.loads(sys.argv[1])
 if not isinstance(pages, list):
     raise SystemExit("rulesets API returned an invalid listing; refusing to create or update")
-
-rulesets = []
 for page in pages:
-    if isinstance(page, list):
-        items = page
-    elif isinstance(page, dict):
-        items = [page]
-    else:
-        raise SystemExit("rulesets API returned an invalid page; refusing to create or update")
+    items = page if isinstance(page, list) else [page]
     for item in items:
-        if not isinstance(item, dict) or not all(
-            key in item for key in ("id", "name", "target", "conditions", "rules")
-        ):
-            raise SystemExit("rulesets API returned an invalid ruleset; refusing to create or update")
-        rulesets.append(item)
+        if not isinstance(item, dict) or not isinstance(item.get("id"), int):
+            raise SystemExit("rulesets API returned an invalid ruleset summary; refusing to create or update")
+        print(item["id"])
+PY
+)"
+details="["
+separator=""
+for ruleset_id in $ids; do
+    details+="${separator}$(gh api "repos/${REPOSITORY}/rulesets/${ruleset_id}")"
+    separator=","
+done
+details+="]"
+plan="$(python3 - "$CREATE_RULESET_NAME" "$details" <<'PY'
+import json
+import sys
+
+create_name, raw_details = sys.argv[1:]
+rulesets = json.loads(raw_details)
+if not isinstance(rulesets, list):
+    raise SystemExit("rulesets API returned invalid ruleset details; refusing to create or update")
+for item in rulesets:
+    if not isinstance(item, dict) or not all(
+        key in item for key in ("id", "name", "target", "conditions", "rules")
+    ):
+        raise SystemExit("rulesets API returned an invalid ruleset; refusing to create or update")
+
+# bifrost-dev's default branch is master, so a ruleset scoped to the default
+# branch protects master.
+MASTER_REFS = {"refs/heads/master", "~DEFAULT_BRANCH"}
 
 def targets_master(item):
     conditions = item.get("conditions", {})
@@ -52,7 +69,7 @@ def targets_master(item):
     include = refs.get("include", []) if isinstance(refs, dict) else []
     return (item.get("target") == "branch"
             and isinstance(include, list)
-            and "refs/heads/master" in include)
+            and bool(MASTER_REFS & set(include)))
 
 def has_existing_guards(item):
     rules = item.get("rules", [])
@@ -75,6 +92,8 @@ if matches:
     if not isinstance(ruleset_id, int) or not isinstance(name, str) or not name:
         raise SystemExit("matching master ruleset has no numeric id or name; refusing to guess")
     action = "update"
+    # Keep the existing ruleset's branch targeting exactly as it is.
+    conditions = existing["conditions"]
 else:
     if master_rulesets:
         raise SystemExit(
@@ -84,14 +103,13 @@ else:
     ruleset_id = None
     name = create_name
     action = "create"
+    conditions = {"ref_name": {"include": ["refs/heads/master"], "exclude": []}}
 
 request_body = {
     "name": name,
     "target": "branch",
     "enforcement": "active",
-    "conditions": {
-        "ref_name": {"include": ["refs/heads/master"], "exclude": []},
-    },
+    "conditions": conditions,
     "rules": [
         {"type": "deletion"},
         {"type": "non_fast_forward"},
