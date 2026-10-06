@@ -201,9 +201,10 @@ mode.
 The supervisor accepts `PR verification` only from the GitHub Actions run whose
 path is `.github/workflows/ci.yml`, whose head SHA is the tested head, and whose
 event is `pull_request`. It follows the latest attempt and matches the check run
-to that workflow run's check suite. The agent ends its turn after publication and stays live and idle while CI
-runs. Follow-up prompts use the same environment without a suspend or restore. While CI or a supervisor decision is
-pending, the supervisor posts `mergemarshall/verdict: pending` on that exact head.
+to that workflow run's check suite. The agent ends its turn after publication
+and stays live and idle while CI runs. Follow-up prompts use the same environment
+without a suspend or restore. While CI or a supervisor decision is pending,
+the supervisor posts `mergemarshall/verdict: pending` on that exact head.
 
 ## Sync mode: when CI is red
 
