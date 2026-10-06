@@ -2499,6 +2499,72 @@ class KnownFailureBaselineTests(TestCase):
         conn.close()
 
 
+class MissingFailedJobLogTests(TestCase):
+    def test_missing_log_uses_metadata_steps_and_continues_to_other_jobs(self):
+        conn = make_db()
+        jobs = {
+            "workflowName": "CI",
+            "jobs": [
+                {
+                    "name": "compile",
+                    "databaseId": 101,
+                    "conclusion": "failure",
+                    "steps": [
+                        {"name": "Checkout", "conclusion": "success"},
+                        {"name": "Build", "conclusion": "failure"},
+                    ],
+                },
+                {
+                    "name": "unit",
+                    "databaseId": 102,
+                    "conclusion": "failure",
+                    "steps": [
+                        {"name": "Run tests", "conclusion": "failure"},
+                    ],
+                },
+            ],
+        }
+        with (
+            mock.patch.object(automerge, "gh_json", return_value=jobs),
+            mock.patch.object(
+                automerge,
+                "run_gh",
+                side_effect=[
+                    monitor.CommandError("log not found: 101"),
+                    "FAILED tests/test_api.py::test_bad - AssertionError",
+                ],
+            ) as get_log,
+        ):
+            monitor._process_known_failure_run(
+                conn,
+                "CI",
+                {
+                    "databaseId": 555,
+                    "headSha": "f" * 40,
+                    "url": "https://example.test/run/555",
+                    "conclusion": "failure",
+                },
+            )
+
+        self.assertEqual(get_log.call_count, 2)
+        rows = conn.execute(
+            "SELECT job_name,identity_kind,identity FROM known_failures "
+            "ORDER BY job_name,identity_kind,identity"
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                ("compile", "step", "Build"),
+                ("unit", "test", "pytest:tests/test_api.py::test_bad"),
+            ],
+        )
+        processed = conn.execute(
+            "SELECT run_id FROM known_failure_runs WHERE workflow='CI'"
+        ).fetchone()
+        self.assertEqual(processed["run_id"], 555)
+        conn.close()
+
+
 if __name__ == "__main__":
     import unittest
 

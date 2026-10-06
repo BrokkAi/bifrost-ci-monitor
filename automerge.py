@@ -1780,10 +1780,17 @@ def collect_failure_report_for_run(run_id: int) -> FailureReport:
         database_id = job.get("databaseId") or job.get("id")
         raw_log = ""
         if isinstance(database_id, int):
-            raw_log = run_gh([
-                "run", "view", str(run_id), "--repo", REPO_NAME,
-                "--job", str(database_id), "--log-failed",
-            ], timeout=120)
+            try:
+                raw_log = run_gh([
+                    "run", "view", str(run_id), "--repo", REPO_NAME,
+                    "--job", str(database_id), "--log-failed",
+                ], timeout=120)
+            except (AutomergeError, monitor.CommandError) as exc:
+                # GitHub can expire logs or never create them for a job that
+                # failed before producing output. The job metadata above still
+                # provides authoritative failed-step identities, and missing
+                # logs must not stop processing this or later jobs.
+                log(f"failed-job log unavailable for run {run_id}, job {name}: {exc}")
         details[key] = FailedJobDetails(failed_steps, parse_test_identities(raw_log))
         if raw_log:
             all_logs.append(f"{key} (failed steps: {', '.join(sorted(failed_steps)) or 'unknown'}):\n"

@@ -327,9 +327,13 @@ whose parsed identity no longer appears, closes an open ledger row.
 
 Both cron entry points share a persisted five-minute upkeep guard. They fetch
 recent completed runs for CI, Hourly CI, and Nightly CI, and fetch logs only for
-failed jobs. The repair and automerge prompts include up to 40 open identities
-and a count of additional rows. The monitor omits rows already linked to an
-open repair PR or escalation issue. Agents may return `known-failure:` lines
+failed jobs. The first backfill is limited to the five newest completed runs
+per workflow from the last 24 hours; older runs are never traversed. If a
+failed-job log is unavailable, failed-step names from the job metadata still
+enter the ledger and other jobs continue normally. The repair and automerge
+prompts include up to 40 open identities and a count of additional rows. The
+monitor omits rows already linked to an open repair PR or escalation issue.
+Agents may return `known-failure:` lines
 with a one-line diagnosis; a diagnosis is stored only when the corresponding
 identity already exists in the ledger. The bot maintains and pins one issue
 named `Known CI failures on master`; its rendered table is informational and

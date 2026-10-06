@@ -1914,6 +1914,47 @@ class KnownFailureLedgerTests(unittest.TestCase):
             first.close()
             second.close()
 
+    def test_initial_backfill_is_capped_to_five_runs_from_last_24_hours(self):
+        now = dt.datetime(2026, 10, 6, 12, tzinfo=dt.timezone.utc)
+        items = []
+        for index, hours_ago in enumerate([6, 2, 48, 1, 5, 3, 4]):
+            created = now - dt.timedelta(hours=hours_ago)
+            items.append({
+                "databaseId": 700 + index,
+                "headSha": f"{index:040x}",
+                "url": f"https://example.test/runs/{700 + index}",
+                "conclusion": "success",
+                "headBranch": "master",
+                "createdAt": created.isoformat(),
+            })
+
+        with (
+            mock.patch.object(monitor, "_known_failure_runs", return_value=items) as list_runs,
+            mock.patch.object(monitor, "_process_known_failure_run") as process_run,
+            mock.patch.object(monitor, "refresh_known_failure_link_states"),
+            mock.patch.object(monitor, "_sync_known_failure_issue"),
+        ):
+            self.assertTrue(monitor.update_known_failures(
+                self.conn, self.transport, now=now
+            ))
+
+        self.assertEqual(
+            [(call.args[0], call.kwargs["limit"]) for call in list_runs.call_args_list],
+            [(workflow, 5) for workflow, _event in monitor.TRACKED_WORKFLOWS],
+        )
+        calls_by_workflow = {}
+        for call in process_run.call_args_list:
+            calls_by_workflow.setdefault(call.args[1], []).append(
+                call.args[2]["databaseId"]
+            )
+        expected_ids = {701, 703, 704, 705, 706}
+        self.assertEqual(set(calls_by_workflow), {
+            workflow for workflow, _event in monitor.TRACKED_WORKFLOWS
+        })
+        for selected_ids in calls_by_workflow.values():
+            self.assertEqual(set(selected_ids), expected_ids)
+            self.assertEqual(len(selected_ids), 5)
+
     def test_diagnosis_lines_update_only_existing_parser_seen_rows(self):
         now = monitor.utc_now()
         self.conn.execute(

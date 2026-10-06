@@ -332,8 +332,12 @@ ledger entries.
 Both cron jobs call one shared upkeep function, guarded by a persisted
 five-minute timestamp so only one job processes runs in that interval. It
 reads completed master runs for CI, Hourly CI, and Nightly CI, processes each
-run once, skips cancelled runs, and downloads logs only for failed jobs. A
-failure is fixed when a later completed run has the same job passing or its
+run once, skips cancelled runs, and downloads logs only for failed jobs. The
+initial backfill is limited to the five newest completed runs per workflow
+from the last 24 hours; older history is never traversed. If a failed-job log
+is unavailable, failed-step names from that run's job metadata still enter the
+ledger and processing continues with other jobs. A failure is fixed when a
+later completed run has the same job passing or its
 parsed identity absent from that job's failures. Repeated upkeep errors are
 logged and reported to Slack once per reason without stopping either main job.
 An upkeep pass makes three workflow-run-list calls, one run-details call per

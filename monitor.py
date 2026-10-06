@@ -489,10 +489,13 @@ def _failure_datetime(value: str | None) -> dt.datetime | None:
         return None
 
 
-def _known_failure_runs(workflow: str, event: str | None) -> list[dict[str, Any]]:
+def _known_failure_runs(
+    workflow: str, event: str | None, *, limit: int = 100
+) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit), 100))
     args = [
         "run", "list", "--repo", REPO_NAME, "--workflow", workflow,
-        "--branch", BRANCH, "--status", "completed", "--limit", "100",
+        "--branch", BRANCH, "--status", "completed", "--limit", str(limit),
         "--json",
         "databaseId,headSha,status,conclusion,url,workflowName,createdAt,updatedAt,headBranch,event",
     ]
@@ -775,6 +778,10 @@ def update_known_failures(
     try:
         ensure_known_failure_schema(conn)
         current_time = now or dt.datetime.now(dt.timezone.utc)
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=dt.timezone.utc)
+        else:
+            current_time = current_time.astimezone(dt.timezone.utc)
         # Serialize the timestamp check and claim, so the monitor and automerge
         # cron ticks cannot both enter upkeep in the same five-minute window.
         conn.execute("BEGIN IMMEDIATE")
@@ -787,12 +794,21 @@ def update_known_failures(
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (current_time.isoformat(timespec="seconds"),),
         )
+        processed_state_empty = conn.execute(
+            "SELECT 1 FROM known_failure_runs LIMIT 1"
+        ).fetchone() is None
         conn.commit()
+        cutoff = current_time - dt.timedelta(hours=24)
         for workflow, event in TRACKED_WORKFLOWS:
-            runs = _known_failure_runs(workflow, event)
+            runs = _known_failure_runs(
+                workflow, event, limit=5 if processed_state_empty else 100
+            )
             selected = []
             for item in runs:
                 if str(item.get("headBranch") or BRANCH) != BRANCH:
+                    continue
+                created_at = _failure_datetime(item.get("createdAt"))
+                if created_at is None or created_at < cutoff:
                     continue
                 run_id = item.get("databaseId")
                 if not isinstance(run_id, int):
@@ -803,7 +819,14 @@ def update_known_failures(
                 ).fetchone()
                 if not done:
                     selected.append(item)
-            selected.sort(key=lambda item: str(item.get("createdAt") or ""))
+            selected.sort(
+                key=lambda item: _failure_datetime(item.get("createdAt"))
+                or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+                reverse=True,
+            )
+            if processed_state_empty:
+                selected = selected[:5]
+            selected.reverse()
             for item in selected:
                 _process_known_failure_run(conn, workflow, item)
         refresh_known_failure_link_states(conn)
