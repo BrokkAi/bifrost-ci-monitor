@@ -134,6 +134,7 @@ def make_db(
         );
         """
     )
+    monitor.ensure_known_failure_schema(conn)
     automerge.create_batch(
         conn, selected, BASE_SHA, batch_id=batch_id, ci_mode=ci_mode, kind=kind,
     )
@@ -2440,6 +2441,62 @@ class LaunchAndLifecycleTests(TestCase):
             two = automerge.acquire_lock(path)
             self.assertIsNotNone(two)
             two.close()
+
+
+class KnownFailureBaselineTests(TestCase):
+    @staticmethod
+    def add_known_failure(conn, *, sha: str, job: str, kind: str, identity: str):
+        conn.execute(
+            "INSERT INTO known_failures(workflow,job_name,identity_kind,identity,"
+            "first_seen_sha,first_seen_run_id,first_seen_run_url,first_seen_at,"
+            "last_seen_sha,last_seen_run_id,last_seen_run_url,last_seen_at,"
+            "last_seen_failed_steps_json,status,updated_at) "
+            "VALUES ('CI',?,?,?,?,?,?,?,?,?,?,?,'[]','open',?)",
+            (job, kind, identity, "a" * 40, 41, "run-41", "now", sha, 41,
+             "run-41", "now", "now"),
+        )
+
+    def test_sync_baseline_uses_ancestor_known_failure_when_ci_missing(self):
+        conn = make_db(phase="waiting_ci", ci_mode="sync")
+        row = row_for(conn)
+        self.add_known_failure(
+            conn, sha=HEAD_TWO, job="unit", kind="test",
+            identity="pytest:tests/test_api.py::test_old",
+        )
+        with (
+            mock.patch.object(automerge, "_workflow_runs_for_master_sha", return_value=[]),
+            mock.patch.object(automerge, "compare_commit_ancestry", return_value=True) as compare,
+            mock.patch.object(automerge, "_dispatch_master_baseline") as dispatch,
+        ):
+            baseline = automerge.resolve_baseline(conn, row)
+        self.assertEqual(baseline.state, "ready")
+        self.assertIn("known-failures ledger", baseline.source)
+        self.assertEqual(baseline.failed_jobs, frozenset({"CI/unit"}))
+        self.assertEqual(
+            baseline.failure_details["CI/unit"].tests,
+            frozenset({"pytest:tests/test_api.py::test_old"}),
+        )
+        compare.assert_called_once_with(HEAD_TWO, BASE_SHA)
+        dispatch.assert_not_called()
+        conn.close()
+
+    def test_sync_baseline_uses_ledger_before_dispatch_after_cancelled_ci(self):
+        conn = make_db(phase="waiting_ci", ci_mode="sync")
+        row = row_for(conn)
+        self.add_known_failure(
+            conn, sha=BASE_SHA, job="compile", kind="step", identity="build",
+        )
+        with (
+            mock.patch.object(automerge, "_workflow_runs_for_master_sha", return_value=[
+                {"id": 12, "status": "completed", "conclusion": "cancelled"}
+            ]),
+            mock.patch.object(automerge, "_dispatch_master_baseline") as dispatch,
+        ):
+            baseline = automerge.resolve_baseline(conn, row)
+        self.assertEqual(baseline.state, "ready")
+        self.assertEqual(baseline.failed_jobs, frozenset({"CI/compile"}))
+        dispatch.assert_not_called()
+        conn.close()
 
 
 if __name__ == "__main__":

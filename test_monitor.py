@@ -1439,7 +1439,8 @@ class MjRunnerTests(unittest.TestCase):
             )
         self.assertEqual((session_id, branch), ("s-42", "ci-repair/42-1"))
         build_prompt.assert_called_once_with(
-            run, None, "ci-repair/42-1", queued_prs
+            run, None, "ci-repair/42-1", queued_prs,
+            known_failures_context="",
         )
 
     def test_no_pr_runs_escalation_detection(self):
@@ -1822,3 +1823,238 @@ class GitHubAuthTests(unittest.TestCase):
             [call.kwargs["env"]["GH_TOKEN"] for call in run.call_args_list],
             ["expired-token", "fresh-token"],
         )
+
+
+class KnownFailureLedgerTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        monitor.ensure_known_failure_schema(self.conn)
+        self.transport = monitor.SlackTransport("webhook", webhook="https://hooks.slack.com/services/test")
+
+    def tearDown(self):
+        self.conn.close()
+
+    @staticmethod
+    def run_item(run_id: int, sha: str, conclusion: str = "failure") -> dict:
+        return {
+            "databaseId": run_id,
+            "headSha": sha,
+            "url": f"https://github.com/BrokkAi/bifrost-dev/actions/runs/{run_id}",
+            "conclusion": conclusion,
+        }
+
+    def test_ledger_upserts_parser_identity_and_open_to_fixed(self):
+        import automerge
+
+        report = automerge.FailureReport(
+            frozenset({"CI/unit"}),
+            {"CI/unit": automerge.FailedJobDetails(
+                frozenset({"Run tests"}), frozenset({"pytest:tests/test_api.py::test_old"})
+            )},
+            "pytest log",
+        )
+        with mock.patch.object(automerge, "collect_failure_report_for_run", return_value=report):
+            monitor._process_known_failure_run(self.conn, "CI", self.run_item(101, "a" * 40))
+            monitor._process_known_failure_run(self.conn, "CI", self.run_item(102, "b" * 40))
+        row = self.conn.execute("SELECT * FROM known_failures").fetchone()
+        self.assertEqual(row["first_seen_sha"], "a" * 40)
+        self.assertEqual(row["last_seen_sha"], "b" * 40)
+        self.assertEqual(row["last_seen_run_id"], 102)
+        self.assertEqual(row["status"], "open")
+
+        passing = automerge.FailureReport(
+            frozenset(), {}, "", frozenset({"CI/unit"})
+        )
+        with mock.patch.object(automerge, "collect_failure_report_for_run", return_value=passing):
+            monitor._process_known_failure_run(self.conn, "CI", self.run_item(103, "c" * 40, "success"))
+        fixed = self.conn.execute("SELECT * FROM known_failures").fetchone()
+        self.assertEqual(fixed["status"], "fixed")
+        self.assertEqual(fixed["fixed_by_sha"], "c" * 40)
+        self.assertTrue(fixed["fixed_at"])
+
+    def test_cancelled_run_teaches_nothing(self):
+        import automerge
+
+        report = automerge.FailureReport(
+            frozenset({"CI/unit"}),
+            {"CI/unit": automerge.FailedJobDetails(
+                frozenset({"Run tests"}), frozenset({"pytest:tests/test_api.py::test_old"})
+            )},
+            "",
+        )
+        with mock.patch.object(automerge, "collect_failure_report_for_run", return_value=report):
+            monitor._process_known_failure_run(self.conn, "CI", self.run_item(201, "a" * 40))
+        with mock.patch.object(automerge, "collect_failure_report_for_run") as collect:
+            monitor._process_known_failure_run(
+                self.conn, "CI", self.run_item(202, "b" * 40, "cancelled")
+            )
+        collect.assert_not_called()
+        row = self.conn.execute("SELECT status,last_seen_sha FROM known_failures").fetchone()
+        self.assertEqual(tuple(row), ("open", "a" * 40))
+
+    def test_upkeep_five_minute_guard_is_shared_across_connections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "activity.db"
+            first = sqlite3.connect(path)
+            second = sqlite3.connect(path)
+            first.row_factory = second.row_factory = sqlite3.Row
+            monitor.ensure_known_failure_schema(first)
+            monitor.ensure_known_failure_schema(second)
+            now = dt.datetime(2026, 10, 6, tzinfo=dt.timezone.utc)
+            with (
+                mock.patch.object(monitor, "_known_failure_runs", return_value=[]) as list_runs,
+                mock.patch.object(monitor, "_sync_known_failure_issue"),
+            ):
+                self.assertTrue(monitor.update_known_failures(first, self.transport, now=now))
+                self.assertFalse(monitor.update_known_failures(
+                    second, self.transport, now=now + dt.timedelta(minutes=4, seconds=59)
+                ))
+            self.assertEqual(list_runs.call_count, len(monitor.TRACKED_WORKFLOWS))
+            first.close()
+            second.close()
+
+    def test_diagnosis_lines_update_only_existing_parser_seen_rows(self):
+        now = monitor.utc_now()
+        self.conn.execute(
+            "INSERT INTO known_failures(workflow,job_name,identity_kind,identity,"
+            "first_seen_sha,first_seen_run_id,first_seen_run_url,first_seen_at,"
+            "last_seen_sha,last_seen_run_id,last_seen_run_url,last_seen_at,updated_at) "
+            "VALUES ('CI','unit','test','pytest:tests/test_api.py::test_old',?,?,?,?,?,?,?, ?,?)",
+            ("a" * 40, 9, "run-url", now, "a" * 40, 9, "run-url", now, now),
+        )
+        message = (
+            "known-failure: CI | unit | pytest:tests/test_api.py::test_old | old fixture contract\n"
+            "known-failure: CI | unit | forged-test | should not be stored"
+        )
+        self.assertEqual(
+            monitor.store_known_failure_diagnoses(self.conn, message, "ci-repair"), 1
+        )
+        rows = self.conn.execute("SELECT identity,diagnosis,diagnosis_source FROM known_failures").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["diagnosis"], "old fixture contract")
+        self.assertEqual(rows[0]["diagnosis_source"], "ci-repair")
+
+    def test_repair_links_only_parser_observed_open_failures(self):
+        now = monitor.utc_now()
+        self.conn.execute(
+            "INSERT INTO known_failures(workflow,job_name,identity_kind,identity,"
+            "first_seen_sha,first_seen_run_id,first_seen_run_url,first_seen_at,"
+            "last_seen_sha,last_seen_run_id,last_seen_run_url,last_seen_at,updated_at) "
+            "VALUES ('CI','unit','test','pytest:case_a',?,?,?,?,?,?,?, ?,?)",
+            ("a" * 40, 9, "run", now, "a" * 40, 9, "run", now, now),
+        )
+        self.conn.execute(
+            "INSERT INTO known_failures(workflow,job_name,identity_kind,identity,"
+            "first_seen_sha,first_seen_run_id,first_seen_run_url,first_seen_at,"
+            "last_seen_sha,last_seen_run_id,last_seen_run_url,last_seen_at,updated_at) "
+            "VALUES ('CI','unit','test','pytest:unseen',?,?,?,?,?,?,?, ?,?)",
+            ("a" * 40, 9, "run", now, "a" * 40, 9, "run", now, now),
+        )
+        self.conn.execute(
+            "INSERT INTO known_failure_runs(workflow,run_id,sha,url,conclusion,processed_at,"
+            "failure_identities_json) VALUES ('CI',9,?,'run','failure',?,?)",
+            ("a" * 40, now, json.dumps([{
+                "job": "unit", "kind": "test", "identity": "pytest:case_a", "steps": []
+            }])),
+        )
+        self.assertEqual(monitor.link_known_failures_to_work(
+            self.conn, 9, pr_url="https://github.com/x/pull/9"
+        ), 1)
+        rows = self.conn.execute(
+            "SELECT identity,linked_pr_url,linked_pr_state FROM known_failures ORDER BY identity"
+        ).fetchall()
+        self.assertEqual(rows[0]["linked_pr_url"], "https://github.com/x/pull/9")
+        self.assertEqual(rows[0]["linked_pr_state"], "OPEN")
+        self.assertIsNone(rows[1]["linked_pr_url"])
+
+    def test_prompt_context_is_capped_and_injected(self):
+        now = monitor.utc_now()
+        for index in range(42):
+            self.conn.execute(
+                "INSERT INTO known_failures(workflow,job_name,identity_kind,identity,"
+                "first_seen_sha,first_seen_run_id,first_seen_run_url,first_seen_at,"
+                "last_seen_sha,last_seen_run_id,last_seen_run_url,last_seen_at,updated_at) "
+                "VALUES ('CI','unit','test',?,?,?,?,?,?,?,?,?,?)",
+                (f"pytest:test_{index}", "a" * 40, index, "run", now,
+                 "a" * 40, index, "run", now, now),
+            )
+        context = monitor.render_known_failures_prompt(self.conn)
+        self.assertIn("2 additional open failures omitted", context)
+        self.assertEqual(sum(1 for line in context.splitlines() if line.startswith("- CI /")), 40)
+        self.conn.execute(
+            "UPDATE known_failures SET linked_pr_url='https://github.com/x/pull/1', "
+            "linked_pr_state='CLOSED' WHERE identity='pytest:test_0'"
+        )
+        self.conn.execute(
+            "UPDATE known_failures SET linked_issue_url='https://github.com/x/issues/2', "
+            "linked_issue_state='OPEN' WHERE identity='pytest:test_1'"
+        )
+        monitor_prompt_context = monitor.render_known_failures_prompt(
+            self.conn, omit_linked=True
+        )
+        self.assertIn("pytest:test_0", monitor_prompt_context)
+        self.assertNotIn("pytest:test_1 ", monitor_prompt_context)
+        import automerge
+        pull = automerge.PullRequest(7, "Change", "b" * 40, "url")
+        automerge_prompt = automerge.build_prompt(
+            "ledger-test", [pull], "a" * 40, known_failures_context=context
+        )
+        self.assertIn("Known failures on master", automerge_prompt)
+        monitor_prompt = monitor.build_prompt(
+            make_run(), known_failures_context=context
+        )
+        self.assertIn("Known failures on master", monitor_prompt)
+        self.assertIn("Focus on new failures", monitor_prompt)
+
+    def test_known_failures_issue_updates_only_when_rendered_set_changes(self):
+        now = monitor.utc_now()
+        self.conn.execute(
+            "INSERT INTO known_failures(workflow,job_name,identity_kind,identity,"
+            "first_seen_sha,first_seen_run_id,first_seen_run_url,first_seen_at,"
+            "last_seen_sha,last_seen_run_id,last_seen_run_url,last_seen_at,updated_at) "
+            "VALUES ('CI','unit','step','Build',?,?,?,?,?,?,?, ?,?)",
+            ("a" * 40, 9, "run-url", now, "a" * 40, 9, "run-url", now, now),
+        )
+        monitor._set_known_failure_state(self.conn, "issue_number", "22")
+        with mock.patch.object(monitor, "run_gh", return_value="ok") as gh:
+            monitor._sync_known_failure_issue(self.conn)
+            self.assertNotIn("Master has no known failures.", monitor._known_failure_issue_body(self.conn))
+            gh.reset_mock()
+            monitor._sync_known_failure_issue(self.conn)
+            gh.assert_not_called()
+            self.conn.execute(
+                "UPDATE known_failures SET diagnosis='known linkage' WHERE workflow='CI'"
+            )
+            monitor._sync_known_failure_issue(self.conn)
+            gh.assert_called_once()
+            body = gh.call_args.args[0][-1]
+        self.assertIn("| Workflow | Job |", monitor._known_failure_issue_body(self.conn))
+        self.assertIn("known linkage", body)
+
+    def test_missing_issue_is_created_labeled_stored_and_pinned(self):
+        with mock.patch.object(
+            monitor, "run_gh",
+            side_effect=["[]", "https://github.com/BrokkAi/bifrost-dev/issues/55", "ok"],
+        ) as gh:
+            monitor._sync_known_failure_issue(self.conn)
+        self.assertEqual(monitor._known_failure_state(self.conn, "issue_number"), "55")
+        self.assertEqual(monitor._known_failure_state(self.conn, "issue_pinned"), "1")
+        create_args = gh.call_args_list[1].args[0]
+        self.assertIn("--label", create_args)
+        self.assertIn("known-ci-failures", create_args)
+        self.assertEqual(gh.call_args_list[2].args[0][:3], ["issue", "pin", "55"])
+
+    def test_repeated_ledger_upkeep_error_notifies_once_per_reason(self):
+        with mock.patch.object(monitor, "slack_send", return_value=(True, None)) as slack:
+            for index in range(4):
+                monitor._record_known_failure_error(
+                    self.conn, self.transport, "github_rate_limited", f"failure {index}"
+                )
+        slack.assert_called_once()
+        row = self.conn.execute(
+            "SELECT failure_count,notified_at FROM known_failure_errors WHERE reason=?",
+            ("github_rate_limited",),
+        ).fetchone()
+        self.assertEqual(row["failure_count"], 4)
+        self.assertTrue(row["notified_at"])

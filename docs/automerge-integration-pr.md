@@ -131,7 +131,7 @@ later cron tick. Existing batches migrated without a mode keep `sync` behavior.
   `automerge-local: pass|fail`, `Tests run: ...`, and
   `Baseline failures: ...`. Only `pass` can proceed to publication.
 
-  If master is already red, async mode uses those local exact-base test results
+If master is already red, async mode uses those local exact-base test results
   to distinguish baseline failures from new ones; it does not wait for master
   CI. After the supervisor's common pre-merge checks pass, it posts
   `mergemarshall/verdict: success` on the locally tested integration head with a
@@ -165,8 +165,11 @@ pending, the supervisor posts `mergemarshall/verdict: pending` on that exact hea
    when GitHub confirms that the base commit and its tested head have the same
    tree. Otherwise use the newest `ci.yml` run on `master` for the exact base
    commit. A pending run keeps the agent suspended while the supervisor waits.
-   If the run is missing or cancelled, dispatch `ci.yml` on `master` only while
-   master still points at the base SHA. Persist the dispatch intent and a
+   If the run is missing or cancelled, first use any matching open CI ledger
+   identities whose last-seen SHA equals the base or is an ancestor of it.
+   The ledger is parser-derived evidence for this comparison. If no such entry
+   applies, dispatch `ci.yml` on `master` only while master still points at the
+   base SHA. Persist the dispatch intent and a
    10-minute grace deadline before dispatching; on each later tick, first list
    dispatch runs created since that intent and accept only a run whose head SHA
    equals the base SHA. Do not retry while the grace period is active and no
@@ -313,6 +316,46 @@ PR could fake; that is accepted for the same current contributor set.
 
 The baseline run selection above is the approved policy for bifrost-dev; the
 former open question about missing or pending master CI is resolved.
+
+## Shared known-failures ledger
+
+`monitor.py` and `automerge.py` maintain an additive `known_failures` table in
+the shared SQLite database. A primary key is `(workflow, job, identity kind,
+identity)`, where identity is either a deterministic failed-test identity
+from the automerge log parser or, when no test can be parsed, the failed step
+name. The table keeps first/last seen commit, run ID and URL, open/fixed state,
+fix commit, related repair PR or escalation issue, and an optional short
+diagnosis with its source. Agent `known-failure:` lines can annotate only an
+identity the supervisor has already observed; agent text alone never creates
+ledger entries.
+
+Both cron jobs call one shared upkeep function, guarded by a persisted
+five-minute timestamp so only one job processes runs in that interval. It
+reads completed master runs for CI, Hourly CI, and Nightly CI, processes each
+run once, skips cancelled runs, and downloads logs only for failed jobs. A
+failure is fixed when a later completed run has the same job passing or its
+parsed identity absent from that job's failures. Repeated upkeep errors are
+logged and reported to Slack once per reason without stopping either main job.
+An upkeep pass makes three workflow-run-list calls, one run-details call per
+new completed run, and one failed-log call per failed job. It refreshes each
+distinct linked PR/issue state once. The generated issue is searched for only
+when no issue number is stored; create/edit/pin calls happen only on the first
+render or when the rendered body changes.
+
+The monitor repair prompt omits failures already linked to open work and asks
+the agent to focus on new failures. Automerge build, test-feedback, rebuild,
+and update prompts include up to 40 open entries and the count of the rest.
+When a sync base CI run is missing or cancelled, an open CI ledger entry counts
+as baseline only if its last-seen commit equals the batch base or GitHub proves
+it is an ancestor. These identities have the same trust level as sync
+not-worse comparison: they come from the same deterministic parser, not from
+the generated issue or agent text.
+
+The `Known CI failures on master` issue is a pinned generated view of the open
+table; SQLite is authoritative and the issue is never parsed back. The bot
+creates it with the `known-ci-failures` label, rewrites the body only when its
+rendered content changes, and continues if pinning is denied. The repository
+administrator must create that label before first use.
 
 Strict "green only" remains the intended default for other repositories.
 

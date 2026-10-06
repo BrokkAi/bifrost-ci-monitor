@@ -39,6 +39,14 @@ it to `False` allows ambient `gh` authentication and logs that fallback
 explicitly. The supervisor caches the token for at most 30 minutes and asks
 Mjolnir for a fresh one after a GitHub 401 response.
 
+Both cron jobs update the shared `known_failures` ledger at most once every
+five minutes. It records parser-derived identities from completed master runs
+for CI, Hourly CI, and Nightly CI, marks failures fixed when their job passes or
+their identity disappears, and links monitor repair PRs or escalation issues.
+The pinned `Known CI failures on master` issue is a generated view; SQLite is
+the source of truth. Create the `known-ci-failures` label before the first
+upkeep run so the bot can label the issue it creates.
+
 ## Lifecycle
 
 The monitor atomically claims each workflow run in
@@ -264,8 +272,11 @@ head and the selected baseline run for the exact batch base back to the same
 session. If the base is a previous integration merge, its final PR CI is used
 only when its tested head and the base have identical Git trees. Otherwise the
 baseline is the newest `ci.yml` run on master for that exact SHA. Pending CI is
-waited on; missing or cancelled CI is dispatched on master only while master
-still points to the base. After dispatch, the supervisor waits on a persisted
+waited on; when CI is missing or cancelled, the supervisor first checks for
+open ledger failures whose last-seen commit is equal to or an ancestor of the
+base. Those parser-derived identities count as baseline evidence. If none
+qualify, CI is dispatched on master only while master still points to the base.
+After dispatch, the supervisor waits on a persisted
 10-minute grace period for the run to appear before retrying. If no baseline
 can be established, the batch stays waiting and Slack is notified once. The
 supervisor compares failed tests and failed steps independently within each
@@ -304,6 +315,25 @@ their master contents, which triggers the normal rebuild and automatic gates.
 Sync not-worse mode trusts test output produced by PR code, which could fake
 its reported failures. This is accepted while Bifrost PRs are authored by the
 team's agents and people. Strict green-only mode does not have this issue.
+
+### Known CI failures ledger
+
+The additive `known_failures` table shares the monitor's SQLite database. Its
+key is workflow, job, and either a deterministic test identity parsed from a
+failed-job log or a failed step name when the log has no parseable test. The
+same parser powers sync not-worse comparisons. Each completed master run is
+recorded once; cancelled runs are ignored. A later passing job, or a failure
+whose parsed identity no longer appears, closes an open ledger row.
+
+Both cron entry points share a persisted five-minute upkeep guard. They fetch
+recent completed runs for CI, Hourly CI, and Nightly CI, and fetch logs only for
+failed jobs. The repair and automerge prompts include up to 40 open identities
+and a count of additional rows. The monitor omits rows already linked to an
+open repair PR or escalation issue. Agents may return `known-failure:` lines
+with a one-line diagnosis; a diagnosis is stored only when the corresponding
+identity already exists in the ledger. The bot maintains and pins one issue
+named `Known CI failures on master`; its rendered table is informational and
+is never read back as data.
 
 ### Async mode
 
@@ -368,6 +398,7 @@ labels:
 - `automerge-rejected` — marks a PR rejected at its current head, paired with a
   trusted bot comment containing `automerge-rejected-head: <full sha>`.
 - `mergemarshall-batch` — marks the integration PR.
+- `known-ci-failures` — labels the generated master-failure ledger issue.
 
 ## Running and inspecting
 
