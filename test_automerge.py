@@ -432,9 +432,9 @@ class IdentityAndPromptTests(TestCase):
             for phrase in expected:
                 self.assertIn(phrase, prompt)
             for phrase in (
-                "LD_PRELOAD=libeatmydata.so cargo",
-                "Do not export `LD_PRELOAD` for the whole session",
-                "apt-get update && apt-get install -y eatmydata",
+                "`eatmydata cargo nextest run ...`",
+                "do not export LD_PRELOAD for the whole session",
+                "a missing `./target` in the checkout is expected",
                 ".github/workflows/AGENTS.md",
                 "Disk sync writes",
             ):

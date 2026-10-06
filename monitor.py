@@ -69,7 +69,7 @@ MJ_MODEL = "deepseek-flash"
 # Model for single-model sub-agents, e.g. "gpt-6-luna"; None runs without sub-agents.
 MJ_SUBAGENT_MODEL: str | None = None
 AGENT_LABEL = "DeepSeek Flash (mj)"
-CARGO_TEST_ENV_GUIDANCE = """Build/test environment: read `.github/workflows/AGENTS.md` under `Disk sync writes` for the rationale. For every cargo build or test command, prefix that command with `LD_PRELOAD=libeatmydata.so` (for example, `LD_PRELOAD=libeatmydata.so cargo test ...`). Do not export `LD_PRELOAD` for the whole session: Mjolnir keeps state in SQLite and needs its fsync behavior. Check `dpkg -L eatmydata` to locate `libeatmydata.so`; if it is missing from the container, first install it with `apt-get update && apt-get install -y eatmydata` (sessions run as root)."""
+CARGO_TEST_ENV_GUIDANCE = """Build/test environment: eatmydata is installed in this container. Run every cargo build and test command through it, for example `eatmydata cargo nextest run ...`, the way CI does (see `.github/workflows/AGENTS.md`, "Disk sync writes"). The wrapper applies only to that command; do not export LD_PRELOAD for the whole session, and do not check for or install eatmydata. Cargo builds go through the mbx build cache: build output lives in mbx's managed target directory, not in `./target`, so a missing `./target` in the checkout is expected. Do not look for, create, or clean target directories; just run the cargo commands."""
 MJ_TURN_TIMEOUT_SECONDS = 60 * 60
 MJ_HANDOFF_TIMEOUT_SECONDS = 10 * 60
 MJ_WAIT_POLL_SECONDS = 5

@@ -1679,9 +1679,9 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("Every commit you make must include the trailer", prompt)
         self.assertIn("URL of the revert PR", prompt)
         for expected in (
-            "LD_PRELOAD=libeatmydata.so cargo",
-            "Do not export `LD_PRELOAD` for the whole session",
-            "apt-get update && apt-get install -y eatmydata",
+            "`eatmydata cargo nextest run ...`",
+            "do not export LD_PRELOAD for the whole session",
+            "a missing `./target` in the checkout is expected",
             ".github/workflows/AGENTS.md",
             "Disk sync writes",
         ):
