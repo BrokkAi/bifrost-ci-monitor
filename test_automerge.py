@@ -1059,6 +1059,26 @@ not ok 2 - node subtest name
         self.assertTrue(automerge.compare_failure_reports(jobs, jobs, same_step, baseline)[0])
         self.assertFalse(automerge.compare_failure_reports(jobs, jobs, different_step, baseline)[0])
 
+    def test_baseline_comparison_matches_job_across_runner_label_changes(self):
+        baseline_job = (
+            "CI/os matrix / extension boundary "
+            "(runs-on=37051646884-1-hourly-extension-windows-x64/image=windows25-full-x64)"
+        )
+        current_job = (
+            "CI/os matrix / extension boundary "
+            "(runs-on=37051646884-2-hourly-extension-windows-x64/image=windows25-full-x64)"
+        )
+        details = {
+            baseline_job: automerge.FailedJobDetails(
+                frozenset({"Run tests"}), frozenset({"rust:tests::known"})
+            )
+        }
+        allowed, _reason = automerge.compare_failure_reports(
+            {current_job}, {baseline_job},
+            {current_job: details[baseline_job]}, details,
+        )
+        self.assertTrue(allowed)
+
 
 class RulesetScriptTests(TestCase):
     def run_script_with_fake_gh(self, listing: list[dict], *, dry_run: bool,

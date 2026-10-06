@@ -392,6 +392,160 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) 
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
+KNOWN_FAILURE_JOB_NAME_MIGRATION = "normalize_job_names_v1"
+
+
+def normalize_ci_job_name(value: Any) -> str:
+    """Remove per-run RunsOn labels while preserving real matrix values."""
+    name = str(value or "").strip()
+
+    def strip_runner_parts(match: re.Match[str]) -> str:
+        parts = match.group(1).split(",")
+        kept = [
+            part.strip() for part in parts
+            if part.strip()
+            if not re.match(r"^\s*runs-on\s*=", part, re.IGNORECASE)
+        ]
+        return f"({', '.join(kept)})" if kept else ""
+
+    name = re.sub(r"\(([^()]*)\)", strip_runner_parts, name)
+    # RunsOn labels can also be appended without parentheses. The value runs
+    # through the next comma, whitespace, or closing parenthesis.
+    name = re.sub(r"\bruns-on\s*=\s*[^,\s)]+", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\(\s*,", "(", name)
+    name = re.sub(r",\s*\)", ")", name)
+    name = re.sub(r"\(\s*\)", "", name)
+    name = re.sub(r"\s*,\s*", ", ", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name.rstrip(" ,/").strip() or "unknown job"
+
+
+def _migrate_known_failure_job_names(conn: sqlite3.Connection) -> None:
+    """Normalize ledger job keys and merge duplicates in one idempotent txn."""
+    version = conn.execute(
+        "SELECT value FROM known_failure_state WHERE key=?",
+        (KNOWN_FAILURE_JOB_NAME_MIGRATION,),
+    ).fetchone()
+    if version and version["value"] == "1":
+        return
+
+    savepoint = "known_failure_job_name_migration"
+    nested = conn.in_transaction
+    if nested:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    else:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        version = conn.execute(
+            "SELECT value FROM known_failure_state WHERE key=?",
+            (KNOWN_FAILURE_JOB_NAME_MIGRATION,),
+        ).fetchone()
+        if not version or version["value"] != "1":
+            rows = conn.execute("SELECT * FROM known_failures").fetchall()
+            groups: dict[tuple[str, str, str, str], list[sqlite3.Row]] = {}
+            excluded: list[sqlite3.Row] = []
+            for row in rows:
+                normalized = normalize_ci_job_name(row["job_name"])
+                if normalized.casefold() == "pr verification":
+                    excluded.append(row)
+                else:
+                    key = (
+                        str(row["workflow"]), normalized,
+                        str(row["identity_kind"]), str(row["identity"]),
+                    )
+                    groups.setdefault(key, []).append(row)
+
+            for row in excluded:
+                conn.execute(
+                    "DELETE FROM known_failures WHERE workflow=? AND job_name=? "
+                    "AND identity_kind=? AND identity=?",
+                    (row["workflow"], row["job_name"], row["identity_kind"], row["identity"]),
+                )
+
+            for (workflow, normalized, identity_kind, identity), members in groups.items():
+                earliest = min(
+                    members,
+                    key=lambda row: (str(row["first_seen_at"]), int(row["first_seen_run_id"])),
+                )
+                latest = max(
+                    members,
+                    key=lambda row: (str(row["last_seen_at"]), int(row["last_seen_run_id"])),
+                )
+                canonical = min(
+                    members,
+                    key=lambda row: (
+                        str(row["first_seen_at"]), int(row["first_seen_run_id"]),
+                        str(row["job_name"]),
+                    ),
+                )
+                for row in members:
+                    if row is canonical:
+                        continue
+                    conn.execute(
+                        "DELETE FROM known_failures WHERE workflow=? AND job_name=? "
+                        "AND identity_kind=? AND identity=?",
+                        (row["workflow"], row["job_name"], row["identity_kind"], row["identity"]),
+                    )
+
+                linked_pr = max(
+                    (row for row in members if row["linked_pr_url"]),
+                    key=lambda row: str(row["updated_at"]), default=None,
+                )
+                linked_issue = max(
+                    (row for row in members if row["linked_issue_url"]),
+                    key=lambda row: str(row["updated_at"]), default=None,
+                )
+                diagnosis_row = max(
+                    (row for row in members if row["diagnosis"]),
+                    key=lambda row: str(row["updated_at"]), default=None,
+                )
+                is_open = any(str(row["status"]).lower() == "open" for row in members)
+                fixed_row = max(
+                    (row for row in members if str(row["status"]).lower() == "fixed"),
+                    key=lambda row: str(row["updated_at"]), default=None,
+                )
+                conn.execute(
+                    "UPDATE known_failures SET job_name=?,first_seen_sha=?,first_seen_run_id=?,"
+                    "first_seen_run_url=?,first_seen_at=?,last_seen_sha=?,last_seen_run_id=?,"
+                    "last_seen_run_url=?,last_seen_at=?,last_seen_failed_steps_json=?,status=?,"
+                    "fixed_at=?,fixed_by_sha=?,linked_pr_url=?,linked_pr_state=?,linked_issue_url=?,"
+                    "linked_issue_state=?,diagnosis=?,diagnosis_source=?,updated_at=? "
+                    "WHERE workflow=? AND job_name=? AND identity_kind=? AND identity=?",
+                    (normalized, earliest["first_seen_sha"], earliest["first_seen_run_id"],
+                     earliest["first_seen_run_url"], earliest["first_seen_at"],
+                     latest["last_seen_sha"], latest["last_seen_run_id"],
+                     latest["last_seen_run_url"], latest["last_seen_at"],
+                     latest["last_seen_failed_steps_json"], "open" if is_open else "fixed",
+                     None if is_open else (fixed_row["fixed_at"] if fixed_row else None),
+                     None if is_open else (fixed_row["fixed_by_sha"] if fixed_row else None),
+                     linked_pr["linked_pr_url"] if linked_pr else None,
+                     linked_pr["linked_pr_state"] if linked_pr else canonical["linked_pr_state"],
+                     linked_issue["linked_issue_url"] if linked_issue else None,
+                     linked_issue["linked_issue_state"] if linked_issue else canonical["linked_issue_state"],
+                     diagnosis_row["diagnosis"] if diagnosis_row else None,
+                     diagnosis_row["diagnosis_source"] if diagnosis_row else None,
+                     max(str(row["updated_at"]) for row in members),
+                     workflow, canonical["job_name"], identity_kind, identity),
+                )
+
+            conn.execute(
+                "INSERT INTO known_failure_state(key,value) VALUES (?, '1') "
+                "ON CONFLICT(key) DO UPDATE SET value='1'",
+                (KNOWN_FAILURE_JOB_NAME_MIGRATION,),
+            )
+        if nested:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        else:
+            conn.commit()
+    except Exception:
+        if nested:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        else:
+            conn.rollback()
+        raise
+
+
 def ensure_known_failure_schema(conn: sqlite3.Connection) -> None:
     """Create the shared failure ledger additively for both cron jobs."""
     conn.executescript(
@@ -454,6 +608,7 @@ def ensure_known_failure_schema(conn: sqlite3.Connection) -> None:
     )
     ensure_column(conn, "known_failures", "linked_pr_state", "TEXT NOT NULL DEFAULT 'OPEN'")
     ensure_column(conn, "known_failures", "linked_issue_state", "TEXT NOT NULL DEFAULT 'OPEN'")
+    _migrate_known_failure_job_names(conn)
 
 
 KNOWN_FAILURE_UPKEEP_SECONDS = 5 * 60
@@ -701,7 +856,9 @@ def _process_known_failure_run(
         report = collect_failure_report_for_run(run_id)
         identities = []
         for key, detail in report.details.items():
-            job_name = key.split("/", 1)[-1]
+            job_name = normalize_ci_job_name(key.split("/", 1)[-1])
+            if job_name.casefold() == "pr verification":
+                continue
             if detail.tests:
                 for identity in sorted(detail.tests):
                     identities.append({
@@ -740,14 +897,17 @@ def _process_known_failure_run(
             # For a failed job, a previously known identity absent from this run's
             # deterministic parsed failures is also fixed.
             seen_jobs = {
-                key.split("/", 1)[-1]
+                normalize_ci_job_name(key.split("/", 1)[-1])
                 for key in (*report.failed_jobs, *report.successful_jobs)
+                if normalize_ci_job_name(key.split("/", 1)[-1]).casefold()
+                != "pr verification"
+            }
+            successful_jobs = {
+                normalize_ci_job_name(key.split("/", 1)[-1])
+                for key in report.successful_jobs
             }
             for job_name in seen_jobs:
-                succeeded = any(
-                    key.split("/", 1)[-1] == job_name
-                    for key in report.successful_jobs
-                )
+                succeeded = job_name in successful_jobs
                 existing = conn.execute(
                     "SELECT job_name,identity_kind,identity FROM known_failures "
                     "WHERE workflow=? AND job_name=? AND status='open'",
@@ -862,6 +1022,7 @@ def store_known_failure_diagnoses(
             if not match:
                 continue
             workflow, job, identity, diagnosis = (part.strip() for part in match.groups())
+            job = normalize_ci_job_name(job)
             diagnosis = " ".join(diagnosis.split())[:500]
             if not diagnosis:
                 continue
@@ -906,7 +1067,8 @@ def link_known_failures_to_work(
                 "linked_issue_state=CASE WHEN ? IS NOT NULL THEN 'OPEN' ELSE linked_issue_state END, "
                 "updated_at=? "
                 "WHERE workflow=? AND job_name=? AND identity_kind=? AND identity=? AND status='open'",
-                (pr_url, pr_url, issue_url, issue_url, utc_now(), run["workflow"], item.get("job"),
+                (pr_url, pr_url, issue_url, issue_url, utc_now(), run["workflow"],
+                 normalize_ci_job_name(item.get("job")),
                  item.get("kind"), item.get("identity")),
             )
             count += cursor.rowcount

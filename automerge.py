@@ -1635,7 +1635,7 @@ def collect_failed_jobs(commit_sha: str) -> tuple[set[str], str]:
                 "failure", "timed_out", "action_required"
             }:
                 continue
-            name = str(job.get("name") or "unknown job")
+            name = monitor.normalize_ci_job_name(job.get("name") or "unknown job")
             failures.add(f"{workflow}/{name}" if workflow else name)
         raw_log = run_gh(["run", "view", str(run_id), "--repo", REPO_NAME, "--log-failed"], timeout=120)
         logs.append(f"Run {run_id} ({workflow}):\n{raw_log[-6000:]}")
@@ -1693,7 +1693,28 @@ def parse_test_identities(logs: str) -> frozenset[str]:
     return frozenset(found)
 
 
+def _normalize_failure_job_key(job: str) -> str:
+    workflow, separator, name = str(job).partition("/")
+    normalized = monitor.normalize_ci_job_name(name if separator else workflow)
+    return f"{workflow}/{normalized}" if separator else normalized
+
+
+def _normalize_failure_details(
+    details: dict[str, FailedJobDetails],
+) -> dict[str, FailedJobDetails]:
+    normalized: dict[str, FailedJobDetails] = {}
+    for job, detail in details.items():
+        key = _normalize_failure_job_key(job)
+        previous = normalized.get(key, FailedJobDetails())
+        normalized[key] = FailedJobDetails(
+            previous.failed_steps | detail.failed_steps,
+            previous.tests | detail.tests,
+        )
+    return normalized
+
+
 def _failure_details_json(details: dict[str, FailedJobDetails]) -> str:
+    details = _normalize_failure_details(details)
     return json.dumps({
         job: {
             "failed_steps": sorted(item.failed_steps),
@@ -1721,7 +1742,7 @@ def _failure_details_from_json(raw: Any) -> dict[str, FailedJobDetails]:
                 frozenset(str(step) for step in steps),
                 frozenset(str(test) for test in tests),
             )
-    return result
+    return _normalize_failure_details(result)
 
 
 def compare_failure_reports(
@@ -1731,6 +1752,10 @@ def compare_failure_reports(
     baseline: dict[str, FailedJobDetails],
 ) -> tuple[bool, str]:
     """Supervisor-side not-worse comparison at job, test, and failed-step level."""
+    current_jobs = {_normalize_failure_job_key(job) for job in current_jobs}
+    baseline_jobs = {_normalize_failure_job_key(job) for job in baseline_jobs}
+    current = _normalize_failure_details(current)
+    baseline = _normalize_failure_details(baseline)
     if not current_jobs <= baseline_jobs:
         return False, "integration CI has failed jobs absent from the baseline"
     for job in current_jobs:
@@ -1762,7 +1787,7 @@ def collect_failure_report_for_run(run_id: int) -> FailureReport:
     for job in jobs:
         if not isinstance(job, dict):
             continue
-        name = str(job.get("name") or "unknown job")
+        name = monitor.normalize_ci_job_name(job.get("name") or "unknown job")
         key = f"{workflow}/{name}" if workflow else name
         if job.get("conclusion") == "success":
             successes.add(key)
@@ -1791,7 +1816,12 @@ def collect_failure_report_for_run(run_id: int) -> FailureReport:
                 # provides authoritative failed-step identities, and missing
                 # logs must not stop processing this or later jobs.
                 log(f"failed-job log unavailable for run {run_id}, job {name}: {exc}")
-        details[key] = FailedJobDetails(failed_steps, parse_test_identities(raw_log))
+        tests = parse_test_identities(raw_log)
+        previous = details.get(key)
+        details[key] = FailedJobDetails(
+            failed_steps | (previous.failed_steps if previous else frozenset()),
+            tests | (previous.tests if previous else frozenset()),
+        )
         if raw_log:
             all_logs.append(f"{key} (failed steps: {', '.join(sorted(failed_steps)) or 'unknown'}):\n"
                             f"{raw_log[-6000:]}")
@@ -1963,7 +1993,10 @@ def _known_failure_baseline(
     lines: list[str] = []
     run_ids: list[int] = []
     for item in accepted:
-        job = f"CI/{item['job_name']}"
+        job_name = monitor.normalize_ci_job_name(item["job_name"])
+        if job_name.casefold() == "pr verification":
+            continue
+        job = f"CI/{job_name}"
         grouped.setdefault(job, {"tests": set(), "steps": set()})
         if item["identity_kind"] == "test":
             grouped[job]["tests"].add(str(item["identity"]))
@@ -1984,6 +2017,8 @@ def _known_failure_baseline(
         job: FailedJobDetails(frozenset(value["steps"]), frozenset(value["tests"]))
         for job, value in grouped.items()
     }
+    if not details:
+        return None
     return BaselineResult(
         "ready", "known-failures ledger (same deterministic parser)",
         max(run_ids) if run_ids else None,

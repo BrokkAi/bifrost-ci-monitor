@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -1835,6 +1836,144 @@ class KnownFailureLedgerTests(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
+    def test_job_name_normalizer_removes_runs_on_and_keeps_matrix_values(self):
+        runner_job = (
+            "os matrix / extension boundary "
+            "(runs-on=37051646884-1-hourly-extension-windows-x64/"
+            "image=windows25-full-x64/family=m7i+m7a/cpu=4/ram=16/"
+            "volume=60gb/extras=s3-cache)"
+        )
+        self.assertEqual(
+            monitor.normalize_ci_job_name(runner_job),
+            "os matrix / extension boundary",
+        )
+        self.assertEqual(
+            monitor.normalize_ci_job_name("compile (x86_64-unknown-linux-gnu)"),
+            "compile (x86_64-unknown-linux-gnu)",
+        )
+        self.assertEqual(
+            monitor.normalize_ci_job_name("compile (windows-latest)"),
+            "compile (windows-latest)",
+        )
+        self.assertEqual(
+            monitor.normalize_ci_job_name(
+                "compile (x86_64-unknown-linux-gnu, runs-on=123/image=linux)"
+            ),
+            "compile (x86_64-unknown-linux-gnu)",
+        )
+        self.assertEqual(
+            monitor.normalize_ci_job_name("compile runs-on=123/image=linux"),
+            "compile",
+        )
+
+    def test_job_name_migration_merges_duplicates_and_removes_pr_verification(self):
+        runner_one = "extension boundary (runs-on=111/image=windows/family=m7i)"
+        runner_two = "extension boundary (runs-on=222/image=windows/family=m7a)"
+
+        def insert_row(
+            job: str, *, first_sha: str, first_id: int, first_at: str,
+            last_sha: str, last_id: int, last_at: str, status: str,
+            fixed_at: str | None = None, fixed_sha: str | None = None,
+            pr: str | None = None, pr_state: str = "OPEN",
+            issue: str | None = None, diagnosis: str | None = None,
+            diagnosis_source: str | None = None, updated_at: str,
+            identity: str = "Build",
+        ):
+            self.conn.execute(
+                "INSERT INTO known_failures(workflow,job_name,identity_kind,identity,"
+                "first_seen_sha,first_seen_run_id,first_seen_run_url,first_seen_at,"
+                "last_seen_sha,last_seen_run_id,last_seen_run_url,last_seen_at,"
+                "last_seen_failed_steps_json,status,fixed_at,fixed_by_sha,linked_pr_url,"
+                "linked_pr_state,linked_issue_url,linked_issue_state,diagnosis,"
+                "diagnosis_source,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("Hourly CI", job, "step", identity, first_sha, first_id, f"run-{first_id}",
+                 first_at, last_sha, last_id, f"run-{last_id}", last_at, '["Build"]',
+                 status, fixed_at, fixed_sha, pr, pr_state, issue, "OPEN", diagnosis,
+                 diagnosis_source, updated_at),
+            )
+
+        insert_row(
+            runner_one, first_sha="a" * 40, first_id=1, first_at="2026-01-01T00:00:00+00:00",
+            last_sha="b" * 40, last_id=2, last_at="2026-01-02T00:00:00+00:00",
+            status="fixed", fixed_at="2026-01-03T00:00:00+00:00", fixed_sha="c" * 40,
+            pr="https://github.com/example/pull/1", pr_state="CLOSED",
+            diagnosis="known compiler issue", diagnosis_source="automerge",
+            updated_at="2026-01-03T00:00:00+00:00",
+        )
+        insert_row(
+            runner_two, first_sha="d" * 40, first_id=3, first_at="2026-01-02T00:00:00+00:00",
+            last_sha="e" * 40, last_id=4, last_at="2026-01-04T00:00:00+00:00",
+            status="open", issue="https://github.com/example/issues/8",
+            updated_at="2026-01-04T00:00:00+00:00",
+        )
+        insert_row(
+            "PR verification", first_sha="f" * 40, first_id=5,
+            first_at="2026-01-04T00:00:00+00:00", last_sha="f" * 40,
+            last_id=5, last_at="2026-01-04T00:00:00+00:00", status="open",
+            updated_at="2026-01-04T00:00:00+00:00", identity="Required checks",
+        )
+        previous_body = monitor._known_failure_issue_body(self.conn)
+        monitor._set_known_failure_state(self.conn, "issue_number", "4519")
+        monitor._set_known_failure_state(self.conn, "issue_labeled", "1")
+        monitor._set_known_failure_state(self.conn, "issue_pinned", "1")
+        monitor._set_known_failure_state(
+            self.conn, "issue_body_sha256",
+            hashlib.sha256(previous_body.encode("utf-8")).hexdigest(),
+        )
+        self.conn.execute(
+            "DELETE FROM known_failure_state WHERE key=?",
+            (monitor.KNOWN_FAILURE_JOB_NAME_MIGRATION,),
+        )
+        self.conn.commit()
+
+        monitor.ensure_known_failure_schema(self.conn)
+        rows = self.conn.execute("SELECT * FROM known_failures").fetchall()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["job_name"], "extension boundary")
+        self.assertEqual(row["first_seen_sha"], "a" * 40)
+        self.assertEqual(row["first_seen_run_id"], 1)
+        self.assertEqual(row["first_seen_run_url"], "run-1")
+        self.assertEqual(row["first_seen_at"], "2026-01-01T00:00:00+00:00")
+        self.assertEqual(row["last_seen_sha"], "e" * 40)
+        self.assertEqual(row["last_seen_run_id"], 4)
+        self.assertEqual(row["last_seen_run_url"], "run-4")
+        self.assertEqual(row["last_seen_at"], "2026-01-04T00:00:00+00:00")
+        self.assertEqual(row["status"], "open")
+        self.assertIsNone(row["fixed_at"])
+        self.assertEqual(row["linked_pr_url"], "https://github.com/example/pull/1")
+        self.assertEqual(row["linked_issue_url"], "https://github.com/example/issues/8")
+        self.assertEqual(row["diagnosis"], "known compiler issue")
+        self.assertEqual(row["diagnosis_source"], "automerge")
+        with mock.patch.object(monitor, "run_gh", return_value="ok") as gh:
+            monitor._sync_known_failure_issue(self.conn)
+        gh.assert_called_once()
+        self.assertIn("extension boundary", gh.call_args.args[0][-1])
+        self.assertNotIn("runs-on=", gh.call_args.args[0][-1])
+
+        monitor.ensure_known_failure_schema(self.conn)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM known_failures").fetchone()[0], 1)
+
+    def test_ledger_excludes_aggregate_pr_verification_job(self):
+        import automerge
+
+        report = automerge.FailureReport(
+            frozenset({"CI/PR verification", "CI/unit"}),
+            {
+                "CI/PR verification": automerge.FailedJobDetails(
+                    frozenset({"Verify required jobs"}), frozenset()
+                ),
+                "CI/unit (runs-on=123/image=windows)": automerge.FailedJobDetails(
+                    frozenset({"Run tests"}), frozenset({"pytest:tests/test_api.py::test_bad"})
+                ),
+            },
+            "logs",
+        )
+        with mock.patch.object(automerge, "collect_failure_report_for_run", return_value=report):
+            monitor._process_known_failure_run(self.conn, "CI", self.run_item(301, "a" * 40))
+        rows = self.conn.execute("SELECT job_name FROM known_failures").fetchall()
+        self.assertEqual([row["job_name"] for row in rows], ["unit"])
+
     @staticmethod
     def run_item(run_id: int, sha: str, conclusion: str = "failure") -> dict:
         return {
@@ -1965,7 +2104,8 @@ class KnownFailureLedgerTests(unittest.TestCase):
             ("a" * 40, 9, "run-url", now, "a" * 40, 9, "run-url", now, now),
         )
         message = (
-            "known-failure: CI | unit | pytest:tests/test_api.py::test_old | old fixture contract\n"
+            "known-failure: CI | unit (runs-on=123/image=linux) | "
+            "pytest:tests/test_api.py::test_old | old fixture contract\n"
             "known-failure: CI | unit | forged-test | should not be stored"
         )
         self.assertEqual(

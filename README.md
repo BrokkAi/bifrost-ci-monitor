@@ -321,8 +321,10 @@ team's agents and people. Strict green-only mode does not have this issue.
 The additive `known_failures` table shares the monitor's SQLite database. Its
 key is workflow, job, and either a deterministic test identity parsed from a
 failed-job log or a failed step name when the log has no parseable test. The
-same parser powers sync not-worse comparisons. Each completed master run is
-recorded once; cancelled runs are ignored. A later passing job, or a failure
+same parser powers sync not-worse comparisons. Job names omit RunsOn's
+per-run labels while retaining real matrix values. The aggregate
+`PR verification` job is excluded. Each completed master run is recorded once;
+cancelled runs are ignored. A later passing job, or a failure
 whose parsed identity no longer appears, closes an open ledger row.
 
 Both cron entry points share a persisted five-minute upkeep guard. They fetch

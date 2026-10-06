@@ -325,7 +325,9 @@ identity)`, where identity is either a deterministic failed-test identity
 from the automerge log parser or, when no test can be parsed, the failed step
 name. The table keeps first/last seen commit, run ID and URL, open/fixed state,
 fix commit, related repair PR or escalation issue, and an optional short
-diagnosis with its source. Agent `known-failure:` lines can annotate only an
+diagnosis with its source. Job names omit RunsOn's per-run labels while
+retaining real matrix values; the aggregate `PR verification` job is excluded.
+Agent `known-failure:` lines can annotate only an
 identity the supervisor has already observed; agent text alone never creates
 ledger entries.
 
