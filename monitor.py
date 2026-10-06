@@ -62,9 +62,10 @@ GH_TOKEN_TTL_SECONDS = 30 * 60
 MJ_WORKSPACE = "CI"
 MJ_TARGET = "podman"
 MJ_BUNDLE = "bifrost"
-MJ_MODEL = "opus"
-MJ_SUBAGENT_MODEL = "gpt-6-luna"
-AGENT_LABEL = "Claude Opus 5.5 + GPT-6 Luna sub-agents (mj)"
+MJ_MODEL = "deepseek-flash"
+# Model for single-model sub-agents, e.g. "gpt-6-luna"; None runs without sub-agents.
+MJ_SUBAGENT_MODEL: str | None = None
+AGENT_LABEL = "DeepSeek Flash (mj)"
 MJ_TURN_TIMEOUT_SECONDS = 60 * 60
 MJ_HANDOFF_TIMEOUT_SECONDS = 10 * 60
 MJ_WAIT_POLL_SECONDS = 5
@@ -1263,6 +1264,12 @@ def launch_title(run: CiRun, attempt: int) -> str:
     return f"{run.workflow} {run.sha[:8]} run {run.run_id} attempt {attempt} CI repair"
 
 
+def subagent_args() -> list[str]:
+    if MJ_SUBAGENT_MODEL is None:
+        return ["--subagents", "none"]
+    return ["--subagents", "single-model", "--subagent-model", MJ_SUBAGENT_MODEL]
+
+
 def new_session_argv(
     run: CiRun, base_sha: str, attempt: int, prompt_file: str
 ) -> list[str]:
@@ -1274,8 +1281,7 @@ def new_session_argv(
         "--target", MJ_TARGET,
         "--bundle", MJ_BUNDLE,
         "--model", MJ_MODEL,
-        "--subagents", "single-model",
-        "--subagent-model", MJ_SUBAGENT_MODEL,
+        *subagent_args(),
         "--at", base_sha,
         "--branch", branch,
         "--title", title,

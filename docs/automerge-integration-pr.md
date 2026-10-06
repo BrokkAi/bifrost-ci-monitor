@@ -49,7 +49,7 @@ Unchanged from the current job, with one policy setting:
 ## Building the integration branch
 
 One mj session per batch, as now (`--workspace CI --target podman --bundle
-bifrost --model deepseek-v4-pro --subagents none`).
+bifrost --model deepseek-flash --subagents none`).
 
 1. Start branch `mergemarshall/batch-<id>` at current master.
 2. Merge each PR head with a merge commit. Never squash or rebase, at either

@@ -478,14 +478,20 @@ class MjRunnerTests(unittest.TestCase):
             "chat", token="xoxb-test", channel="C0123456789"
         )
 
+    def test_mj_new_argv_uses_single_model_subagents_when_configured(self):
+        with mock.patch.object(monitor, "MJ_SUBAGENT_MODEL", "gpt-6-luna"):
+            argv = monitor.new_session_argv(make_run(), "a" * 40, 1, "/tmp/p")
+        start = argv.index("--subagents")
+        self.assertEqual(
+            argv[start:start + 4],
+            ["--subagents", "single-model", "--subagent-model", "gpt-6-luna"],
+        )
+
     def test_mj_new_argv_has_required_selectors_and_no_profile(self):
         run = make_run()
-        self.assertEqual(monitor.MJ_MODEL, "opus")
-        self.assertEqual(monitor.MJ_SUBAGENT_MODEL, "gpt-6-luna")
-        self.assertEqual(
-            monitor.AGENT_LABEL,
-            "Claude Opus 5.5 + GPT-6 Luna sub-agents (mj)",
-        )
+        self.assertEqual(monitor.MJ_MODEL, "deepseek-flash")
+        self.assertIsNone(monitor.MJ_SUBAGENT_MODEL)
+        self.assertEqual(monitor.AGENT_LABEL, "DeepSeek Flash (mj)")
         argv = monitor.new_session_argv(
             run, "a" * 40, 3, "/tmp/repair.prompt"
         )
@@ -501,11 +507,9 @@ class MjRunnerTests(unittest.TestCase):
                 "--bundle",
                 "bifrost",
                 "--model",
-                "opus",
+                "deepseek-flash",
                 "--subagents",
-                "single-model",
-                "--subagent-model",
-                "gpt-6-luna",
+                "none",
                 "--at",
                 "a" * 40,
                 "--branch",
@@ -519,7 +523,6 @@ class MjRunnerTests(unittest.TestCase):
         )
         self.assertNotIn("--profile", argv)
         self.assertNotIn("--effort", argv)
-        self.assertNotIn("none", argv)
 
     def test_launch_parses_session_id_through_fake_mj_seam(self):
         run = make_run()
@@ -533,7 +536,7 @@ class MjRunnerTests(unittest.TestCase):
         self.assertEqual((session_id, branch), ("s-42", "ci-repair/42-1"))
         argv = command.call_args_list[-1].args[0]
         self.assertEqual(
-            argv[:15],
+            argv[:13],
             [
                 "new",
                 "--workspace",
@@ -543,11 +546,9 @@ class MjRunnerTests(unittest.TestCase):
                 "--bundle",
                 "bifrost",
                 "--model",
-                "opus",
+                "deepseek-flash",
                 "--subagents",
-                "single-model",
-                "--subagent-model",
-                "gpt-6-luna",
+                "none",
                 "--at",
                 "b" * 40,
             ],

@@ -418,13 +418,12 @@ class IdentityAndPromptTests(TestCase):
         conn = make_db(phase="building", session_id=None)
         row = row_for(conn)
         argv = automerge.new_session_argv(row, "/tmp/prompt")
-        self.assertEqual(automerge.AUTOMERGE_MODEL, "deepseek-v4-pro")
-        self.assertEqual(automerge.AUTOMERGE_AGENT_LABEL, "DeepSeek V4 Pro (mj)")
-        self.assertNotEqual(automerge.AUTOMERGE_MODEL, monitor.MJ_MODEL)
+        self.assertEqual(automerge.AUTOMERGE_MODEL, "deepseek-flash")
+        self.assertEqual(automerge.AUTOMERGE_AGENT_LABEL, "DeepSeek Flash (mj)")
         self.assertEqual(argv, [
             "new", "--workspace", monitor.MJ_WORKSPACE,
             "--target", monitor.MJ_TARGET, "--bundle", monitor.MJ_BUNDLE,
-            "--model", "deepseek-v4-pro", "--subagents", "none",
+            "--model", "deepseek-flash", "--subagents", "none",
             "--at", BASE_SHA, "--branch", "mergemarshall/batch-batch-test",
             "--title", "Bifrost automerge batch batch-test",
             "--prompt-file", "/tmp/prompt", "--json",

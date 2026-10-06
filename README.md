@@ -49,10 +49,9 @@ polls with a local lock. Before launch it confirms that the same run is still
 red and reads the current master SHA from GitHub.
 
 A new repair uses the CI workspace, podman target, bifrost bundle, and the
-`opus` model with `single-model` sub-agents fixed to `gpt-6-luna`. Mjolnir
-creates the branch ci-repair/<run-id>-<attempt> at that full master SHA and
-receives the prompt from a temporary file. Its agent label is
-`Claude Opus 5.5 + GPT-6 Luna sub-agents (mj)`. The container's Git and gh
+`deepseek-flash` model with no sub-agents. Mjolnir creates the branch
+ci-repair/<run-id>-<attempt> at that full master SHA and receives the prompt
+from a temporary file. Its agent label is `DeepSeek Flash (mj)`. The container's Git and gh
 commands use the session's injected GitHub token.
 
 While a turn runs, the monitor polls mj wait and the finished-only transcript
@@ -132,10 +131,12 @@ starting.
 
 ## Agent selection
 
-The CI monitor sessions use `--model opus --subagents single-model
---subagent-model gpt-6-luna` and the label Claude Opus 5.5 + GPT-6 Luna
-sub-agents (mj). Automerge uses its separate `deepseek-v4-pro` model with
-`--subagents none` and the label DeepSeek V4 Pro (mj). The executables have
+The CI monitor sessions use `--model deepseek-flash --subagents none` and the
+label DeepSeek Flash (mj). Setting `MJ_SUBAGENT_MODEL` (for example to
+`gpt-6-luna`) switches to `--subagents single-model --subagent-model <model>`;
+the planned setup is `opus` with `gpt-6-luna` sub-agents through Amazon
+Bedrock, once the CI account has Bedrock access. Automerge uses `deepseek-flash` too, set separately, with
+`--subagents none` and the label DeepSeek Flash (mj). The executables have
 absolute defaults: `mj` at `$HOME/.cargo/bin/mj` and `gh` at `/usr/bin/gh`.
 Override them with `BIFROST_MJ_BIN` and `BIFROST_GH_BIN`. Both scripts check
 that the required executables exist and are executable at startup, then post a
@@ -218,7 +219,7 @@ without a mode remain `sync`.
 The default queue includes every open, non-draft PR based on `master`, except
 one rejected at its current head. The optional `READY_POLICY="approved"`
 setting also requires an approved review. Integration PRs are excluded from
-the source queue. One DeepSeek V4 Pro (`deepseek-v4-pro`, no sub-agents)
+the source queue. One DeepSeek Flash (`deepseek-flash`, no sub-agents)
 session starts from current master, merges source heads with merge commits,
 resolves conflicts, runs targeted checks using `ci-impact` and repository
 guidance, then opens or updates one integration PR. Its title lists its source
