@@ -188,11 +188,16 @@ or a custom OAuth flow whose response contains incoming_webhook.url.
 
 Agents, including the CI repair agent, open pull requests instead of pushing
 to master. `automerge.py` batches eligible PRs into one integration PR and
-merges only after the repository's `PR verification` check passes. Run it from
-cron every minute. It has a separate non-blocking lock and persists its phase,
-integration PR number, and Mjolnir session in its own tables in
+merges after the selected CI mode's gate and common pre-merge checks pass. Run
+it from cron every minute. It has a separate non-blocking lock and persists its
+phase, mode, integration PR number, and Mjolnir session in its own tables in
 `~/Projects/bifrost-ci/activity.db`. After a restart it reattaches during
 building, CI wait, repair, and merge phases.
+
+`CI_MODE` is a module setting with Bifrost's default set to `"async"`; set it
+to `"sync"` for CI-gated batches. Each batch stores its mode when created and
+keeps it across restarts and later setting changes. Existing batches migrated
+without a mode remain `sync`.
 
 The default queue includes every open, non-draft PR based on `master`, except
 one rejected at its current head. The optional `READY_POLICY="approved"`
@@ -202,6 +207,8 @@ merges source heads with merge commits, resolves conflicts, runs targeted
 checks using `ci-impact` and the repository guidance, then opens or updates one
 integration PR. Its title lists its source PRs and it carries the
 `mergecop-batch` label.
+
+### Sync mode
 
 The agent session is suspended while the supervisor polls `PR verification`
 every minute. It accepts that check only from `.github/workflows/ci.yml` for
@@ -219,8 +226,8 @@ supervisor compares failed tests and failed steps independently within each
 same failed job against that baseline. The
 agent can append fixes or eject a responsible PR by rebuilding the branch
 without it; ejection never uses a revert commit. Force-push is permitted only
-for rebuilding `mergecop/batch-<id>`, using that exact branch ref. There are
-at most four CI rounds per batch.
+for rebuilding `mergecop/batch-<id>`, using that exact branch ref. Sync batches
+allow at most four CI rounds.
 
 The supervisor decides whether red CI is not worse than the batch base by
 comparing failed jobs, test identities, and failed step names. The agent's
@@ -228,8 +235,8 @@ comparing failed jobs, test identities, and failed step names. The agent's
 the integration PR is based on current master, every constituent PR is still
 open, non-draft, based on master, and at its tested head, and every recorded
 source head is present while no ejected head remains in the integration tree.
-Once all gates pass, it posts the required `mergecop/verdict` success status on
-the exact CI-tested integration head, then runs
+Once all sync gates pass, it posts the required `mergecop/verdict` success
+status on the exact CI-tested integration head, then runs
 `gh pr merge <n> --merge --match-head-commit <tested-sha>`. A GitHub refusal
 caused by master advancing returns the status to pending, merges master into
 the batch branch, and requires fresh CI before another success status. The
@@ -248,9 +255,34 @@ without it. Afterward the PR can be marked ready for separate human handling.
 Its owner can also push a follow-up restoring the workflow/action files to
 their master contents, which triggers the normal rebuild and automatic gates.
 
-Not-worse mode trusts test output produced by PR code, which could fake its
-reported failures. This is accepted while Bifrost PRs are authored by the
+Sync not-worse mode trusts test output produced by PR code, which could fake
+its reported failures. This is accepted while Bifrost PRs are authored by the
 team's agents and people. Strict green-only mode does not have this issue.
+
+### Async mode
+
+The session runs targeted tests locally, using `AGENTS.md`, `ci-impact`, and
+`.github/workflows` to choose the affected checks. It reruns any failing test at
+the exact batch base in a separate worktree. Failures reproduced at the base
+are baseline; new failures must be fixed or the responsible PR must be removed
+and rejected at its tested head. The final agent message includes
+`automerge-local: pass|fail`, `Tests run: ...`, and
+`Baseline failures: ...`. Only `pass` proceeds to publication.
+
+The supervisor does not wait for or query CI, run baseline workflows, or apply
+the four-round sync limit. It performs the same master-freshness, source state
+and head, ancestry, and workflow-change checks as sync mode. After they pass, it
+posts `mergecop/verdict` success on the locally tested head with a description
+such as `async: local targeted tests passed; CI runs after merge`, then merges
+with `--match-head-commit`. The integration PR and master CI run normally after
+merge. If master is red, the agent reruns targeted failures at the batch base
+locally; it does not wait for master CI. Any breakage after merge is handled by
+the existing CI monitor, which opens `ci-fix` PRs for later queue batches. The
+Slack outcome links the integration PR so people can watch its CI.
+
+Async mode also trusts test output produced by PR code: a PR could fake its
+local results. This is accepted for Bifrost's current contributors, the team's
+agents and people.
 
 The desired master ruleset requires a pull request with zero approvals, the
 `mergecop/verdict` status from mergecopbot (GitHub App ID 5203169), and an

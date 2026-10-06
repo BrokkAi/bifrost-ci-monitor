@@ -59,6 +59,7 @@ def make_db(
     ci_round: int = 1,
     ci_head_sha: str = HEAD_ONE,
     status: str = "running",
+    ci_mode: str = "sync",
 ) -> sqlite3.Connection:
     selected = pulls or [pull()]
     conn = sqlite3.connect(":memory:")
@@ -75,7 +76,8 @@ def make_db(
             agent_transcript TEXT NOT NULL DEFAULT '', agent_final_message TEXT NOT NULL DEFAULT '',
             suspend_pending INTEGER NOT NULL DEFAULT 0, suspend_verify_failures INTEGER NOT NULL DEFAULT 0,
             outcome_posted INTEGER NOT NULL DEFAULT 0, finished_at TEXT,
-            phase TEXT NOT NULL DEFAULT 'building', integration_pr_number INTEGER,
+            phase TEXT NOT NULL DEFAULT 'building', ci_mode TEXT NOT NULL DEFAULT 'sync',
+            integration_pr_number INTEGER,
             integration_pr_url TEXT, active_pull_requests_json TEXT,
             ejected_pull_requests_json TEXT NOT NULL DEFAULT '[]',
             excluded_source_heads_json TEXT NOT NULL DEFAULT '[]',
@@ -110,7 +112,7 @@ def make_db(
         );
         """
     )
-    automerge.create_batch(conn, selected, BASE_SHA, batch_id=batch_id)
+    automerge.create_batch(conn, selected, BASE_SHA, batch_id=batch_id, ci_mode=ci_mode)
     conn.execute(
         "UPDATE automerge_batches SET phase=?, status=?, session_id=?, thread_ts=?, "
         "start_notification_sent=1, integration_pr_number=?, ci_round=?, ci_head_sha=?, "
@@ -130,6 +132,12 @@ def failure_report(
     jobs: set[str], logs: str = "", details: dict[str, automerge.FailedJobDetails] | None = None,
 ) -> automerge.FailureReport:
     return automerge.FailureReport(frozenset(jobs), details or {}, logs)
+
+
+def async_local_report(verdict: str = "pass") -> str:
+    return (f"automerge-local: {verdict}\n"
+            "Tests run: cargo test -p bifrost-core\n"
+            "Baseline failures: none")
 
 
 class SelectionTests(TestCase):
@@ -287,6 +295,34 @@ class IdentityAndPromptTests(TestCase):
         ):
             self.assertIn(expected, prompt)
         self.assertNotIn("git push origin HEAD:master", prompt)
+
+    def test_async_agent_prompt_requires_local_baseline_gate_and_skips_ci(self):
+        prompt = automerge.build_prompt(
+            "abc123", [pull(7)], BASE_SHA, ci_mode="async",
+        )
+        for expected in (
+            "async CI mode",
+            "targeted tests locally",
+            f"exact base commit {BASE_SHA}",
+            "Baseline failures:",
+            "automerge-local: pass",
+            "Never wait for CI",
+            "Do not open/update the integration PR before the local gate passes",
+        ):
+            self.assertIn(expected, prompt)
+        self.assertNotIn("CI is red, the supervisor will resume", prompt)
+
+    def test_async_result_requires_tests_and_baseline_summary(self):
+        self.assertEqual(automerge._async_local_result(async_local_report()), "pass")
+        self.assertIsNone(automerge._async_local_result(
+            "automerge-local: pass\nTests run: none\nBaseline failures: none",
+        ))
+        self.assertIsNone(automerge._async_local_result(
+            "automerge-local: pass\nTests run: cargo test",
+        ))
+        self.assertIsNone(automerge._async_local_result(
+            async_local_report() + "\nautomerge-local: fail",
+        ))
 
     def test_mj_new_argv_uses_model_and_branch(self):
         conn = make_db(phase="building", session_id=None)
@@ -1026,6 +1062,159 @@ class PublicationGateTests(TestCase):
         no_workflow_changes.start()
         self.addCleanup(no_workflow_changes.stop)
 
+    def test_async_local_pass_lands_without_querying_ci(self):
+        conn = make_db(phase="building", ci_mode="async")
+        with conn:
+            conn.execute("UPDATE automerge_batches SET agent_final_message=? WHERE batch_id=?",
+                         (async_local_report(), "batch-test"))
+        view = {"state": "OPEN", "isDraft": False, "baseRefName": "master",
+                "headRefOid": HEAD_ONE, "baseRefOid": BASE_SHA,
+                "url": "https://github.test/pr/211"}
+        merged = {"state": "MERGED", "mergedAt": "now",
+                  "mergeCommit": {"oid": HEAD_THREE}}
+        with (
+            mock.patch.object(automerge, "_store_agent_result", return_value=async_local_report()),
+            mock.patch.object(automerge, "find_integration_pr", return_value={
+                "number": 211, "url": view["url"], "headRefOid": HEAD_ONE,
+            }),
+            mock.patch.object(automerge, "integration_pr_view", side_effect=[view, view, merged]),
+            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "check_pr_verification",
+                              side_effect=AssertionError("async mode queried PR CI")) as check_ci,
+            mock.patch.object(automerge, "_latest_completed_ci_run_for_head",
+                              side_effect=AssertionError("async mode queried CI runs")),
+            mock.patch.object(automerge, "resolve_baseline",
+                              side_effect=AssertionError("async mode resolved a baseline")),
+            mock.patch.object(automerge, "current_master_sha", return_value=BASE_SHA),
+            mock.patch.object(automerge, "_record_trusted_rejection_markers", return_value=False),
+            mock.patch.object(automerge, "_recheck_sources", return_value=([pull()], [])),
+            mock.patch.object(automerge, "verify_source_ancestry", return_value=(True, "ok")),
+            mock.patch.object(automerge, "integration_pr_changes_ci_control_files", return_value=False),
+            mock.patch.object(automerge, "_try_post_verdict_status", return_value=True) as status,
+            mock.patch.object(automerge, "run_gh") as gh,
+            mock.patch.object(automerge, "_complete_landed_batch") as complete,
+        ):
+            transport = monitor.SlackTransport("webhook", webhook="x")
+            automerge._agent_turn_finished(conn, transport, row_for(conn), "session-existing")
+            self.assertEqual(row_for(conn)["phase"], "merging")
+            automerge._merge_integration(conn, transport, row_for(conn))
+        check_ci.assert_not_called()
+        self.assertTrue(any(call.args[0][:2] == ["pr", "merge"]
+                            for call in gh.call_args_list))
+        self.assertTrue(any(call.args[4:6] == (
+            "success", "async: local targeted tests passed; CI runs after merge",
+        ) for call in status.call_args_list))
+        complete.assert_called_once()
+        conn.close()
+
+    def test_async_local_fail_with_ejection_rebuilds_and_does_not_merge(self):
+        conn = make_db(phase="building", ci_mode="async", pulls=[pull(7), pull(8, HEAD_TWO)])
+        final = ("automerge-local: fail\nTests run: cargo test -p bifrost-core\n"
+                 "Baseline failures: none\n"
+                 f"automerge-ejected-pr: 7 {HEAD_ONE}\nNew failure in PR 7.")
+        with (
+            mock.patch.object(automerge, "_store_agent_result", return_value=final),
+            mock.patch.object(automerge, "find_integration_pr") as find_pr,
+            mock.patch.object(automerge, "run_gh") as gh,
+        ):
+            automerge._agent_turn_finished(
+                conn, monitor.SlackTransport("webhook", webhook="x"),
+                row_for(conn), "session-existing",
+            )
+        updated = row_for(conn)
+        self.assertEqual(updated["phase"], "fixing")
+        self.assertEqual([item.number for item in automerge.row_pulls(updated)], [8])
+        self.assertIn("local gate", updated["pending_prompt"])
+        self.assertEqual(json.loads(updated["excluded_source_heads_json"]), [{
+            "number": 7, "head_sha": HEAD_ONE, "kind": "ejected",
+        }])
+        find_pr.assert_not_called()
+        self.assertFalse(any(call.args[0][:2] == ["pr", "merge"]
+                             for call in gh.call_args_list))
+        conn.close()
+
+    def test_async_source_change_premerge_gate_rebuilds_without_ci(self):
+        conn = make_db(phase="merging", ci_mode="async", pulls=[pull(7), pull(8, HEAD_TWO)])
+        with conn:
+            conn.execute("UPDATE automerge_batches SET agent_final_message=? WHERE batch_id=?",
+                         (async_local_report(), "batch-test"))
+        view = {"state": "OPEN", "isDraft": False, "baseRefName": "master",
+                "headRefOid": HEAD_ONE, "baseRefOid": BASE_SHA}
+        with (
+            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "integration_pr_view", return_value=view),
+            mock.patch.object(automerge, "check_pr_verification",
+                              side_effect=AssertionError("async mode queried CI")) as check_ci,
+            mock.patch.object(automerge, "current_master_sha", return_value=BASE_SHA),
+            mock.patch.object(automerge, "_record_trusted_rejection_markers", return_value=False),
+            mock.patch.object(automerge, "_recheck_sources", return_value=(
+                [pull(8, HEAD_TWO)], ["PR #7 Change 7: head changed"],
+            )),
+            mock.patch.object(automerge, "_try_post_verdict_status"),
+            mock.patch.object(automerge, "run_gh") as gh,
+        ):
+            automerge._merge_integration(
+                conn, monitor.SlackTransport("webhook", webhook="x"), row_for(conn),
+            )
+        check_ci.assert_not_called()
+        updated = row_for(conn)
+        self.assertEqual(updated["phase"], "fixing")
+        self.assertEqual([item.number for item in automerge.row_pulls(updated)], [8])
+        self.assertIn("async batch", updated["pending_prompt"])
+        self.assertFalse(any(call.args[0][:2] == ["pr", "merge"]
+                             for call in gh.call_args_list))
+        conn.close()
+
+    def test_async_master_advance_rechecks_locally_without_ci(self):
+        conn = make_db(phase="merging", ci_mode="async")
+        with conn:
+            conn.execute("UPDATE automerge_batches SET agent_final_message=? WHERE batch_id=?",
+                         (async_local_report(), "batch-test"))
+        view = {"state": "OPEN", "isDraft": False, "baseRefName": "master",
+                "headRefOid": HEAD_ONE, "baseRefOid": BASE_SHA}
+        with (
+            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "integration_pr_view", return_value=view),
+            mock.patch.object(automerge, "check_pr_verification",
+                              side_effect=AssertionError("async mode queried CI")) as check_ci,
+            mock.patch.object(automerge, "current_master_sha", return_value=HEAD_TWO),
+            mock.patch.object(automerge, "_try_post_verdict_status") as post,
+            mock.patch.object(automerge, "queue_agent_prompt") as queue,
+        ):
+            automerge._merge_integration(
+                conn, monitor.SlackTransport("webhook", webhook="x"), row_for(conn),
+            )
+        check_ci.assert_not_called()
+        self.assertEqual(row_for(conn)["base_sha"], HEAD_TWO)
+        prompt = queue.call_args.args[2]
+        self.assertIn("targeted tests", prompt)
+        self.assertNotIn("CI must run again", prompt)
+        post.assert_called_once()
+        conn.close()
+
+    def test_async_changed_head_retests_without_a_sync_round_limit(self):
+        conn = make_db(phase="merging", ci_mode="async", ci_round=99)
+        with conn:
+            conn.execute("UPDATE automerge_batches SET agent_final_message=? WHERE batch_id=?",
+                         (async_local_report(), "batch-test"))
+        view = {"state": "OPEN", "isDraft": False, "baseRefName": "master",
+                "headRefOid": HEAD_TWO, "baseRefOid": BASE_SHA}
+        with (
+            mock.patch.object(automerge, "_is_session_suspended", return_value=True),
+            mock.patch.object(automerge, "integration_pr_view", return_value=view),
+            mock.patch.object(automerge, "check_pr_verification",
+                              side_effect=AssertionError("async mode queried CI")) as check_ci,
+            mock.patch.object(automerge, "_queue_async_local_recheck") as recheck,
+            mock.patch.object(automerge, "_terminal") as terminal,
+        ):
+            automerge._merge_integration(
+                conn, monitor.SlackTransport("webhook", webhook="x"), row_for(conn),
+            )
+        check_ci.assert_not_called()
+        recheck.assert_called_once()
+        terminal.assert_not_called()
+        conn.close()
+
     def test_master_advance_queues_merge_and_retest_turn(self):
         conn = make_db(phase="merging")
         row = row_for(conn)
@@ -1146,14 +1335,18 @@ class PublicationGateTests(TestCase):
         conn.close()
 
     def test_ci_workflow_changes_hold_batch_pending_for_human_review(self):
-        conn = make_db(phase="merging")
+        conn = make_db(phase="merging", ci_mode="async")
+        with conn:
+            conn.execute("UPDATE automerge_batches SET agent_final_message=? WHERE batch_id=?",
+                         (async_local_report(), "batch-test"))
         view = {"state": "OPEN", "isDraft": False, "baseRefName": "master",
                 "headRefOid": HEAD_ONE, "baseRefOid": BASE_SHA}
         transport = monitor.SlackTransport("webhook", webhook="x")
         with (
             mock.patch.object(automerge, "_is_session_suspended", return_value=True),
             mock.patch.object(automerge, "integration_pr_view", return_value=view),
-            mock.patch.object(automerge, "check_pr_verification", return_value="success"),
+            mock.patch.object(automerge, "check_pr_verification",
+                              side_effect=AssertionError("async mode queried CI")) as check_ci,
             mock.patch.object(automerge, "current_master_sha", return_value=BASE_SHA),
             mock.patch.object(automerge, "_record_trusted_rejection_markers", return_value=False),
             mock.patch.object(automerge, "_recheck_sources", return_value=([pull()], [])),
@@ -1169,6 +1362,7 @@ class PublicationGateTests(TestCase):
             "needs human review: CI workflow changes",
         )
         notify.assert_called_once()
+        check_ci.assert_not_called()
         self.assertEqual(notify.call_args.args[3], "ci_workflow_changes")
         self.assertEqual(row_for(conn)["phase"], "merging")
         self.assertFalse(any(call.args[0][:2] == ["pr", "merge"]
@@ -1448,7 +1642,11 @@ class LaunchAndLifecycleTests(TestCase):
             with mock.patch.object(automerge, "DB_PATH", path):
                 conn = automerge.connect_db()
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(automerge_batches)")}
+            defaults = {row["name"]: row["dflt_value"]
+                        for row in conn.execute("PRAGMA table_info(automerge_batches)")}
             self.assertIn("phase", columns)
+            self.assertIn("ci_mode", columns)
+            self.assertEqual(defaults["ci_mode"], "'sync'")
             self.assertIn("integration_pr_number", columns)
             self.assertIn("ci_round", columns)
             self.assertIn("integration_merge_commit_sha", columns)
@@ -1460,6 +1658,57 @@ class LaunchAndLifecycleTests(TestCase):
             self.assertIn("verdict_status_sha", columns)
             self.assertIn("verdict_status_state", columns)
             conn.close()
+
+    def test_new_batch_persists_ci_mode_and_ignores_later_setting_change(self):
+        self.assertEqual(automerge.CI_MODE, "async")
+        conn = make_db()
+        with mock.patch.object(automerge, "CI_MODE", "async"):
+            batch_id = automerge.create_batch(
+                conn, [pull(12)], BASE_SHA, batch_id="captured-async-mode",
+            )
+        with conn:
+            conn.execute(
+                "UPDATE automerge_batches SET phase='waiting_ci', status='running', "
+                "start_notification_sent=1, session_id='session-existing', "
+                "integration_pr_number=212, ci_head_sha=?, agent_final_message=? "
+                "WHERE batch_id=?",
+                (HEAD_TWO, async_local_report(), batch_id),
+            )
+        with (
+            mock.patch.object(automerge, "CI_MODE", "sync"),
+            mock.patch.object(automerge, "_merge_integration") as merge,
+            mock.patch.object(automerge, "_poll_ci") as poll,
+        ):
+            automerge.process_batch(
+                conn, monitor.SlackTransport("webhook", webhook="x"), batch_id,
+            )
+        self.assertEqual(row_for(conn, batch_id)["ci_mode"], "async")
+        self.assertEqual(automerge._batch_ci_mode(row_for(conn, batch_id)), "async")
+        merge.assert_called_once()
+        poll.assert_not_called()
+        conn.close()
+
+    def test_async_slack_outcome_links_integration_pr_for_post_merge_ci(self):
+        conn = make_db(phase="terminal", ci_mode="async")
+        with conn:
+            conn.execute(
+                "UPDATE automerge_batches SET status='completed', terminal_status='merged', "
+                "integration_pr_url=?, outcome_posted=0 WHERE batch_id=?",
+                ("https://github.test/pr/211", "batch-test"),
+            )
+        outcome = automerge.BatchOutcome((
+            automerge.PullRequestOutcome(pull(), "merged"),
+        ), (), ())
+        with (
+            mock.patch.object(automerge, "detect_batch_outcomes", return_value=outcome),
+            mock.patch.object(monitor, "slack_send", return_value=(True, None)) as send,
+        ):
+            automerge.finish_batch(
+                conn, monitor.SlackTransport("webhook", webhook="x"), row_for(conn),
+            )
+        self.assertIn("<https://github.test/pr/211|#211>", send.call_args.args[1])
+        self.assertEqual(row_for(conn)["outcome_posted"], 1)
+        conn.close()
 
     def test_launch_failure_adopts_exact_title_without_duplicate(self):
         conn = make_db(phase="building", session_id=None, status="launching")

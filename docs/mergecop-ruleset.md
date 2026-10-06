@@ -14,9 +14,12 @@ active on `refs/heads/master` with these rules:
 
 This means people cannot push directly to `master` or self-merge their own
 changes. Source PRs, including `ci-fix` PRs, land through the automerge queue's
-integration PR. The supervisor posts `mergecop/verdict` only after CI and all
-pre-merge checks pass, on the exact integration head that was tested. Session
-tokens cannot write this status; the supervisor uses its GitHub App token.
+integration PR. The supervisor posts `mergecop/verdict` only after the
+mode-specific quality gate and common pre-merge checks pass, on the exact
+integration head that was tested. In `sync` mode this includes the verified PR
+CI result; in `async` mode it is the agent's local targeted-test pass, and
+GitHub CI runs after merge. Session tokens cannot write this status; the
+supervisor uses its GitHub App token.
 Do not grant that App `checks:write`: a check run named `mergecop/verdict`
 created by the App could also satisfy the required status rule. Grant only the
 status-writing permission needed by the supervisor.
