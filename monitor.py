@@ -62,10 +62,13 @@ GH_TOKEN_TTL_SECONDS = 30 * 60
 MJ_WORKSPACE = "CI"
 MJ_TARGET = "podman"
 MJ_BUNDLE = "bifrost"
+MJ_CPUS = 32
+MJ_MEMORY_GIB = 28
 MJ_MODEL = "deepseek-flash"
 # Model for single-model sub-agents, e.g. "gpt-6-luna"; None runs without sub-agents.
 MJ_SUBAGENT_MODEL: str | None = None
 AGENT_LABEL = "DeepSeek Flash (mj)"
+CARGO_TEST_ENV_GUIDANCE = """Build/test environment: read `.github/workflows/AGENTS.md` under `Disk sync writes` for the rationale. For every cargo build or test command, prefix that command with `LD_PRELOAD=libeatmydata.so` (for example, `LD_PRELOAD=libeatmydata.so cargo test ...`). Do not export `LD_PRELOAD` for the whole session: Mjolnir keeps state in SQLite and needs its fsync behavior. Check `dpkg -L eatmydata` to locate `libeatmydata.so`; if it is missing from the container, first install it with `apt-get update && apt-get install -y eatmydata` (sessions run as root)."""
 MJ_TURN_TIMEOUT_SECONDS = 60 * 60
 MJ_HANDOFF_TIMEOUT_SECONDS = 10 * 60
 MJ_WAIT_POLL_SECONDS = 5
@@ -1280,6 +1283,8 @@ def new_session_argv(
         "--workspace", MJ_WORKSPACE,
         "--target", MJ_TARGET,
         "--bundle", MJ_BUNDLE,
+        "--cpus", str(MJ_CPUS),
+        "--memory-gib", str(MJ_MEMORY_GIB),
         "--model", MJ_MODEL,
         *subagent_args(),
         "--at", base_sha,
@@ -1462,6 +1467,7 @@ Use gh from inside this container to read the failing run, the commits after {ru
 {open_issue_context}
 {queued_pr_context}
 Your job is to get master green quickly, not to repair every breaking change here. Classify EACH failing test independently (a red run often bundles unrelated regressions) into one of the paths below, then act:
+{CARGO_TEST_ENV_GUIDANCE}
 - FIX and REVERT both end in commits. Handle every failure that falls under them in this invocation: one commit for the fixes and one revert commit per reverted change. Every commit you make must include the trailer CI-Repair-Run: {run.run_id}. Then follow the publication steps below and exit successfully. If this invocation includes both fixes and reverts, put all of its commits in one PR.
 - If anything remains that needs BLOCKED REVERT or ESCALATE, do not file it in the same invocation as a FIX or REVERT commit. The repair PR enters the automerge queue; if the remainder keeps CI red after that queue runs, the monitor re-engages you and that later pass files it with nothing left to fix. Summarize what you already diagnosed in your closing message so the later pass and the humans can pick it up from the thread.
 - Only when nothing falls under FIX or REVERT, follow BLOCKED REVERT or ESCALATE, covering all remaining failures in one issue.

@@ -506,6 +506,10 @@ class MjRunnerTests(unittest.TestCase):
                 "podman",
                 "--bundle",
                 "bifrost",
+                "--cpus",
+                "32",
+                "--memory-gib",
+                "28",
                 "--model",
                 "deepseek-flash",
                 "--subagents",
@@ -536,7 +540,7 @@ class MjRunnerTests(unittest.TestCase):
         self.assertEqual((session_id, branch), ("s-42", "ci-repair/42-1"))
         argv = command.call_args_list[-1].args[0]
         self.assertEqual(
-            argv[:13],
+            argv[:17],
             [
                 "new",
                 "--workspace",
@@ -545,6 +549,10 @@ class MjRunnerTests(unittest.TestCase):
                 "podman",
                 "--bundle",
                 "bifrost",
+                "--cpus",
+                "32",
+                "--memory-gib",
+                "28",
                 "--model",
                 "deepseek-flash",
                 "--subagents",
@@ -1649,6 +1657,8 @@ class MjRunnerTests(unittest.TestCase):
 class PromptContractTests(unittest.TestCase):
     def test_repair_prompt_requires_trailer_and_pr_publication(self):
         prompt = monitor.build_prompt(make_run(), branch="ci-repair/42-3")
+        self.assertEqual(monitor.MJ_CPUS, 32)
+        self.assertEqual(monitor.MJ_MEMORY_GIB, 28)
         self.assertIn("CI-Repair-Run: 42", prompt)
         self.assertIn(
             "git push origin HEAD:refs/heads/ci-repair/42-3", prompt
@@ -1666,6 +1676,14 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("Do not merge the PR yourself", prompt)
         self.assertIn("Every commit you make must include the trailer", prompt)
         self.assertIn("URL of the revert PR", prompt)
+        for expected in (
+            "LD_PRELOAD=libeatmydata.so cargo",
+            "Do not export `LD_PRELOAD` for the whole session",
+            "apt-get update && apt-get install -y eatmydata",
+            ".github/workflows/AGENTS.md",
+            "Disk sync writes",
+        ):
+            self.assertIn(expected, prompt)
         self.assertNotIn("WORKTREE_BRANCH", prompt)
         self.assertNotIn("monitor owns", prompt.lower())
 

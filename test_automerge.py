@@ -383,6 +383,11 @@ class IdentityAndPromptTests(TestCase):
             prompts.append(str(row_for(conn)["pending_prompt"]))
         with mock.patch.object(automerge, "_try_post_verdict_status"):
             automerge._queue_master_update(
+                sync_conn, monitor.SlackTransport("webhook", webhook="x"),
+                row_for(sync_conn), HEAD_THREE, HEAD_TWO,
+            )
+            prompts.append(str(row_for(sync_conn)["pending_prompt"]))
+            automerge._queue_master_update(
                 async_conn, monitor.SlackTransport("webhook", webhook="x"),
                 row_for(async_conn), HEAD_THREE, HEAD_TWO,
             )
@@ -403,6 +408,14 @@ class IdentityAndPromptTests(TestCase):
         )
         for prompt in prompts:
             for phrase in expected:
+                self.assertIn(phrase, prompt)
+            for phrase in (
+                "LD_PRELOAD=libeatmydata.so cargo",
+                "Do not export `LD_PRELOAD` for the whole session",
+                "apt-get update && apt-get install -y eatmydata",
+                ".github/workflows/AGENTS.md",
+                "Disk sync writes",
+            ):
                 self.assertIn(phrase, prompt)
         sync_conn.close()
         async_conn.close()
@@ -440,11 +453,14 @@ class IdentityAndPromptTests(TestCase):
         conn = make_db(phase="building", session_id=None)
         row = row_for(conn)
         argv = automerge.new_session_argv(row, "/tmp/prompt")
+        self.assertEqual(monitor.MJ_CPUS, 32)
+        self.assertEqual(monitor.MJ_MEMORY_GIB, 28)
         self.assertEqual(automerge.AUTOMERGE_MODEL, "deepseek-flash")
         self.assertEqual(automerge.AUTOMERGE_AGENT_LABEL, "DeepSeek Flash (mj)")
         self.assertEqual(argv, [
             "new", "--workspace", monitor.MJ_WORKSPACE,
             "--target", monitor.MJ_TARGET, "--bundle", monitor.MJ_BUNDLE,
+            "--cpus", "32", "--memory-gib", "28",
             "--model", "deepseek-flash", "--subagents", "none",
             "--at", BASE_SHA, "--branch", "mergemarshall/batch-batch-test",
             "--title", "Bifrost automerge batch batch-test",
