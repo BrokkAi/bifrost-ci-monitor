@@ -23,11 +23,12 @@ The agent diagnoses each failure independently and follows one of four paths:
 The repair agent publishes only its `ci-repair/<run-id>-<attempt>` branch and
 PR; it never force-pushes, writes directly to master, or merges its own PR. If
 one invocation makes both fixes and reverts, it puts all of its commits in one
-PR. The automerge agent batches open, ready PRs, runs the full test suite, and
-merges passing batches with merge commits; broken PRs are rejected and
-conflicts are resolved by automerge. Each commit keeps the run trailer for
-auditability. The monitor detects publication by looking up the PR for the
-session branch.
+PR. The automerge agent batches open, ready PRs into one integration PR. The
+repository's own CI verifies that exact integration head before the bot merges
+it; red batches are repaired or have responsible PRs removed and rebuilt.
+Conflicts are resolved by automerge, and created commits keep their run trailer
+for auditability. The monitor detects repair publication by looking up the PR
+for the session branch.
 
 ## Lifecycle
 
@@ -37,8 +38,8 @@ first appears so RunsOn can request a replacement attempt, and serializes
 polls with a local lock. Before launch it confirms that the same run is still
 red and reads the current master SHA from GitHub.
 
-A new repair uses the CI workspace, podman target, bifrost bundle, and opus
-model. Mjolnir creates the branch ci-repair/<run-id>-<attempt> at that full
+A new repair uses the CI workspace, podman target, bifrost bundle, and
+DeepSeek V4 Pro model. Mjolnir creates the branch ci-repair/<run-id>-<attempt> at that full
 master SHA and receives the prompt from a temporary file. The container's Git
 and gh commands use the user's injected GitHub token.
 
@@ -185,39 +186,96 @@ or a custom OAuth flow whose response contains incoming_webhook.url.
 
 ## PR automerge
 
-Agents, including the CI repair agent, open pull requests instead of
-pushing to master. `automerge.py` lands them in batches. Run it from cron
-every minute. It has its own non-blocking lock, so a run that finds a batch
-in progress exits, and after a restart it reconnects to the batch's
-recorded Mjolnir session. Its state is in automerge-owned tables in
-`~/Projects/bifrost-ci/activity.db`.
+Agents, including the CI repair agent, open pull requests instead of pushing
+to master. `automerge.py` batches eligible PRs into one integration PR and
+merges only after the repository's `PR verification` check passes. Run it from
+cron every minute. It has a separate non-blocking lock and persists its phase,
+integration PR number, and Mjolnir session in its own tables in
+`~/Projects/bifrost-ci/activity.db`. After a restart it reattaches during
+building, CI wait, repair, and merge phases.
 
-A batch is every open, non-draft pull request that targets `master`,
-except one rejected at its current head commit. Each batch runs in one
-Mjolnir session that starts at the current master commit:
+The default queue includes every open, non-draft PR based on `master`, except
+one rejected at its current head. The optional `READY_POLICY="approved"`
+setting also requires an approved review. Integration PRs are excluded from
+the source queue. One DeepSeek V4 Pro session starts from current master,
+merges source heads with merge commits, resolves conflicts, runs targeted
+checks using `ci-impact` and the repository guidance, then opens or updates one
+integration PR. Its title lists its source PRs and it carries the
+`mergecop-batch` label.
 
-- The agent merges each pull request's head with a merge commit, so GitHub
-  marks it merged when it reaches master. It resolves every conflict
-  itself; a conflict is never a reason to send a pull request back.
-- It runs the full test suite. A test that also fails at the batch's base
-  commit is not evidence against any pull request. If the base cannot be
-  tested and the batch fails, nothing is rejected or pushed, and the batch
-  is reported as blocked.
-- A pull request that breaks tests is removed from the batch and rejected:
-  label `automerge-rejected` plus a comment with the line
-  `automerge-rejected-head: <full sha>`. Only comments from the GitHub
-  account automerge runs as count. A new push to the pull request makes it
-  eligible again, and the label is removed when it is next admitted.
-- Before pushing, the agent checks that every included pull request is
-  still open, not a draft, based on `master`, and at the head that was
-  tested. Any that changed are removed and the batch is retested.
-- It pushes with `git push origin HEAD:master` and never force-pushes.
+The agent session is suspended while the supervisor polls `PR verification`
+every minute. It accepts that check only from `.github/workflows/ci.yml` for
+the exact tested head and `pull_request` event, matching the latest attempt's
+check suite. On red, the supervisor sends failed-step logs for the integration
+head and the selected baseline run for the exact batch base back to the same
+session. If the base is a previous integration merge, its final PR CI is used
+only when its tested head and the base have identical Git trees. Otherwise the
+baseline is the newest `ci.yml` run on master for that exact SHA. Pending CI is
+waited on; missing or cancelled CI is dispatched on master only while master
+still points to the base. After dispatch, the supervisor waits on a persisted
+10-minute grace period for the run to appear before retrying. If no baseline
+can be established, the batch stays waiting and Slack is notified once. The
+supervisor compares failed tests and failed steps independently within each
+same failed job against that baseline. The
+agent can append fixes or eject a responsible PR by rebuilding the branch
+without it; ejection never uses a revert commit. Force-push is permitted only
+for rebuilding `mergecop/batch-<id>`, using that exact branch ref. There are
+at most four CI rounds per batch.
 
-The session has a two-hour budget, relays finished messages to Slack, and
-is suspended when the batch ends. The outcome is read from GitHub. If
-`mj new` fails or gives no reply, the queue stays held until a session list
-proves that no session with the batch's title exists, so two batches never
-run at once.
+The supervisor decides whether red CI is not worse than the batch base by
+comparing failed jobs, test identities, and failed step names. The agent's
+`automerge-verdict` is advice only. Before merge, the supervisor checks that
+the integration PR is based on current master, every constituent PR is still
+open, non-draft, based on master, and at its tested head, and every recorded
+source head is present while no ejected head remains in the integration tree.
+Once all gates pass, it posts the required `mergecop/verdict` success status on
+the exact CI-tested integration head, then runs
+`gh pr merge <n> --merge --match-head-commit <tested-sha>`. A GitHub refusal
+caused by master advancing returns the status to pending, merges master into
+the batch branch, and requires fresh CI before another success status. The
+supervisor posts pending while CI runs and failure when a batch closes without
+landing. The bot never pushes master.
+
+If the integration diff changes `.github/workflows/` or `.github/actions/`,
+the supervisor leaves the status pending with `needs human review: CI workflow
+changes` and holds the batch, because pull-request CI runs workflow definitions
+from the PR. A maintainer can review the diff and CI evidence, then have an
+authorized operator post success on the exact reviewed head through the
+supervisor App status path and merge with `--match-head-commit`. To land the
+other batch PRs first, the maintainer can mark the workflow-changing source PR
+as a draft; the existing source-state gate will rebuild the integration PR
+without it. Afterward the PR can be marked ready for separate human handling.
+Its owner can also push a follow-up restoring the workflow/action files to
+their master contents, which triggers the normal rebuild and automatic gates.
+
+Not-worse mode trusts test output produced by PR code, which could fake its
+reported failures. This is accepted while Bifrost PRs are authored by the
+team's agents and people. Strict green-only mode does not have this issue.
+
+The desired master ruleset requires a pull request with zero approvals, the
+`mergecop/verdict` status from mergecopbot (GitHub App ID 5203169), and an
+up-to-date branch; it blocks force-push and deletion and has no bypass actors.
+People cannot push directly to master or self-merge; changes land through the
+queue. See [the ruleset guide](docs/mergecop-ruleset.md). An administrator
+applies it manually with `bash scripts/apply-mergecop-ruleset.sh`; inspect the
+JSON without making changes using `bash scripts/apply-mergecop-ruleset.sh
+--dry-run`. The script is never run by cron or by `automerge.py`.
+
+Each agent turn has a one-hour budget. On expiry the supervisor interrupts the
+turn and notifies Slack. Finished messages and the GitHub outcome are reported
+in the batch Slack thread. A failed or ambiguous `mj new` holds the queue until
+the session listing proves the exact-title session is absent.
+
+The supervisor uses the GitHub App token from `mj github-token --owner
+BrokkAi`; sessions receive their own Mjolnir GitHub token, which cannot post
+the required verdict status.
+
+Create these labels in GitHub before enabling the job; the job does not create
+labels:
+
+- `automerge-rejected` — marks a PR rejected at its current head, paired with a
+  trusted bot comment containing `automerge-rejected-head: <full sha>`.
+- `mergecop-batch` — marks the integration PR.
 
 ## Running and inspecting
 

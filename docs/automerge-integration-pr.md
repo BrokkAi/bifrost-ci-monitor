@@ -1,0 +1,228 @@
+# Automerge through an integration pull request
+
+Status: approved and implemented in `automerge.py` and `test_automerge.py`; the
+supervisor status and desired master ruleset are documented in
+`docs/mergecop-ruleset.md`. An administrator must run
+`scripts/apply-mergecop-ruleset.sh` to apply the ruleset.
+Replaces the direct-push design in `automerge.py` (commit e7d784e).
+
+## Goal
+
+Land every ready pull request (PR) through the repository's own CI. The agent
+combines the ready PRs, resolves conflicts, runs targeted tests, and opens one
+integration PR. The repository's existing CI tests that PR. When CI is red, the
+agent fixes the integration branch or removes the PR that broke it, and CI runs
+again. When CI is green, the exact tested commit is merged.
+
+What was tested is what lands.
+
+## Facts about bifrost-dev (read 2026-10-05)
+
+- Merge commits are allowed. Squash is allowed. Rebase is off.
+- No classic branch protection. One ruleset, "Protect `master`", blocks only
+  deletion and force-pushes. No required reviews or checks.
+- `ci.yml` runs on `pull_request` and `merge_group`. Its `PR verification` job
+  always runs and summarizes the other jobs. A `ci-impact` job chooses which
+  jobs run.
+- Recent PR CI runs took 2 to 130 minutes. Master CI is red at the time of
+  writing.
+
+## Identity
+
+Everything acts as the GitHub App `mergecopbot` (app 5203169, installation
+168296327). The supervisor gets tokens with `mj github-token --owner BrokkAi`.
+Sessions get tokens from mj, without `statuses: write`; only the supervisor's
+token has that permission. Trusted rejection comments are those written by
+`mergecopbot[bot]`, a configured value, not looked up at runtime.
+
+## Batch selection
+
+Unchanged from the current job, with one policy setting:
+
+- Open PRs with base `master`, not drafts, except PRs rejected at their current
+  head (label `automerge-rejected` plus a trusted
+  `automerge-rejected-head: <sha>` comment).
+- Policy setting `ready`: `non-draft` (bifrost-dev default, because it does not
+  require reviews) or `approved` (review decision APPROVED).
+- PRs already in an active integration PR are not selected again.
+
+## Building the integration branch
+
+One mj session per batch, as now (`--workspace CI --target podman --bundle
+bifrost --model deepseek-v4-pro --subagents none`).
+
+1. Start branch `mergecop/batch-<id>` at current master.
+2. Merge each PR head with a merge commit. Never squash or rebase, at either
+   level, so GitHub marks each PR merged when the integration PR lands.
+3. Resolve every conflict. A conflict is never a reason to send a PR back.
+4. Every commit the agent creates carries `Automerge-Batch: <id>`.
+5. Run targeted tests locally: build, plus the tests for the areas the batch
+   changes. Use the repository's own `ci-impact` logic and AGENTS.md to choose
+   them. This is a fast, approximate check; CI is the authority.
+6. Push the branch and open or update the integration PR:
+   - title `Merge batch: #182 #187 #191`;
+   - body lists each PR with the head commit included and the agent's
+     conflict-resolution and fix notes;
+   - label `mergecop-batch`.
+
+## Waiting for CI (supervisor, not the agent)
+
+The supervisor accepts `PR verification` only from the GitHub Actions run whose
+path is `.github/workflows/ci.yml`, whose head SHA is the tested head, and whose
+event is `pull_request`. It follows the latest attempt and matches the check run
+to that workflow run's check suite. The agent session is suspended while CI
+runs, so no agent time is spent waiting. While CI or a supervisor decision is
+pending, the supervisor posts `mergecop/verdict: pending` on that exact head.
+
+## When CI is red
+
+1. The supervisor collects the failed jobs and the log tails of failed steps
+   (`gh run view --log-failed`) for that head commit.
+2. Baseline comes from the most recent CI run that tested the batch's exact
+   base tree. If the base is a recorded merge commit from an earlier
+   integration batch, use that batch's final integration-PR CI result only
+   when GitHub confirms that the base commit and its tested head have the same
+   tree. Otherwise use the newest `ci.yml` run on `master` for the exact base
+   commit. A pending run keeps the agent suspended while the supervisor waits.
+   If the run is missing or cancelled, dispatch `ci.yml` on `master` only while
+   master still points at the base SHA. Persist the dispatch intent and a
+   10-minute grace deadline before dispatching; on each later tick, first list
+   dispatch runs created since that intent and accept only a run whose head SHA
+   equals the base SHA. Do not retry while the grace period is active and no
+   matching run has appeared. After it expires, reconcile the runs and retry
+   only if master still points at the base SHA. If no usable baseline can be
+   established, fail closed, notify Slack once, and leave the batch waiting for
+   the next tick to re-evaluate. The selected baseline run's
+   failed jobs and failed-step logs are supplied to the agent and parsed by the
+   supervisor. The supervisor compares failing test identities as well as jobs;
+   each job's failing test identities and failed-step names must independently
+   be subsets of that same job's baseline failures. A job with no baseline
+   failure is always worse. For a failed job with no parseable test identity
+   (such as build, lint, or crash failures), its failing step name must still
+   match a step that failed in that same baseline job.
+3. It resumes the same session and sends the failures with `mj prompt`.
+4. The agent either:
+   - fixes the interaction with a new commit on the branch, or
+   - ejects the PR or PRs responsible. Ejecting means rebuilding the branch
+     from its base without them and force-pushing the integration branch (only
+     that branch). Never eject with a revert commit: the ejected PR's commits
+     would still reach master and GitHub would mark it merged.
+5. Each ejected PR is rejected at the exact head that was tested (label plus
+   trusted comment with the failing jobs and evidence). A new push re-admits it.
+6. Targeted tests again, then push. CI runs again.
+
+Limits: at most 4 CI rounds per batch. After that, the batch closes without
+landing, the integration PR is closed with a summary, and Slack is notified.
+
+## Human review for CI workflow changes
+
+The supervisor inspects the integration PR's changed files before landing. If
+any path is under `.github/workflows/` or `.github/actions/`, it leaves
+`mergecop/verdict` pending with `needs human review: CI workflow changes`, sends
+one Slack notice, and keeps the batch held. This is necessary because
+`pull_request` CI runs the workflow definitions from the PR being tested.
+
+A maintainer has two paths:
+
+- To land the workflow change, review the integration PR's workflow/action diff
+  and its CI evidence. An authorized operator then posts
+  `mergecop/verdict: success` on the exact reviewed head through the supervisor
+  App's status-writing path and merges with
+  `gh pr merge <n> --merge --match-head-commit <sha>`. The automerge job does
+  not post that success automatically.
+- To land the other batch PRs first, mark the workflow-changing source PR as a
+  draft. The existing source-state gate removes it and asks the batch session
+  to rebuild the integration branch without it. After the other PRs land, the
+  source PR can be marked ready again for separate human handling. Alternatively,
+  its owner can push a follow-up restoring the workflow/action files to their
+  master contents; the changed head triggers the normal rebuild, and automatic
+  landing resumes once the integration diff no longer changes those paths.
+
+## When CI is green
+
+1. Up to date: if master has moved since the branch's base, the agent merges
+   master into the branch (merge commit), runs targeted tests, and pushes, and
+   CI runs again. The desired master ruleset also requires an up-to-date branch;
+   the supervisor checks freshness before posting success and treats a GitHub
+   refusal caused by a master advance as a request to update and re-test.
+2. Re-check each included PR: still open, not draft, base master, head
+   unchanged. If any changed, it is removed (rebuild, not reject) and CI runs
+   again.
+3. Once CI and every pre-merge check pass, the supervisor posts
+   `mergecop/verdict: success` on the integration PR's exact tested head. The
+   description is `green` or `not worse than master: N baseline failures`; the
+   target links to the Slack thread or integration PR. Success is never posted
+   on an untested commit.
+4. Merge with `gh pr merge <n> --merge --match-head-commit <tested sha>`. The
+   head check makes GitHub refuse the merge if the head moved. If GitHub refuses
+   because master advanced, the supervisor changes the tested head's verdict
+   back to pending, asks the agent to merge master into the batch branch, and
+   waits for fresh CI before posting success again.
+5. Confirm every included PR now shows as merged. Comment on any that does not.
+6. Slack outcome: landed PRs, ejected PRs with reasons, CI rounds used.
+
+## Interaction with the CI fixer
+
+`ci-fix` PRs are ordinary queue members. While master is red, the next batch is
+the route by which a fix lands.
+
+## Review of agent-written code
+
+Conflict resolutions and interaction fixes are written by the agent and land
+without human review. bifrost-dev requires no reviews today, so this changes
+nothing there. For other repositories, the product default needs a decision:
+land as is, or require review when the agent's own changes exceed a size
+threshold. Not part of this change.
+
+## Repository rules
+
+The desired ruleset "Protect `master`" requires pull requests (zero approvals), requires
+`mergecop/verdict` from the GitHub App mergecopbot (app id 5203169), requires
+branches to be up to date, and blocks force-push and deletion. It has no bypass
+actors. This prevents direct pushes and self-merges by people; source PRs land
+through the automerge queue and its tested integration PR. The existing
+deletion and force-push blocks remain. The ruleset setup is not automatic; an
+administrator applies this desired configuration using the script below.
+
+An administrator can inspect and apply the ruleset with
+`bash scripts/apply-mergecop-ruleset.sh --dry-run` and then
+`bash scripts/apply-mergecop-ruleset.sh`. The script shows the complete JSON,
+requires explicit confirmation, and creates or updates by ruleset name using
+the administrator's own `gh` authentication. It is never called automatically
+and is not used by `automerge.py`.
+
+## Landing when the base tree is already red
+
+Decision for bifrost-dev: "not worse than the batch base tree", compared test by test.
+
+- A batch lands when every CI failure on the integration PR also fails at the
+  branch's base commit. The supervisor compares deterministic failing test
+  identities, not only job names, so a new failure inside a job that was
+  already red still blocks landing.
+- The supervisor hands the agent the failed-step logs for both the
+  integration PR and the selected baseline run described above. It does not
+  substitute a run from a different base SHA.
+- If a failure cannot be shown to be a baseline failure, it counts against
+  the batch. Unparseable failed jobs count as worse unless the same job and
+  failed step also failed at the baseline.
+- The agent may include `automerge-verdict: not-worse` and a list of baseline
+  failures as advice for the hand-back. This verdict is not a landing
+  condition; the supervisor's job, test, and step comparison decides.
+- The Slack outcome lists the baseline failures that the batch landed with.
+
+This not-worse policy trusts test output produced by PR code. A PR could modify
+tests or their runner to fake its reported failures. This is accepted for the
+current contributor set of Bifrost agents and people; strict green-only mode
+does not rely on this test-level comparison and does not have this issue.
+
+The baseline run selection above is the approved policy for bifrost-dev; the
+former open question about missing or pending master CI is resolved.
+
+Strict "green only" remains the intended default for other repositories.
+
+## Reused from the current job
+
+Batch selection and rejection markers, launch identity and ambiguous-launch
+handling, transcript relay, Slack notices, locking, restart re-attachment.
+Replaced: the agent prompt, full-suite run, and direct push. New: the CI wait
+loop, the failure hand-back, and merging the integration PR.
