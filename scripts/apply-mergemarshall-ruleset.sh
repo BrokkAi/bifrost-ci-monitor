@@ -109,7 +109,7 @@ request_body = {
             "type": "required_status_checks",
             "parameters": {
                 "required_status_checks": [
-                    {"context": "mergecop/verdict", "integration_id": 5203169},
+                    {"context": "mergemarshall/verdict", "integration_id": 5203169},
                 ],
                 "strict_required_status_checks_policy": True,
             },

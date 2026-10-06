@@ -1,11 +1,11 @@
-# `master` ruleset for mergecop
+# `master` ruleset for MergeMarshall
 
 The repository ruleset named "Protect `master`" for `BrokkAi/bifrost-dev` must be
 active on `refs/heads/master` with these rules:
 
 - Require changes to land through a pull request, with zero required
   approvals.
-- Require the `mergecop/verdict` commit status from the GitHub App
+- Require the `mergemarshall/verdict` commit status from the GitHub App
   `mergemarshall` (App ID `5203169`).
 - Require the pull request branch to be up to date with `master` before it can
   merge.
@@ -14,13 +14,13 @@ active on `refs/heads/master` with these rules:
 
 This means people cannot push directly to `master` or self-merge their own
 changes. Source PRs, including `ci-fix` PRs, land through the automerge queue's
-integration PR. The supervisor posts `mergecop/verdict` only after the
+integration PR. The supervisor posts `mergemarshall/verdict` only after the
 mode-specific quality gate and common pre-merge checks pass, on the exact
 integration head that was tested. In `sync` mode this includes the verified PR
 CI result; in `async` mode it is the agent's local targeted-test pass, and
 GitHub CI runs after merge. Session tokens cannot write this status; the
 supervisor uses its GitHub App token.
-Do not grant that App `checks:write`: a check run named `mergecop/verdict`
+Do not grant that App `checks:write`: a check run named `mergemarshall/verdict`
 created by the App could also satisfy the required status rule. Grant only the
 status-writing permission needed by the supervisor.
 
@@ -33,8 +33,8 @@ only when no ruleset targets master, and only after explicit confirmation. An
 administrator must run it manually with their own authenticated `gh` session:
 
 ```sh
-bash scripts/apply-mergecop-ruleset.sh --dry-run
-bash scripts/apply-mergecop-ruleset.sh
+bash scripts/apply-mergemarshall-ruleset.sh --dry-run
+bash scripts/apply-mergemarshall-ruleset.sh
 ```
 
 Both modes make a read-only API request to identify the target ruleset. The

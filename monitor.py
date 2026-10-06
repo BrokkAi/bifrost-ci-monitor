@@ -33,23 +33,38 @@ TRACKED_WORKFLOWS: tuple[tuple[str, str | None], ...] = (
     ("Nightly CI", None),
 )
 BRANCH = "master"
-DB_PATH = Path("/home/jonathan/Projects/bifrost-ci/activity.db")
-STATE_DIR = Path("/home/jonathan/.local/state/bifrost-ci-monitor")
+HOME_DIR = Path.home()
+
+
+def configured_path(environment_name: str, default: Path) -> Path:
+    configured = os.environ.get(environment_name)
+    return Path(configured).expanduser() if configured else default
+
+
+DB_PATH = configured_path(
+    "BIFROST_CI_DB", HOME_DIR / "Projects" / "bifrost-ci" / "activity.db"
+)
+STATE_DIR = configured_path(
+    "BIFROST_CI_MONITOR_STATE", HOME_DIR / ".local" / "state" / "bifrost-ci-monitor"
+)
 LOCK_PATH = STATE_DIR / "monitor.lock"
-CONFIG_DIR = Path("/home/jonathan/.config/bifrost-ci-monitor")
+CONFIG_DIR = configured_path(
+    "BIFROST_CI_CONFIG_DIR", HOME_DIR / ".config" / "bifrost-ci-monitor"
+)
 WEBHOOK_PATH = CONFIG_DIR / "slack-webhook-url"
 BOT_TOKEN_PATH = CONFIG_DIR / "bot-token"
 CHANNEL_PATH = CONFIG_DIR / "channel-id"
-MJ_BIN = Path("/home/jonathan/.cargo/bin/mj")
-GH_BIN = Path("/usr/bin/gh")
+MJ_BIN = configured_path("BIFROST_MJ_BIN", HOME_DIR / ".cargo" / "bin" / "mj")
+GH_BIN = configured_path("BIFROST_GH_BIN", Path("/usr/bin/gh"))
 GH_OWNER = "BrokkAi"
 REQUIRE_APP_TOKEN = True  # Disable only for local development with ambient gh auth.
 GH_TOKEN_TTL_SECONDS = 30 * 60
 MJ_WORKSPACE = "CI"
 MJ_TARGET = "podman"
 MJ_BUNDLE = "bifrost"
-MJ_MODEL = "deepseek-v4-pro"
-AGENT_LABEL = "DeepSeek V4 Pro (mj)"
+MJ_MODEL = "opus"
+MJ_SUBAGENT_MODEL = "gpt-6-luna"
+AGENT_LABEL = "Claude Opus 5.5 + GPT-6 Luna sub-agents (mj)"
 MJ_TURN_TIMEOUT_SECONDS = 60 * 60
 MJ_HANDOFF_TIMEOUT_SECONDS = 10 * 60
 MJ_WAIT_POLL_SECONDS = 5
@@ -94,6 +109,26 @@ GH_TOKEN_CACHE: str | None = None
 GH_AUTH_SOURCE: str | None = None
 GH_TOKEN_CACHE_AT = 0.0
 GH_AUTH_FAILURE_HANDLER: Callable[[GitHubAuthError], None] | None = None
+
+
+def runtime_binary_issues(*, include_mj: bool = True) -> list[tuple[str, str]]:
+    required = [("gh", GH_BIN)]
+    if include_mj:
+        required.append(("mj", MJ_BIN))
+    issues: list[tuple[str, str]] = []
+    for command, path in required:
+        if not path.is_absolute():
+            issues.append(
+                (f"{command}_path_invalid", f"{command} path must be absolute: {path}")
+            )
+        elif not path.is_file() or not os.access(path, os.X_OK):
+            issues.append(
+                (
+                    f"{command}_missing",
+                    f"{command} is missing or not executable at {path}",
+                )
+            )
+    return issues
 
 
 def reset_github_auth_cache() -> None:
@@ -1154,13 +1189,13 @@ def record_blocked_reason(
         )
 
 
-def notify_github_auth_blocked(
+def notify_host_blocked(
     conn: sqlite3.Connection,
     transport: SlackTransport,
-    exc: GitHubAuthError,
+    reason: str,
+    details: str,
 ) -> None:
-    reason = exc.reason
-    log(f"monitor blocked ({reason}): {exc}")
+    log(f"Bifrost automation blocked ({reason}): {details}")
     with conn:
         conn.execute(
             """
@@ -1168,7 +1203,7 @@ def notify_github_auth_blocked(
                 (workflow_run_id, reason, created_at, details)
             VALUES (-1, ?, ?, ?)
             """,
-            (reason, utc_now(), str(exc)),
+            (reason, utc_now(), details),
         )
         row = conn.execute(
             "SELECT slack_notification_attempted FROM blocked_notifications "
@@ -1178,7 +1213,7 @@ def notify_github_auth_blocked(
     if row is not None and not row["slack_notification_attempted"]:
         ok, _ = slack_send(
             transport,
-            f":warning: Bifrost CI monitor is blocked ({reason}): {exc}",
+            f":warning: Bifrost CI automation is blocked ({reason}): {details}",
         )
         with conn:
             conn.execute(
@@ -1186,6 +1221,26 @@ def notify_github_auth_blocked(
                 "WHERE workflow_run_id = -1 AND reason = ?",
                 (int(ok), reason),
             )
+
+
+def notify_github_auth_blocked(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+    exc: GitHubAuthError,
+) -> None:
+    notify_host_blocked(conn, transport, exc.reason, str(exc))
+
+
+def ensure_runtime_binaries(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+    *,
+    include_mj: bool = True,
+) -> bool:
+    issues = runtime_binary_issues(include_mj=include_mj)
+    for reason, details in issues:
+        notify_host_blocked(conn, transport, reason, details)
+    return not issues
 
 
 def ensure_github_auth(
@@ -1219,6 +1274,8 @@ def new_session_argv(
         "--target", MJ_TARGET,
         "--bundle", MJ_BUNDLE,
         "--model", MJ_MODEL,
+        "--subagents", "single-model",
+        "--subagent-model", MJ_SUBAGENT_MODEL,
         "--at", base_sha,
         "--branch", branch,
         "--title", title,
@@ -1814,7 +1871,8 @@ def suspend_session(
             )
     try:
         result = mj_command(
-            ["suspend", "--session", session_id, "--json"], timeout=60
+            ["suspend", "--session", session_id, "--acknowledge-unpublished-work", "--json"],
+            timeout=60,
         )
         warning = suspend_response_warning(result)
         if warning:
@@ -2703,6 +2761,8 @@ def run_monitor() -> int:
         lambda exc: notify_github_auth_blocked(conn, transport, exc)
     )
     try:
+        if not ensure_runtime_binaries(conn, transport):
+            return 3
         if not ensure_github_auth(conn, transport):
             return 3
         runner_error = check_mj_support()
@@ -2925,6 +2985,8 @@ def check_only() -> int:
         lambda exc: notify_github_auth_blocked(conn, transport, exc)
     )
     try:
+        if not ensure_runtime_binaries(conn, transport):
+            return 3
         if not ensure_github_auth(conn, transport):
             return 3
         result = poll_ci()

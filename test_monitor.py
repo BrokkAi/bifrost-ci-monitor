@@ -480,6 +480,12 @@ class MjRunnerTests(unittest.TestCase):
 
     def test_mj_new_argv_has_required_selectors_and_no_profile(self):
         run = make_run()
+        self.assertEqual(monitor.MJ_MODEL, "opus")
+        self.assertEqual(monitor.MJ_SUBAGENT_MODEL, "gpt-6-luna")
+        self.assertEqual(
+            monitor.AGENT_LABEL,
+            "Claude Opus 5.5 + GPT-6 Luna sub-agents (mj)",
+        )
         argv = monitor.new_session_argv(
             run, "a" * 40, 3, "/tmp/repair.prompt"
         )
@@ -495,7 +501,11 @@ class MjRunnerTests(unittest.TestCase):
                 "--bundle",
                 "bifrost",
                 "--model",
-                "deepseek-v4-pro",
+                "opus",
+                "--subagents",
+                "single-model",
+                "--subagent-model",
+                "gpt-6-luna",
                 "--at",
                 "a" * 40,
                 "--branch",
@@ -509,6 +519,7 @@ class MjRunnerTests(unittest.TestCase):
         )
         self.assertNotIn("--profile", argv)
         self.assertNotIn("--effort", argv)
+        self.assertNotIn("none", argv)
 
     def test_launch_parses_session_id_through_fake_mj_seam(self):
         run = make_run()
@@ -522,7 +533,7 @@ class MjRunnerTests(unittest.TestCase):
         self.assertEqual((session_id, branch), ("s-42", "ci-repair/42-1"))
         argv = command.call_args_list[-1].args[0]
         self.assertEqual(
-            argv[:11],
+            argv[:15],
             [
                 "new",
                 "--workspace",
@@ -532,7 +543,11 @@ class MjRunnerTests(unittest.TestCase):
                 "--bundle",
                 "bifrost",
                 "--model",
-                "deepseek-v4-pro",
+                "opus",
+                "--subagents",
+                "single-model",
+                "--subagent-model",
+                "gpt-6-luna",
                 "--at",
                 "b" * 40,
             ],
@@ -1131,6 +1146,7 @@ class MjRunnerTests(unittest.TestCase):
     def test_timeout_interrupts_hands_off_in_session_and_suspends(self):
         insert_invocation(self.conn, session_id="session-timeout")
         commands = []
+        suspend_argv = []
         prompts = []
 
         def fake_mj(args, *, timeout=60):
@@ -1146,6 +1162,7 @@ class MjRunnerTests(unittest.TestCase):
                 prompts.append(prompt_path.read_text())
                 return completed(json.dumps({"session_id": "session-timeout", "turn_id": 2}))
             if args[0] == "suspend":
+                suspend_argv.append(args)
                 if "--acknowledge-unpublished-work" not in args:
                     return completed(
                         "",
@@ -1175,7 +1192,8 @@ class MjRunnerTests(unittest.TestCase):
         self.assertIn("List any unpushed commits", prompts[0])
         self.assertIn("Do not push any commit", prompts[0])
         self.assertLess(commands.index("interrupt-turn"), commands.index("prompt"))
-        self.assertEqual(commands.count("suspend"), 2)
+        self.assertEqual(commands.count("suspend"), 1)
+        self.assertIn("--acknowledge-unpublished-work", suspend_argv[0])
 
     def test_session_is_suspended_after_success_and_supervision_failure(self):
         insert_invocation(self.conn, session_id="session-outcome")
@@ -1229,7 +1247,7 @@ class MjRunnerTests(unittest.TestCase):
         )
         with mock.patch.object(
             monitor, "mj_command", return_value=response
-        ), mock.patch.object(
+        ) as mj, mock.patch.object(
             monitor, "slack_send", return_value=(True, "reply")
         ) as slack:
             self.assertTrue(
@@ -1237,6 +1255,7 @@ class MjRunnerTests(unittest.TestCase):
                     self.conn, self.transport, 42, "session-warning"
                 )
             )
+        self.assertIn("--acknowledge-unpublished-work", mj.call_args.args[0])
         self.assertIn("one sub-agent has not handed back", slack.call_args.args[1])
         self.assertEqual(slack.call_args.kwargs["thread_ts"], "thread-1")
 
@@ -1704,6 +1723,7 @@ class GitHubAuthTests(unittest.TestCase):
                 mock.patch.object(monitor, "LOCK_PATH", root / "state" / "monitor.lock"),
                 mock.patch.object(monitor, "DB_PATH", root / "activity.db"),
                 mock.patch.object(monitor, "load_slack_transport", return_value=transport),
+                mock.patch.object(monitor, "runtime_binary_issues", return_value=[]),
                 mock.patch.object(monitor, "mj_command", return_value=token_failure),
                 mock.patch.object(monitor, "poll_ci") as poll,
                 mock.patch.object(monitor, "slack_send", return_value=(True, None)) as slack,
@@ -1722,6 +1742,28 @@ class GitHubAuthTests(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual(row, ("github_app_token_unavailable", 1))
+
+    def test_missing_runtime_binaries_are_reported_once_per_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            conn_patch = mock.patch.object(monitor, "DB_PATH", root / "activity.db")
+            conn_patch.start()
+            self.addCleanup(conn_patch.stop)
+            conn = monitor.connect_db()
+            self.addCleanup(conn.close)
+            transport = monitor.SlackTransport("webhook", webhook="test")
+            with (
+                mock.patch.object(monitor, "GH_BIN", root / "missing-gh"),
+                mock.patch.object(monitor, "MJ_BIN", root / "missing-mj"),
+                mock.patch.object(monitor, "slack_send", return_value=(True, None)) as slack,
+            ):
+                self.assertFalse(monitor.ensure_runtime_binaries(conn, transport))
+                self.assertFalse(monitor.ensure_runtime_binaries(conn, transport))
+            self.assertEqual(slack.call_count, 2)
+            reasons = [row[0] for row in conn.execute(
+                "SELECT reason FROM blocked_notifications WHERE workflow_run_id=-1 ORDER BY reason"
+            )]
+            self.assertEqual(reasons, ["gh_missing", "mj_missing"])
 
     def test_gh_receives_app_token_and_cached_token_refreshes_after_30_minutes(self):
         token_results = [completed("first-token"), completed("second-token")]

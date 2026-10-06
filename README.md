@@ -42,15 +42,18 @@ Mjolnir for a fresh one after a GitHub 401 response.
 ## Lifecycle
 
 The monitor atomically claims each workflow run in
-~/Projects/bifrost-ci/activity.db. It waits five minutes after a failed attempt
+`$HOME/Projects/bifrost-ci/activity.db` by default. Override the database path
+with `BIFROST_CI_DB`. It waits five minutes after a failed attempt
 first appears so RunsOn can request a replacement attempt, and serializes
 polls with a local lock. Before launch it confirms that the same run is still
 red and reads the current master SHA from GitHub.
 
-A new repair uses the CI workspace, podman target, bifrost bundle, and
-DeepSeek V4 Pro model. Mjolnir creates the branch ci-repair/<run-id>-<attempt> at that full
-master SHA and receives the prompt from a temporary file. The container's Git
-and gh commands use the user's injected GitHub token.
+A new repair uses the CI workspace, podman target, bifrost bundle, and the
+`opus` model with `single-model` sub-agents fixed to `gpt-6-luna`. Mjolnir
+creates the branch ci-repair/<run-id>-<attempt> at that full master SHA and
+receives the prompt from a temporary file. Its agent label is
+`Claude Opus 5.5 + GPT-6 Luna sub-agents (mj)`. The container's Git and gh
+commands use the session's injected GitHub token.
 
 While a turn runs, the monitor polls mj wait and the finished-only transcript
 about every five seconds. The bot transport relays each completed agent message
@@ -129,13 +132,16 @@ starting.
 
 ## Agent selection
 
-Messages use the fixed label DeepSeek V4 Pro (mj). Sessions use the model
-`deepseek-v4-pro`, through a Codex harness profile with a DeepSeek API key.
-Mjolnir selects a configured profile that offers that model using its
-model-based load balancing. The
-monitor does not pin a profile or reasoning effort. It uses the absolute CLI
-path /home/jonathan/.cargo/bin/mj because cron's PATH does not include
-~/.cargo/bin.
+The CI monitor sessions use `--model opus --subagents single-model
+--subagent-model gpt-6-luna` and the label Claude Opus 5.5 + GPT-6 Luna
+sub-agents (mj). Automerge uses its separate `deepseek-v4-pro` model with
+`--subagents none` and the label DeepSeek V4 Pro (mj). The executables have
+absolute defaults: `mj` at `$HOME/.cargo/bin/mj` and `gh` at `/usr/bin/gh`.
+Override them with `BIFROST_MJ_BIN` and `BIFROST_GH_BIN`. Both scripts check
+that the required executables exist and are executable at startup, then post a
+once-per-reason blocked notice if one is missing. `BIFROST_CI_MONITOR_STATE`,
+`BIFROST_CI_AUTOMERGE_STATE`, and `BIFROST_CI_CONFIG_DIR` override the state
+and secrets directories, which otherwise live under the current user's home.
 
 The installed mj must support transcript --finished-only. The monitor checks
 this at startup and reports a blocked reason for a red run when the installed
@@ -187,11 +193,11 @@ or a custom OAuth flow whose response contains incoming_webhook.url.
 
 6. Store and test the webhook without putting it in Git:
 
-       /home/jonathan/Projects/bifrost-ci-monitor/monitor.py --configure-slack
-       /home/jonathan/Projects/bifrost-ci-monitor/monitor.py --test-slack
+       ./monitor.py --configure-slack
+       ./monitor.py --test-slack
 
-   The first command hides the URL while reading it and writes a mode-0600
-   file under ~/.config/bifrost-ci-monitor/.
+The first command hides the URL while reading it and writes a mode-0600
+file under `$HOME/.config/bifrost-ci-monitor/` by default.
 
 ## PR automerge
 
@@ -200,7 +206,8 @@ to master. `automerge.py` batches eligible PRs into one integration PR and
 merges after the selected CI mode's gate and common pre-merge checks pass. Run
 it from cron every minute. It has a separate non-blocking lock and persists its
 phase, mode, integration PR number, and Mjolnir session in its own tables in
-`~/Projects/bifrost-ci/activity.db`. After a restart it reattaches during
+`$HOME/Projects/bifrost-ci/activity.db` by default (`BIFROST_CI_DB` overrides
+the database path). After a restart it reattaches during
 building, CI wait, repair, and merge phases.
 
 `CI_MODE` is a module setting with Bifrost's default set to `"async"`; set it
@@ -211,11 +218,16 @@ without a mode remain `sync`.
 The default queue includes every open, non-draft PR based on `master`, except
 one rejected at its current head. The optional `READY_POLICY="approved"`
 setting also requires an approved review. Integration PRs are excluded from
-the source queue. One DeepSeek V4 Pro session starts from current master,
-merges source heads with merge commits, resolves conflicts, runs targeted
-checks using `ci-impact` and the repository guidance, then opens or updates one
-integration PR. Its title lists its source PRs and it carries the
-`mergecop-batch` label.
+the source queue. One DeepSeek V4 Pro (`deepseek-v4-pro`, no sub-agents)
+session starts from current master, merges source heads with merge commits,
+resolves conflicts, runs targeted checks using `ci-impact` and repository
+guidance, then opens or updates one integration PR. Its title lists its source
+PRs and it carries the
+`mergemarshall-batch` label.
+
+Run `python automerge.py --check` (or `--once`) to inspect the next tick's
+selection and plan. It reads queue state and GitHub but does not create a batch,
+remove labels, start Mjolnir, post Slack, or write to GitHub.
 
 ### Sync mode
 
@@ -235,7 +247,7 @@ supervisor compares failed tests and failed steps independently within each
 same failed job against that baseline. The
 agent can append fixes or eject a responsible PR by rebuilding the branch
 without it; ejection never uses a revert commit. Force-push is permitted only
-for rebuilding `mergecop/batch-<id>`, using that exact branch ref. Sync batches
+for rebuilding `mergemarshall/batch-<id>`, using that exact branch ref. Sync batches
 allow at most four CI rounds.
 
 The supervisor decides whether red CI is not worse than the batch base by
@@ -244,7 +256,7 @@ comparing failed jobs, test identities, and failed step names. The agent's
 the integration PR is based on current master, every constituent PR is still
 open, non-draft, based on master, and at its tested head, and every recorded
 source head is present while no ejected head remains in the integration tree.
-Once all sync gates pass, it posts the required `mergecop/verdict` success
+Once all sync gates pass, it posts the required `mergemarshall/verdict` success
 status on the exact CI-tested integration head, then runs
 `gh pr merge <n> --merge --match-head-commit <tested-sha>`. A GitHub refusal
 caused by master advancing returns the status to pending, merges master into
@@ -281,7 +293,7 @@ and rejected at its tested head. The final agent message includes
 The supervisor does not wait for or query CI, run baseline workflows, or apply
 the four-round sync limit. It performs the same master-freshness, source state
 and head, ancestry, and workflow-change checks as sync mode. After they pass, it
-posts `mergecop/verdict` success on the locally tested head with a description
+posts `mergemarshall/verdict` success on the locally tested head with a description
 such as `async: local targeted tests passed; CI runs after merge`, then merges
 with `--match-head-commit`. The integration PR and master CI run normally after
 merge. If master is red, the agent reruns targeted failures at the batch base
@@ -294,12 +306,12 @@ local results. This is accepted for Bifrost's current contributors, the team's
 agents and people.
 
 The desired master ruleset requires a pull request with zero approvals, the
-`mergecop/verdict` status from mergemarshall (GitHub App ID 5203169), and an
+`mergemarshall/verdict` status from mergemarshall (GitHub App ID 5203169), and an
 up-to-date branch; it blocks force-push and deletion and has no bypass actors.
 People cannot push directly to master or self-merge; changes land through the
-queue. See [the ruleset guide](docs/mergecop-ruleset.md). An administrator
-applies it manually with `bash scripts/apply-mergecop-ruleset.sh`; inspect the
-JSON without making changes using `bash scripts/apply-mergecop-ruleset.sh
+queue. See [the ruleset guide](docs/mergemarshall-ruleset.md). An administrator
+applies it manually with `bash scripts/apply-mergemarshall-ruleset.sh`; inspect the
+JSON without making changes using `bash scripts/apply-mergemarshall-ruleset.sh
 --dry-run`. The script is never run by cron or by `automerge.py`.
 
 Each agent turn has a one-hour budget. On expiry the supervisor interrupts the
@@ -314,15 +326,17 @@ the required verdict status.
 Create these labels in GitHub before enabling the job; the job does not create
 labels:
 
+- `ci-fix` — labels CI repair pull requests.
+- `buildfailure` — labels issues filed for blocked or unrevertable failures.
 - `automerge-rejected` — marks a PR rejected at its current head, paired with a
   trusted bot comment containing `automerge-rejected-head: <full sha>`.
-- `mergecop-batch` — marks the integration PR.
+- `mergemarshall-batch` — marks the integration PR.
 
 ## Running and inspecting
 
-    /home/jonathan/Projects/bifrost-ci-monitor/monitor.py --check
-    /home/jonathan/Projects/bifrost-ci-monitor/monitor.py --init-db
-    sqlite3 ~/Projects/bifrost-ci/activity.db 'select workflow_run_id,sha,status,exit_code,started_at,finished_at from invocations order by started_at desc;'
+    ./monitor.py --check
+    ./monitor.py --init-db
+    sqlite3 "${BIFROST_CI_DB:-$HOME/Projects/bifrost-ci/activity.db}" 'select workflow_run_id,sha,status,exit_code,started_at,finished_at from invocations order by started_at desc;'
     crontab -l
 
 The installed cron entry uses absolute paths and a non-overlapping process lock.

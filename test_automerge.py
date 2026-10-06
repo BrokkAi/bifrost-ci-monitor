@@ -7,6 +7,8 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase, mock
@@ -147,7 +149,7 @@ class SelectionTests(TestCase):
             api_pull(2, draft=True),
             api_pull(3, labels=[automerge.REJECTED_LABEL]),
             api_pull(4, labels=[automerge.INTEGRATION_LABEL]),
-            api_pull(5, head_ref="mergecop/batch-old"),
+            api_pull(5, head_ref="mergemarshall/batch-old"),
         ]
 
         def fake_gh(args: list[str], *, timeout: int = 60) -> str:
@@ -193,6 +195,27 @@ class SelectionTests(TestCase):
         self.assertEqual([item.number for item in selected], [8])
         self.assertIn("--remove-label", calls[-1])
 
+    def test_dry_selection_admits_new_head_without_removing_rejection_label(self):
+        rows = [api_pull(8, head_sha=HEAD_TWO, labels=[automerge.REJECTED_LABEL])]
+        calls: list[list[str]] = []
+
+        def fake_gh(args: list[str], *, timeout: int = 60) -> str:
+            calls.append(args)
+            if "/issues/8/comments?" in args[-1]:
+                return json.dumps([[
+                    {"id": 1, "created_at": "2026-10-05T10:00:00Z",
+                     "user": {"login": automerge.TRUSTED_REJECTION_LOGIN},
+                     "body": f"automerge-rejected-head: {HEAD_ONE}\nOld evidence."}
+                ]])
+            if args[:2] == ["api", "--paginate"]:
+                return json.dumps([rows])
+            raise AssertionError(args)
+
+        with mock.patch.object(automerge, "run_gh", side_effect=fake_gh):
+            selected = automerge.select_eligible_pull_requests(dry_run=True)
+        self.assertEqual([item.number for item in selected], [8])
+        self.assertFalse(any(args[:2] == ["pr", "edit"] for args in calls))
+
     def test_newest_trusted_marker_wins(self):
         marker = automerge.newest_trusted_rejection([
             {"id": 1, "created_at": "2026-10-05T10:00:00Z",
@@ -207,6 +230,29 @@ class SelectionTests(TestCase):
         ])
         self.assertEqual(marker.head_sha, HEAD_THREE)
         self.assertIn("Newest evidence", marker.evidence)
+
+
+class InspectionTests(TestCase):
+    def test_check_only_prints_plan_without_creating_database_or_mutating(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "activity.db"
+            output = StringIO()
+            with (
+                mock.patch.object(automerge, "DB_PATH", database),
+                mock.patch.object(monitor, "runtime_binary_issues", return_value=[]),
+                mock.patch.object(monitor, "github_app_token", return_value="fake-token"),
+                mock.patch.object(automerge, "select_eligible_pull_requests",
+                                  return_value=[pull()]) as select,
+                mock.patch.object(automerge, "current_master_sha", return_value=BASE_SHA),
+                redirect_stdout(output),
+            ):
+                self.assertEqual(automerge.check_only(), 0)
+            report = json.loads(output.getvalue())
+            self.assertEqual(report["state"], "ready")
+            self.assertEqual(report["selected_prs"][0]["number"], 7)
+            self.assertEqual(report["base_sha"], BASE_SHA)
+            select.assert_called_once_with(dry_run=True)
+            self.assertFalse(database.exists())
 
 
 class IdentityAndPromptTests(TestCase):
@@ -281,17 +327,63 @@ class IdentityAndPromptTests(TestCase):
     def test_agent_prompt_uses_integration_pr_and_safe_eject_contract(self):
         prompt = automerge.build_prompt("abc123", [pull(7), pull(9, HEAD_TWO)], BASE_SHA)
         for expected in (
-            "mergecop/batch-abc123",
+            "mergemarshall/batch-abc123",
             "Merge batch: #7 #9",
             "merge commit (no squash and no rebase)",
             "Resolve every conflict yourself",
             "Automerge-Batch: abc123",
             "ci-impact",
-            "mergecop-batch",
+            "mergemarshall-batch",
             "Never use a revert commit",
             "Do not merge the integration PR yourself",
         ):
             self.assertIn(expected, prompt)
+
+    def test_fix_versus_eject_guidance_is_present_in_mode_and_rebuild_prompts(self):
+        pulls = [pull(7), pull(8, HEAD_TWO)]
+        prompts = [
+            automerge.build_prompt("batch-test", pulls, BASE_SHA, ci_mode="sync"),
+            automerge.build_prompt("batch-test", pulls, BASE_SHA, ci_mode="async"),
+        ]
+        sync_conn = make_db(phase="waiting_ci", ci_mode="sync")
+        sync_row = row_for(sync_conn)
+        prompts.append(automerge.build_ci_feedback(
+            sync_row, {"ci.yml/test"}, set(), "failed tests", "baseline"
+        ))
+        async_conn = make_db(phase="fixing", ci_mode="async")
+        async_row = row_for(async_conn)
+        automerge._queue_async_gate_retry(
+            async_conn, async_row, async_local_report("fail"), "new targeted failure"
+        )
+        prompts.append(str(row_for(async_conn)["pending_prompt"]))
+        for conn in (sync_conn, async_conn):
+            automerge._request_rebuild(conn, row_for(conn), pulls, "source set changed")
+            prompts.append(str(row_for(conn)["pending_prompt"]))
+        with mock.patch.object(automerge, "_try_post_verdict_status"):
+            automerge._queue_master_update(
+                async_conn, monitor.SlackTransport("webhook", webhook="x"),
+                row_for(async_conn), HEAD_THREE, HEAD_TWO,
+            )
+            prompts.append(str(row_for(async_conn)["pending_prompt"]))
+            automerge._queue_async_local_recheck(
+                async_conn, monitor.SlackTransport("webhook", webhook="x"),
+                row_for(async_conn), HEAD_THREE, "head moved",
+            )
+            prompts.append(str(row_for(async_conn)["pending_prompt"]))
+        expected = (
+            "two PRs that pass alone but conflict in behaviour",
+            "mechanical update with a straightforward fix",
+            "test stale in another PR's code",
+            "broken on its own",
+            "redesign or substantially rewrite",
+            "When unsure, eject",
+            "Conflicts are never grounds for rejection",
+        )
+        for prompt in prompts:
+            for phrase in expected:
+                self.assertIn(phrase, prompt)
+        sync_conn.close()
+        async_conn.close()
         self.assertNotIn("git push origin HEAD:master", prompt)
 
     def test_async_agent_prompt_requires_local_baseline_gate_and_skips_ci(self):
@@ -326,11 +418,14 @@ class IdentityAndPromptTests(TestCase):
         conn = make_db(phase="building", session_id=None)
         row = row_for(conn)
         argv = automerge.new_session_argv(row, "/tmp/prompt")
+        self.assertEqual(automerge.AUTOMERGE_MODEL, "deepseek-v4-pro")
+        self.assertEqual(automerge.AUTOMERGE_AGENT_LABEL, "DeepSeek V4 Pro (mj)")
+        self.assertNotEqual(automerge.AUTOMERGE_MODEL, monitor.MJ_MODEL)
         self.assertEqual(argv, [
             "new", "--workspace", monitor.MJ_WORKSPACE,
             "--target", monitor.MJ_TARGET, "--bundle", monitor.MJ_BUNDLE,
-            "--model", monitor.MJ_MODEL, "--subagents", "none",
-            "--at", BASE_SHA, "--branch", "mergecop/batch-batch-test",
+            "--model", "deepseek-v4-pro", "--subagents", "none",
+            "--at", BASE_SHA, "--branch", "mergemarshall/batch-batch-test",
             "--title", "Bifrost automerge batch batch-test",
             "--prompt-file", "/tmp/prompt", "--json",
         ])
@@ -963,7 +1058,7 @@ class RulesetScriptTests(TestCase):
                 "GH_BODY_LOG": str(body_log),
             })
             command = ["bash", str(Path(__file__).parent / "scripts" /
-                                    "apply-mergecop-ruleset.sh")]
+                                    "apply-mergemarshall-ruleset.sh")]
             if dry_run:
                 command.append("--dry-run")
             result = subprocess.run(
@@ -1004,7 +1099,7 @@ class RulesetScriptTests(TestCase):
         required = rules["required_status_checks"]["parameters"]
         self.assertTrue(required["strict_required_status_checks_policy"])
         self.assertEqual(required["required_status_checks"], [{
-            "context": "mergecop/verdict", "integration_id": 5203169,
+            "context": "mergemarshall/verdict", "integration_id": 5203169,
         }])
         self.assertEqual(len(calls), 1)
         self.assertIn("rulesets?per_page=100", calls[0])
@@ -1374,10 +1469,10 @@ class PublicationGateTests(TestCase):
         row = row_for(conn)
         automerge._request_rebuild(conn, row, [pull(8, HEAD_TWO)], "PR #7 caused test regression")
         prompt = row_for(conn)["pending_prompt"]
-        self.assertIn("Rebuild `mergecop/batch-batch-test`", prompt)
+        self.assertIn("Rebuild `mergemarshall/batch-batch-test`", prompt)
         self.assertIn("Do not use revert commits", prompt)
         self.assertIn(
-            "git push --force-with-lease origin HEAD:refs/heads/mergecop/batch-batch-test",
+            "git push --force-with-lease origin HEAD:refs/heads/mergemarshall/batch-batch-test",
             prompt,
         )
         self.assertNotIn("git revert", prompt)
@@ -1795,6 +1890,21 @@ class LaunchAndLifecycleTests(TestCase):
                                        row_for(conn), "session-existing")
         self.assertEqual(events, ["notify", "interrupt", "suspend", "close"])
         self.assertEqual(row_for(conn)["status"], "failed")
+        conn.close()
+
+    def test_request_suspend_acknowledges_unpublished_work(self):
+        conn = make_db(phase="building")
+        with mock.patch.object(
+            monitor, "mj_command", return_value=subprocess.CompletedProcess([], 0, "{}", "")
+        ) as mj:
+            self.assertTrue(automerge.request_suspend(
+                conn, monitor.SlackTransport("webhook", webhook="x"),
+                "batch-test", "session-existing",
+            ))
+        self.assertEqual(mj.call_args.args[0], [
+            "suspend", "--session", "session-existing",
+            "--acknowledge-unpublished-work", "--json",
+        ])
         conn.close()
 
     def test_timeout_holds_queue_if_interrupt_cannot_be_confirmed(self):

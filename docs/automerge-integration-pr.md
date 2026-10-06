@@ -2,8 +2,8 @@
 
 Status: approved and implemented in `automerge.py` and `test_automerge.py`; the
 supervisor status and desired master ruleset are documented in
-`docs/mergecop-ruleset.md`. An administrator must run
-`scripts/apply-mergecop-ruleset.sh` to apply the ruleset.
+`docs/mergemarshall-ruleset.md`. An administrator must run
+`scripts/apply-mergemarshall-ruleset.sh` to apply the ruleset.
 Replaces the direct-push design in `automerge.py` (commit e7d784e).
 
 ## Goal
@@ -51,7 +51,7 @@ Unchanged from the current job, with one policy setting:
 One mj session per batch, as now (`--workspace CI --target podman --bundle
 bifrost --model deepseek-v4-pro --subagents none`).
 
-1. Start branch `mergecop/batch-<id>` at current master.
+1. Start branch `mergemarshall/batch-<id>` at current master.
 2. Merge each PR head with a merge commit. Never squash or rebase, at either
    level, so GitHub marks each PR merged when the integration PR lands.
 3. Resolve every conflict. A conflict is never a reason to send a PR back.
@@ -63,7 +63,7 @@ bifrost --model deepseek-v4-pro --subagents none`).
    - title `Merge batch: #182 #187 #191`;
    - body lists each PR with the head commit included and the agent's
      conflict-resolution and fix notes;
-   - label `mergecop-batch`.
+   - label `mergemarshall-batch`.
 
 ## CI modes
 
@@ -91,7 +91,7 @@ later cron tick. Existing batches migrated without a mode keep `sync` behavior.
   If master is already red, async mode uses those local exact-base test results
   to distinguish baseline failures from new ones; it does not wait for master
   CI. After the supervisor's common pre-merge checks pass, it posts
-  `mergecop/verdict: success` on the locally tested integration head with a
+  `mergemarshall/verdict: success` on the locally tested integration head with a
   description such as `async: local targeted tests passed; CI runs after merge`,
   then merges with `--match-head-commit`. The integration PR and master CI run
   normally after merge. The existing CI monitor handles any resulting breakage
@@ -110,7 +110,7 @@ path is `.github/workflows/ci.yml`, whose head SHA is the tested head, and whose
 event is `pull_request`. It follows the latest attempt and matches the check run
 to that workflow run's check suite. The agent session is suspended while CI
 runs, so no agent time is spent waiting. While CI or a supervisor decision is
-pending, the supervisor posts `mergecop/verdict: pending` on that exact head.
+pending, the supervisor posts `mergemarshall/verdict: pending` on that exact head.
 
 ## Sync mode: when CI is red
 
@@ -156,7 +156,7 @@ landing, the integration PR is closed with a summary, and Slack is notified.
 
 The supervisor inspects the integration PR's changed files before landing. If
 any path is under `.github/workflows/` or `.github/actions/`, it leaves
-`mergecop/verdict` pending with `needs human review: CI workflow changes`, sends
+`mergemarshall/verdict` pending with `needs human review: CI workflow changes`, sends
 one Slack notice, and keeps the batch held. This is necessary because
 `pull_request` CI runs the workflow definitions from the PR being tested.
 
@@ -164,7 +164,7 @@ A maintainer has two paths:
 
 - To land the workflow change, review the integration PR's workflow/action diff
   and its CI evidence. An authorized operator then posts
-  `mergecop/verdict: success` on the exact reviewed head through the supervisor
+  `mergemarshall/verdict: success` on the exact reviewed head through the supervisor
   App's status-writing path and merges with
   `gh pr merge <n> --merge --match-head-commit <sha>`. The automerge job does
   not post that success automatically.
@@ -187,7 +187,7 @@ A maintainer has two paths:
    unchanged. If any changed, it is removed (rebuild, not reject) and CI runs
    again.
 3. Once CI and every pre-merge check pass, the supervisor posts
-   `mergecop/verdict: success` on the integration PR's exact tested head. The
+   `mergemarshall/verdict: success` on the integration PR's exact tested head. The
    description is `green` or `not worse than master: N baseline failures`; the
    target links to the Slack thread or integration PR. Success is never posted
    on an untested commit.
@@ -215,7 +215,7 @@ threshold. Not part of this change.
 ## Repository rules
 
 The desired ruleset "Protect `master`" requires pull requests (zero approvals), requires
-`mergecop/verdict` from the GitHub App mergemarshall (app id 5203169), requires
+`mergemarshall/verdict` from the GitHub App mergemarshall (app id 5203169), requires
 branches to be up to date, and blocks force-push and deletion. It has no bypass
 actors. This prevents direct pushes and self-merges by people; source PRs land
 through the automerge queue and its tested integration PR. The existing
@@ -223,8 +223,8 @@ deletion and force-push blocks remain. The ruleset setup is not automatic; an
 administrator applies this desired configuration using the script below.
 
 An administrator can inspect and apply the ruleset with
-`bash scripts/apply-mergecop-ruleset.sh --dry-run` and then
-`bash scripts/apply-mergecop-ruleset.sh`. The script shows the complete JSON,
+`bash scripts/apply-mergemarshall-ruleset.sh --dry-run` and then
+`bash scripts/apply-mergemarshall-ruleset.sh`. The script shows the complete JSON,
 requires explicit confirmation, and creates or updates by ruleset name using
 the administrator's own `gh` authentication. It is never called automatically
 and is not used by `automerge.py`.
