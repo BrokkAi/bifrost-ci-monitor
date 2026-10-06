@@ -29,11 +29,11 @@ What was tested is what lands.
 
 ## Identity
 
-Everything acts as the GitHub App `mergecopbot` (app 5203169, installation
+Everything acts as the GitHub App `mergemarshall` (app 5203169, installation
 168296327). The supervisor gets tokens with `mj github-token --owner BrokkAi`.
 Sessions get tokens from mj, without `statuses: write`; only the supervisor's
 token has that permission. Trusted rejection comments are those written by
-`mergecopbot[bot]`, a configured value, not looked up at runtime.
+`mergemarshall[bot]`, a configured value, not looked up at runtime.
 
 ## Batch selection
 
@@ -215,7 +215,7 @@ threshold. Not part of this change.
 ## Repository rules
 
 The desired ruleset "Protect `master`" requires pull requests (zero approvals), requires
-`mergecop/verdict` from the GitHub App mergecopbot (app id 5203169), requires
+`mergecop/verdict` from the GitHub App mergemarshall (app id 5203169), requires
 branches to be up to date, and blocks force-push and deletion. It has no bypass
 actors. This prevents direct pushes and self-merges by people; source PRs land
 through the automerge queue and its tested integration PR. The existing

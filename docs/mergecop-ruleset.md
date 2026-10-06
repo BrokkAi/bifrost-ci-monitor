@@ -6,7 +6,7 @@ active on `refs/heads/master` with these rules:
 - Require changes to land through a pull request, with zero required
   approvals.
 - Require the `mergecop/verdict` commit status from the GitHub App
-  `mergecopbot` (App ID `5203169`).
+  `mergemarshall` (App ID `5203169`).
 - Require the pull request branch to be up to date with `master` before it can
   merge.
 - Block force-pushes and branch deletion.

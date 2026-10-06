@@ -285,7 +285,7 @@ local results. This is accepted for Bifrost's current contributors, the team's
 agents and people.
 
 The desired master ruleset requires a pull request with zero approvals, the
-`mergecop/verdict` status from mergecopbot (GitHub App ID 5203169), and an
+`mergecop/verdict` status from mergemarshall (GitHub App ID 5203169), and an
 up-to-date branch; it blocks force-push and deletion and has no bypass actors.
 People cannot push directly to master or self-merge; changes land through the
 queue. See [the ruleset guide](docs/mergecop-ruleset.md). An administrator
