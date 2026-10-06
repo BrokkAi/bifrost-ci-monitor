@@ -7,10 +7,8 @@ from __future__ import annotations
 
 import fcntl
 import json
-import os
 import re
 import sqlite3
-import subprocess
 import tempfile
 import time
 import uuid
@@ -40,7 +38,6 @@ INTEGRATION_LABEL = "mergecop-batch"
 TRUSTED_REJECTION_LOGIN = "mergemarshall[bot]"
 GH_OWNER = "BrokkAi"
 READY_POLICY = "non-draft"  # Change to "approved" to require an APPROVED review decision.
-REQUIRE_APP_TOKEN = True  # Disable only for local development with ambient gh auth.
 CI_MODE = "async"  # Bifrost default; supported values are "async" and "sync".
 REJECTION_MARKER = re.compile(
     r"(?m)^automerge-rejected-head:\s*([0-9a-f]{40})\s*$", re.IGNORECASE
@@ -58,8 +55,6 @@ BASELINE_DISPATCH_GRACE_SECONDS = 10 * 60
 VERDICT_CONTEXT = "mergecop/verdict"
 VERDICT_APP_ID = 5203169
 TURN_TICK_SECONDS = 50
-GH_TOKEN_CACHE: str | None = None
-GH_AUTH_SOURCE: str | None = None
 
 
 class AutomergeError(RuntimeError):
@@ -152,91 +147,19 @@ def log(message: str) -> None:
 
 
 def run_gh(args: list[str], *, timeout: int = 60) -> str:
-    """Run gh with the Mjolnir app token when available; patched by tests."""
-    env = os.environ.copy()
-    if GH_TOKEN_CACHE:
-        env["GH_TOKEN"] = GH_TOKEN_CACHE
+    """Use the same host-side app-token runner as the CI monitor."""
     try:
-        result = subprocess.run(
-            [str(GH_BIN), *args],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-            check=False,
-            env=env,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise monitor.CommandError(f"gh {' '.join(args[:3])} failed: {exc}") from exc
-    if result.returncode:
-        output = (result.stdout or "").strip()
-        raise monitor.CommandError(
-            f"gh {' '.join(args[:3])} exited {result.returncode}"
-            + (f": {output}" if output else "")
-        )
-    return (result.stdout or "").strip()
-
-
-def _token_command_unavailable(detail: str, reason: str | None = None) -> bool:
-    lowered = detail.casefold()
-    return reason == "mj_missing" or any(
-        phrase in lowered
-        for phrase in (
-            "unknown command",
-            "unknown subcommand",
-            "unrecognized command",
-            "no such command",
-            "is not a mj command",
-        )
-    )
+        return monitor.run_gh(args, timeout=timeout)
+    except monitor.GitHubAuthError as exc:
+        raise AutomergeError(str(exc), reason=exc.reason) from exc
 
 
 def github_app_token() -> str | None:
-    """Use the app token seam; ambient auth is an explicit local-dev opt-in."""
-    global GH_TOKEN_CACHE, GH_AUTH_SOURCE
-    if GH_AUTH_SOURCE is not None:
-        return GH_TOKEN_CACHE
-
-    def unavailable(detail: str, reason: str) -> str | None:
-        global GH_TOKEN_CACHE, GH_AUTH_SOURCE
-        if REQUIRE_APP_TOKEN:
-            raise AutomergeError(
-                f"GitHub App token is required but unavailable: {detail}",
-                reason=reason,
-            )
-        GH_TOKEN_CACHE = None
-        GH_AUTH_SOURCE = f"AMBIENT gh auth (REQUIRE_APP_TOKEN=False; {reason})"
-        log(f"WARNING: {GH_AUTH_SOURCE}; {detail}")
-        return None
-
+    """Compatibility seam that delegates token policy to the shared monitor."""
     try:
-        result = monitor.mj_command(["github-token", "--owner", GH_OWNER], timeout=30)
-    except FileNotFoundError as exc:
-        return unavailable(str(exc), "github_app_token_unavailable")
-    except (monitor.MjError, OSError, subprocess.TimeoutExpired) as exc:
-        error_reason = getattr(exc, "reason", None)
-        reason = "github_app_token_unavailable" if _token_command_unavailable(
-            str(exc), error_reason
-        ) else "github_token_failed"
-        return unavailable(str(exc), reason)
-    else:
-        detail = monitor.mj_output(result)
-        if result.returncode != 0:
-            reason = "github_app_token_unavailable" if _token_command_unavailable(detail) \
-                else "github_token_failed"
-            return unavailable(f"mj github-token exited {result.returncode}: {detail}", reason)
-        else:
-            raw = (result.stdout or "").strip()
-            try:
-                payload = json.loads(raw)
-            except (ValueError, TypeError):
-                payload = raw
-            token = payload.get("token") if isinstance(payload, dict) else payload
-            if not isinstance(token, str) or not token.strip():
-                return unavailable("mj github-token returned no token", "github_token_invalid")
-            GH_TOKEN_CACHE, GH_AUTH_SOURCE = token.strip(), "mj github-token"
-    log(f"GitHub requests use {GH_AUTH_SOURCE}")
-    return GH_TOKEN_CACHE
+        return monitor.github_app_token()
+    except monitor.GitHubAuthError as exc:
+        raise AutomergeError(str(exc), reason=exc.reason) from exc
 
 
 def ensure_github_auth(conn: sqlite3.Connection, transport: monitor.SlackTransport) -> bool:
@@ -3092,12 +3015,10 @@ def active_batch(conn: sqlite3.Connection) -> sqlite3.Row | None:
 
 
 def run_automerge() -> int:
-    global GH_TOKEN_CACHE, GH_AUTH_SOURCE
     lock_handle = acquire_lock()
     if lock_handle is None:
         return 0
-    GH_TOKEN_CACHE = None
-    GH_AUTH_SOURCE = None
+    monitor.reset_github_auth_cache()
     try:
         try:
             transport = monitor.load_slack_transport()

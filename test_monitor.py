@@ -1681,3 +1681,83 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("Do not push any commit", prompt)
         self.assertIn("List any unpushed commits", prompt)
         self.assertNotIn("recovery block", prompt.lower())
+
+
+class GitHubAuthTests(unittest.TestCase):
+    def setUp(self):
+        monitor.reset_github_auth_cache()
+        monitor.REQUIRE_APP_TOKEN = True
+        monitor.GH_AUTH_FAILURE_HANDLER = None
+
+    def tearDown(self):
+        monitor.reset_github_auth_cache()
+        monitor.REQUIRE_APP_TOKEN = True
+        monitor.GH_AUTH_FAILURE_HANDLER = None
+
+    def test_monitor_refuses_to_poll_without_app_token_and_notifies_once_per_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transport = monitor.SlackTransport("webhook", webhook="test")
+            token_failure = completed("unknown command github-token", 1)
+            with (
+                mock.patch.object(monitor, "STATE_DIR", root / "state"),
+                mock.patch.object(monitor, "LOCK_PATH", root / "state" / "monitor.lock"),
+                mock.patch.object(monitor, "DB_PATH", root / "activity.db"),
+                mock.patch.object(monitor, "load_slack_transport", return_value=transport),
+                mock.patch.object(monitor, "mj_command", return_value=token_failure),
+                mock.patch.object(monitor, "poll_ci") as poll,
+                mock.patch.object(monitor, "slack_send", return_value=(True, None)) as slack,
+            ):
+                self.assertEqual(monitor.run_monitor(), 3)
+                self.assertEqual(monitor.run_monitor(), 3)
+                poll.assert_not_called()
+                self.assertEqual(slack.call_count, 1)
+
+            conn = sqlite3.connect(root / "activity.db")
+            try:
+                row = conn.execute(
+                    "SELECT reason, slack_notification_attempted "
+                    "FROM blocked_notifications WHERE workflow_run_id = -1"
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(row, ("github_app_token_unavailable", 1))
+
+    def test_gh_receives_app_token_and_cached_token_refreshes_after_30_minutes(self):
+        token_results = [completed("first-token"), completed("second-token")]
+        gh_results = [completed("ok"), completed("ok"), completed("ok")]
+        with (
+            mock.patch.object(monitor, "mj_command", side_effect=token_results) as mj,
+            mock.patch.object(monitor.subprocess, "run", side_effect=gh_results) as run,
+            mock.patch.object(
+                monitor.time, "monotonic", side_effect=[100, 100, 1500, 1901, 1901]
+            ),
+        ):
+            monitor.run_gh(["api", "user"])
+            monitor.run_gh(["api", "user"])
+            monitor.run_gh(["api", "user"])
+        self.assertEqual(mj.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["env"]["GH_TOKEN"] for call in run.call_args_list],
+            ["first-token", "first-token", "second-token"],
+        )
+
+    def test_gh_401_forces_a_fresh_app_token_before_retry(self):
+        with (
+            mock.patch.object(
+                monitor,
+                "mj_command",
+                side_effect=[completed("expired-token"), completed("fresh-token")],
+            ) as mj,
+            mock.patch.object(
+                monitor.subprocess,
+                "run",
+                side_effect=[completed("HTTP 401: Unauthorized", 1), completed("ok")],
+            ) as run,
+        ):
+            self.assertEqual(monitor.run_gh(["api", "user"]), "ok")
+        self.assertEqual(mj.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["env"]["GH_TOKEN"] for call in run.call_args_list],
+            ["expired-token", "fresh-token"],
+        )

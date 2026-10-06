@@ -211,20 +211,18 @@ class SelectionTests(TestCase):
 
 class IdentityAndPromptTests(TestCase):
     def setUp(self):
-        automerge.GH_TOKEN_CACHE = None
-        automerge.GH_AUTH_SOURCE = None
-        automerge.REQUIRE_APP_TOKEN = True
+        monitor.reset_github_auth_cache()
+        monitor.REQUIRE_APP_TOKEN = True
 
     def tearDown(self):
-        automerge.GH_TOKEN_CACHE = None
-        automerge.GH_AUTH_SOURCE = None
-        automerge.REQUIRE_APP_TOKEN = True
+        monitor.reset_github_auth_cache()
+        monitor.REQUIRE_APP_TOKEN = True
 
     def test_mj_token_is_used_for_gh_and_cached(self):
         token_result = subprocess.CompletedProcess([], 0, "app-token-value\n", "")
         with (
             mock.patch.object(monitor, "mj_command", return_value=token_result) as mj_command,
-            mock.patch.object(automerge.subprocess, "run",
+            mock.patch.object(monitor.subprocess, "run",
                               return_value=SimpleNamespace(returncode=0, stdout="ok")) as run,
         ):
             self.assertEqual(automerge.github_app_token(), "app-token-value")
@@ -235,13 +233,13 @@ class IdentityAndPromptTests(TestCase):
         self.assertEqual(run.call_args.kwargs["env"]["GH_TOKEN"], "app-token-value")
 
     def test_ambient_auth_fallback_only_when_mj_command_is_unavailable(self):
-        automerge.REQUIRE_APP_TOKEN = False
+        monitor.REQUIRE_APP_TOKEN = False
         with mock.patch.object(
             monitor, "mj_command",
             side_effect=monitor.MjError("missing mj executable", reason="mj_missing"),
         ):
             self.assertIsNone(automerge.github_app_token())
-        self.assertIn("AMBIENT gh auth", automerge.GH_AUTH_SOURCE)
+        self.assertIn("AMBIENT gh auth", monitor.GH_AUTH_SOURCE)
 
     def test_required_app_token_refuses_missing_command_without_fallback(self):
         with mock.patch.object(
@@ -251,7 +249,7 @@ class IdentityAndPromptTests(TestCase):
             with self.assertRaises(automerge.AutomergeError) as raised:
                 automerge.github_app_token()
         self.assertEqual(raised.exception.reason, "github_app_token_unavailable")
-        self.assertIsNone(automerge.GH_AUTH_SOURCE)
+        self.assertIsNone(monitor.GH_AUTH_SOURCE)
 
     def test_required_app_token_posts_only_one_blocked_notice_per_reason(self):
         conn = make_db()
@@ -278,7 +276,7 @@ class IdentityAndPromptTests(TestCase):
         with mock.patch.object(monitor, "mj_command", return_value=result):
             with self.assertRaises(automerge.AutomergeError):
                 automerge.github_app_token()
-        self.assertIsNone(automerge.GH_AUTH_SOURCE)
+        self.assertIsNone(monitor.GH_AUTH_SOURCE)
 
     def test_agent_prompt_uses_integration_pr_and_safe_eject_contract(self):
         prompt = automerge.build_prompt("abc123", [pull(7), pull(9, HEAD_TWO)], BASE_SHA)

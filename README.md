@@ -30,6 +30,15 @@ Conflicts are resolved by automerge, and created commits keep their run trailer
 for auditability. The monitor detects repair publication by looking up the PR
 for the session branch.
 
+Every host-side `gh` call from the monitor or automerge uses `GH_TOKEN` from
+`mj github-token --owner BrokkAi`; repair sessions continue to use their own
+Mjolnir-injected token. The shared `REQUIRE_APP_TOKEN` setting in `monitor.py`
+defaults to `True`, so polling stops and Slack receives one blocked notice per
+reason if the app token cannot be obtained. For local development only, setting
+it to `False` allows ambient `gh` authentication and logs that fallback
+explicitly. The supervisor caches the token for at most 30 minutes and asks
+Mjolnir for a fresh one after a GitHub 401 response.
+
 ## Lifecycle
 
 The monitor atomically claims each workflow run in

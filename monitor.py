@@ -23,7 +23,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 REPO_NAME = "BrokkAi/bifrost-dev"
@@ -42,6 +42,9 @@ BOT_TOKEN_PATH = CONFIG_DIR / "bot-token"
 CHANNEL_PATH = CONFIG_DIR / "channel-id"
 MJ_BIN = Path("/home/jonathan/.cargo/bin/mj")
 GH_BIN = Path("/usr/bin/gh")
+GH_OWNER = "BrokkAi"
+REQUIRE_APP_TOKEN = True  # Disable only for local development with ambient gh auth.
+GH_TOKEN_TTL_SECONDS = 30 * 60
 MJ_WORKSPACE = "CI"
 MJ_TARGET = "podman"
 MJ_BUNDLE = "bifrost"
@@ -78,7 +81,153 @@ def log(message: str) -> None:
 
 
 class CommandError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, reason: str = "github_command_failed") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+class GitHubAuthError(CommandError):
+    """The supervisor cannot establish its required GitHub authentication."""
+
+
+GH_TOKEN_CACHE: str | None = None
+GH_AUTH_SOURCE: str | None = None
+GH_TOKEN_CACHE_AT = 0.0
+GH_AUTH_FAILURE_HANDLER: Callable[[GitHubAuthError], None] | None = None
+
+
+def reset_github_auth_cache() -> None:
+    global GH_TOKEN_CACHE, GH_AUTH_SOURCE, GH_TOKEN_CACHE_AT
+    GH_TOKEN_CACHE = None
+    GH_AUTH_SOURCE = None
+    GH_TOKEN_CACHE_AT = 0.0
+
+
+def _token_command_unavailable(detail: str, reason: str | None = None) -> bool:
+    lowered = detail.casefold()
+    return reason == "mj_missing" or any(
+        phrase in lowered
+        for phrase in (
+            "unknown command",
+            "unknown subcommand",
+            "unrecognized command",
+            "no such command",
+            "is not a mj command",
+        )
+    )
+
+
+def github_app_token(*, force_refresh: bool = False) -> str | None:
+    """Return the cached Mjolnir app token, refreshing at least every 30 minutes."""
+    global GH_TOKEN_CACHE, GH_AUTH_SOURCE, GH_TOKEN_CACHE_AT
+    if force_refresh:
+        GH_TOKEN_CACHE = None
+        GH_AUTH_SOURCE = None
+        GH_TOKEN_CACHE_AT = 0.0
+    now = time.monotonic()
+    if (
+        not force_refresh
+        and GH_AUTH_SOURCE is not None
+        and not (REQUIRE_APP_TOKEN and GH_TOKEN_CACHE is None)
+        and now - GH_TOKEN_CACHE_AT < GH_TOKEN_TTL_SECONDS
+    ):
+        return GH_TOKEN_CACHE
+
+    def unavailable(detail: str, reason: str) -> str | None:
+        global GH_TOKEN_CACHE, GH_AUTH_SOURCE, GH_TOKEN_CACHE_AT
+        if REQUIRE_APP_TOKEN:
+            raise GitHubAuthError(
+                f"GitHub App token is required but unavailable: {detail}",
+                reason=reason,
+            )
+        GH_TOKEN_CACHE = None
+        GH_AUTH_SOURCE = f"AMBIENT gh auth (REQUIRE_APP_TOKEN=False; {reason})"
+        GH_TOKEN_CACHE_AT = time.monotonic()
+        log(f"WARNING: {GH_AUTH_SOURCE}; {detail}")
+        return None
+
+    try:
+        result = mj_command(["github-token", "--owner", GH_OWNER], timeout=30)
+    except FileNotFoundError as exc:
+        return unavailable(str(exc), "github_app_token_unavailable")
+    except (MjError, OSError, subprocess.TimeoutExpired) as exc:
+        error_reason = getattr(exc, "reason", None)
+        reason = (
+            "github_app_token_unavailable"
+            if _token_command_unavailable(str(exc), error_reason)
+            else "github_token_failed"
+        )
+        return unavailable(str(exc), reason)
+
+    detail = mj_output(result)
+    if result.returncode != 0:
+        reason = (
+            "github_app_token_unavailable"
+            if _token_command_unavailable(detail)
+            else "github_token_failed"
+        )
+        return unavailable(f"mj github-token exited {result.returncode}: {detail}", reason)
+    raw = (result.stdout or "").strip()
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        payload = raw
+    token = payload.get("token") if isinstance(payload, dict) else payload
+    if not isinstance(token, str) or not token.strip():
+        return unavailable("mj github-token returned no token", "github_token_invalid")
+    GH_TOKEN_CACHE = token.strip()
+    GH_AUTH_SOURCE = "mj github-token"
+    GH_TOKEN_CACHE_AT = time.monotonic()
+    log(f"GitHub requests use {GH_AUTH_SOURCE}")
+    return GH_TOKEN_CACHE
+
+
+def run_gh(args: list[str], *, timeout: int = 60) -> str:
+    """Run a host-side gh command with the shared Mjolnir app-token seam."""
+    def acquire_token(*, force_refresh: bool = False) -> str | None:
+        try:
+            return github_app_token(force_refresh=force_refresh)
+        except GitHubAuthError as exc:
+            if GH_AUTH_FAILURE_HANDLER is not None:
+                try:
+                    GH_AUTH_FAILURE_HANDLER(exc)
+                except Exception as notify_exc:
+                    log(f"could not record GitHub auth block: {notify_exc}")
+            raise
+
+    token = acquire_token()
+
+    def invoke(current_token: str | None) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        if current_token:
+            env["GH_TOKEN"] = current_token
+        try:
+            return subprocess.run(
+                [str(GH_BIN), *args],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                check=False,
+                env=env,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise CommandError(f"gh {' '.join(args[:3])} failed: {exc}") from exc
+
+    result = invoke(token)
+    output = (result.stdout or "").strip()
+    if result.returncode != 0 and re.search(
+        r"(?:HTTP\s+401|401\s+Unauthorized|Bad credentials)", output, re.IGNORECASE
+    ):
+        token = acquire_token(force_refresh=True)
+        result = invoke(token)
+        output = (result.stdout or "").strip()
+    if result.returncode != 0:
+        raise CommandError(
+            f"gh {' '.join(args[:3])} exited {result.returncode}"
+            + (f": {output}" if output else "")
+        )
+    return output
 
 
 class MjError(RuntimeError):
@@ -88,6 +237,8 @@ class MjError(RuntimeError):
 
 
 def run_command(args: list[str], *, cwd: Path | None = None, timeout: int = 60) -> str:
+    if args and Path(args[0]).name == "gh":
+        return run_gh(args[1:], timeout=timeout)
     try:
         result = subprocess.run(
             args,
@@ -1001,6 +1152,52 @@ def record_blocked_reason(
             "WHERE workflow_run_id = ? AND reason = ?",
             (int(ok), run.run_id, reason),
         )
+
+
+def notify_github_auth_blocked(
+    conn: sqlite3.Connection,
+    transport: SlackTransport,
+    exc: GitHubAuthError,
+) -> None:
+    reason = exc.reason
+    log(f"monitor blocked ({reason}): {exc}")
+    with conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO blocked_notifications
+                (workflow_run_id, reason, created_at, details)
+            VALUES (-1, ?, ?, ?)
+            """,
+            (reason, utc_now(), str(exc)),
+        )
+        row = conn.execute(
+            "SELECT slack_notification_attempted FROM blocked_notifications "
+            "WHERE workflow_run_id = -1 AND reason = ?",
+            (reason,),
+        ).fetchone()
+    if row is not None and not row["slack_notification_attempted"]:
+        ok, _ = slack_send(
+            transport,
+            f":warning: Bifrost CI monitor is blocked ({reason}): {exc}",
+        )
+        with conn:
+            conn.execute(
+                "UPDATE blocked_notifications SET slack_notification_attempted = ? "
+                "WHERE workflow_run_id = -1 AND reason = ?",
+                (int(ok), reason),
+            )
+
+
+def ensure_github_auth(
+    conn: sqlite3.Connection, transport: SlackTransport
+) -> bool:
+    """Check app-token availability before recovery or CI polling can call gh."""
+    try:
+        github_app_token()
+    except GitHubAuthError as exc:
+        notify_github_auth_blocked(conn, transport, exc)
+        return False
+    return True
 
 
 def repair_branch(run_id: int, attempt: int) -> str:
@@ -2485,6 +2682,7 @@ def row_session_id(conn: sqlite3.Connection, run_id: int) -> str:
 
 
 def run_monitor() -> int:
+    global GH_AUTH_FAILURE_HANDLER
     STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     STATE_DIR.chmod(0o700)
     lock_handle = LOCK_PATH.open("a+", encoding="utf-8")
@@ -2500,7 +2698,13 @@ def run_monitor() -> int:
         return 2
 
     conn = connect_db()
+    previous_auth_handler = GH_AUTH_FAILURE_HANDLER
+    GH_AUTH_FAILURE_HANDLER = (
+        lambda exc: notify_github_auth_blocked(conn, transport, exc)
+    )
     try:
+        if not ensure_github_auth(conn, transport):
+            return 3
         runner_error = check_mj_support()
         mark_unattached_invocations_retryable(conn)
         recover_launching_invocations(conn, transport)
@@ -2708,11 +2912,25 @@ def run_monitor() -> int:
             )
             return 4
     finally:
+        GH_AUTH_FAILURE_HANDLER = previous_auth_handler
         conn.close()
 
 
 def check_only() -> int:
-    result = poll_ci()
+    global GH_AUTH_FAILURE_HANDLER
+    transport = load_slack_transport()
+    conn = connect_db()
+    previous_auth_handler = GH_AUTH_FAILURE_HANDLER
+    GH_AUTH_FAILURE_HANDLER = (
+        lambda exc: notify_github_auth_blocked(conn, transport, exc)
+    )
+    try:
+        if not ensure_github_auth(conn, transport):
+            return 3
+        result = poll_ci()
+    finally:
+        GH_AUTH_FAILURE_HANDLER = previous_auth_handler
+        conn.close()
     print(
         json.dumps(
             {
