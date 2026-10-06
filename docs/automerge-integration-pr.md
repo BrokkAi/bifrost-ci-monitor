@@ -46,6 +46,37 @@ Unchanged from the current job, with one policy setting:
   require reviews) or `approved` (review decision APPROVED).
 - PRs already in an active integration PR are not selected again.
 
+## Priority lane and operator fast-track
+
+Anyone with write access can apply the `mergemarshall-priority` label. When at
+least one otherwise eligible PR has that label, the next selection contains
+only eligible priority PRs; every other PR waits. The label is not assigned
+automatically to CI monitor `ci-fix` PRs. If the selected priority set is one
+up-to-date PR, the existing direct-landing path applies.
+
+On each cron tick, if an eligible priority PR is not already in an active
+non-priority batch, the supervisor preempts that batch through the same
+persisted abort path as `--abort-batch`, with reason `preempted by priority PR
+#N`. No source PR is rejected. It starts the priority selection that tick when
+the abort completes, or on the next tick if it cannot finish immediately. A
+priority batch is never preempted by another priority PR. A batch whose success
+status has been posted or whose merge phase has started is allowed to finish
+before priority work starts.
+
+An operator can use `python automerge.py --land-now <PR-number>` to fast-track
+one PR. This waits up to two minutes for the cron lock, requires the PR to be
+open, non-draft, based on `master`, unrejected at its current head, and up to
+date with master (`behind_by == 0`). A behind PR is refused with instructions
+to update its branch. The normal CI-workflow-change hold applies unless the
+operator explicitly adds `--allow-workflow-changes`. The supervisor records a
+direct batch with source `operator`, posts
+`mergemarshall/verdict: success` on the exact head with description
+`fast-track by operator`, and merges with
+`gh pr merge <n> --merge --match-head-commit <sha>`. It does not abort or
+otherwise alter a batch already in progress; that batch handles any resulting
+master movement through its normal freshness/update path. The operator path
+does not wait for CI. Slack identifies operator fast-tracks separately.
+
 ## Building the integration branch
 
 One mj session per batch, as now (`--workspace CI --target podman --bundle

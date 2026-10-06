@@ -40,6 +40,7 @@ STATE_DIR = monitor.configured_path(
 LOCK_PATH = STATE_DIR / "automerge.lock"
 REJECTED_LABEL = "automerge-rejected"
 INTEGRATION_LABEL = "mergemarshall-batch"
+PRIORITY_LABEL = "mergemarshall-priority"
 TRUSTED_REJECTION_LOGIN = "mergemarshall[bot]"
 GH_OWNER = "BrokkAi"
 READY_POLICY = "non-draft"  # Change to "approved" to require an APPROVED review decision.
@@ -108,6 +109,7 @@ class PullRequest:
     title: str
     head_sha: str
     url: str
+    priority: bool = False
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -115,6 +117,7 @@ class PullRequest:
             "title": self.title,
             "head_sha": self.head_sha,
             "url": self.url,
+            "priority": self.priority,
         }
 
 
@@ -286,7 +289,7 @@ def remove_rejection_label(number: int) -> None:
 
 
 def select_eligible_pull_requests(*, dry_run: bool = False) -> list[PullRequest]:
-    """Return all open, non-draft master PRs not rejected at their current head."""
+    """Select eligible PRs, restricting the lane to priority PRs when present."""
     eligible: list[PullRequest] = []
     for item in list_open_pull_requests():
         base = item.get("base")
@@ -335,9 +338,11 @@ def select_eligible_pull_requests(*, dry_run: bool = False) -> list[PullRequest]
                 title=str(item.get("title") or f"PR #{number}"),
                 head_sha=head_sha.lower(),
                 url=str(item.get("html_url") or f"https://github.com/{REPO_NAME}/pull/{number}"),
+                priority=PRIORITY_LABEL in labels,
             )
         )
-    return sorted(eligible, key=lambda pull: pull.number)
+    priority = [pull for pull in eligible if pull.priority]
+    return sorted(priority or eligible, key=lambda pull: pull.number)
 
 
 def current_master_sha() -> str:
@@ -390,6 +395,9 @@ def connect_db() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS automerge_batches (
             batch_id TEXT PRIMARY KEY,
             kind TEXT NOT NULL DEFAULT 'batch',
+            source TEXT NOT NULL DEFAULT 'queue',
+            priority INTEGER NOT NULL DEFAULT 0,
+            allow_workflow_changes INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL,
             base_sha TEXT NOT NULL,
             pull_requests_json TEXT NOT NULL,
@@ -469,6 +477,9 @@ def connect_db() -> sqlite3.Connection:
     ensure_column(conn, "automerge_batches", "agent_final_message", "TEXT NOT NULL DEFAULT ''")
     for column, declaration in (
         ("kind", "TEXT NOT NULL DEFAULT 'batch'"),
+        ("source", "TEXT NOT NULL DEFAULT 'queue'"),
+        ("priority", "INTEGER NOT NULL DEFAULT 0"),
+        ("allow_workflow_changes", "INTEGER NOT NULL DEFAULT 0"),
         ("phase", "TEXT NOT NULL DEFAULT 'building'"),
         ("ci_mode", "TEXT NOT NULL DEFAULT 'sync'"),
         ("integration_pr_number", "INTEGER"),
@@ -528,6 +539,8 @@ def create_batch(
     batch_id: str | None = None,
     ci_mode: str | None = None,
     kind: str = "batch",
+    source: str = "queue",
+    allow_workflow_changes: bool = False,
 ) -> str:
     if not pulls:
         raise ValueError("cannot create an empty automerge batch")
@@ -550,14 +563,18 @@ def create_batch(
         conn.execute(
             """
             INSERT INTO automerge_batches
-                (batch_id, kind, status, base_sha, pull_requests_json, title, branch, created_at,
+                (batch_id, kind, source, priority, allow_workflow_changes, status, base_sha,
+                 pull_requests_json, title, branch, created_at,
                  active_pull_requests_json, phase, ci_mode, integration_pr_number,
                  integration_pr_url, ci_head_sha)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 identifier,
                 kind,
+                source,
+                int(any(pull.priority for pull in pulls)),
+                int(allow_workflow_changes),
                 status,
                 base_sha,
                 json.dumps([pull.as_json() for pull in pulls]),
@@ -582,6 +599,7 @@ def create_selected_batch(
     *,
     ci_mode: str | None = None,
     batch_id: str | None = None,
+    source: str | None = None,
 ) -> str:
     """Use direct landing only for one PR whose head already contains master."""
     kind = "batch"
@@ -593,6 +611,7 @@ def create_selected_batch(
             log(f"could not verify whether PR #{pulls[0].number} is up to date; using batch path: {exc}")
     return create_batch(
         conn, pulls, base_sha, batch_id=batch_id, ci_mode=ci_mode, kind=kind,
+        source=source or ("priority" if any(pull.priority for pull in pulls) else "queue"),
     )
 
 
@@ -621,6 +640,28 @@ def _batch_kind(row: sqlite3.Row | dict[str, Any]) -> str:
     return str(value or "batch")
 
 
+def _batch_source(row: sqlite3.Row | dict[str, Any]) -> str:
+    try:
+        value = row["source"]
+    except (KeyError, IndexError):
+        value = "queue"
+    return str(value or "queue")
+
+
+def _batch_priority(row: sqlite3.Row | dict[str, Any]) -> bool:
+    try:
+        return bool(row["priority"])
+    except (KeyError, IndexError):
+        return any(pull.priority for pull in row_pulls(row))
+
+
+def _batch_allows_workflow_changes(row: sqlite3.Row | dict[str, Any]) -> bool:
+    try:
+        return bool(row["allow_workflow_changes"])
+    except (KeyError, IndexError):
+        return False
+
+
 def _async_local_result(final: str) -> str | None:
     """Accept an async gate only with an explicit verdict and evidence summary."""
     matches = LOCAL_GATE_MARKER.findall(final or "")
@@ -646,6 +687,7 @@ def row_pulls(row: sqlite3.Row | dict[str, Any]) -> list[PullRequest]:
                 title=str(item["title"]),
                 head_sha=str(item["head_sha"]),
                 url=str(item["url"]),
+                priority=bool(item.get("priority", False)),
             )
             for item in data
             if isinstance(item, dict)
@@ -930,14 +972,17 @@ def send_start_notification(
         return
     pulls = row_pulls(row)
     details = ", ".join(f"#{pull.number} {pull.title}" for pull in pulls)
+    lane = "PRIORITY " if _batch_priority(row) else ""
+    if _batch_source(row) == "operator":
+        lane = "OPERATOR FAST-TRACK "
     if _batch_kind(row) == "direct":
         message = (
-            f":arrows_counterclockwise: Bifrost direct merge {row['batch_id']} "
+            f":arrows_counterclockwise: Bifrost {lane}direct merge {row['batch_id']} "
             f"starting from {row['base_sha'][:8]} with PR #{pulls[0].number}: {details}"
         )
     else:
         message = (
-            f":arrows_counterclockwise: Bifrost {AUTOMERGE_AGENT_LABEL} batch "
+            f":arrows_counterclockwise: Bifrost {lane}{AUTOMERGE_AGENT_LABEL} batch "
             f"{row['batch_id']} starting from {row['base_sha'][:8]} "
             f"with {len(pulls)} PRs: {details}"
         )
@@ -1316,8 +1361,12 @@ def detect_batch_outcomes(pulls: list[PullRequest]) -> BatchOutcome:
 
 def format_batch_outcome(batch_id: str, terminal_status: str, outcome: BatchOutcome,
                          *, ejected: list[str] | None = None,
-                         kind: str = "batch") -> str:
-    subject = "direct merge" if kind == "direct" else "integration batch"
+                         kind: str = "batch", priority: bool = False,
+                         source: str = "queue") -> str:
+    lane = "operator fast-track " if source == "operator" else (
+        "priority " if priority else ""
+    )
+    subject = f"{lane}direct merge" if kind == "direct" else f"{lane}integration batch"
     lines = [f"Bifrost {subject} {batch_id} finished ({terminal_status})."]
     lines.append("Landed (GitHub confirms merged):")
     lines.extend(f"• PR #{item.pull.number} {item.pull.title}" for item in outcome.merged)
@@ -1357,9 +1406,10 @@ def finish_batch(conn: sqlite3.Connection, transport: monitor.SlackTransport,
     ejected = [str(item) for item in ejected_data] if isinstance(ejected_data, list) else []
     summary = format_batch_outcome(
         batch_id, str(row["terminal_status"] or "completed"), outcome,
-        ejected=ejected, kind=_batch_kind(row),
+        ejected=ejected, kind=_batch_kind(row), priority=_batch_priority(row),
+        source=_batch_source(row),
     )
-    if _batch_kind(row) == "batch" and row["terminal_status"] == "aborted":
+    if row["terminal_status"] == "aborted":
         reason = str(row["abort_reason"] or "Operator requested abort.")
         summary = f"{summary}\nAbort reason: {reason}"[:SLACK_MESSAGE_LIMIT]
     if row["ci_not_worse"]:
@@ -3648,6 +3698,11 @@ def _process_direct_batch(
     pull = pull_list[0]
     gate, view = _direct_premerge_check(pull)
     head = str(view.get("headRefOid") or pull.head_sha).lower()
+    allow_workflow_changes = (
+        _batch_source(row) == "operator" and _batch_allows_workflow_changes(row)
+    )
+    if gate == "workflow_changes" and allow_workflow_changes:
+        gate = "ready"
     if gate == "merged":
         _complete_direct_merge(conn, transport, row, view)
         return
@@ -3659,12 +3714,18 @@ def _process_direct_batch(
         )
         return
     if gate == "master_advanced":
+        message = (
+            "PR is behind master; update the branch and retry --land-now"
+            if _batch_source(row) == "operator"
+            else "master advanced; PR will enter the normal batch path next tick"
+        )
         _try_post_verdict_status(
             conn, transport, row, pull.head_sha, "pending",
-            "master advanced; PR will enter the normal batch path next tick",
+            message,
         )
         _direct_terminal(
             conn, transport, row, "direct_fell_back_to_batch",
+            message if _batch_source(row) == "operator" else
             "master advanced before direct landing; PR remains eligible for a normal batch.",
             verdict_state=None,
         )
@@ -3721,6 +3782,8 @@ def _process_direct_batch(
             return
     else:
         verdict = "direct: single up-to-date PR"
+    if _batch_source(row) == "operator":
+        verdict = "fast-track by operator"
 
     with conn:
         conn.execute(
@@ -3909,6 +3972,70 @@ def active_batch(conn: sqlite3.Connection) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def _batch_is_in_publish_phase(row: sqlite3.Row | dict[str, Any]) -> bool:
+    phase = str(row["phase"] or "")
+    return (
+        phase in {"merging", "direct_merging"}
+        or str(row["verdict_status_state"] or "") == "success"
+    )
+
+
+def _priority_preemption_target(
+    row: sqlite3.Row | dict[str, Any], pulls: list[PullRequest],
+) -> PullRequest | None:
+    """Return a priority PR that can preempt this not-yet-publishing batch."""
+    if (_batch_kind(row) not in {"batch", "direct"}
+            or _batch_source(row) == "operator" or _batch_priority(row)
+            or _batch_is_in_publish_phase(row)
+            or str(row["phase"] or "") in {"aborting", "terminal"}):
+        return None
+    already_in_batch = {pull.number for pull in _all_batch_pulls(row)}
+    candidates = [pull for pull in pulls
+                  if pull.priority and pull.number not in already_in_batch]
+    return min(candidates, key=lambda pull: pull.number) if candidates else None
+
+
+def abort_batch_locked(
+    conn: sqlite3.Connection,
+    transport: monitor.SlackTransport,
+    row: sqlite3.Row | dict[str, Any],
+    reason: str,
+) -> None:
+    """Run the persisted abort path while the caller holds the cron lock."""
+    batch_id = str(row["batch_id"])
+    if row["session_id"] or row["launch_attempted"]:
+        for missing_reason, details in monitor.runtime_binary_issues(include_mj=True):
+            if missing_reason.startswith("mj_"):
+                notify_blocked_once(conn, transport, batch_id, missing_reason, details)
+                raise AutomergeError(details, reason=missing_reason)
+    with conn:
+        conn.execute(
+            "UPDATE automerge_batches SET phase='aborting', status='running', "
+            "abort_reason=COALESCE(abort_reason, ?) WHERE batch_id=?",
+            (reason.strip() or "Operator requested abort.", batch_id),
+        )
+    latest = conn.execute(
+        "SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,),
+    ).fetchone()
+    send_start_notification(conn, transport, latest)
+    _complete_abort(conn, transport, latest)
+
+
+def preempt_batch_for_priority(
+    conn: sqlite3.Connection,
+    transport: monitor.SlackTransport,
+    row: sqlite3.Row | dict[str, Any],
+    pulls: list[PullRequest],
+) -> bool:
+    target = _priority_preemption_target(row, pulls)
+    if target is None:
+        return False
+    abort_batch_locked(
+        conn, transport, row, f"preempted by priority PR #{target.number}",
+    )
+    return True
+
+
 def read_active_batch_for_check() -> dict[str, Any] | None:
     """Read durable queue state without creating or migrating database tables."""
     if not DB_PATH.is_file():
@@ -3976,7 +4103,7 @@ def check_only() -> int:
         "base_sha": base_sha,
         "selected_prs": [pull.as_json() for pull in pulls],
         "would_do": (
-            "create and launch a batch for the selected PRs"
+            "create a direct landing or integration batch for the selected PRs"
             if pulls else "wait for eligible PRs"
         ),
     }, indent=2, sort_keys=True))
@@ -4013,25 +4140,8 @@ def run_abort_batch(batch_id: str, reason: str = "Operator requested abort.") ->
             if str(row["phase"] or "") == "terminal":
                 log(f"automerge batch {batch_id} is already terminal")
                 return 2
-            if row["session_id"] or row["launch_attempted"]:
-                for missing_reason, details in monitor.runtime_binary_issues(include_mj=True):
-                    if missing_reason.startswith("mj_"):
-                        notify_blocked_once(
-                            conn, transport, batch_id, missing_reason, details,
-                        )
-                        return 3
-            with conn:
-                conn.execute(
-                    "UPDATE automerge_batches SET phase='aborting', status='running', "
-                    "abort_reason=COALESCE(abort_reason, ?) WHERE batch_id=?",
-                    (reason.strip() or "Operator requested abort.", batch_id),
-                )
-            latest = conn.execute(
-                "SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,),
-            ).fetchone()
-            send_start_notification(conn, transport, latest)
             try:
-                _complete_abort(conn, transport, latest)
+                abort_batch_locked(conn, transport, row, reason)
             except (AutomergeError, monitor.MjError, monitor.CommandError,
                     OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
                 blocked_reason = (
@@ -4043,6 +4153,112 @@ def run_abort_batch(batch_id: str, reason: str = "Operator requested abort.") ->
                 log(f"batch {batch_id} abort is pending ({blocked_reason}): {exc}")
                 return 4
             return 0
+        finally:
+            conn.close()
+    finally:
+        lock_handle.close()
+
+
+def run_land_now(number: int, *, allow_workflow_changes: bool = False) -> int:
+    """Fast-track one current, up-to-date PR through the persisted direct path."""
+    lock_handle = acquire_lock_wait(timeout=120)
+    if lock_handle is None:
+        log("land-now timed out waiting for the automerge lock")
+        return 2
+    monitor.reset_github_auth_cache()
+    try:
+        try:
+            transport = monitor.load_slack_transport()
+        except (OSError, RuntimeError, ValueError) as exc:
+            log(str(exc))
+            return 2
+        conn = connect_db()
+        try:
+            for missing_reason, details in monitor.runtime_binary_issues(include_mj=False):
+                notify_blocked_once(
+                    conn, transport, "__automerge_runtime__", missing_reason, details,
+                )
+                return 3
+            if not ensure_github_auth(conn, transport):
+                return 3
+            try:
+                view = direct_pull_request_view(number)
+                state = str(view.get("state") or "").lower()
+                head = str(view.get("headRefOid") or "").lower()
+                if (state != "open" or bool(view.get("isDraft"))
+                        or view.get("baseRefName") != BASE_BRANCH
+                        or not re.fullmatch(r"[0-9a-f]{40}", head)):
+                    log(f"PR #{number} must be open, non-draft, based on master, with a valid head")
+                    return 2
+                if REJECTED_LABEL in _labels(view):
+                    marker = newest_trusted_rejection(list_pull_comments(number))
+                    if marker is not None and marker.head_sha == head:
+                        log(f"PR #{number} is rejected at head {head}; a new head is required")
+                        return 2
+                    remove_rejection_label(number)
+                behind_by = compare_pr_behind_by(head)
+                if behind_by != 0:
+                    log(
+                        f"PR #{number} is behind master by {behind_by} commit(s); "
+                        "update the branch, then retry --land-now"
+                    )
+                    return 2
+                base_sha = current_master_sha()
+                pull = PullRequest(
+                    number=number,
+                    title=str(view.get("title") or f"PR #{number}"),
+                    head_sha=head,
+                    url=str(view.get("url") or f"https://github.com/{REPO_NAME}/pull/{number}"),
+                    priority=PRIORITY_LABEL in _labels(view),
+                )
+                existing = conn.execute(
+                    "SELECT batch_id FROM automerge_batches WHERE source='operator' "
+                    "AND kind='direct' AND integration_pr_number=? AND ci_head_sha=? "
+                    "AND status IN ('launching', 'running', 'finishing') "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (number, head),
+                ).fetchone()
+                if existing is not None:
+                    batch_id = str(existing["batch_id"])
+                    with conn:
+                        conn.execute(
+                            "UPDATE automerge_batches SET allow_workflow_changes=? "
+                            "WHERE batch_id=?",
+                            (int(allow_workflow_changes), batch_id),
+                        )
+                else:
+                    batch_id = create_batch(
+                        conn, [pull], base_sha, ci_mode="async", kind="direct",
+                        source="operator", allow_workflow_changes=allow_workflow_changes,
+                    )
+                process_batch(conn, transport, batch_id)
+                result = conn.execute(
+                    "SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,),
+                ).fetchone()
+                if result and str(result["terminal_status"] or "").startswith("direct_fell_back"):
+                    log(f"PR #{number} was not fast-tracked: {result['terminal_status']}")
+                    return 2
+                if (result and str(result["verdict_status_description"] or "")
+                        == "needs human review: CI workflow changes"):
+                    log(
+                        f"PR #{number} is held for human review of CI workflow/action changes; "
+                        "after review, retry with --allow-workflow-changes if approved"
+                    )
+                    return 0
+                if result and str(result["phase"] or "") == "terminal":
+                    return 0 if str(result["terminal_status"] or "") == "merged" else 2
+                log(f"PR #{number} fast-track has not been confirmed merged; see the Slack notice")
+                return 4
+            except (AutomergeError, monitor.CommandError, monitor.MjError,
+                    OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+                reason = (
+                    exc.reason
+                    if isinstance(exc, (AutomergeError, monitor.MjError))
+                    else "land_now_failed"
+                )
+                notify_blocked_once(conn, transport, f"operator-{number}", reason, str(exc))
+                log(f"land-now for PR #{number} blocked ({reason}): {exc}")
+                return 4
         finally:
             conn.close()
     finally:
@@ -4071,14 +4287,35 @@ def run_automerge() -> int:
             monitor.update_known_failures(conn, transport)
             check_pending_suspensions(conn, transport)
             row = active_batch(conn)
-            if row is None:
-                pulls = select_eligible_pull_requests()
-                if not pulls:
-                    return 0
-                base_sha = current_master_sha()
-                batch_id = create_selected_batch(conn, pulls, base_sha)
-            else:
-                batch_id = str(row["batch_id"])
+            try:
+                pulls: list[PullRequest] | None = None
+                if row is not None:
+                    pulls = select_eligible_pull_requests()
+                    if preempt_batch_for_priority(conn, transport, row, pulls):
+                        row = active_batch(conn)
+                        if row is None:
+                            # Re-read labels and heads after aborting the prior batch.
+                            pulls = select_eligible_pull_requests()
+                if row is None:
+                    if pulls is None:
+                        pulls = select_eligible_pull_requests()
+                    if not pulls:
+                        return 0
+                    base_sha = current_master_sha()
+                    batch_id = create_selected_batch(conn, pulls, base_sha)
+                else:
+                    batch_id = str(row["batch_id"])
+            except (AutomergeError, monitor.CommandError, monitor.MjError,
+                    OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+                reason = (
+                    exc.reason
+                    if isinstance(exc, (AutomergeError, monitor.MjError))
+                    else "automerge_queue_failed"
+                )
+                owner = str(row["batch_id"]) if row is not None else "__automerge_queue__"
+                notify_blocked_once(conn, transport, owner, reason, str(exc))
+                log(f"queue selection blocked ({reason}): {exc}")
+                return 4
             try:
                 process_batch(conn, transport, batch_id)
             except (AutomergeError, monitor.MjError, monitor.CommandError,
@@ -4109,13 +4346,25 @@ def main(argv: list[str] | None = None) -> int:
         "--abort-batch", metavar="BATCH_ID",
         help="interrupt, suspend, and close the integration PR for a batch",
     )
+    actions.add_argument(
+        "--land-now", metavar="PR_NUMBER", type=int,
+        help="operator fast-track one open, up-to-date PR through direct landing",
+    )
+    parser.add_argument(
+        "--allow-workflow-changes", action="store_true",
+        help="allow --land-now to land a PR that changes CI workflow/action files",
+    )
     parser.add_argument("--reason", default="Operator requested abort.",
                         help="reason recorded on the integration PR and in Slack")
     args = parser.parse_args(argv)
+    if args.allow_workflow_changes and args.land_now is None:
+        parser.error("--allow-workflow-changes requires --land-now")
     if args.check:
         return check_only()
     if args.abort_batch:
         return run_abort_batch(args.abort_batch, args.reason)
+    if args.land_now is not None:
+        return run_land_now(args.land_now, allow_workflow_changes=args.allow_workflow_changes)
     try:
         return run_automerge()
     except (AutomergeError, monitor.CommandError, monitor.MjError, OSError,

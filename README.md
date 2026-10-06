@@ -227,7 +227,20 @@ without a mode remain `sync`.
 The default queue includes every open, non-draft PR based on `master`, except
 one rejected at its current head. The optional `READY_POLICY="approved"`
 setting also requires an approved review. Integration PRs are excluded from
-the source queue. When exactly one PR is eligible and GitHub compare reports
+the source queue. If any eligible PR has the `mergemarshall-priority` label,
+the next selection contains only eligible priority PRs; all other PRs wait.
+Anyone with write access may apply the label. `ci-fix` PRs are not priority
+unless someone explicitly applies that label. A single up-to-date priority PR
+uses the existing direct-landing path.
+
+Priority work preempts a non-priority integration batch while it is building or
+waiting for CI. The supervisor aborts that batch through the regular abort path
+with reason `preempted by priority PR #N`, leaves its source PRs unrejected, and
+starts priority work on the same tick when possible. A priority batch is never
+preempted by another priority PR. Once the supervisor has posted success or
+entered the merge phase, the current batch finishes first.
+
+When exactly one PR is eligible and GitHub compare reports
 `behind_by == 0` against current `master`, the supervisor records a `direct`
 attempt and lands that PR without an Mjolnir session or integration branch.
 If it is behind, or more than one PR is eligible, the normal batch path runs.
@@ -250,6 +263,20 @@ post `mergemarshall/verdict: success` on that exact reviewed head with the
 supervisor App token and merge it using
 `gh pr merge <n> --merge --match-head-commit <sha>`. The job never posts success
 automatically for this hold; see the [spec's human review steps](docs/automerge-integration-pr.md#human-review-for-ci-workflow-changes).
+
+An operator can fast-track one PR with
+`python automerge.py --land-now <PR-number>`. It waits up to two minutes for
+the cron lock, requires an open, non-draft PR based on master and up to date
+with master, and applies the rejection and workflow-change gates. A PR behind
+master is refused with a prompt to update its branch. Workflow or action
+changes remain held unless the operator explicitly supplies
+`--allow-workflow-changes`. The supervisor posts `mergemarshall/verdict`
+success on the exact head with description `fast-track by operator`, then
+merges with `--merge --match-head-commit`. It records a direct batch with
+source `operator` and does not abort or modify a batch already in progress; an
+active batch handles any resulting master movement through its normal update
+path. This operator path does not wait for CI. Slack marks operator
+fast-tracks separately.
 
 For regular batches, one DeepSeek Flash (`deepseek-flash`, no sub-agents)
 session starts from current master, merges source heads with merge commits,
@@ -404,6 +431,8 @@ labels:
 - `automerge-rejected` — marks a PR rejected at its current head, paired with a
   trusted bot comment containing `automerge-rejected-head: <full sha>`.
 - `mergemarshall-batch` — marks the integration PR.
+- `mergemarshall-priority` — opts an otherwise eligible PR into the priority
+  lane; the supervisor does not create this label.
 - `known-ci-failures` — labels the generated master-failure ledger issue.
 
 ## Running and inspecting
