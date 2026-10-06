@@ -65,6 +65,49 @@ bifrost --model deepseek-flash --subagents none`).
      conflict-resolution and fix notes;
    - label `mergemarshall-batch`.
 
+## Direct single-PR landing
+
+If selection returns exactly one eligible PR and GitHub compare
+`master...<head-sha>` reports `behind_by == 0`, the supervisor creates a durable
+batch record of kind `direct` and does not start an Mjolnir session or create an
+integration branch. A behind PR or a queue with multiple eligible PRs follows
+the ordinary integration-batch path. Direct records capture `CI_MODE` when
+created and are resumed from SQLite after a restart.
+
+Before landing, both modes recheck that the source PR is open, non-draft, based
+on `master`, still at the selected head, and not rejected at that exact head.
+The supervisor also verifies it is still up to date with master and scans the
+PR diff for `.github/workflows/` and `.github/actions/` changes. Such changes
+remain pending for a person because pull-request CI executes workflow
+definitions supplied by the PR.
+
+- In `async`, the direct PR lands as soon as the common source and workflow
+  checks pass. The supervisor does not query CI.
+- In `sync`, the supervisor waits for `PR verification` from the latest
+  `.github/workflows/ci.yml` `pull_request` run whose head SHA is exactly the
+  selected PR head. Green CI lands. Red CI lands only when the supervisor's
+  existing same-job test-identity and failed-step comparison shows that the
+  failing jobs are no worse than the baseline for the captured master tree.
+  If a red result is worse, the supervisor itself rejects that source head:
+  it posts the trusted `automerge-rejected-head: <full sha>` comment with the
+  failing jobs, tests, steps, CI run, baseline, and comparison evidence, then
+  applies `automerge-rejected`.
+
+After every gate passes, the supervisor posts `mergemarshall/verdict: success`
+on the source PR head and runs
+`gh pr merge <n> --merge --match-head-commit <sha>`. The persisted
+`direct_merging` phase makes restart recovery safe: if GitHub already merged the
+PR, the next tick observes that state and records completion; otherwise it
+retries the same exact-head merge without duplicating the status. If master
+advances and GitHub refuses the merge, the direct attempt ends without
+rejecting the PR; the next cron tick selects it through the normal batch path.
+
+For a direct PR held because it changes CI workflow or action files, a
+maintainer reviews the diff and CI evidence, then an authorized operator posts
+success on the exact reviewed PR head through the supervisor App status path
+and merges with `--match-head-commit`. The automerge job does not post success
+automatically for this hold.
+
 ## CI modes
 
 The Bifrost module setting `CI_MODE` defaults to `"async"`. When a batch is
@@ -151,6 +194,19 @@ pending, the supervisor posts `mergemarshall/verdict: pending` on that exact hea
 
 Limits: at most 4 CI rounds per sync batch. After that, the batch closes without
 landing, the integration PR is closed with a summary, and Slack is notified.
+
+## Operator abort
+
+`python automerge.py --abort-batch <batch-id> [--reason TEXT]` waits up to two
+minutes for the cron supervisor's same non-blocking lock before changing the
+batch. It interrupts an active Mjolnir turn, suspends that session with
+`--acknowledge-unpublished-work`, posts `mergemarshall/verdict: failure` on the
+integration PR's current head, and closes the integration PR with the supplied
+reason. It does not delete the remote branch. It removes any rejection labels
+applied to this batch's source PRs, writes no rejection markers, marks the
+batch aborted, and releases the queue. The abort phase is persisted so cron can
+finish the operation after a process restart; an aborted Slack outcome is
+retried independently if delivery fails.
 
 ## Human review for CI workflow changes
 

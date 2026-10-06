@@ -219,7 +219,31 @@ without a mode remain `sync`.
 The default queue includes every open, non-draft PR based on `master`, except
 one rejected at its current head. The optional `READY_POLICY="approved"`
 setting also requires an approved review. Integration PRs are excluded from
-the source queue. One DeepSeek Flash (`deepseek-flash`, no sub-agents)
+the source queue. When exactly one PR is eligible and GitHub compare reports
+`behind_by == 0` against current `master`, the supervisor records a `direct`
+attempt and lands that PR without an Mjolnir session or integration branch.
+If it is behind, or more than one PR is eligible, the normal batch path runs.
+
+Direct attempts repeat the source state, head, rejection-marker, and workflow
+change gates before merging. Async mode lands immediately after those checks.
+Sync mode waits for `PR verification` from the exact `.github/workflows/ci.yml`
+`pull_request` run at that head; green lands, and red lands only when the
+supervisor's same-job test and step comparison proves it is no worse than the
+captured master baseline. A worse red result is rejected by the supervisor at
+that exact head with `automerge-rejected-head: <full sha>`, evidence, and the
+`automerge-rejected` label. A PR that changes `.github/workflows/` or
+`.github/actions/` stays pending for human review in either mode. If master
+advances before the merge, the direct attempt ends without rejecting the PR;
+the next tick sends it through the normal batch path.
+
+For a direct PR held because it changes CI workflow or action files, a
+maintainer reviews the diff and CI evidence. An authorized operator can then
+post `mergemarshall/verdict: success` on that exact reviewed head with the
+supervisor App token and merge it using
+`gh pr merge <n> --merge --match-head-commit <sha>`. The job never posts success
+automatically for this hold; see the [spec's human review steps](docs/automerge-integration-pr.md#human-review-for-ci-workflow-changes).
+
+For regular batches, one DeepSeek Flash (`deepseek-flash`, no sub-agents)
 session starts from current master, merges source heads with merge commits,
 resolves conflicts, runs targeted checks using `ci-impact` and repository
 guidance, then opens or updates one integration PR. Its title lists its source
@@ -319,6 +343,18 @@ Each agent turn has a one-hour budget. On expiry the supervisor interrupts the
 turn and notifies Slack. Finished messages and the GitHub outcome are reported
 in the batch Slack thread. A failed or ambiguous `mj new` holds the queue until
 the session listing proves the exact-title session is absent.
+
+An operator can abort an active integration batch with
+`python automerge.py --abort-batch <batch-id> --reason "<reason>"`. The command
+waits up to two minutes for the same lock used by cron, interrupts and suspends
+its session, posts a failure status on the integration head, and closes the
+integration PR with the reason. It leaves the branch in place, removes any
+rejection labels applied by that batch, rejects no source PRs, and releases the
+queue. The aborted outcome is posted in Slack and retried on later ticks if
+Slack is unavailable.
+For a `direct` record there is no integration PR to close: abort marks the
+attempt, posts failure on its source head, and leaves the source PR open and
+eligible.
 
 The supervisor uses the GitHub App token from `mj github-token --owner
 BrokkAi`; sessions receive their own Mjolnir GitHub token, which cannot post

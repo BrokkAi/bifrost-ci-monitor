@@ -30,6 +30,23 @@ def pull(number: int = 7, head_sha: str = HEAD_ONE) -> automerge.PullRequest:
     )
 
 
+def direct_view(
+    *, state: str = "OPEN", head_sha: str = HEAD_ONE,
+    draft: bool = False, base: str = "master", labels: list[str] | None = None,
+    merged: bool = False,
+) -> dict:
+    return {
+        "state": "MERGED" if merged else state,
+        "headRefOid": head_sha,
+        "baseRefName": base,
+        "isDraft": draft,
+        "url": f"https://github.com/{automerge.REPO_NAME}/pull/7",
+        "mergedAt": "now" if merged else None,
+        "mergeCommit": {"oid": HEAD_THREE} if merged else None,
+        "labels": [{"name": label} for label in labels or []],
+    }
+
+
 def api_pull(
     number: int,
     *,
@@ -62,6 +79,7 @@ def make_db(
     ci_head_sha: str = HEAD_ONE,
     status: str = "running",
     ci_mode: str = "sync",
+    kind: str = "batch",
 ) -> sqlite3.Connection:
     selected = pulls or [pull()]
     conn = sqlite3.connect(":memory:")
@@ -69,7 +87,8 @@ def make_db(
     conn.executescript(
         """
         CREATE TABLE automerge_batches (
-            batch_id TEXT PRIMARY KEY, status TEXT NOT NULL, base_sha TEXT NOT NULL,
+            batch_id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'batch',
+            status TEXT NOT NULL, base_sha TEXT NOT NULL,
             pull_requests_json TEXT NOT NULL, title TEXT NOT NULL UNIQUE,
             branch TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
             launch_attempted INTEGER NOT NULL DEFAULT 0, launch_attempted_at TEXT,
@@ -100,6 +119,7 @@ def make_db(
             verdict_status_sha TEXT, verdict_status_state TEXT,
             verdict_status_description TEXT,
             ci_not_worse INTEGER NOT NULL DEFAULT 0,
+            abort_reason TEXT, direct_rejection_evidence TEXT,
             pending_prompt TEXT,
             prompt_delivered INTEGER NOT NULL DEFAULT 0, turn_started_at TEXT
         );
@@ -114,7 +134,9 @@ def make_db(
         );
         """
     )
-    automerge.create_batch(conn, selected, BASE_SHA, batch_id=batch_id, ci_mode=ci_mode)
+    automerge.create_batch(
+        conn, selected, BASE_SHA, batch_id=batch_id, ci_mode=ci_mode, kind=kind,
+    )
     conn.execute(
         "UPDATE automerge_batches SET phase=?, status=?, session_id=?, thread_ts=?, "
         "start_notification_sent=1, integration_pr_number=?, ci_round=?, ci_head_sha=?, "
@@ -1719,6 +1741,441 @@ class PublicationGateTests(TestCase):
             conn.close()
 
 
+class DirectMergeTests(TestCase):
+    def _empty_db(self) -> sqlite3.Connection:
+        conn = make_db()
+        conn.execute("DELETE FROM automerge_batches WHERE batch_id='batch-test'")
+        conn.commit()
+        return conn
+
+    def test_one_up_to_date_pr_is_persisted_as_direct_without_session(self):
+        conn = self._empty_db()
+        with mock.patch.object(automerge, "gh_json", return_value={"behind_by": 0}) as gh:
+            batch_id = automerge.create_selected_batch(
+                conn, [pull()], BASE_SHA, ci_mode="async", batch_id="direct-one",
+            )
+        row = row_for(conn, batch_id)
+        self.assertEqual(row["kind"], "direct")
+        self.assertEqual(row["phase"], "direct_merge")
+        self.assertEqual(row["integration_pr_number"], 7)
+        self.assertEqual(row["ci_head_sha"], HEAD_ONE)
+        self.assertIsNone(row["session_id"])
+        self.assertIn("compare/master..." + HEAD_ONE, gh.call_args.args[0][1])
+        conn.close()
+
+    def test_behind_pr_uses_normal_batch_path(self):
+        conn = self._empty_db()
+        with mock.patch.object(automerge, "gh_json", return_value={"behind_by": 2}):
+            batch_id = automerge.create_selected_batch(
+                conn, [pull()], BASE_SHA, ci_mode="sync", batch_id="behind-one",
+            )
+        row = row_for(conn, batch_id)
+        self.assertEqual(row["kind"], "batch")
+        self.assertEqual(row["phase"], "building")
+        self.assertEqual(row["branch"], "mergemarshall/batch-behind-one")
+        conn.close()
+
+    def test_two_eligible_prs_use_normal_batch_without_compare(self):
+        conn = self._empty_db()
+        with mock.patch.object(automerge, "gh_json") as gh:
+            batch_id = automerge.create_selected_batch(
+                conn, [pull(), pull(8, HEAD_TWO)], BASE_SHA,
+                batch_id="multiple-prs",
+            )
+        self.assertEqual(row_for(conn, batch_id)["kind"], "batch")
+        gh.assert_not_called()
+        conn.close()
+
+    def test_async_direct_lands_without_mj_or_ci(self):
+        conn = make_db(
+            kind="direct", phase="direct_merge", ci_mode="async", session_id=None,
+            integration_pr_number=7,
+        )
+        merged = direct_view(merged=True)
+        status = direct_view()
+        with (
+            mock.patch.object(automerge, "_direct_premerge_check", return_value=("ready", status)),
+            mock.patch.object(automerge, "direct_pull_request_view", return_value=merged),
+            mock.patch.object(automerge, "check_pr_verification",
+                              side_effect=AssertionError("async direct mode queried CI")) as ci,
+            mock.patch.object(automerge, "run_gh") as gh,
+            mock.patch.object(automerge, "_try_post_verdict_status", return_value=True) as post,
+            mock.patch.object(automerge, "_complete_landed_batch") as complete,
+            mock.patch.object(monitor, "mj_command",
+                              side_effect=AssertionError("direct mode called Mjolnir")) as mj,
+        ):
+            automerge.process_batch(
+                conn, monitor.SlackTransport("webhook", webhook="x"), "batch-test",
+            )
+        merge = next(call.args[0] for call in gh.call_args_list
+                     if call.args[0][:2] == ["pr", "merge"])
+        self.assertEqual(merge[:3], ["pr", "merge", "7"])
+        self.assertIn("--merge", merge)
+        self.assertEqual(merge[merge.index("--match-head-commit") + 1], HEAD_ONE)
+        self.assertEqual(post.call_args.args[3:], (
+            HEAD_ONE, "success", "direct: single up-to-date PR",
+        ))
+        ci.assert_not_called()
+        mj.assert_not_called()
+        complete.assert_called_once()
+        conn.close()
+
+    def test_sync_direct_waits_for_pr_verification_provenance(self):
+        conn = make_db(
+            kind="direct", phase="direct_waiting_ci", ci_mode="sync", session_id=None,
+            integration_pr_number=7,
+        )
+        with (
+            mock.patch.object(automerge, "_direct_premerge_check",
+                              return_value=("ready", direct_view())),
+            mock.patch.object(automerge, "check_pr_verification", return_value="pending") as ci,
+            mock.patch.object(automerge, "_try_post_verdict_status") as post,
+            mock.patch.object(automerge, "run_gh") as gh,
+            mock.patch.object(monitor, "mj_command") as mj,
+        ):
+            automerge.process_batch(
+                conn, monitor.SlackTransport("webhook", webhook="x"), "batch-test",
+            )
+        ci.assert_called_once_with(HEAD_ONE)
+        self.assertEqual(post.call_args.args[3:6], (HEAD_ONE, "pending", "CI pending"))
+        self.assertFalse(any(call.args[0][:2] == ["pr", "merge"]
+                             for call in gh.call_args_list))
+        mj.assert_not_called()
+        self.assertEqual(row_for(conn)["phase"], "direct_waiting_ci")
+        conn.close()
+
+    def test_sync_green_direct_lands_on_the_checked_head(self):
+        conn = make_db(
+            kind="direct", phase="direct_waiting_ci", ci_mode="sync", session_id=None,
+            integration_pr_number=7,
+        )
+        with (
+            mock.patch.object(automerge, "_direct_premerge_check",
+                              side_effect=[("ready", direct_view()), ("ready", direct_view())]),
+            mock.patch.object(automerge, "check_pr_verification", return_value="success") as ci,
+            mock.patch.object(automerge, "direct_pull_request_view",
+                              return_value=direct_view(merged=True)),
+            mock.patch.object(automerge, "_try_post_verdict_status", return_value=True) as post,
+            mock.patch.object(automerge, "run_gh") as gh,
+            mock.patch.object(automerge, "_complete_landed_batch") as complete,
+            mock.patch.object(monitor, "mj_command") as mj,
+        ):
+            automerge.process_batch(
+                conn, monitor.SlackTransport("webhook", webhook="x"), "batch-test",
+            )
+        ci.assert_called_once_with(HEAD_ONE)
+        self.assertEqual(post.call_args.args[3:], (
+            HEAD_ONE, "success", "direct: single up-to-date PR",
+        ))
+        self.assertTrue(any(call.args[0][:2] == ["pr", "merge"]
+                            for call in gh.call_args_list))
+        complete.assert_called_once()
+        mj.assert_not_called()
+        conn.close()
+
+    def test_sync_red_direct_lands_when_supervisor_proves_not_worse(self):
+        conn = make_db(
+            kind="direct", phase="direct_waiting_ci", ci_mode="sync", session_id=None,
+            integration_pr_number=7,
+        )
+        details = {
+            "ci.yml/test": automerge.FailedJobDetails(
+                frozenset({"test step"}), frozenset({"crate::baseline_failure"}),
+            ),
+        }
+        report = failure_report({"ci.yml/test"}, "failing baseline test", details)
+        baseline = automerge.BaselineResult(
+            "ready", "master ci.yml run 12", 12, frozenset({"ci.yml/test"}),
+            "baseline log", failure_details=details,
+        )
+        with (
+            mock.patch.object(automerge, "_direct_premerge_check",
+                              side_effect=[("ready", direct_view()), ("ready", direct_view())]),
+            mock.patch.object(automerge, "check_pr_verification", return_value="failure"),
+            mock.patch.object(automerge, "_latest_completed_pr_ci_run_for_head",
+                              return_value={"id": 14, "conclusion": "failure"}),
+            mock.patch.object(automerge, "collect_failure_report_for_run", return_value=report),
+            mock.patch.object(automerge, "resolve_baseline", return_value=baseline),
+            mock.patch.object(automerge, "direct_pull_request_view",
+                              return_value=direct_view(merged=True)),
+            mock.patch.object(automerge, "_try_post_verdict_status", return_value=True) as status,
+            mock.patch.object(automerge, "run_gh") as gh,
+            mock.patch.object(automerge, "_complete_landed_batch") as complete,
+            mock.patch.object(automerge, "finish_batch"),
+            mock.patch.object(monitor, "mj_command") as mj,
+        ):
+            automerge.process_batch(
+                conn, monitor.SlackTransport("webhook", webhook="x"), "batch-test",
+            )
+        self.assertEqual(row_for(conn)["ci_not_worse"], 1)
+        self.assertTrue(any(call.args[3:5] == (
+            HEAD_ONE, "success",
+        ) and "not worse than master" in call.args[5] for call in status.call_args_list))
+        self.assertTrue(any(call.args[0][:2] == ["pr", "merge"]
+                            for call in gh.call_args_list))
+        complete.assert_called_once()
+        mj.assert_not_called()
+        conn.close()
+
+    def test_sync_red_worse_direct_pr_is_rejected_with_trusted_marker(self):
+        conn = make_db(
+            kind="direct", phase="direct_waiting_ci", ci_mode="sync", session_id=None,
+            integration_pr_number=7,
+        )
+        report = failure_report(
+            {"ci.yml/test"}, "new failing test log",
+            {"ci.yml/test": automerge.FailedJobDetails(
+                frozenset({"test step"}), frozenset({"crate::new_failure"}),
+            )},
+        )
+        baseline = automerge.BaselineResult("ready", "master ci.yml run 12", 12)
+        calls: list[list[str]] = []
+        with (
+            mock.patch.object(automerge, "_direct_premerge_check",
+                              return_value=("ready", direct_view())),
+            mock.patch.object(automerge, "check_pr_verification", return_value="failure"),
+            mock.patch.object(automerge, "_latest_completed_pr_ci_run_for_head",
+                              return_value={"id": 14, "conclusion": "failure"}),
+            mock.patch.object(automerge, "collect_failure_report_for_run", return_value=report),
+            mock.patch.object(automerge, "resolve_baseline", return_value=baseline),
+            mock.patch.object(automerge, "direct_pull_request_view", return_value=direct_view()),
+            mock.patch.object(automerge, "list_pull_comments", return_value=[]),
+            mock.patch.object(automerge, "_try_post_verdict_status", return_value=True) as status,
+            mock.patch.object(automerge, "run_gh", side_effect=lambda args, timeout=60: calls.append(args) or ""),
+            mock.patch.object(automerge, "finish_batch"),
+            mock.patch.object(monitor, "mj_command") as mj,
+        ):
+            automerge.process_batch(
+                conn, monitor.SlackTransport("webhook", webhook="x"), "batch-test",
+            )
+        comment = next(args for args in calls if args[:2] == ["pr", "comment"])
+        self.assertIn(f"automerge-rejected-head: {HEAD_ONE}", comment[comment.index("--body") + 1])
+        self.assertIn("crate::new_failure", comment[comment.index("--body") + 1])
+        label = next(args for args in calls if args[:2] == ["pr", "edit"])
+        self.assertEqual(label[label.index("--add-label") + 1], automerge.REJECTED_LABEL)
+        self.assertFalse(any(args[:2] == ["pr", "merge"] for args in calls))
+        self.assertTrue(any(call.args[3:5] == (HEAD_ONE, "failure")
+                            for call in status.call_args_list))
+        self.assertEqual(row_for(conn)["terminal_status"], "direct_rejected")
+        mj.assert_not_called()
+        conn.close()
+
+    def test_workflow_change_holds_direct_pr_for_human(self):
+        conn = make_db(
+            kind="direct", phase="direct_merge", ci_mode="async", session_id=None,
+            integration_pr_number=7,
+        )
+        with (
+            mock.patch.object(automerge, "direct_pull_request_view", return_value=direct_view()),
+            mock.patch.object(automerge, "integration_pr_changes_ci_control_files", return_value=True),
+            mock.patch.object(automerge, "compare_pr_behind_by",
+                              side_effect=AssertionError("workflow hold should run first")),
+            mock.patch.object(automerge, "check_pr_verification",
+                              side_effect=AssertionError("async direct mode queried CI")) as ci,
+            mock.patch.object(automerge, "_try_post_verdict_status") as status,
+            mock.patch.object(automerge, "notify_blocked_once") as notify,
+            mock.patch.object(automerge, "run_gh") as gh,
+            mock.patch.object(monitor, "mj_command") as mj,
+        ):
+            automerge.process_batch(
+                conn, monitor.SlackTransport("webhook", webhook="x"), "batch-test",
+            )
+        self.assertEqual(status.call_args.args[3:6], (
+            HEAD_ONE, "pending", "needs human review: CI workflow changes",
+        ))
+        self.assertEqual(notify.call_args.args[3], "ci_workflow_changes")
+        self.assertFalse(any(call.args[0][:2] == ["pr", "merge"]
+                             for call in gh.call_args_list))
+        ci.assert_not_called()
+        mj.assert_not_called()
+        self.assertEqual(row_for(conn)["phase"], "direct_merge")
+        conn.close()
+
+    def test_direct_merge_refusal_after_master_moves_releases_for_batch_retry(self):
+        conn = make_db(
+            kind="direct", phase="direct_merge", ci_mode="async", session_id=None,
+            integration_pr_number=7,
+        )
+        refusal = automerge.AutomergeError(
+            "GitHub says the branch is not up to date", reason="github_command_failed",
+        )
+
+        def mark_outcome_posted(db, _transport, _row):
+            with db:
+                db.execute(
+                    "UPDATE automerge_batches SET outcome_posted=1 WHERE batch_id='batch-test'"
+                )
+
+        with (
+            mock.patch.object(automerge, "_direct_premerge_check",
+                              return_value=("ready", direct_view())),
+            mock.patch.object(automerge, "direct_pull_request_view", return_value=direct_view()),
+            mock.patch.object(automerge, "compare_pr_behind_by", return_value=1) as compare,
+            mock.patch.object(automerge, "_try_post_verdict_status", return_value=True) as status,
+            mock.patch.object(automerge, "run_gh", side_effect=refusal) as gh,
+            mock.patch.object(automerge, "finish_batch", side_effect=mark_outcome_posted) as finish,
+            mock.patch.object(automerge, "notify_blocked_once") as notify,
+        ):
+            automerge.process_batch(
+                conn, monitor.SlackTransport("webhook", webhook="x"), "batch-test",
+            )
+        merge = gh.call_args.args[0]
+        self.assertEqual(merge[:2], ["pr", "merge"])
+        self.assertEqual(row_for(conn)["terminal_status"], "direct_fell_back_to_batch")
+        self.assertIsNone(automerge.active_batch(conn))
+        self.assertFalse(any("automerge-rejected-head:" in str(call.args)
+                             for call in gh.call_args_list))
+        self.assertTrue(any(call.args[3:5] == (HEAD_ONE, "pending")
+                            for call in status.call_args_list))
+        compare.assert_called_once_with(HEAD_ONE)
+        finish.assert_called_once()
+        notify.assert_not_called()
+        conn.close()
+
+    def test_restart_after_success_status_merges_once_without_reposting(self):
+        conn = make_db(
+            kind="direct", phase="direct_merge", ci_mode="async", session_id=None,
+            integration_pr_number=7,
+        )
+        real_status = automerge._try_post_verdict_status
+        crash_after_success = True
+        status_posts: list[list[str]] = []
+        merge_calls: list[list[str]] = []
+
+        def fake_gh(args: list[str], *, timeout: int = 60) -> str:
+            if args[:2] == ["api", f"repos/{automerge.REPO_NAME}/statuses/{HEAD_ONE}"]:
+                status_posts.append(args)
+            elif args[:2] == ["pr", "merge"]:
+                merge_calls.append(args)
+            else:
+                raise AssertionError(args)
+            return ""
+
+        def crash_after_status(*args, **kwargs):
+            nonlocal crash_after_success
+            posted = real_status(*args, **kwargs)
+            if crash_after_success and args[4] == "success":
+                crash_after_success = False
+                raise SystemExit("simulated process crash after status")
+            return posted
+
+        common = (
+            mock.patch.object(automerge, "_direct_premerge_check",
+                              return_value=("ready", direct_view())),
+            mock.patch.object(automerge, "direct_pull_request_view",
+                              return_value=direct_view(merged=True)),
+            mock.patch.object(automerge, "run_gh", side_effect=fake_gh),
+            mock.patch.object(automerge, "_complete_landed_batch"),
+        )
+        with common[0], common[1], common[2], common[3], \
+                mock.patch.object(automerge, "_try_post_verdict_status", side_effect=crash_after_status):
+            with self.assertRaises(SystemExit):
+                automerge.process_batch(
+                    conn, monitor.SlackTransport("webhook", webhook="x"), "batch-test",
+                )
+        self.assertEqual(row_for(conn)["phase"], "direct_merging")
+        self.assertEqual(row_for(conn)["verdict_status_state"], "success")
+        with common[0], common[1], common[2], common[3]:
+            automerge.process_batch(
+                conn, monitor.SlackTransport("webhook", webhook="x"), "batch-test",
+            )
+        self.assertEqual(len(status_posts), 1)
+        self.assertEqual(len(merge_calls), 1)
+        conn.close()
+
+
+class AbortBatchTests(TestCase):
+    def _run_abort(self, phase: str, session_id: str | None) -> None:
+        conn = make_db(phase=phase, session_id=session_id)
+        with conn:
+            conn.execute(
+                "UPDATE automerge_batches SET phase='aborting', abort_reason=?, "
+                "integration_pr_url=? WHERE batch_id='batch-test'",
+                ("operator stop: test reason", f"https://github.github/pr/{211}"),
+            )
+        transport = monitor.SlackTransport("webhook", webhook="x")
+
+        def mark_outcome_posted(db, _transport, _row):
+            with db:
+                db.execute(
+                    "UPDATE automerge_batches SET outcome_posted=1 WHERE batch_id='batch-test'"
+                )
+
+        session_status = mock.patch.object(
+            automerge, "_session_status", return_value={"state": "running"},
+        )
+        interrupt = mock.patch.object(automerge, "interrupt_and_wait")
+        suspend = mock.patch.object(automerge, "request_suspend", return_value=True)
+        with (
+            session_status as session,
+            interrupt as stop,
+            suspend as checkpoint,
+            mock.patch.object(automerge, "integration_pr_view", return_value={
+                "state": "OPEN", "headRefOid": HEAD_TWO,
+                "url": "https://github.github/pr/211",
+            }),
+            mock.patch.object(automerge, "direct_pull_request_view",
+                              return_value=direct_view(labels=[automerge.REJECTED_LABEL])),
+            mock.patch.object(automerge, "post_verdict_status") as post,
+            mock.patch.object(automerge, "run_gh") as gh,
+            mock.patch.object(automerge, "finish_batch", side_effect=mark_outcome_posted) as finish,
+        ):
+            automerge._complete_abort(conn, transport, row_for(conn))
+        updated = row_for(conn)
+        self.assertEqual(updated["phase"], "terminal")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["terminal_status"], "aborted")
+        self.assertIsNone(automerge.active_batch(conn))
+        if session_id:
+            session.assert_called_once_with(session_id)
+            stop.assert_called_once()
+            checkpoint.assert_called_once_with(conn, transport, "batch-test", session_id)
+        else:
+            session.assert_not_called()
+            stop.assert_not_called()
+            checkpoint.assert_not_called()
+        post.assert_called_once()
+        self.assertEqual(post.call_args.args[2:4], (HEAD_TWO, "failure"))
+        close = next(call.args[0] for call in gh.call_args_list
+                     if call.args[0][:2] == ["pr", "close"])
+        self.assertEqual(close[close.index("--comment") + 1], "operator stop: test reason")
+        self.assertTrue(any(call.args[0][:2] == ["pr", "edit"]
+                            and "--remove-label" in call.args[0]
+                            for call in gh.call_args_list))
+        self.assertFalse(any("--add-label" in call.args[0]
+                             or "automerge-rejected-head:" in call.args[0]
+                             for call in gh.call_args_list))
+        finish.assert_called_once()
+        conn.close()
+
+    def test_abort_building_interrupts_suspends_and_releases_queue(self):
+        self._run_abort("building", "session-building")
+
+    def test_abort_waiting_ci_interrupts_suspends_and_releases_queue(self):
+        self._run_abort("waiting_ci", "session-waiting-ci")
+
+    def test_abort_without_session_closes_pr_and_releases_queue(self):
+        self._run_abort("building", None)
+
+    def test_abort_lock_wait_retries_the_cron_lock(self):
+        handle = mock.Mock()
+        with (
+            mock.patch.object(automerge, "acquire_lock", side_effect=[None, None, handle]) as acquire,
+            mock.patch.object(automerge.time, "sleep") as sleep,
+        ):
+            result = automerge.acquire_lock_wait(timeout=10)
+        self.assertIs(result, handle)
+        self.assertEqual(acquire.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_abort_cli_dispatches_batch_id_and_reason(self):
+        with mock.patch.object(automerge, "run_abort_batch", return_value=0) as abort:
+            self.assertEqual(automerge.main([
+                "--abort-batch", "batch-123", "--reason", "operator reason",
+            ]), 0)
+        abort.assert_called_once_with("batch-123", "operator reason")
+
+
 class LaunchAndLifecycleTests(TestCase):
     def test_phase_and_integration_pr_fields_migrate_additively(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1736,6 +2193,9 @@ class LaunchAndLifecycleTests(TestCase):
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(automerge_batches)")}
             defaults = {row["name"]: row["dflt_value"]
                         for row in conn.execute("PRAGMA table_info(automerge_batches)")}
+            self.assertIn("kind", columns)
+            self.assertEqual(defaults["kind"], "'batch'")
+            self.assertIn("abort_reason", columns)
             self.assertIn("phase", columns)
             self.assertIn("ci_mode", columns)
             self.assertEqual(defaults["ci_mode"], "'sync'")
