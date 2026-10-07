@@ -27,13 +27,16 @@ def install(config, repository):
     return installed
 
 
-def service_unit(repository, listen):
+def service_unit(repository, listen, github_cli=None):
     address = ipaddress.ip_address(listen)
     if not address.is_private or address.is_unspecified:
         raise ValueError("service must listen on a specific private address")
     repo = Path(repository).resolve()
-    if any(c in str(repo) for c in ['\n', '"', '%']):
-        raise ValueError("unsupported service repository path")
+    local_gh = Path.home() / ".local/bin/gh"
+    configured_gh = github_cli or os.environ.get("BIFROST_GH_BIN")
+    gh = Path(configured_gh or (local_gh if os.access(local_gh, os.X_OK) else "/usr/bin/gh")).expanduser().resolve()
+    if any(c in str(path) for path in [repo, gh] for c in ['\n', '"', '%']):
+        raise ValueError("unsupported service path")
     return f'''[Unit]
 Description=MergeMarshall batch skill service
 After=network-online.target
@@ -43,6 +46,7 @@ Type=simple
 WorkingDirectory={repo}
 ExecStart=/usr/bin/python3 "{repo}/mm_service.py" --listen {address}
 Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/bin:/bin
+Environment="BIFROST_GH_BIN={gh}"
 Restart=on-failure
 RestartSec=2
 
@@ -56,13 +60,14 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=Path, default=Path.home() / ".config/mjolnir/config.toml")
     parser.add_argument("--repository", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--service-listen", help="install/start the user service on this private host IP")
+    parser.add_argument("--github-cli", help="GitHub CLI used by the service (defaults to BIFROST_GH_BIN or the user's installed gh)")
     args = parser.parse_args()
     for path in install(args.config, args.repository):
         print(path)
     if args.service_listen:
         unit = Path.home() / ".config/systemd/user/mm-skills.service"
         unit.parent.mkdir(parents=True, exist_ok=True)
-        unit.write_text(service_unit(args.repository, args.service_listen))
+        unit.write_text(service_unit(args.repository, args.service_listen, args.github_cli))
         env = dict(os.environ)
         env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
         subprocess.run(["systemctl", "--user", "daemon-reload"], env=env, check=True)

@@ -3441,13 +3441,9 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
 def _complete_landed_batch(conn: sqlite3.Connection, transport: monitor.SlackTransport,
                            row: sqlite3.Row | dict[str, Any], number: int,
                            *, merge_commit_sha: str | None = None) -> None:
-    outcome = detect_batch_outcomes(_all_batch_pulls(row))
-    for pending in outcome.pending:
-        try:
-            run_gh(["pr", "comment", str(pending.pull.number), "--repo", REPO_NAME,
-                    "--body", f"Integration PR #{number} landed, but GitHub does not yet show this constituent PR as merged. Please inspect the batch."])
-        except (monitor.CommandError, AutomergeError) as exc:
-            log(f"could not comment on unmerged PR #{pending.pull.number}: {exc}")
+    # Indirect merge status can lag, and excluded PRs intentionally remain open.
+    # Report constituent states once in finish_batch's summary, without sending
+    # provisional warning comments (and subscription emails) on individual PRs.
     if merge_commit_sha is None:
         try:
             merged_view = integration_pr_view(number)

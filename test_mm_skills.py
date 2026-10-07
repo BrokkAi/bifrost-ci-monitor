@@ -43,6 +43,18 @@ class InstallerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 installer.service_unit(ROOT, address)
 
+    def test_service_uses_the_configured_github_cli(self):
+        with mock.patch.dict(installer.os.environ, {"BIFROST_GH_BIN": "/opt/github/gh"}):
+            self.assertIn('Environment="BIFROST_GH_BIN=/opt/github/gh"',
+                          installer.service_unit(ROOT, "172.31.3.117"))
+            self.assertIn('Environment="BIFROST_GH_BIN=/opt/override/gh"',
+                          installer.service_unit(ROOT, "172.31.3.117", "/opt/override/gh"))
+        with (mock.patch.dict(installer.os.environ, {}, clear=True),
+              mock.patch.object(installer.Path, "home", return_value=Path("/home/test")),
+              mock.patch.object(installer.os, "access", return_value=True)):
+            self.assertIn('Environment="BIFROST_GH_BIN=/home/test/.local/bin/gh"',
+                          installer.service_unit(ROOT, "172.31.3.117"))
+
     def test_install_is_idempotent_and_preserves_existing_skills(self):
         with tempfile.TemporaryDirectory() as root:
             profile = Path(root) / "profile"

@@ -368,6 +368,10 @@ the batch branch, and requires fresh CI before another success status. The
 supervisor posts pending while CI runs and failure when a batch closes without
 landing. The bot never pushes master.
 
+After landing, constituent PR states appear in the single batch summary. The
+bot does not post per-PR warnings for provisional unmerged status: GitHub's
+indirect merge status can lag, and excluded PRs intentionally remain open.
+
 If the integration diff changes `.github/workflows/` or `.github/actions/`,
 the supervisor leaves the status pending with `needs human review: CI workflow
 changes` and holds the batch, because pull-request CI runs workflow definitions

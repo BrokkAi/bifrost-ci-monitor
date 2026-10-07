@@ -1744,6 +1744,38 @@ class PublicationGateTests(TestCase):
         self.assertEqual(row_for(conn)["verdict_status_state"], "success")
         conn.close()
 
+    def test_landed_batch_reports_pending_states_once_without_pr_comments(self):
+        conn = make_db(phase="merging", pulls=[pull(7), pull(8, HEAD_TWO), pull(9, HEAD_THREE)])
+        self.addCleanup(conn.close)
+        automerge._persist_excluded_source_heads(conn, row_for(conn), [
+            {"number": 8, "head_sha": HEAD_TWO, "kind": "removed"},
+            {"number": 9, "head_sha": HEAD_THREE, "kind": "rejected"},
+        ])
+        # Included #7 has not yet reflected its indirect merge. The other two
+        # were excluded and are not expected to become merged with this batch.
+        outcomes = automerge.BatchOutcome((), (), tuple(
+            automerge.PullRequestOutcome(p, "open") for p in [pull(7), pull(8, HEAD_TWO), pull(9, HEAD_THREE)]
+        ))
+        with (
+            mock.patch.object(automerge, "detect_batch_outcomes", return_value=outcomes) as detect,
+            mock.patch.object(automerge, "request_suspend"),
+            mock.patch.object(automerge, "run_gh", side_effect=AssertionError("unexpected PR comment")) as gh,
+            mock.patch.object(monitor, "slack_send", return_value=(True, None)) as send,
+        ):
+            automerge._complete_landed_batch(
+                conn, monitor.SlackTransport("webhook", webhook="x"), row_for(conn), 211,
+                merge_commit_sha=HEAD_THREE,
+            )
+        gh.assert_not_called()
+        detect.assert_called_once()
+        send.assert_called_once()
+        self.assertIn("Still open or otherwise pending:", send.call_args.args[1])
+        self.assertIn("PR #7", send.call_args.args[1])
+        updated = row_for(conn)
+        self.assertEqual(updated["terminal_status"], "merged")
+        self.assertEqual(updated["integration_merge_commit_sha"], HEAD_THREE)
+        self.assertEqual(updated["outcome_posted"], 1)
+
     def test_red_not_worse_merge_rechecks_job_subset_at_publication(self):
         conn = make_db(phase="merging")
         with conn:
