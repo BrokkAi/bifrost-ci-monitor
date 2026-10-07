@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Brokk AI
-"""Poll Bifrost CI workflows and launch one Mjolnir container repair per failed run."""
+"""Poll Bifrost CI failures and repair one unclaimed issue per Mjolnir session."""
 
 from __future__ import annotations
 
@@ -3645,242 +3645,34 @@ def row_session_id(conn: sqlite3.Connection, run_id: int) -> str:
 
 
 def run_monitor() -> int:
+    """Poll issue-scoped repairs; legacy run invocations remain historical records."""
+    import issue_fixer
+
     global GH_AUTH_FAILURE_HANDLER
     STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    STATE_DIR.chmod(0o700)
-    lock_handle = LOCK_PATH.open("a+", encoding="utf-8")
-    try:
-        fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return 0
-
-    try:
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_handle:
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
         transport = load_slack_transport()
-    except (OSError, RuntimeError, ValueError) as exc:
-        log(str(exc))
-        return 2
-
-    conn = connect_db()
-    previous_auth_handler = GH_AUTH_FAILURE_HANDLER
-    GH_AUTH_FAILURE_HANDLER = (
-        lambda exc: notify_github_auth_blocked(conn, transport, exc)
-    )
-    try:
-        if not ensure_runtime_binaries(conn, transport):
-            return 3
-        if not ensure_github_auth(conn, transport):
-            return 3
-        update_known_failures(conn, transport)
-        runner_error = check_mj_support()
-        mark_unattached_invocations_retryable(conn)
-        recover_launching_invocations(conn, transport)
-        check_pending_suspensions(conn, transport)
-        retry_pending_pr_detections(conn, transport)
-        reattach_running_invocations(
-            conn, transport, runner_error=runner_error
-        )
-        excluded_run_ids = handled_run_ids(conn)
+        conn = connect_db()
+        previous = GH_AUTH_FAILURE_HANDLER
+        GH_AUTH_FAILURE_HANDLER = lambda exc: notify_github_auth_blocked(conn, transport, exc)
         try:
-            first = poll_ci(excluded_run_ids)
-        except (CommandError, ValueError, json.JSONDecodeError) as exc:
-            log(f"CI poll failed: {exc}")
-            return 3
-        if first.state == "completed:success":
-            cleared = clear_escalation(conn)
-            if cleared is not None:
-                log("CI is green again; re-arming the auto-fixer")
-                resolved = (
-                    " The open escalation is resolved." if cleared["escalated"] else ""
-                )
-                slack_send(
-                    transport,
-                    f":white_check_mark: Bifrost CI is green again.{resolved} "
-                    "The auto-fixer is re-armed.",
-                )
+            if not ensure_runtime_binaries(conn, transport) or not ensure_github_auth(conn, transport):
+                return 3
+            # Do not overlap a legacy repair that an operator has not retired.
+            if conn.execute("SELECT 1 FROM invocations WHERE status IN "
+                            "('claimed','launching','running','pr_detection_pending') LIMIT 1").fetchone():
+                log("issue fixer waiting for a legacy repair invocation to finish")
+                return 0
+            update_known_failures(conn, transport)
+            issue_fixer.tick(conn, transport)
             return 0
-        if first.state != "red" or first.run is None:
-            return 0
-        run = first.run
-
-        episode = get_escalation(conn)
-        try:
-            episode = refresh_escalation_ownership(conn, episode)
-        except CommandError as exc:
-            log(f"escalation issue-state lookup failed: {exc}; retrying next tick")
-            record_blocked_reason(
-                conn,
-                transport,
-                first.run,
-                "github_prelaunch_failed",
-                str(exc),
-                thread_ts=episode["thread_ts"] if episode is not None else None,
-            )
-            return 3
-        try:
-            signature = failing_signature(run)
-        except (CommandError, ValueError, json.JSONDecodeError) as exc:
-            log(f"failing-surface lookup failed for run {run.run_id}: {exc}")
-            signature = ""
-        open_issue_url: str | None = None
-        reply_ts: str | None = None
-        if episode is not None:
-            baseline = signature_members(episode["signature"])
-            if signature:
-                new_surface = signature_members(signature) - baseline
-            elif run.sha == episode["sha"]:
-                new_surface = set()
-            else:
-                new_surface = {"<unreadable surface>"}
-            if not new_surface:
-                if episode["last_reported_run_id"] == run.run_id:
-                    return 0
-                if episode["escalated"]:
-                    issue = episode["issue_url"]
-                    ticket = f" (<{issue}|open ticket>)" if issue else ""
-                    slack_send(
-                        transport,
-                        f":red_circle: New failed build "
-                        f"{format_commit(run.sha)} — still the failing set a human "
-                        f"already owns{ticket}; standing down. <{run.url}|{run.workflow} run>",
-                        thread_ts=episode["thread_ts"],
-                    )
-                    mark_reported(conn, run.run_id)
-                    return 0
-                reply_ts = episode["thread_ts"]
-                log(f"new failed build within the current set; re-engaging {AGENT_LABEL}")
-            else:
-                open_issue_url = (
-                    episode["issue_url"] if episode["escalated"] else None
-                )
-                log(
-                    f"new failing surface ({sorted(new_surface)}); resetting the thread"
-                )
-
-        retry_row = conn.execute(
-            "SELECT thread_ts, status FROM invocations WHERE workflow_run_id = ?",
-            (run.run_id,),
-        ).fetchone()
-        if invocation_exists(conn, run.run_id):
-            return 0
-        if runner_error:
-            details = (
-                "Installed mj does not support transcript --finished-only; "
-                "upgrade mj before the monitor can launch or supervise a repair."
-                if runner_error == "mj_too_old"
-                else f"Mjolnir runner unavailable ({runner_error})."
-            )
-            record_blocked_reason(
-                conn, transport, run, runner_error, details,
-                thread_ts=retry_row["thread_ts"] if retry_row else None,
-            )
-            return 4
-
-        try:
-            second = poll_ci(excluded_run_ids)
-        except (CommandError, ValueError, json.JSONDecodeError) as exc:
-            record_blocked_reason(
-                conn, transport, run, "github_prelaunch_failed", str(exc)
-            )
-            return 4
-        if (
-            second.state != "red"
-            or second.run is None
-            or second.run.run_id != run.run_id
-        ):
-            return 0
-        queued_prs = prepare_queued_prs_before_launch(
-            conn,
-            transport,
-            run,
-            reply_ts or (retry_row["thread_ts"] if retry_row else None),
-        )
-        if queued_prs is None:
-            return 4
-        base_sha = second.head_sha
-        if not claim_invocation(conn, run, base_sha):
-            return 0
-        with conn:
-            conn.execute(
-                "UPDATE invocations SET queued_ci_fix_prs_json = ? "
-                "WHERE workflow_run_id = ?",
-                (serialize_queued_prs(queued_prs), run.run_id),
-            )
-        invocation = conn.execute(
-            "SELECT attempt_count, started_at FROM invocations WHERE workflow_run_id = ?",
-            (run.run_id,),
-        ).fetchone()
-        attempt = int(invocation["attempt_count"] or 1)
-
-        if (
-            reply_ts is None
-            and retry_row is not None
-            and retry_row["status"] in RETRYABLE_INVOCATION_STATUSES
-            and retry_row["thread_ts"]
-        ):
-            reply_ts = str(retry_row["thread_ts"])
-        commit_link = format_commit(run.sha)
-        if reply_ts:
-            thread_ts = reply_ts
-            slack_send(
-                transport,
-                f":rotating_light: New failed build {commit_link} still red on the "
-                f"same set; {AGENT_LABEL} re-engaged. <{run.url}|Open {run.workflow} run>",
-                thread_ts=thread_ts,
-            )
-        else:
-            _, thread_ts = slack_send(
-                transport,
-                f":rotating_light: Bifrost {run.workflow} is red at {commit_link}. "
-                f"{AGENT_LABEL} auto-fixer engaged. <{run.url}|Open {run.workflow} run>",
-            )
-        with conn:
-            conn.execute(
-                "UPDATE invocations SET status = 'launching', "
-                "start_notification_attempted = 1, thread_ts = ? "
-                "WHERE workflow_run_id = ?",
-                (thread_ts, run.run_id),
-            )
-
-        session_id: str | None = None
-        lifecycle_called = False
-        try:
-            log(
-                f"launching {AGENT_LABEL} for red {run.workflow} at "
-                f"{run.sha[:8]} from master {base_sha[:8]}"
-            )
-            session_id, branch = launch_mj_session_with_queued_prs(
-                run, base_sha, attempt, open_issue_url, queued_prs,
-                render_known_failures_prompt(conn, omit_linked=True),
-            )
-            store_session(conn, run.run_id, session_id)
-            lifecycle_called = True
-            result = run_session_lifecycle(
-                conn,
-                transport,
-                run,
-                session_id,
-                branch,
-                None,
-            )
-            detect_and_finalize_pr(conn, transport, run, result, branch)
-            return 0
-        except (MjError, CommandError, ValueError, sqlite3.Error) as exc:
-            if session_id and not lifecycle_called:
-                suspend_session(conn, transport, run.run_id, session_id)
-            reason = (
-                exc.reason
-                if isinstance(exc, MjError)
-                else "github_compare_failed"
-                if lifecycle_called
-                else "mj_new_failed"
-            )
-            record_blocked_reason(
-                conn, transport, run, reason, str(exc), thread_ts=thread_ts
-            )
-            return 4
-    finally:
-        GH_AUTH_FAILURE_HANDLER = previous_auth_handler
-        conn.close()
+        finally:
+            GH_AUTH_FAILURE_HANDLER = previous
+            conn.close()
 
 
 def check_only() -> int:

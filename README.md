@@ -1,158 +1,105 @@
 # Bifrost CI Auto-fixer
 
-This monitor polls the CI, Hourly CI, and Nightly CI GitHub Actions workflows
-for BrokkAi/bifrost-dev every five minutes. CI push runs follow master; Hourly
-CI and Nightly CI also include their scheduled and manually dispatched runs.
-When a settled latest run is red, the monitor starts a Mjolnir container session
-at the current master SHA fetched from GitHub.
+`monitor.py` polls the shared failure ledger and runs one issue-scoped repair at
+a time through `issue_fixer.py`. Triage diagnoses failed CI, Hourly CI, and Nightly
+CI runs and creates individual `buildfailure` issues. The fixer selects an open,
+unassigned issue without `agent-in-progress`; the aggregate known-failures issue
+is never a repair target. Issues assigned to another person are left to them.
 
-The agent diagnoses each failure independently and follows one of four paths:
+Each session handles only its selected issue. It reads Bifrost's `AGENTS.md`,
+claims the issue for `mergemarshall[bot]` with `agent-in-progress`, and posts a
+claim comment containing its session and branch. It refreshes ownership before
+claiming and publishing. On standing down without a submitted repair, it removes
+only its own claim. GitHub must accept the assignment; a failed claim does not
+permit work to begin.
 
-- FIX: make a small repair, test it, commit it with the trailer
-  CI-Repair-Run: <run-id>, push the session branch, and open a `ci-fix` PR for
-  automerge. The PR body records the failing run and tests, introducing commit,
-  classification, and evidence.
-- REVERT: revert a change when a direct fix is too involved, document the
-  regression, add the same run trailer, and open a `ci-fix` PR. The issue
-  comment and final Slack message link to the revert PR.
-- BLOCKED REVERT: make no changes or commits, file a buildfailure issue, and
-  ping the team when a revert conflicts with later dependent work.
-- ESCALATE: make no changes or commits, file an issue, and ping the team for
-  flaky, infrastructure, or unpinnable failures.
+The agent chooses a straightforward production fix or mechanical test update,
+otherwise reverts the introducing change. If subsequent work makes the revert
+nontrivial, it records the evidence and escalates on the same issue. Unrelated CI
+failures are validation limitations, not extra repair tasks. The agent may also bail
+out on a particularly tricky issue or irreconcilable requirements: it documents
+the blocker, adds `Escalated`, assigns `DavidBakerEffendi`, and releases its own
+claim. Escalated issues are never selected automatically. Fixes go through a
+`ci-fix` PR, with `Fixes #N`, `CI-Repair-Issue: N` and relevant run trailers. The
+agent merges current master before opening/readying the PR, uses draft status
+while working, and never merges its own PR or pushes master.
 
-The repair agent publishes only its `ci-repair/<run-id>-<attempt>` branch and
-PR; it never force-pushes, writes directly to master, or merges its own PR. If
-one invocation makes both fixes and reverts, it puts all of its commits in one
-PR. The automerge agent batches open, ready PRs into one integration PR. The
-repository's own CI verifies that exact integration head before the bot merges
-it; red batches are repaired or have responsible PRs removed and rebuilt.
-Conflicts are resolved by automerge, and created commits keep their run trailer
-for auditability. The monitor detects repair publication by looking up the PR
-for the session branch.
+## Rejected repair PRs
 
-Every host-side `gh` call from the monitor or automerge uses `GH_TOKEN` from
-`mj github-token --owner BrokkAi`; repair sessions continue to use their own
-Mjolnir-injected token. The shared `REQUIRE_APP_TOKEN` setting in `monitor.py`
-defaults to `True`, so polling stops and Slack receives one blocked notice per
-reason if the app token cannot be obtained. For local development only, setting
-it to `False` allows ambient `gh` authentication and logs that fallback
-explicitly. The supervisor caches the token for at most 30 minutes and asks
-Mjolnir for a fresh one after a GitHub 401 response.
+Each idle poll reads current GitHub candidates and selects one with SQL ordering:
+rejected fixer PRs first, then oldest issue number. There is no stored pending queue.
+The scheduler requires a recorded fixer PR association and a trusted merger
+comment whose `automerge-rejected-head` exactly matches the current PR SHA. A
+stale label or another author's PR does not trigger a retry. Another person's
+assignment prevents a retry, too; the existing MergeMarshall claim is allowed
+only for its own recorded repair.
 
-The fixer, merger, and triage poller update the shared `known_failures` ledger at most once every
-five minutes. It records parser-derived identities from completed master runs
-for CI, Hourly CI, and Nightly CI, marks failures fixed when their job passes or
-their identity disappears, and links monitor repair PRs or escalation issues.
-The pinned `Known CI failures on master` issue is a generated view; SQLite is
-the source of truth. Create the `known-ci-failures` label before the first
-upkeep run so the bot can label the issue it creates.
+The retry receives the same issue, PR, branch, rejected head and rejection
+comments. It checks out the existing branch, makes the PR draft before pushing,
+appends corrections, merges master, validates and readies the same PR. A changed
+head re-enters the merge queue. Each rejected head is handled once; a rejection
+of a later head can launch another repair. This priority does not interrupt an
+already running repair.
 
-## Lifecycle
+## Dossier
 
-The monitor atomically claims each workflow run in
-`$HOME/Projects/bifrost-ci/activity.db` by default. Override the database path
-with `BIFROST_CI_DB`. It waits five minutes after a failed attempt
-first appears so RunsOn can request a replacement attempt, and serializes
-polls with a local lock. Before launch it confirms that the same run is still
-red and reads the current master SHA from GitHub.
+The prompt includes the target issue body, recent comments, only that issue's
+linked failure observations and diagnosis provenance, plus a compact inventory
+of open PRs targeting master. The agent judges PR relevance. A rejection retry
+also includes the merger's rejection evidence. There is no dump of every open
+issue or directive to fix every red test.
 
-A new repair uses the CI workspace, podman target, bifrost bundle, and the
-`deepseek-flash` model with no sub-agents. Mjolnir creates the branch
-ci-repair/<run-id>-<attempt> at that full master SHA and receives the prompt
-from a temporary file. Its agent label is `DeepSeek Flash (mj)`. The container's Git and gh
-commands use the session's injected GitHub token.
+Bodies are excerpts with explicit truncation flags. The final JSON-encoded
+prompt is capped at 96 KiB, leaving room within mj's 128 KiB request limit. If
+necessary, general PR inventory entries are omitted first, followed by older
+comments; counts tell the agent what to retrieve with `gh`. Target issue and
+rejection evidence take precedence.
 
-Each new repair also receives a timestamped dossier: the observed run and checkout
-SHA, open ledger failures with diagnosis provenance, recent triage jobs, every
-open issue, and every open PR targeting master (including drafts and PRs without
-`ci-fix`). Failure-ticket bodies and PR bodies are bounded excerpts with explicit
-truncation flags. The fixer judges relevance, reads full bodies and comments,
-and checks current master before acting. Inventory failures are recorded in the
-dossier so the agent can retry them; they do not prevent launching a repair.
+## Lifecycle and inspection
 
-While a turn runs, the monitor polls mj wait and the finished-only transcript
-about every five seconds. The bot transport relays each completed agent message
-into the Slack thread. The transcript cursor and captured text are saved after
-each poll. If the monitor restarts, it looks up the recorded Mjolnir session,
-reattaches to an active turn, and resumes from the saved cursor without
-reposting completed messages. Relay delivery is acknowledged item by item;
-failed Slack posts remain eligible for retry. A post-close transcript revision
-with an already-posted stable ID is deduplicated, so its late update is omitted.
-When the turn ends, the monitor drains the transcript once more and looks for a
-PR created from that session's exact branch. If it finds one, Slack reports the
-linked PR number and escalation detection is skipped. If none exists, the
-monitor checks the transcript for escalation. GitHub lookup failures retry on
-later ticks; after three consecutive failures the invocation gets the distinct
-`pr_detection_failed` status and a Slack notice.
+The `issue_repairs` table in `$HOME/Projects/bifrost-ci/activity.db` stores one
+job per issue or exact rejected PR head, its prompt, branch, session, transcript
+cursor and outcome. Multiple issues from the same CI run can have independent
+sessions. Historical run-wide `invocations` remain readable; they are no longer
+scheduled. A still-active legacy invocation blocks new work until retired.
 
-Repairs have no runtime deadline. A bounded poll that finds the agent still
-working continues observing the same live session. A supervision failure leaves
-it live for the next monitor invocation to reattach; elapsed time does not kill
-the repair. After capturing a terminal result, the monitor asks Mjolnir to
-suspend and checkpoint the container without waiting for the background
-suspension to finish. Legacy timeout handoffs already recorded in the database
-can still be recovered, but normal repairs never enter that path. Later ticks verify that
-requested suspensions reached a stopped state, retry once, and report persistent
-failures in the Slack thread.
+Repairs use workspace CI, target podman, bundle bifrost, `deepseek-flash`, no
+subagents, 32 CPUs and 28 GiB RAM. New jobs branch from current master; rejection
+retries use the existing PR branch. The session stays live through the work and
+has no wall-clock deadline. Each cron tick observes it without suspending or
+restarting the agent. After the final outcome is captured and the submitted PR
+is verified, the session is checkpointed and suspended. Supervision failures
+are recorded for the next poll, leaving the session intact.
 
-An invocation with an active session remains attached across monitor restarts.
-Older worktree recovery statuses and manifests are retained as finished
-history; they do not block current polling. Repair sessions do not use the
-local ~/Projects/bifrost-ci Git worktree or its tags; the monitor's existing
-SQLite database remains at ~/Projects/bifrost-ci/activity.db.
+`monitor.py` retains the shared GitHub App authentication, Slack transport,
+ledger and CI helpers used by all three components. Every host-side `gh` call
+uses the installation token from `mj github-token`; sessions use mj's injected
+token. Configuration and data stay on the host; do not commit secrets or DBs.
+The pinned `Known CI failures on master` issue is generated from the SQLite
+ledger. Only completed CI evidence clears a failure; a fixer PR merely links
+its target issue's observations to proposed work.
 
-## Slack delivery
+With the Slack bot transport, each repair gets a thread and completed agent
+messages are relayed with persisted cursors and stable-ID deduplication. The
+webhook transport gets engagement and outcome messages. See MORNING-SETUP.md.
 
-Slack has two transports. With a bot token and channel configured through
---configure-bot, engagement opens a thread and finished agent messages stream
-into its replies. An incoming webhook configured through --configure-slack
-receives engagement and outcome messages but cannot receive the live feed.
-The bot transport is preferred when available. See MORNING-SETUP.md for bot
-token setup.
-
-If the monitor cannot launch or supervise a red run because Mjolnir is missing,
-too old, unreachable, or fails to start the session, or GitHub blocks launch,
-it logs each tick and posts one blocked notification for each distinct
-(run, reason).
-
-### Recover an unresolved launch
-
-An invocation may remain in `launching` when the monitor cannot tell whether
-`mj new` created its session. Before making it retryable, derive its exact title
-from the row and confirm that title is absent from workspace CI:
-
-```sh
-run_id=12345
-sqlite3 ~/Projects/bifrost-ci/activity.db \
-  "SELECT status, attempt_count,
-          workflow || ' ' || substr(sha, 1, 8) || ' run ' || workflow_run_id ||
-          ' attempt ' || attempt_count || ' CI repair' AS title
-   FROM invocations WHERE workflow_run_id = $run_id;"
-mj sessions --workspace CI --json
-```
-
-Compare the title exactly, including the attempt number. If it is present, leave
-the row alone so the monitor can adopt that session. If the workspace listing
-succeeds and the exact title is absent, mark only that unresolved row retryable:
+Inspect current work:
 
 ```sh
 sqlite3 ~/Projects/bifrost-ci/activity.db \
-  "UPDATE invocations SET status = 'launch_failed'
-   WHERE workflow_run_id = $run_id AND status = 'launching'
-     AND codex_session_id IS NULL;"
+  "SELECT issue_number,status,session_id,retry_pr_number,repair_pr_number,last_error
+   FROM issue_repairs ORDER BY created_at DESC LIMIT 10;"
 ```
 
-The next monitor tick increments the attempt and launches again. Do not run the
-update when Mjolnir cannot list workspace CI or the exact session may still be
-starting.
+An ambiguous `mj new` result is reconciled by the job's exact persisted title;
+the poller adopts a matching session instead of starting a duplicate. If it
+remains `launching`, inspect workspace CI before resetting that job to `selected`.
+Never retry creation while the original request may still be provisioning.
 
 ## Agent selection
 
 The CI monitor sessions use `--model deepseek-flash --subagents none` and the
-label DeepSeek Flash (mj). Setting `MJ_SUBAGENT_MODEL` (for example to
-`gpt-6-luna`) switches to `--subagents single-model --subagent-model <model>`;
-the planned setup is `opus` with `gpt-6-luna` sub-agents through Amazon
-Bedrock, once the CI account has Bedrock access. Automerge uses `deepseek-flash` too, set separately, with
+label DeepSeek Flash (mj). Automerge uses `deepseek-flash` too, set separately, with
 `--subagents none` and the label DeepSeek Flash (mj). The executables have
 absolute defaults: `mj` at `$HOME/.cargo/bin/mj` and `gh` at `/usr/bin/gh`.
 Override them with `BIFROST_MJ_BIN` and `BIFROST_GH_BIN`. Both scripts check
@@ -161,10 +108,9 @@ once-per-reason blocked notice if one is missing. `BIFROST_CI_MONITOR_STATE`,
 `BIFROST_CI_AUTOMERGE_STATE`, and `BIFROST_CI_CONFIG_DIR` override the state
 and secrets directories, which otherwise live under the current user's home.
 
-The installed mj must support transcript --finished-only. The monitor checks
-this at startup and reports a blocked reason for a red run when the installed
-CLI is too old. Upgrade Mjolnir from ~/Projects/mjolnir before enabling repair
-launches.
+The installed mj must support transcript --finished-only. A transcript error
+is recorded on the active repair for a later retry. Upgrade Mjolnir from
+~/Projects/mjolnir before enabling repair launches.
 
 Runtime state and secrets stay local. Do not commit the Slack webhook, bot
 token, SQLite database, cron output, or session data.
