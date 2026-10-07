@@ -41,7 +41,7 @@ class IssueFixerTests(TestCase):
     def job(self, number=12, *, retry=None):
         with mock.patch.object(fixer, "api", return_value=[]):
             return fixer.create_job(self.conn, issue(number), retry, "bad test" if retry else None,
-                                    f"retry:{retry['number']}" if retry else f"issue:{number}", [], "b" * 40)
+                                    f"retry:{retry['number']}" if retry else fixer.initial_work_key(issue(number), []), [], "b" * 40)
 
     def owned_pr(self):
         job = self.job()
@@ -111,6 +111,13 @@ class IssueFixerTests(TestCase):
         second = self.job(13)
         self.assertEqual(first["base_sha"], second["base_sha"])
         self.assertNotEqual(first["branch"], second["branch"])
+
+    def test_changed_requirements_can_reengage_but_own_comments_cannot(self):
+        job = self.job()
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='completed' WHERE id=?", (job["id"],))
+        self.assertIsNone(fixer.select_work(self.conn, [dict(issue(), updated_at="later", comments=10)], []))
+        self.assertIsNotNone(fixer.select_work(self.conn, [dict(issue(), body="Revised requirements")], []))
 
     def test_prompt_is_one_issue_and_claims_then_rechecks_ownership(self):
         job = self.job()

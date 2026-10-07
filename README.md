@@ -7,11 +7,12 @@ unassigned issue without `agent-in-progress`; the aggregate known-failures issue
 is never a repair target. Issues assigned to another person are left to them.
 
 Each session handles only its selected issue. It reads Bifrost's `AGENTS.md`,
-claims the issue for `mergemarshall[bot]` with `agent-in-progress`, and posts a
-claim comment containing its session and branch. It refreshes ownership before
+claims the issue with `agent-in-progress`, and posts a MergeMarshall claim comment
+containing its session and branch. GitHub rejects assigning this App bot (403),
+so the user authorized label/comment ownership; bot assignment is not required.
+It refreshes ownership before
 claiming and publishing. On standing down without a submitted repair, it removes
-only its own claim. GitHub must accept the assignment; a failed claim does not
-permit work to begin.
+only its own claim. A failed label/comment claim does not permit work to begin.
 
 The agent chooses a straightforward production fix or mechanical test update,
 otherwise reverts the introducing change. If subsequent work makes the revert
@@ -58,7 +59,7 @@ rejection evidence take precedence.
 ## Lifecycle and inspection
 
 The `issue_repairs` table in `$HOME/Projects/bifrost-ci/activity.db` stores one
-job per issue or exact rejected PR head, its prompt, branch, session, transcript
+job per issue evidence snapshot or exact rejected PR head, its prompt, branch, session, transcript
 cursor and outcome. Multiple issues from the same CI run can have independent
 sessions. Historical run-wide `invocations` remain readable; they are no longer
 scheduled. A still-active legacy invocation blocks new work until retired.
@@ -76,8 +77,8 @@ ledger and CI helpers used by all three components. Every host-side `gh` call
 uses the installation token from `mj github-token`; sessions use mj's injected
 token. Configuration and data stay on the host; do not commit secrets or DBs.
 The pinned `Known CI failures on master` issue is generated from the SQLite
-ledger. Only completed CI evidence clears a failure; a fixer PR merely links
-its target issue's observations to proposed work.
+ledger. Completed CI or evidence-backed triage can retire the exact failure observation;
+a fixer PR merely links its target issue's observations to proposed work.
 
 With the Slack bot transport, each repair gets a thread and completed agent
 messages are relayed with persisted cursors and stable-ID deduplication. The

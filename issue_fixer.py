@@ -12,7 +12,7 @@ import automerge
 import monitor
 
 ASSIGNEE = "mergemarshall[bot]"
-CLAIM_MODE = "assignee"
+CLAIM_MODE = "comment"
 ESCALATION_ASSIGNEE = "DavidBakerEffendi"
 ESCALATION_LABEL = "Escalated"
 MAX_PROMPT_BYTES = 96 * 1024  # Leave room in mj's 128 KiB JSON request envelope.
@@ -78,6 +78,16 @@ def observations(conn, issue_url):
         "ORDER BY workflow,job_name,identity", (issue_url, issue_url))]
 
 
+def initial_work_key(issue, rows):
+    # A new failure observation or changed requirements can re-engage a ticket.
+    # Our own claim/release comments must not immediately launch it again.
+    evidence = [(r["workflow"], r["job_name"], r["identity_kind"], r["identity"],
+                 r["last_seen_sha"], r["last_seen_run_id"]) for r in rows]
+    digest = hashlib.sha256(json.dumps([issue["title"], issue.get("body"), evidence],
+                                      sort_keys=True).encode()).hexdigest()
+    return f"issue:{issue['number']}:{digest}"
+
+
 def select_work(conn, issues, prs):
     by_number = {i["number"]: i for i in issues}
     candidates = []
@@ -105,9 +115,7 @@ def select_work(conn, issues, prs):
         rows = observations(conn, issue["html_url"])
         if any(r["linked_pr_state"] == "OPEN" or r["linked_issue_state"] == "OPEN" for r in rows):
             continue
-        # One initial investigation per ticket. Further attempts are driven by
-        # exact-head merger rejection, not by comments our own agent writes.
-        key = f"issue:{issue['number']}"
+        key = initial_work_key(issue, rows)
         candidates.append(dict(issue=issue, pr=None, rejection=None, work_key=key,
                                rejected_repair=0, issue_number=issue["number"]))
     # Live GitHub candidates exist only for this SELECT. No pending queue is
@@ -117,8 +125,6 @@ def select_work(conn, issues, prs):
         WHERE NOT EXISTS (
             SELECT 1 FROM issue_repairs AS attempt
             WHERE attempt.work_key = json_extract(candidate.value, '$.work_key')
-               OR (json_extract(candidate.value, '$.rejected_repair') = 0
-                   AND attempt.issue_number = json_extract(candidate.value, '$.issue_number'))
         )
         ORDER BY json_extract(value, '$.rejected_repair') DESC,
                  json_extract(value, '$.issue_number') ASC
@@ -167,7 +173,8 @@ def build_prompt(job, context):
     if CLAIM_MODE == "comment":
         claim = (f"Add `agent-in-progress` with `gh issue edit {number} --repo {monitor.REPO_NAME} "
                  "--add-label agent-in-progress`. GitHub does not accept this App as an assignee; "
-                 "the user authorized a label plus the claim comment below as its ownership record.")
+                 f"the user authorized a label plus the claim comment below as `{ASSIGNEE}`'s ownership record. "
+                 "Do not attempt bot assignment or remove other people's assignments.")
     retry = ""
     if job.get("retry_pr_number"):
         retry = f"""
@@ -408,22 +415,26 @@ def finish(conn, job):
         if (ESCALATION_LABEL.casefold() not in {name.casefold() for name in labels(issue)} or ESCALATION_ASSIGNEE not in owners
                 or ASSIGNEE in owners or "agent-in-progress" in labels(issue)):
             raise ValueError("escalation handoff is incomplete: add Escalated, assign David, and release own claim")
-    if report["outcome"] == "submitted":
+    if report["outcome"] in {"submitted", "deferred"} and type(report.get("pr")) is int:
         pr = api(f"pulls/{report['pr']}")
+    if report["outcome"] == "submitted":
         if (pr["head"]["ref"] != job["branch"] or pr["head"]["repo"]["full_name"] != monitor.REPO_NAME
                 or (pr["state"] != "open" and not pr.get("merged")) or pr.get("draft")
                 or (job["retry_pr_number"] and (pr["number"] != job["retry_pr_number"]
                     or pr["head"]["sha"] == job["rejected_head_sha"]))):
             raise ValueError("submitted PR does not match the repaired branch/head or is not ready")
+    owned_pr = pr if report["outcome"] == "submitted" else None
     with conn:
         if pr:
             # A repair must never claim all failures from the same CI run.
-            conn.execute("UPDATE known_failures SET linked_pr_url=?,linked_pr_state='OPEN',updated_at=? "
+            pr_state = "MERGED" if pr.get("merged") else pr["state"].upper()
+            conn.execute("UPDATE known_failures SET linked_pr_url=?,linked_pr_state=?,updated_at=? "
                          "WHERE status='open' AND triage_issue_url=?",
-                         (pr["html_url"], monitor.utc_now(), job["issue_url"]))
+                         (pr["html_url"], pr_state, monitor.utc_now(), job["issue_url"]))
         conn.execute("UPDATE issue_repairs SET status='completed',finished_at=?,repair_pr_number=?,"
                      "repair_pr_url=?,last_error=NULL WHERE id=?",
-                     (monitor.utc_now(), pr["number"] if pr else None, pr["html_url"] if pr else None, job["id"]))
+                     (monitor.utc_now(), owned_pr["number"] if owned_pr else None,
+                      owned_pr["html_url"] if owned_pr else None, job["id"]))
 
 
 def cleanup(conn, transport):
