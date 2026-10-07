@@ -4,7 +4,9 @@ description: Publish a locally tested MergeMarshall branch and reconcile its int
 ---
 
 First record your local assessment with mm-db for the exact committed HEAD,
-including commands actually run and reproduced baseline failures. Then:
+including checks run there, separately identified reused results with their
+original tested SHAs and applicability reasons, and reproduced baseline failures.
+Then:
 
 ```sh
 python3 <this skill>/scripts/mm_autopr.py --notes-file /tmp/merge-notes.md

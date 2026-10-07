@@ -328,16 +328,29 @@ reproduced baseline failures alone require no rebuild. Do not rebuild and retest
 between individual exclusions from the same diagnosis pass. Build blockers can
 hide more failures; record blocked checks and reassess after the combined rebuild.
 
+After exclusions, fixes, conflict resolutions, or base updates, choose reruns from
+the actual diff against the last tested candidate. Cover affected behavior,
+shared dependencies/interactions, and previously failing checks addressed by the
+changes. A membership or HEAD change alone does not require another full suite.
+Reuse results for areas whose covered code, dependencies, test inputs, and settings
+remain unaffected, unless contradictory evidence appears. Expand when impact
+cannot be bounded or a specific concern warrants it, and record that reason.
+Keep original tested SHAs, commands, logs, and reuse reasons in the progress note.
+Fixture/golden generation is editing; validate affected checks on the resulting
+committed tree without blessing enabled. Record a fresh assessment for the final
+HEAD and current source set, distinguishing checks run there from reused results
+with their original tested SHAs and applicability reasons.
+
 Reproduce only failures observed in the candidate's selected checks at the exact
 base, reusing existing exact-tree evidence where available. Passing tests and
 ledger failures absent from the candidate need no baseline runs. Test committed
 trees without temporary source edits or validation shims. Baseline build failures
 may block dependent checks; report those as blocked and run unaffected useful
 checks. Baseline summaries contain candidate failures reproduced at base;
-repaired tests belong in fix notes. After changes, reassess affected validation
-and make the final assessment describe the resulting committed candidate. When
-selected checks pass or only reproduced baseline failures remain, proceed to
-the mode's publication/reporting step. No local test command registry is implemented.
+repaired tests belong in fix notes. The final assessment describes the resulting
+committed candidate. When selected checks pass or only reproduced baseline
+failures remain, proceed to the mode's publication/reporting step. No local test
+command registry is implemented.
 
 Persist classification in `validation_impact_json` with the exact base and
 heads. Reclassify when the source set, base, or candidate changes; reuse the

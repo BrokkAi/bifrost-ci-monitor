@@ -37,6 +37,15 @@ preserving applicable fixes and conflict resolutions. Do not rebuild and retest
 between individual exclusions from the same diagnosis pass. Test evidence is your
 explicit assessment; this helper does not select tests or infer a verdict.
 
+After changes, select reruns from the diff against the last tested candidate,
+covering affected behavior and shared dependencies/interactions. Retain justified
+results for unaffected areas. Record a fresh assessment at the current source
+revision and final committed HEAD; an earlier passing assessment does not transfer
+automatically. In the one-line `--tests` summary, distinguish commands run at that
+HEAD from reused results, identifying their original tested SHAs and why they
+remain applicable. Keep detailed commands, logs, and reuse reasons in the private
+progress note.
+
 The state response lists pending GitHub writes. A recorded rejection or comment
 is accepted even if GitHub delivery is pending; continue the batch. The supervisor
 retries delivery. A rejection is tracked by its exact head and does not change
