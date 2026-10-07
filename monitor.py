@@ -760,28 +760,35 @@ def _known_failure_issue_body(conn: sqlite3.Connection) -> str:
     return "\n".join(lines)
 
 
+def _update_known_failure_issue(number: int, body: str) -> None:
+    """Write the generated body with the REST endpoint; a failed write retries next upkeep."""
+    endpoint = f"repos/{REPO_NAME}/issues/{number}"
+    updated = run_gh([
+        "api", endpoint, "--method", "PATCH", "--raw-field", f"body={body}",
+        "--jq", ".number",
+    ])
+    if updated != str(number):
+        raise CommandError("GitHub returned the wrong issue after updating the ledger",
+                           reason="github_invalid_response")
+
+
 def _sync_known_failure_issue(conn: sqlite3.Connection) -> None:
     body = _known_failure_issue_body(conn)
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    if _known_failure_state(conn, "issue_body_sha256") == digest:
-        return
     number_value = _known_failure_state(conn, "issue_number")
+    if (number_value and _known_failure_state(conn, "issue_labeled")
+            and _known_failure_state(conn, "issue_body_sha256") == digest):
+        return
     created = False
     if number_value:
         number = int(number_value)
-        edit_args = ["issue", "edit", str(number), "--repo", REPO_NAME, "--body", body]
+        _update_known_failure_issue(number, body)
         if not _known_failure_state(conn, "issue_labeled"):
-            edit_args.extend(["--add-label", KNOWN_FAILURE_ISSUE_LABEL])
-        try:
-            run_gh(edit_args)
+            run_gh([
+                "api", f"repos/{REPO_NAME}/issues/{number}/labels", "--method", "POST",
+                "--raw-field", f"labels[]={KNOWN_FAILURE_ISSUE_LABEL}",
+            ])
             _set_known_failure_state(conn, "issue_labeled", "1")
-        except CommandError as exc:
-            log(f"stored known-failures issue #{number} could not be edited; searching by title: {exc}")
-            with conn:
-                conn.execute(
-                    "DELETE FROM known_failure_state WHERE key IN ('issue_number','issue_pinned')"
-                )
-            number_value = None
     if not number_value:
         matches = json.loads(run_gh([
             "issue", "list", "--repo", REPO_NAME, "--state", "all",
@@ -803,9 +810,10 @@ def _sync_known_failure_issue(conn: sqlite3.Connection) -> None:
             _set_known_failure_state(conn, "issue_labeled", "1")
         else:
             number = int(match["number"])
+            _update_known_failure_issue(number, body)
             run_gh([
-                "issue", "edit", str(number), "--repo", REPO_NAME, "--body", body,
-                "--add-label", KNOWN_FAILURE_ISSUE_LABEL,
+                "api", f"repos/{REPO_NAME}/issues/{number}/labels", "--method", "POST",
+                "--raw-field", f"labels[]={KNOWN_FAILURE_ISSUE_LABEL}",
             ])
             _set_known_failure_state(conn, "issue_labeled", "1")
         _set_known_failure_state(conn, "issue_number", str(number))
@@ -1003,6 +1011,8 @@ def update_known_failures(
                 _process_known_failure_run(conn, workflow, item)
         refresh_known_failure_link_states(conn)
         _sync_known_failure_issue(conn)
+        with conn:
+            conn.execute("DELETE FROM known_failure_errors")
         return True
     except Exception as exc:
         if conn.in_transaction:

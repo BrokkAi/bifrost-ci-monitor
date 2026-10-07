@@ -322,7 +322,9 @@ existing observed identity; it never creates evidence.
 
 SQLite is authoritative. The pinned `Known CI failures on master` issue is a
 generated view, never parsed back as state. Update only changed renders and
-continue if pinning is denied. Triage issue links do not suppress the fixer;
+continue if pinning is denied. Update its stored issue number through REST;
+failed idempotent updates retry on later upkeep without discarding that number.
+Title search is only for initial setup. Triage issue links do not suppress the fixer;
 it reuses those issues. A repair PR associates observations with proposed
 work, but is not evidence that failures are fixed.
 

@@ -1993,11 +1993,13 @@ class KnownFailureLedgerTests(unittest.TestCase):
         self.assertEqual(row["linked_issue_url"], "https://github.com/example/issues/8")
         self.assertEqual(row["diagnosis"], "known compiler issue")
         self.assertEqual(row["diagnosis_source"], "automerge")
-        with mock.patch.object(monitor, "run_gh", return_value="ok") as gh:
+        with mock.patch.object(monitor, "run_gh", return_value="4519") as gh:
             monitor._sync_known_failure_issue(self.conn)
         gh.assert_called_once()
-        self.assertIn("extension boundary", gh.call_args.args[0][-1])
-        self.assertNotIn("runs-on=", gh.call_args.args[0][-1])
+        patch_args = gh.call_args.args[0]
+        body = patch_args[patch_args.index("--raw-field") + 1]
+        self.assertIn("extension boundary", body)
+        self.assertNotIn("runs-on=", body)
 
         monitor.ensure_known_failure_schema(self.conn)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM known_failures").fetchone()[0], 1)
@@ -2246,7 +2248,16 @@ class KnownFailureLedgerTests(unittest.TestCase):
             ("a" * 40, 9, "run-url", now, "a" * 40, 9, "run-url", now, now),
         )
         monitor._set_known_failure_state(self.conn, "issue_number", "22")
-        with mock.patch.object(monitor, "run_gh", return_value="ok") as gh:
+        monitor._set_known_failure_state(self.conn, "issue_labeled", "1")
+
+        def github(args):
+            if args[:2] == ["api", f"repos/{monitor.REPO_NAME}/issues/22"]:
+                return "22"
+            if args[:3] == ["issue", "pin", "22"]:
+                return "ok"
+            raise AssertionError(f"unexpected GitHub call: {args[:3]}")
+
+        with mock.patch.object(monitor, "run_gh", side_effect=github) as gh:
             monitor._sync_known_failure_issue(self.conn)
             self.assertNotIn("Master has no known failures.", monitor._known_failure_issue_body(self.conn))
             gh.reset_mock()
@@ -2257,9 +2268,41 @@ class KnownFailureLedgerTests(unittest.TestCase):
             )
             monitor._sync_known_failure_issue(self.conn)
             gh.assert_called_once()
-            body = gh.call_args.args[0][-1]
+            patch_args = gh.call_args.args[0]
+            self.assertIn("PATCH", patch_args)
+            body = patch_args[patch_args.index("--raw-field") + 1]
         self.assertIn("| Workflow | Job |", monitor._known_failure_issue_body(self.conn))
         self.assertIn("known linkage", body)
+
+    def test_transient_issue_update_error_preserves_number_for_retry(self):
+        monitor._set_known_failure_state(self.conn, "issue_number", "4519")
+        monitor._set_known_failure_state(self.conn, "issue_labeled", "1")
+        with mock.patch.object(
+            monitor, "run_gh", side_effect=monitor.CommandError("GitHub HTTP 503"),
+        ) as gh:
+            with self.assertRaises(monitor.CommandError):
+                monitor._sync_known_failure_issue(self.conn)
+        self.assertEqual(monitor._known_failure_state(self.conn, "issue_number"), "4519")
+        gh.assert_called_once()
+        self.assertIn("PATCH", gh.call_args.args[0])
+
+    def test_ambiguous_issue_update_retries_the_same_idempotent_patch(self):
+        monitor._set_known_failure_state(self.conn, "issue_number", "4519")
+        monitor._set_known_failure_state(self.conn, "issue_labeled", "1")
+        monitor._set_known_failure_state(self.conn, "issue_pinned", "1")
+        desired = monitor._known_failure_issue_body(self.conn)
+        with mock.patch.object(monitor, "run_gh", side_effect=[
+            monitor.CommandError("response lost"), "4519",
+        ]) as gh:
+            with self.assertRaises(monitor.CommandError):
+                monitor._sync_known_failure_issue(self.conn)
+            monitor._sync_known_failure_issue(self.conn)
+        self.assertEqual(gh.call_count, 2)
+        self.assertEqual(gh.call_args_list[0].args, gh.call_args_list[1].args)
+        self.assertEqual(
+            monitor._known_failure_state(self.conn, "issue_body_sha256"),
+            hashlib.sha256(desired.encode()).hexdigest(),
+        )
 
     def test_missing_issue_is_created_labeled_stored_and_pinned(self):
         with mock.patch.object(
@@ -2287,3 +2330,18 @@ class KnownFailureLedgerTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["failure_count"], 4)
         self.assertTrue(row["notified_at"])
+
+    def test_successful_ledger_upkeep_clears_previous_error_episode(self):
+        with mock.patch.object(monitor, "slack_send", return_value=(True, None)):
+            for _ in range(3):
+                monitor._record_known_failure_error(
+                    self.conn, self.transport, "github_command_failed", "old error"
+                )
+        with (
+            mock.patch.object(monitor, "_known_failure_runs", return_value=[]),
+            mock.patch.object(monitor, "refresh_known_failure_link_states"),
+            mock.patch.object(monitor, "_sync_known_failure_issue"),
+        ):
+            self.assertTrue(monitor.update_known_failures(self.conn, self.transport, force=True))
+        count = self.conn.execute("SELECT COUNT(*) FROM known_failure_errors").fetchone()[0]
+        self.assertEqual(count, 0)
