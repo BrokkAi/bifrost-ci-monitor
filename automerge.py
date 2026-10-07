@@ -1131,7 +1131,10 @@ def deliver_blocked_notice(
     batch = conn.execute(
         "SELECT thread_ts FROM automerge_batches WHERE batch_id = ?", (batch_id,)
     ).fetchone()
-    loud = reason in {"github_write_retry", "verdict_status_failed"}
+    loud = reason in {
+        "github_write_retry", "verdict_status_failed",
+        "source_ancestry_unverified", "baseline_unavailable", "ci_run_unavailable",
+    }
     prefix = ":rotating_light:" if loud else ":warning:"
     try:
         ok, _ = monitor.slack_send(
@@ -2710,6 +2713,7 @@ def compare_commit_ancestry(ancestor_sha: str, descendant_sha: str) -> bool:
 
 def verify_source_ancestry(
     row: sqlite3.Row | dict[str, Any], integration_head: str,
+    *, base_sha: str | None = None,
 ) -> tuple[bool, str]:
     excluded = _excluded_source_heads(row)
     excluded_keys = {(entry["number"], entry["head_sha"]) for entry in excluded}
@@ -2722,6 +2726,10 @@ def verify_source_ancestry(
             return False, f"included PR #{pull.number} head is not an ancestor of the integration head"
     for entry in excluded:
         if compare_commit_ancestry(entry["head_sha"], integration_head):
+            # A source that landed independently is part of the current base,
+            # not a change reintroduced by this integration branch.
+            if compare_commit_ancestry(entry["head_sha"], base_sha or str(row["base_sha"])):
+                continue
             return False, f"excluded PR #{entry['number']} head is still an ancestor of the integration head"
     return True, "all included and excluded source heads match the integration tree"
 
@@ -2929,7 +2937,11 @@ def _poll_ci(conn: sqlite3.Connection, transport: monitor.SlackTransport,
              row: sqlite3.Row | dict[str, Any]) -> None:
     if not _session_is_idle(row):
         return
-    number, head, _ = _integration_head(row)
+    number, head, base_ref = _integration_head(row)
+    master = current_master_sha()
+    if str(row["base_sha"]).lower() != master or base_ref != master:
+        _queue_master_update(conn, transport, row, master, head)
+        return
     if head != str(row["ci_head_sha"] or "").lower():
         if int(row["ci_round"] or 0) >= MAX_CI_ROUNDS:
             _terminal(conn, transport, row, "ci_round_limit",
@@ -2975,7 +2987,10 @@ def _poll_ci(conn: sqlite3.Connection, transport: monitor.SlackTransport,
         report = collect_failure_report_for_run(run_id)
     except (AutomergeError, monitor.CommandError) as exc:
         reason = exc.reason if isinstance(exc, AutomergeError) else "ci_run_unavailable"
-        notify_blocked_once(conn, transport, str(row["batch_id"]), reason, str(exc))
+        notify_blocked_once(
+            conn, transport, str(row["batch_id"]), "ci_run_unavailable",
+            f"{reason}: {exc}. Retrying the CI run lookup automatically.",
+        )
         return
     _store_ci_result(conn, row, head, "failure", report.failed_jobs, report.logs, run_id,
                       report.details)
@@ -2984,7 +2999,8 @@ def _poll_ci(conn: sqlite3.Connection, transport: monitor.SlackTransport,
         return
     if baseline.state == "blocked":
         notify_blocked_once(
-            conn, transport, str(row["batch_id"]), "baseline_unavailable", baseline.details
+            conn, transport, str(row["batch_id"]), "baseline_unavailable",
+            f"{baseline.details} Retrying baseline resolution automatically.",
         )
         return
     failed_jobs = set(report.failed_jobs)
@@ -3266,7 +3282,10 @@ def _sync_ci_gate_allows_merge(
             report = collect_failure_report_for_run(run_id)
         except (AutomergeError, monitor.CommandError) as exc:
             reason = exc.reason if isinstance(exc, AutomergeError) else "ci_run_unavailable"
-            notify_blocked_once(conn, transport, str(row["batch_id"]), reason, str(exc))
+            notify_blocked_once(
+                conn, transport, str(row["batch_id"]), "ci_run_unavailable",
+                f"{reason}: {exc}. Retrying the CI run lookup automatically.",
+            )
             return None
         base_jobs = set(_load_json_list(row["base_failed_jobs_json"]))
         not_worse, comparison = compare_failure_reports(
@@ -3341,6 +3360,11 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
                               (row["batch_id"],)).fetchone()
         _try_post_verdict_status(conn, transport, latest, head, "pending", "CI pending")
         return
+    master = current_master_sha()
+    base_ref = str(view.get("baseRefOid") or "").lower()
+    if str(row["base_sha"]).lower() != master or base_ref != master:
+        _queue_master_update(conn, transport, row, master, tested)
+        return
     if mode == "async":
         if _async_local_result(str(row["agent_final_message"] or "")) != "pass":
             _queue_async_gate_retry(
@@ -3353,11 +3377,6 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
         check_state = _sync_ci_gate_allows_merge(conn, transport, row, head)
         if check_state is None:
             return
-    master = current_master_sha()
-    base_ref = str(view.get("baseRefOid") or "").lower()
-    if base_ref != master:
-        _queue_master_update(conn, transport, row, master, tested)
-        return
     new_trusted_rejections = _record_trusted_rejection_markers(conn, row)
     row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                        (row["batch_id"],)).fetchone()
@@ -3382,19 +3401,20 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
         _terminal(conn, transport, row, "empty_batch", "No source PRs remain to land.")
         return
     try:
-        ancestry_ok, ancestry_reason = verify_source_ancestry(row, tested)
+        ancestry_ok, ancestry_reason = verify_source_ancestry(row, tested, base_sha=master)
     except (AutomergeError, monitor.CommandError) as exc:
         _try_post_verdict_status(conn, transport, row, tested, "pending",
                                  "source ancestry verification pending")
         reason = exc.reason if isinstance(exc, AutomergeError) else "github_compare_failed"
         notify_blocked_once(conn, transport, str(row["batch_id"]),
-                             "source_ancestry_unverified", f"{reason}: {exc}")
+                             "source_ancestry_unverified",
+                             f"{reason}: {exc}. Retrying ancestry verification automatically.")
         return
     if not ancestry_ok:
         _try_post_verdict_status(conn, transport, row, tested, "pending",
-                                 "source ancestry mismatch; merge blocked")
-        notify_blocked_once(conn, transport, str(row["batch_id"]),
-                             "source_ancestry_mismatch", ancestry_reason)
+                                 "source ancestry mismatch; rebuilding and re-testing")
+        _rebuild_or_finish(conn, transport, row, pulls,
+                           "source ancestry mismatch: " + ancestry_reason)
         return
     if mode == "async":
         verdict = "async: local targeted tests passed; CI runs after merge"
@@ -3691,7 +3711,10 @@ def _direct_sync_gate(
         report = collect_failure_report_for_run(run_id)
     except (AutomergeError, monitor.CommandError) as exc:
         reason = exc.reason if isinstance(exc, AutomergeError) else "ci_run_unavailable"
-        notify_blocked_once(conn, transport, str(row["batch_id"]), reason, str(exc))
+        notify_blocked_once(
+            conn, transport, str(row["batch_id"]), "ci_run_unavailable",
+            f"{reason}: {exc}. Retrying the CI run lookup automatically.",
+        )
         return None
 
     _store_ci_result(conn, row, head, "failure", report.failed_jobs,
@@ -3701,7 +3724,8 @@ def _direct_sync_gate(
         return None
     if baseline.state == "blocked":
         notify_blocked_once(
-            conn, transport, str(row["batch_id"]), "baseline_unavailable", baseline.details,
+            conn, transport, str(row["batch_id"]), "baseline_unavailable",
+            f"{baseline.details} Retrying baseline resolution automatically.",
         )
         return None
     with conn:

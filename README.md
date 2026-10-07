@@ -285,7 +285,7 @@ remove labels, start Mjolnir, post Slack, or write to GitHub.
 
 ### Sync mode
 
-The agent session is suspended while the supervisor polls `PR verification`
+The agent session stays live and idle while the supervisor polls `PR verification`
 every minute. It accepts that check only from `.github/workflows/ci.yml` for
 the exact tested head and `pull_request` event, matching the latest attempt's
 check suite. On red, the supervisor sends failed-step logs for the integration
@@ -297,9 +297,12 @@ waited on; when CI is missing or cancelled, the supervisor first checks for
 open ledger failures whose last-seen commit is equal to or an ancestor of the
 base. Those parser-derived identities count as baseline evidence. If none
 qualify, CI is dispatched on master only while master still points to the base.
-After dispatch, the supervisor waits on a persisted
+If master advances, the supervisor asks the agent to merge current master and
+retest before waiting for a baseline on the old base. After dispatch, the supervisor waits on a persisted
 10-minute grace period for the run to appear before retrying. If no baseline
-can be established, the batch stays waiting and Slack is notified once. The
+can be established, the batch stays waiting, sends a top-level Slack alert, and
+retries automatically. Unavailable integration CI run data receives the same
+alert and retry treatment. The
 supervisor compares failed tests and failed steps independently within each
 same failed job against that baseline. The
 agent can append fixes or eject a responsible PR by rebuilding the branch
@@ -313,6 +316,11 @@ comparing failed jobs, test identities, and failed step names. The agent's
 the integration PR is based on current master, every constituent PR is still
 open, non-draft, based on master, and at its tested head, and every recorded
 source head is present while no ejected head remains in the integration tree.
+An excluded head already on current master is accepted as part of that base.
+A confirmed ancestry mismatch rebuilds the integration branch from the selected
+source heads and retests it. If GitHub compare data is unavailable, the merge
+remains pending, a top-level Slack alert is sent, and verification retries on
+the next tick.
 Once all sync gates pass, it posts the required `mergemarshall/verdict` success
 status on the exact CI-tested integration head, then runs
 `gh pr merge <n> --merge --match-head-commit <tested-sha>`. A GitHub refusal

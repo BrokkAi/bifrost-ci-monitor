@@ -191,7 +191,11 @@ If master is already red, async mode uses those local exact-base test results
 
 Both modes use the same pre-merge freshness, source-PR state/head, and included
 and excluded ancestry checks. Workflow and local-action changes use those gates
-without an extra human hold.
+without an extra human hold. An excluded head that independently landed on
+current master is valid base ancestry. A confirmed mismatch queues a rebuild
+from the selected source heads and requires fresh tests. Unavailable GitHub
+compare data leaves the merge pending, sends a top-level Slack alert, and is
+retried automatically.
 
 ## Sync mode: waiting for CI (supervisor, not the agent)
 
@@ -199,7 +203,9 @@ The supervisor accepts `PR verification` only from the GitHub Actions run whose
 path is `.github/workflows/ci.yml`, whose head SHA is the tested head, and whose
 event is `pull_request`. It follows the latest attempt and matches the check run
 to that workflow run's check suite. The agent ends its turn after publication
-and stays live and idle while CI runs. Follow-up prompts use the same environment
+and stays live and idle while CI runs. Before querying the CI result or baseline,
+the supervisor checks whether master advanced and, if so, asks the agent to
+merge current master and retest. Follow-up prompts use the same environment
 without a suspend or restore. While CI or a supervisor decision is pending,
 the supervisor posts `mergemarshall/verdict: pending` on that exact head.
 
@@ -223,8 +229,9 @@ the supervisor posts `mergemarshall/verdict: pending` on that exact head.
    equals the base SHA. Do not retry while the grace period is active and no
    matching run has appeared. After it expires, reconcile the runs and retry
    only if master still points at the base SHA. If no usable baseline can be
-   established, fail closed, notify Slack once, and leave the batch waiting for
-   the next tick to re-evaluate. The selected baseline run's
+   established, fail closed, send a top-level Slack alert, and retry baseline
+   resolution automatically on later ticks. Missing integration CI run data
+   receives the same alert and retry treatment. The selected baseline run's
    failed jobs and failed-step logs are supplied to the agent and parsed by the
    supervisor. The supervisor compares failing test identities as well as jobs;
    each job's failing test identities and failed-step names must independently
