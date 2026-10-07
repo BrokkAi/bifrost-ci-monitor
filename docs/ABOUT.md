@@ -13,8 +13,10 @@ to the exact head that failed, so a corrected branch can re-enter the queue.
 The optional approved-review policy can require an approval before selection.
 
 For multiple PRs or a branch behind master, one DeepSeek Flash agent combines
-source heads into an integration branch, resolves conflicts, and runs affected
-checks using Bifrost's repository guidance and ci-impact. It opens one
+source heads into an integration branch and resolves conflicts. The supervisor
+runs Bifrost's ci-impact: docs batches skip all local tests and builds; otherwise
+the agent uses its judgment to choose useful checks and expands testing when
+needed. A full impact classification does not mandate a full local CI run. It opens one
 `mergemarshall-batch` PR with source heads, test evidence, and conflict/fix notes.
 Merge commits preserve the source PRs' history. Integration fixes can address
 mechanical updates and interactions; a PR broken on its own is returned to
@@ -26,7 +28,7 @@ draft so its author can finish and ready it again. Interrupted/rebuilt batches
 can collect new arrivals at most three times; passing finished work is not
 rebuilt simply to collect more PRs.
 
-A master advance requires updating and retesting. A confirmed ancestry
+A master advance requires updating and following a refreshed validation policy. A confirmed ancestry
 mismatch rebuilds from selected source heads; a head independently landed on
 master is valid base ancestry. Unavailable GitHub comparison, CI, or baseline
 data stays pending with an operator alert and automatic retries.

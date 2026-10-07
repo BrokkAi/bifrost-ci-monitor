@@ -28,6 +28,9 @@ class MergeRetryTests(TestCase):
         self.patch(monitor, "run_gh", side_effect=AssertionError("unexpected real GitHub call"))
         self.patch(monitor, "mj_command", side_effect=AssertionError("unexpected real mj call"))
         self.patch(automerge, "list_pull_comments", return_value=[])
+        self.patch(automerge, "run_ci_impact", side_effect=lambda base, heads: {
+            "base_sha": base, "heads": sorted(set(heads)), "mode": "impact",
+        })
         self.transport = monitor.SlackTransport("webhook", webhook="unused")
 
     def patch(self, obj, name, *args, **kwargs):

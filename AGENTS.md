@@ -200,13 +200,26 @@ to be substantially rewritten. Ejection rebuilds from the base without those
 heads; never use a revert that would retain their ancestry. Force-push only
 the exact batch ref, with `--force-with-lease`.
 
-Use Bifrost's AGENTS, `scripts/public/ci-impact.mjs`, and workflow definitions
-to choose checks; ci-impact belongs to Bifrost, not this monitor. Its full
-selection requires its full scope. Run meaningful affected checks, then
+The supervisor runs Bifrost's `scripts/public/ci-impact.mjs` from the captured
+base on the union of exact source-head diffs. `docs` instructs the agent to run
+no tests, builds, or baseline reproductions. Every other mode (including an
+unavailable classification) tells the agent to use its best judgment to choose
+useful local checks and expand testing when failures or specific unresolved
+concerns warrant it. A `full` result does not require the full CI suite locally.
+The agent uses Bifrost's AGENTS and workflow definitions for commands and
+environment conventions, without rerunning ci-impact. Run chosen checks, then
 rerun failures at the exact base to establish baseline evidence. Do not use
 temporary source edits, validation shims, or a different tree as proof. A
 baseline build failure can block dependent checks; report those as blocked
-and run unaffected checks. The command registry/classifier is not implemented.
+and run unaffected checks. No local test command registry is implemented.
+
+Persist classification in `validation_impact_json` with the exact base and
+heads. Reclassify when the source set, base, or candidate changes; reuse the
+result for unchanged retries. Fetch the classifier and diffs through the normal
+App-authenticated GitHub runner, then import `classifyChangeSet` in host Node.js.
+Include both paths of renames. Missing/truncated diff data or classifier errors
+use the judgment policy, never the docs shortcut. Before accepting a docs
+report with no tests, independently classify the actual integration head.
 
 Prompted Cargo commands use `eatmydata`; do not export session-wide
 `LD_PRELOAD`. mbx owns Cargo build storage: do not set `CARGO_TARGET_DIR`,
@@ -230,7 +243,8 @@ an active batch's mode.
 
 Async requires one standalone `automerge-local: pass|fail` line, `Tests run:`
 and `Baseline failures:` in the final agent report, with the tested full HEAD.
-Only pass proceeds. Any new failure must be fixed or the exact responsible
+Only pass proceeds. `Tests run: none` is accepted only for a supervisor-confirmed
+docs candidate; baseline/test summaries remain required. Any new failure must be fixed or the exact responsible
 head removed/rejected; a baseline requires a local rerun at the captured base.
 The supervisor does not wait for/query CI or dispatch baseline runs. There is
 no sync-style CI-round limit. Master CI after landing is handled by triage

@@ -35,9 +35,10 @@ through pull requests.
 
 ## Initial setup
 
-Install Python 3.11 or later, Git, GitHub CLI (`gh`), Mjolnir (`mj`), Podman,
+Install Python 3.11 or later, Node.js 18 or later, Git, GitHub CLI (`gh`), Mjolnir (`mj`), Podman,
 and SQLite's CLI for inspection/backups. The Python programs use the standard
-library. Configure Mjolnir's `CI` workspace, `podman` target, `bifrost` bundle,
+library; the merger uses host Node.js to run Bifrost's CI impact classifier.
+Configure Mjolnir's `CI` workspace, `podman` target, `bifrost` bundle,
 and `deepseek-flash` profile before enabling cron.
 
 Merger/fixer sessions each use 32 CPUs and 28 GiB RAM; triage uses 2 CPUs and

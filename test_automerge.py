@@ -80,6 +80,9 @@ def unchanged_queue():
         mock.patch.object(automerge, "_source_pr_state",
                           side_effect=lambda p: direct_view(head_sha=p.head_sha)),
         mock.patch.object(automerge, "select_eligible_pull_requests", return_value=[]),
+        mock.patch.object(automerge, "run_ci_impact", side_effect=lambda base, heads: {
+            "base_sha": base, "heads": sorted(set(heads)), "mode": "impact",
+        }),
     ):
         yield
 
@@ -117,6 +120,7 @@ def make_db(
             suspend_pending INTEGER NOT NULL DEFAULT 0, suspend_verify_failures INTEGER NOT NULL DEFAULT 0,
             outcome_posted INTEGER NOT NULL DEFAULT 0, finished_at TEXT,
             phase TEXT NOT NULL DEFAULT 'building', ci_mode TEXT NOT NULL DEFAULT 'sync',
+            validation_impact_json TEXT NOT NULL DEFAULT '{}',
             integration_pr_number INTEGER,
             integration_pr_url TEXT, active_pull_requests_json TEXT,
             ejected_pull_requests_json TEXT NOT NULL DEFAULT '[]',
@@ -171,6 +175,11 @@ def make_db(
          ci_round, ci_head_sha, automerge.utc_now(), batch_id),
     )
     conn.commit()
+    with conn:
+        conn.execute("UPDATE automerge_batches SET validation_impact_json=? WHERE batch_id=?",
+                     (json.dumps({"base_sha": BASE_SHA,
+                                  "heads": sorted(set(p.head_sha for p in selected)),
+                                  "mode": "impact"}), batch_id))
     return conn
 
 
@@ -3027,6 +3036,7 @@ class LaunchAndLifecycleTests(TestCase):
             self.assertIn("phase", columns)
             self.assertIn("ci_mode", columns)
             self.assertEqual(defaults["ci_mode"], "'sync'")
+            self.assertEqual(defaults["validation_impact_json"], "'{}'")
             self.assertIn("integration_pr_number", columns)
             self.assertIn("ci_round", columns)
             self.assertIn("integration_merge_commit_sha", columns)
