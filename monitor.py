@@ -898,6 +898,8 @@ def _process_known_failure_run(
                     "last_seen_sha=excluded.last_seen_sha,last_seen_run_id=excluded.last_seen_run_id,"
                     "last_seen_run_url=excluded.last_seen_run_url,last_seen_at=excluded.last_seen_at,"
                     "last_seen_failed_steps_json=excluded.last_seen_failed_steps_json,"
+                    "diagnosis=CASE WHEN known_failures.status='fixed' THEN NULL ELSE known_failures.diagnosis END,"
+                    "diagnosis_source=CASE WHEN known_failures.status='fixed' THEN NULL ELSE known_failures.diagnosis_source END,"
                     "status='open',fixed_at=NULL,fixed_by_sha=NULL,updated_at=excluded.updated_at",
                     (workflow, entry["job"], entry["kind"], entry["identity"],
                      sha, run_id, url, now, sha, run_id, url, now,

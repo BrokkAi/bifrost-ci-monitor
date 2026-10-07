@@ -49,7 +49,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE TABLE IF NOT EXISTS triage_observations (
             fingerprint TEXT PRIMARY KEY, job_id TEXT NOT NULL,
-            diagnosis TEXT NOT NULL, issue_url TEXT, completed_at TEXT NOT NULL
+            diagnosis TEXT NOT NULL, issue_url TEXT, completed_at TEXT NOT NULL,
+            resolved_run_id INTEGER
         );
         CREATE TABLE IF NOT EXISTS triage_publications (
             job_id TEXT NOT NULL, group_index INTEGER NOT NULL,
@@ -57,6 +58,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (job_id, group_index)
         );
     """)
+    monitor.ensure_column(conn, "triage_observations", "resolved_run_id", "INTEGER")
 
 
 def fingerprint(row) -> str:
@@ -71,7 +73,8 @@ def pending(conn) -> list[dict]:
     result = []
     for row in rows:
         digest = fingerprint(row)
-        if conn.execute("SELECT 1 FROM triage_observations WHERE fingerprint=?", (digest,)).fetchone():
+        prior = conn.execute("SELECT resolved_run_id FROM triage_observations WHERE fingerprint=?", (digest,)).fetchone()
+        if prior and (prior["resolved_run_id"] is None or prior["resolved_run_id"] == row["last_seen_run_id"]):
             continue
         result.append(dict(row, failure_id=len(result) + 1, fingerprint=digest))
         if len(result) == 40:
@@ -298,6 +301,53 @@ def publish_issue(conn, job, index, finding, observations) -> str:
     return f"https://github.com/{monitor.REPO_NAME}/issues/{number}"
 
 
+def record_observation(conn, job, finding, observation, url):
+    conn.execute("INSERT INTO triage_observations "
+                 "(fingerprint,job_id,diagnosis,issue_url,completed_at,resolved_run_id) VALUES (?,?,?,?,?,?) "
+                 "ON CONFLICT(fingerprint) DO UPDATE SET job_id=excluded.job_id,diagnosis=excluded.diagnosis,"
+                 "issue_url=excluded.issue_url,completed_at=excluded.completed_at,resolved_run_id=excluded.resolved_run_id",
+                 (observation["fingerprint"], job["id"], finding["diagnosis"], url, monitor.utc_now(),
+                  observation["last_seen_run_id"] if finding["issue"] is None else None))
+
+
+def retire_resolved_observation(conn, job, finding, observation) -> bool:
+    # Caller holds the SQLite writer lock. Never apply a resolution to a newer
+    # failing run, even when it has the same commit and failure fingerprint.
+    current = current_observation(conn, observation)
+    if current is None or current["last_seen_run_id"] != observation["last_seen_run_id"]:
+        return False
+    now = monitor.utc_now()
+    conn.execute(f"UPDATE known_failures SET status='fixed',fixed_at=?,fixed_by_sha=NULL,"
+                 f"diagnosis=?,diagnosis_source=?,updated_at=? WHERE {WHERE_KEY}",
+                 (now, (finding["diagnosis"] + " Evidence: " + finding["evidence"])[:500],
+                  f"triage session {job['session_id']}", now, *(observation[k] for k in KEY)))
+    return True
+
+
+def reconcile_resolved(conn) -> int:
+    """Apply resolved findings from reports published before retirement existed."""
+    retired = 0
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        jobs = conn.execute("SELECT DISTINCT j.* FROM triage_jobs j JOIN triage_observations o ON o.job_id=j.id "
+                            "WHERE j.status='completed' AND j.report_json IS NOT NULL "
+                            "AND o.issue_url IS NULL AND o.resolved_run_id IS NULL").fetchall()
+        for job in jobs:
+            observations = {o["failure_id"]: o for o in json.loads(job["observations_json"])}
+            for finding in json.loads(job["report_json"])["findings"]:
+                if finding["issue"] is not None:
+                    continue
+                for number in finding["failure_ids"]:
+                    observation = observations[number]
+                    cached = conn.execute("SELECT * FROM triage_observations WHERE fingerprint=?",
+                                          (observation["fingerprint"],)).fetchone()
+                    if not cached or cached["job_id"] != job["id"] or cached["resolved_run_id"] is not None:
+                        continue
+                    retired += int(retire_resolved_observation(conn, job, finding, observation))
+                    record_observation(conn, job, finding, observation, None)
+    return retired
+
+
 def publish(conn, job) -> None:
     # The fixer can investigate concurrently; serialize ticket ownership decisions.
     with lock(monitor.LOCK_PATH) as acquired:
@@ -315,9 +365,10 @@ def publish(conn, job) -> None:
             with conn:
                 for n in finding["failure_ids"]:
                     o = observations[n]
-                    conn.execute("INSERT OR IGNORE INTO triage_observations VALUES (?,?,?,?,?)",
-                                 (o["fingerprint"], job["id"], finding["diagnosis"], url, monitor.utc_now()))
-                    if current_observation(conn, o) is not None:
+                    record_observation(conn, job, finding, o, url)
+                    if finding["issue"] is None:
+                        retire_resolved_observation(conn, job, finding, o)
+                    elif current_observation(conn, o) is not None:
                         # Recheck inside the write transaction: ledger polling can run during GitHub calls.
                         conn.execute(f"UPDATE known_failures SET diagnosis=?,diagnosis_source=?,"
                                      f"triage_issue_url=COALESCE(?,triage_issue_url),triage_issue_state="
@@ -329,7 +380,6 @@ def publish(conn, job) -> None:
         with conn:
             conn.execute("UPDATE triage_jobs SET status='completed',finished_at=?,last_error=NULL WHERE id=?",
                          (monitor.utc_now(), job["id"]))
-    # CI alone clears ledger entries. A diagnosis that says resolved is contextual evidence.
     monitor._sync_known_failure_issue(conn)
     monitor.log(f"triage {job['id']}: published findings")
 
@@ -347,6 +397,8 @@ def cleanup(conn) -> None:
 
 def tick(conn) -> None:
     monitor.update_known_failures(conn, monitor.load_slack_transport())
+    if reconcile_resolved(conn):
+        monitor._sync_known_failure_issue(conn)
     cleanup(conn)
     job = conn.execute("SELECT * FROM triage_jobs WHERE status!='completed' ORDER BY created_at LIMIT 1").fetchone()
     if job is None:
@@ -378,6 +430,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="show local queue state without polling GitHub or mj")
     parser.add_argument("--retry-launch", metavar="JOB", help="explicitly retry an ambiguous launch after confirming no matching session exists")
+    parser.add_argument("--reconcile-resolved", action="store_true", help="retire unchanged resolved observations from completed reports and refresh the index without launching a session")
     args = parser.parse_args()
     with lock(LOCK_PATH) as acquired:
         if not acquired:
@@ -389,6 +442,11 @@ def main() -> None:
                     "SELECT id,status,session_id,created_at,finished_at,last_error FROM triage_jobs ORDER BY created_at DESC LIMIT 10")]
                 print(json.dumps({"jobs": jobs, "pending_observations": len(pending(conn)),
                                   "model": MODEL, "cpus": CPUS, "memory_gib": MEMORY_GIB}, indent=2))
+                return
+            if args.reconcile_resolved:
+                count = reconcile_resolved(conn)
+                monitor._sync_known_failure_issue(conn)
+                print(json.dumps({"retired_observations": count}))
                 return
             if args.retry_launch:
                 job = conn.execute("SELECT * FROM triage_jobs WHERE id=?", (args.retry_launch,)).fetchone()

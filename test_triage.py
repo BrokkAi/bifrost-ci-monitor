@@ -8,6 +8,7 @@ from unittest import TestCase, mock
 
 import monitor
 import triage
+import automerge
 
 
 class FakeGitHub:
@@ -85,10 +86,10 @@ class TriageTests(TestCase):
                 "VALUES ('CI','linux','step',?,?,1,'https://github.test/run/1','2026-01-01',"
                 "?,1,'https://github.test/run/1','2026-01-01','2026-01-01')", (identity, sha, sha))
 
-    def job(self):
-        return self.conn.execute("SELECT * FROM triage_jobs WHERE id='job'").fetchone()
+    def job(self, job_id="job"):
+        return self.conn.execute("SELECT * FROM triage_jobs WHERE id=?", (job_id,)).fetchone()
 
-    def make_job(self, status="publishing", existing=None, resolved=False):
+    def make_job(self, status="publishing", existing=None, resolved=False, job_id="job"):
         observations = triage.pending(self.conn)
         report = {"findings": [{"failure_ids": [o["failure_id"] for o in observations],
             "diagnosis": "Missing import", "evidence": "run 1: unresolved symbol at src/lib.rs:2",
@@ -97,7 +98,7 @@ class TriageTests(TestCase):
         with self.conn:
             self.conn.execute("INSERT INTO triage_jobs(id,title,base_sha,created_at,status,"
                               "observations_json,session_id,report_json) VALUES (?,?,?,?,?,?,?,?)",
-                              ("job", "Bifrost CI triage job", "a" * 40, "2026-01-01", status,
+                              (job_id, f"Bifrost CI triage {job_id}", "a" * 40, "2026-01-01", status,
                                json.dumps(observations), "session", json.dumps(report)))
         return report
 
@@ -105,12 +106,14 @@ class TriageTests(TestCase):
         self.add_failure()
         self.conn.execute("ALTER TABLE known_failures DROP COLUMN triage_issue_url")
         self.conn.execute("ALTER TABLE known_failures DROP COLUMN triage_issue_state")
+        self.conn.execute("ALTER TABLE triage_observations DROP COLUMN resolved_run_id")
         self.conn.commit()
         self.reopen()
         row = self.conn.execute("SELECT * FROM known_failures").fetchone()
         self.assertEqual(row["identity"], "Cargo nextest")
         self.assertIsNone(row["triage_issue_url"])
         self.assertEqual(row["triage_issue_state"], "OPEN")
+        self.assertIn("resolved_run_id", {r["name"] for r in self.conn.execute("PRAGMA table_info(triage_observations)")})
 
     def test_groups_shared_cause_into_one_issue_and_preserves_repair_eligibility(self):
         self.add_failure()
@@ -224,13 +227,87 @@ class TriageTests(TestCase):
         self.assertEqual(self.job()["status"], "publishing")
         self.assertEqual(self.github.calls, [])
 
-    def test_resolved_diagnosis_does_not_create_ticket_or_clear_ci_ledger(self):
+    def test_resolved_finding_retires_the_row_without_deleting_history_or_creating_ticket(self):
         self.add_failure()
         self.make_job(resolved=True)
         triage.publish(self.conn, self.job())
         self.assertEqual(self.github.calls, [])
-        self.assertEqual(self.conn.execute("SELECT status FROM known_failures").fetchone()[0], "open")
+        row = self.conn.execute("SELECT * FROM known_failures").fetchone()
+        self.assertEqual(row["status"], "fixed")
+        self.assertIsNotNone(row["fixed_at"])
+        self.assertIsNone(row["fixed_by_sha"])
+        self.assertEqual(row["diagnosis_source"], "triage session session")
+        self.assertIn("Master has no known failures.", monitor._known_failure_issue_body(self.conn))
+        self.assertEqual(monitor.render_known_failures_prompt(self.conn), "")
         self.assertEqual(triage.pending(self.conn), [])
+
+    def test_newer_failure_run_on_same_commit_is_not_retired_by_an_old_report(self):
+        self.add_failure()
+        self.make_job(resolved=True)
+        with self.conn:
+            self.conn.execute("UPDATE known_failures SET last_seen_run_id=2")
+        triage.publish(self.conn, self.job())
+        row = self.conn.execute("SELECT * FROM known_failures").fetchone()
+        self.assertEqual(row["status"], "open")
+        self.assertIsNone(row["diagnosis"])
+        self.assertEqual(len(triage.pending(self.conn)), 1)
+
+    def test_ci_recurrence_reopens_and_retriages_even_with_identical_fingerprint(self):
+        self.add_failure()
+        with self.conn:
+            self.conn.execute("UPDATE known_failures SET last_seen_failed_steps_json=?", (json.dumps(["Cargo nextest"]),))
+        self.make_job(resolved=True)
+        before = triage.fingerprint(self.conn.execute("SELECT * FROM known_failures").fetchone())
+        triage.publish(self.conn, self.job())
+        report = automerge.FailureReport(frozenset({"CI/linux"}), {
+            "CI/linux": automerge.FailedJobDetails(frozenset({"Cargo nextest"}), frozenset())}, "failure log")
+        with mock.patch.object(automerge, "collect_failure_report_for_run", return_value=report):
+            monitor._process_known_failure_run(self.conn, "CI", {
+                "databaseId": 2, "headSha": "a" * 40, "url": "https://github.test/run/2", "conclusion": "failure"})
+        row = self.conn.execute("SELECT * FROM known_failures").fetchone()
+        self.assertEqual(row["status"], "open")
+        self.assertIsNone(row["diagnosis"])
+        self.assertEqual(triage.fingerprint(row), before)
+        self.assertEqual(len(triage.pending(self.conn)), 1)
+        self.make_job(job_id="recurrence")
+        triage.publish(self.conn, self.job("recurrence"))
+        cached = self.conn.execute("SELECT * FROM triage_observations").fetchone()
+        self.assertIsNone(cached["resolved_run_id"])
+        self.assertIsNotNone(cached["issue_url"])
+        self.assertEqual(triage.pending(self.conn), [])
+
+    def legacy_resolved_job(self):
+        self.add_failure()
+        report = self.make_job(status="completed", resolved=True)
+        o = json.loads(self.job()["observations_json"])[0]
+        with self.conn:
+            self.conn.execute("INSERT INTO triage_observations "
+                              "(fingerprint,job_id,diagnosis,issue_url,completed_at) VALUES (?,'job',?,NULL,'2026-01-01')",
+                              (o["fingerprint"], report["findings"][0]["diagnosis"]))
+
+    def test_completed_legacy_resolutions_are_reconciled_once(self):
+        self.legacy_resolved_job()
+        self.assertEqual(triage.reconcile_resolved(self.conn), 1)
+        self.assertEqual(triage.reconcile_resolved(self.conn), 0)
+        self.assertEqual(self.conn.execute("SELECT status FROM known_failures").fetchone()[0], "fixed")
+        self.assertEqual(self.conn.execute("SELECT resolved_run_id FROM triage_observations").fetchone()[0], 1)
+
+    def test_legacy_resolution_cannot_retire_a_newer_run(self):
+        self.legacy_resolved_job()
+        with self.conn:
+            self.conn.execute("UPDATE known_failures SET last_seen_run_id=2")
+        self.assertEqual(triage.reconcile_resolved(self.conn), 0)
+        self.assertEqual(self.conn.execute("SELECT status FROM known_failures").fetchone()[0], "open")
+        self.assertEqual(len(triage.pending(self.conn)), 1)
+
+    def test_legacy_resolution_cannot_replace_a_newer_diagnosis(self):
+        self.legacy_resolved_job()
+        with self.conn:
+            self.conn.execute("UPDATE triage_observations SET job_id='newer-job'")
+            self.conn.execute("UPDATE known_failures SET diagnosis='new failure'")
+        self.assertEqual(triage.reconcile_resolved(self.conn), 0)
+        self.assertEqual(self.conn.execute("SELECT status,diagnosis FROM known_failures").fetchone()[:],
+                         ("open", "new failure"))
 
     def test_aggregate_issue_cannot_be_used_as_individual_failure_ticket(self):
         self.add_failure()
