@@ -306,7 +306,27 @@ prefers captured base versus that base plus suspected exact heads through real
 merges with consistent settings; account for an older PR-head base. Patch
 reversals may suggest hypotheses; acceptance/rejection requires evidence from
 the required committed trees. On contradictory results, reconcile tested trees,
-commands, and settings first. Act on sufficient fix/eject evidence.
+commands, and settings first. Record sufficient fix/eject conclusions in the
+progress note.
+
+When validation fails, preserve the failing committed candidate and logs while
+diagnosing the available failures. Collect failures from selected checks, avoiding
+fail-fast behavior where practical, and continue useful independent checks when
+others are blocked. Group failures by likely cause and delegate independent
+investigations against the same candidate and captured source heads. Assess every
+observed group as reproduced baseline, interaction/mechanical fix, independently
+broken source, or unresolved failure needing evidence. This covers observed
+failures and specific concerns, not separate testing of every PR or hypothetical
+defects. Before changing the integration tree or ending the turn, consolidate
+established rejections and applicable fixes. Resolve attribution questions before
+rejecting a source. Record the combined exact-head exclusion set through mm-db,
+refreshing revisions between mutations, then read the remaining membership;
+dependent descendants are removed without independently rejecting them. If sources
+were excluded, rebuild the recorded remainder once, preserving applicable
+fixes/conflict resolutions. Append fixes for retained PRs and validate the result;
+reproduced baseline failures alone require no rebuild. Do not rebuild and retest
+between individual exclusions from the same diagnosis pass. Build blockers can
+hide more failures; record blocked checks and reassess after the combined rebuild.
 
 Reproduce only failures observed in the candidate's selected checks at the exact
 base, reusing existing exact-tree evidence where available. Passing tests and

@@ -28,9 +28,14 @@ python3 <this skill>/scripts/mm_db.py comment --revision REV --issue N --body-fi
 Removal updates the supervisor immediately. Rejection records the exact-head
 marker and evidence for delivery by the supervisor's App identity; use it only after
 establishing a new failure attributable to that source head. Changed or closed
-PRs are removed without rejection. Rebuild the branch after exclusions, preserving
-relevant conflict resolutions. Test evidence is your explicit assessment; this
-helper does not select tests or infer a verdict.
+PRs are removed without rejection. Diagnose the available failure groups before
+recording the combined rejection set. Record all established exact-head exclusions,
+refreshing the revision between mutations, then read state again for the remaining
+membership. Removing a prerequisite also removes its descendants; do not reject
+them unless they are independently broken. Rebuild the recorded remainder once,
+preserving applicable fixes and conflict resolutions. Do not rebuild and retest
+between individual exclusions from the same diagnosis pass. Test evidence is your
+explicit assessment; this helper does not select tests or infer a verdict.
 
 The state response lists pending GitHub writes. A recorded rejection or comment
 is accepted even if GitHub delivery is pending; continue the batch. The supervisor

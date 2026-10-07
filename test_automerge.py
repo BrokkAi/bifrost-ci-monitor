@@ -629,7 +629,7 @@ class IdentityAndPromptTests(TestCase):
             self.assertIn(expected, prompt)
 
     @unchanged_queue()
-    def test_fix_versus_eject_guidance_is_present_in_mode_and_rebuild_prompts(self):
+    def test_fix_versus_eject_and_combined_exclusions_are_guided_in_launch_and_followup_prompts(self):
         pulls = [pull(7), pull(8, HEAD_TWO)]
         prompts = [
             automerge.build_prompt("batch-test", pulls, BASE_SHA, ci_mode="sync"),
@@ -673,6 +673,13 @@ class IdentityAndPromptTests(TestCase):
             "redesign or substantially rewrite",
             "When unsure, eject",
             "Conflicts are never grounds for rejection",
+            "preserve the failing committed candidate and its logs",
+            "Do not rebuild immediately after identifying the first broken PR",
+            "Assess every observed failure group",
+            "refreshing the revision between mutations",
+            "Do not rebuild and retest between individual exclusions",
+            "reassess them after the combined rebuild",
+            "Reproduced baseline failures alone require no rebuild",
         )
         for prompt in prompts:
             for phrase in expected:

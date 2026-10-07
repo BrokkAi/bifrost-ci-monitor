@@ -100,8 +100,9 @@ SKILLS_GUIDANCE = (
     "or GitHub API writes yourself; the supervisor delivers and retries recorded "
     "intents. Read mm-db state before changing membership. "
     "The supervisor orders prerequisite PRs before dependents and captures their exact heads. "
-    "Removing a prerequisite also removes its descendants; refresh mm-db state and "
-    "rebuild the recorded remainder without rejecting those descendants. Try one "
+    "Removing a prerequisite also removes its descendants; after recording the "
+    "combined exclusions, refresh mm-db state and rebuild the recorded remainder "
+    "without rejecting those descendants. Try one "
     "octopus merge of the verified heads first; if it fails, resolve sequential "
     "merges manually. One octopus merge commit retaining every source head is "
     "allowed. Record removals and test evidence through mm-db, publish through "
@@ -122,6 +123,8 @@ FIX_VS_EJECT_GUIDANCE = (
 REJECTION_TOOL_GUIDANCE = (
     "For each independently broken source head, record `mm-db exclude --kind rejected` "
     "with its exact captured SHA, failing tests, and concrete evidence in the evidence file. "
+    "Record the combined rejection set before rebuilding; refresh the mm-db revision "
+    "between mutations. "
     "The supervisor posts the trusted comment and label asynchronously and retries failures. "
     "Do not post comments, edit labels, or change PR state with gh yourself. "
     "For changed or closed PRs, record `mm-db exclude --kind removed` instead."
@@ -1256,7 +1259,19 @@ def _validation_guidance(base_sha: str, impact: dict[str, Any] | None = None) ->
         "unresolved concerns; broad or grouped checks are appropriate when warranted. "
         "Workflow definitions supply commands; choose checks to resolve those concerns.\n\n"
         + MERGE_DELEGATION_GUIDANCE + "\n\n"
-        "Failure diagnosis: prefer git blame, git log -p, focused diffs, and tracing "
+        "Failure diagnosis: when validation fails, preserve the failing committed "
+        "candidate and its logs while diagnosing the available failures. Do not "
+        "rebuild immediately after identifying the first broken PR. Collect failures "
+        "from the selected checks, avoiding fail-fast behavior where practical, and "
+        "continue useful independent checks when another check is blocked. Group "
+        "failures by likely cause; delegate independent investigations against the "
+        "same candidate and captured source heads. Assess every observed failure "
+        "group as a reproduced baseline, an interaction or mechanical fix to make "
+        "in the batch, an independently broken source PR to reject, or an unresolved "
+        "failure requiring further evidence. This diagnosis covers observed failures "
+        "and specific unresolved concerns; do not test every PR separately or search "
+        "for hypothetical failures.\n\n"
+        "Prefer git blame, git log -p, focused diffs, and tracing "
         "the failing assertion through data/control flow. Here inspection is almost "
         "always faster than bisecting Rust variants that each need another build. "
         "Before an expensive experiment, briefly record the pending decision, "
@@ -1268,7 +1283,22 @@ def _validation_guidance(base_sha: str, impact: dict[str, Any] | None = None) ->
         "consistent settings; account for an older PR-head base. Patch reversals "
         "may suggest hypotheses; acceptance/rejection evidence must describe the "
         "required committed trees. On contradictory results, reconcile tested "
-        "trees, commands, and settings first. Act on sufficient fix/eject evidence.\n\n"
+        "trees, commands, and settings first. Record sufficient fix/eject conclusions "
+        "in the progress note.\n\n"
+        "Before changing the integration tree, consolidate established rejections "
+        "and applicable fixes from the available failure groups into one plan. "
+        "Resolve outstanding attribution questions with useful inspection or "
+        "targeted evidence before rejecting a source. Record every independently "
+        "broken exact source head through mm-db, refreshing the revision between "
+        "mutations. Refresh membership so dependent descendants are removed "
+        "without independently rejecting them. If sources were excluded, rebuild "
+        "the recorded remainder once, preserving applicable fixes and conflict "
+        "resolutions. Apply fixes for retained PRs as appended commits, then validate "
+        "the resulting committed candidate. Reproduced baseline failures alone "
+        "require no rebuild. Do not rebuild and retest between "
+        "individual exclusions from the same diagnosis pass. Complete the available "
+        "failure diagnosis before ending the turn. A build blocker can hide further "
+        "failures; record blocked checks and reassess them after the combined rebuild.\n\n"
         "Baseline and completion: reproduce only failures observed in the "
         "candidate's selected checks, reusing existing exact-tree evidence where "
         "available. Passing tests and ledger failures absent from the candidate "
@@ -1361,7 +1391,7 @@ CI on the integration PR is authoritative.
 
 Publish through mm-autopr after the local assessment. It creates or updates exactly one integration PR with title `{integration_title}`, its source list, and the existing label `{INTEGRATION_LABEL}`. Never publish an empty batch.
 
-After publishing, finish your turn; the supervisor watches CI while this session stays live and idle. When CI is red, the supervisor will send this same session failed job logs for this PR and for master's CI at base {base_sha}. Compare failures test by test. If a failure is reproduced at the base, it is baseline; otherwise identify the responsible PR(s). You may append fix commits, or eject responsible PR(s). Eject by rebuilding this branch from the original base without those PRs and force-pushing only `{branch}` with `git push --force-with-lease origin HEAD:refs/heads/{branch}`. Never use a revert commit. {REJECTION_TOOL_GUIDANCE} For every PR you eject, include this standalone line in your final assistant message: `automerge-ejected-pr: <PR number> <exact listed full head SHA>`.
+After publishing, finish your turn; the supervisor watches CI while this session stays live and idle. When CI is red, the supervisor will send this same session failed job logs for this PR and for master's CI at base {base_sha}. Compare failures test by test. If a failure is reproduced at the base, it is baseline; otherwise identify the responsible PR(s). Diagnose the available failure groups before applying the combined fixes and rejections. Eject by rebuilding this branch once from the original base without the combined rejected source set and force-pushing only `{branch}` with `git push --force-with-lease origin HEAD:refs/heads/{branch}`. Never use a revert commit. {REJECTION_TOOL_GUIDANCE} For every PR you eject, include this standalone line in your final assistant message: `automerge-ejected-pr: <PR number> <exact listed full head SHA>`.
 
 If the supervisor asks you to update to newer master, merge that exact master commit into the integration branch, follow the validation policy supplied for that turn, push only `{branch}`, then finish your turn so the supervisor can watch CI again. Fixes are appended commits. Do not force-push except when rebuilding the branch to eject/remove source PRs, and then force-push only `{branch}`.
 
@@ -1435,7 +1465,7 @@ Apply that guidance to every new failure. The local gate passes when the documen
 
 When the local gate passes, publish `{branch}` through mm-autopr. It creates or updates exactly one integration PR titled `{integration_title}`, with included source heads, conflict-resolution/fix notes, and label `{INTEGRATION_LABEL}`. Do not publish before the local gate passes. Never wait for CI, inspect CI results, or merge the integration PR yourself. The supervisor runs the common pre-merge checks, posts the required verdict status, and merges the exact locally tested head; CI runs after merge and the CI monitor handles any resulting breakage through later PR batches.
 
-Use the same safe removal and rejection rules as sync mode. Eject by rebuilding from {base_sha} without the PR, never by revert. Force-push only `{branch}` using `git push --force-with-lease origin HEAD:refs/heads/{branch}` when rebuilding. {REJECTION_TOOL_GUIDANCE} For each ejected PR include the standalone line `automerge-ejected-pr: <PR number> <exact listed full head SHA>` in your final message.
+Use the same safe removal and rejection rules as sync mode. Diagnose the available failure groups, then eject by rebuilding once from {base_sha} without the combined rejected source set, never by revert. Force-push only `{branch}` using `git push --force-with-lease origin HEAD:refs/heads/{branch}` when rebuilding. {REJECTION_TOOL_GUIDANCE} For each ejected PR include the standalone line `automerge-ejected-pr: <PR number> <exact listed full head SHA>` in your final message.
 
 Your final message must contain exactly one standalone verdict line `automerge-local: pass` or `automerge-local: fail`, a one-line `Tests run: ...` listing every targeted test/command run (or `none` for a docs batch), and a one-line `Baseline failures: ...` listing reproduced failures or `none`. Name the validated full HEAD SHA. Include a short explanation for any failure and one `known-failure: <workflow> | <job> | <test or step> | <one-line diagnosis>` line per ledger failure you diagnose; do not invent identities. The supervisor accepts publication only when the final message reports `pass` with both evidence lines. The supervisor does not interpret CI state in async mode.
 
