@@ -77,12 +77,13 @@ monitor checks the transcript for escalation. GitHub lookup failures retry on
 later ticks; after three consecutive failures the invocation gets the distinct
 `pr_detection_failed` status and a Slack notice.
 
-The repair budget is one hour. At expiry the monitor interrupts the turn, then
-asks that same session for a ten-minute issue handoff. The handoff stops all
-repair work and PR publication, lists any commits not yet published, and gives
-the session id and branch for a human to continue. At the end of every session
-path, the monitor asks Mjolnir to suspend and checkpoint the container without
-waiting for the background suspension to finish. Later ticks verify that
+Repairs have no runtime deadline. A bounded poll that finds the agent still
+working continues observing the same live session. A supervision failure leaves
+it live for the next monitor invocation to reattach; elapsed time does not kill
+the repair. After capturing a terminal result, the monitor asks Mjolnir to
+suspend and checkpoint the container without waiting for the background
+suspension to finish. Legacy timeout handoffs already recorded in the database
+can still be recovered, but normal repairs never enter that path. Later ticks verify that
 requested suspensions reached a stopped state, retry once, and report persistent
 failures in the Slack thread.
 

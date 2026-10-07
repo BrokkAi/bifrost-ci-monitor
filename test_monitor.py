@@ -1205,7 +1205,7 @@ class MjRunnerTests(unittest.TestCase):
         self.assertEqual(commands.count("suspend"), 1)
         self.assertIn("--acknowledge-unpublished-work", suspend_argv[0])
 
-    def test_session_is_suspended_after_success_and_supervision_failure(self):
+    def test_session_is_suspended_after_success_but_kept_live_on_supervision_failure(self):
         insert_invocation(self.conn, session_id="session-outcome")
         for failure in (False, True):
             with self.subTest(failure=failure):
@@ -1243,7 +1243,49 @@ class MjRunnerTests(unittest.TestCase):
                             self.conn, self.transport, make_run(),
                             "session-outcome", "ci-repair/42-1", 3600,
                         )
-                self.assertIn("suspend", calls)
+                self.assertEqual("suspend" in calls, not failure)
+
+    def test_unlimited_repair_survives_poll_timeouts_without_interrupt_or_handoff(self):
+        insert_invocation(self.conn, status="running", session_id="long-repair")
+        with self.conn:
+            self.conn.execute("UPDATE invocations SET started_at='2020-01-01T00:00:00Z'")
+        with (
+            mock.patch.object(monitor, "supervise_turn", side_effect=[
+                monitor.TurnResult("running", "timeout", timed_out=True),
+                monitor.TurnResult("running", "timeout", timed_out=True),
+                monitor.TurnResult("completed", "finished"),
+            ]) as wait,
+            mock.patch.object(monitor, "interrupt_and_wait") as interrupt,
+            mock.patch.object(monitor, "send_session_prompt") as prompt,
+            mock.patch.object(monitor, "drain_transcript"),
+            mock.patch.object(monitor, "read_complete_agent_transcript", return_value="Fixed"),
+            mock.patch.object(monitor, "suspend_session") as suspend,
+        ):
+            result = monitor.run_session_lifecycle(
+                self.conn, self.transport, make_run(), "long-repair", "ci-repair/42-1", None,
+            )
+        self.assertEqual(wait.call_count, 3)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.status, "completed")
+        interrupt.assert_not_called()
+        prompt.assert_not_called()
+        suspend.assert_called_once()
+
+    def test_restart_reattaches_old_repair_without_a_remaining_time_budget(self):
+        insert_invocation(self.conn, status="running", session_id="long-repair")
+        with self.conn:
+            self.conn.execute("UPDATE invocations SET started_at='2020-01-01T00:00:00Z'")
+        with (
+            mock.patch.object(monitor, "require_mj_success", return_value=json.dumps({
+                "state": "running", "is_idle": False, "chat_phase": "running",
+            })),
+            mock.patch.object(monitor, "run_session_lifecycle", return_value=monitor.SessionResult(
+                "completed", "Fixed", False, False,
+            )) as lifecycle,
+            mock.patch.object(monitor, "detect_and_finalize_pr"),
+        ):
+            monitor.reattach_running_invocations(self.conn, self.transport)
+        self.assertIsNone(lifecycle.call_args.args[5])
 
     def test_suspend_warning_is_logged_and_posted_to_thread(self):
         insert_invocation(self.conn, session_id="session-warning")

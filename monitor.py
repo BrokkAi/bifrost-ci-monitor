@@ -2799,7 +2799,7 @@ def run_session_lifecycle(
     run: CiRun,
     session_id: str,
     branch: str,
-    timeout_seconds: int,
+    timeout_seconds: int | None,
     *,
     first_wait: TurnResult | None = None,
     resume_timeout_handoff: bool = False,
@@ -2808,7 +2808,15 @@ def run_session_lifecycle(
     handoff_completed = False
     timed_out = False
     final_status = "failed"
+    result_captured = False
     try:
+        if timeout_seconds is None and not resume_timeout_handoff and not handoff_in_progress:
+            # Polls are bounded; a repair session's total lifetime is not. Keep the
+            # running invocation recoverable if supervision temporarily fails.
+            turn = first_wait
+            while turn is None or turn.timed_out:
+                turn = supervise_turn(conn, transport, run.run_id, session_id, 60)
+            first_wait = turn
         if handoff_in_progress:
             timed_out = True
             handoff = first_wait or supervise_turn(
@@ -2890,6 +2898,7 @@ def run_session_lifecycle(
                 "UPDATE invocations SET output = ? WHERE workflow_run_id = ?",
                 (output, run.run_id),
             )
+        result_captured = True
         return SessionResult(
             final_status,
             output,
@@ -2897,7 +2906,8 @@ def run_session_lifecycle(
             handoff_completed,
         )
     finally:
-        suspend_session(conn, transport, run.run_id, session_id)
+        if result_captured:
+            suspend_session(conn, transport, run.run_id, session_id)
 
 
 def invocation_as_run(row: sqlite3.Row) -> CiRun:
@@ -3150,7 +3160,7 @@ def reattach_running_invocations(
             )
             result = run_session_lifecycle(
                 conn, transport, run, session_id, branch,
-                MJ_TURN_TIMEOUT_SECONDS - elapsed_since(row["started_at"]),
+                None,
                 first_wait=first_wait,
                 resume_timeout_handoff=resume_timeout_handoff,
                 handoff_in_progress=handoff_in_progress,
@@ -3771,7 +3781,7 @@ def run_monitor() -> int:
                 run,
                 session_id,
                 branch,
-                MJ_TURN_TIMEOUT_SECONDS,
+                None,
             )
             detect_and_finalize_pr(conn, transport, run, result, branch)
             return 0
