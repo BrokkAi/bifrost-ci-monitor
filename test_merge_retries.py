@@ -47,6 +47,10 @@ class MergeRetryTests(TestCase):
     def row(self):
         return self.conn.execute("SELECT * FROM automerge_batches WHERE batch_id='retry'").fetchone()
 
+    def draft_intents(self):
+        return self.conn.execute("SELECT * FROM automerge_github_outbox "
+                                 "WHERE kind='draft_changed_head'").fetchall()
+
     def reopen(self):
         self.conn.close()
         self.conn = automerge.connect_db()
@@ -110,7 +114,8 @@ class MergeRetryTests(TestCase):
         terminal = self.patch(automerge, "_terminal")
         automerge._rebuild_or_finish(self.conn, self.transport, self.row(), [pull()], "head changed")
         self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [8])
-        self.assertTrue(self.states[7]["isDraft"])
+        self.assertFalse(self.states[7]["isDraft"])
+        self.assertEqual(len(self.draft_intents()), 1)
         terminal.assert_not_called()
 
     def test_last_source_removed_at_expansion_cap_finishes_without_reintroducing_it(self):
@@ -126,32 +131,35 @@ class MergeRetryTests(TestCase):
 
     def test_changed_source_is_drafted_once_and_removed(self):
         self.states[7] = direct_view(head_sha=HEAD_TWO)
-        keep, removed = automerge._recheck_sources([pull()])
+        keep, removed = automerge._recheck_sources([pull()], conn=self.conn, batch_id="retry")
         self.assertEqual(keep, [])
         self.assertIn("head changed", removed[0])
-        automerge._recheck_sources([pull()])
-        self.gh.assert_called_once_with(["pr", "ready", "7", "--undo", "--repo", monitor.REPO_NAME])
+        automerge._recheck_sources([pull()], conn=self.conn, batch_id="retry")
+        self.assertEqual(len(self.draft_intents()), 1)
+        self.gh.assert_not_called()
 
     def test_invalid_head_never_causes_drafting(self):
         self.states[7] = direct_view(head_sha="")
         with self.assertRaises(automerge.AutomergeError):
-            automerge._recheck_sources([pull()])
+            automerge._recheck_sources([pull()], conn=self.conn, batch_id="retry")
         self.gh.assert_not_called()
 
     def test_closed_or_already_draft_source_does_not_issue_draft_mutation(self):
         for view in (direct_view(state="CLOSED", head_sha=HEAD_TWO), direct_view(draft=True, head_sha=HEAD_TWO)):
             self.states[7] = view
-            self.assertEqual(automerge._recheck_sources([pull()])[0], [])
+            self.assertEqual(automerge._recheck_sources([pull()], conn=self.conn, batch_id="retry")[0], [])
         self.gh.assert_not_called()
 
-    def test_drafting_failure_retries_without_consuming_expansion(self):
+    def test_drafting_failure_retries_in_outbox_without_consuming_expansion(self):
         self.states[7] = direct_view(head_sha=HEAD_TWO)
-        self.gh.side_effect = monitor.CommandError("GitHub unavailable")
-        with self.assertRaises(monitor.CommandError):
-            self.retry()
+        self.assertFalse(self.retry())
+        self.assertEqual(len(self.draft_intents()), 1)
+        with mock.patch.object(automerge, "deliver_github_write",
+                               side_effect=monitor.CommandError("GitHub unavailable")):
+            automerge.retry_github_outbox(self.conn, self.transport)
+        self.assertEqual(self.draft_intents()[0]["attempts"], 1)
         self.assertEqual(self.row()["expansion_count"], 0)
-        self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [7])
-        self.gh.side_effect = self.github_write
+        self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [])
         self.select.return_value = [pull(8, HEAD_THREE)]
         self.retry()
         self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [8])
@@ -159,9 +167,9 @@ class MergeRetryTests(TestCase):
     def test_direct_path_drafts_changed_head_before_refusing_merge(self):
         self.states[7] = direct_view(head_sha=HEAD_TWO)
         self.patch(automerge, "direct_pull_request_view", return_value=self.states[7])
-        gate, _ = automerge._direct_premerge_check(pull())
+        gate, _ = automerge._direct_premerge_check(pull(), conn=self.conn, batch_id="retry")
         self.assertEqual(gate, "source_changed")
-        self.assertTrue(self.states[7]["isDraft"])
+        self.assertEqual(len(self.draft_intents()), 1)
 
     def test_running_agent_is_not_interrupted_for_head_change_or_new_arrival(self):
         self.states[7] = direct_view(head_sha=HEAD_TWO)
@@ -170,7 +178,7 @@ class MergeRetryTests(TestCase):
         self.patch(automerge, "_wait_agent_turn", return_value=False)
         interrupt = self.patch(automerge, "interrupt_and_wait")
         automerge.process_batch(self.conn, self.transport, "retry")
-        self.assertTrue(self.states[7]["isDraft"])
+        self.assertEqual(len(self.draft_intents()), 1)
         self.assertEqual(self.row()["expansion_count"], 0)
         self.select.assert_not_called()
         interrupt.assert_not_called()

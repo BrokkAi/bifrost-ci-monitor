@@ -65,7 +65,14 @@ supervisor lands their tested heads through GitHub.
 All three entry points share `monitor.DB_PATH` and its additive
 `known_failures` ledger. Merger tables include `automerge_batches`,
 `automerge_relayed_messages`, `automerge_blocked_notifications`, and
-`automerge_skill_events`. Fixer tables are
+`automerge_skill_events`. `automerge_github_outbox` holds App-owned GitHub
+comments, labels, integration-PR metadata, and changed-head draft requests.
+The merger agent records intents with `mm-db` and publishes through `mm-autopr`;
+it must not make direct `gh` writes. The supervisor retries outbox delivery after
+ambiguous or failed responses. Queue selection honors recorded exact-head
+rejections and pending drafts before GitHub reflects them. Delivery progress must
+not change the agent's batch revision. The integration PR create and exact-head
+merge remain synchronous. Fixer tables are
 `issue_repairs` and `issue_repair_messages`; triage uses `triage_jobs`,
 `triage_observations`, and `triage_publications`. Historical `invocations`
 remain readable. An active legacy invocation blocks new issue repairs until

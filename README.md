@@ -198,7 +198,8 @@ python3 automerge.py --abort-batch <batch-id> --reason 'Operator intervention: .
 
 Abort interrupts/suspends the agent, closes the integration PR, records a
 failure verdict, and leaves the branch for inspection. It rejects no source
-PRs. For a direct attempt, the source PR stays open.
+PRs. It cancels this batch's queued rejections and retries label cleanup; the
+source heads become eligible again. For a direct attempt, the source PR stays open.
 
 ### Common stalls
 
@@ -208,7 +209,8 @@ PRs. For a direct attempt, the source PR stays open.
 | Missing executable or App token | Check the cron user's paths and Mjolnir App configuration. Keep production jobs on App authentication. |
 | Skill service unreachable | Check its journal, private IP and container route; after correcting the cause, run `systemctl --user restart mm-skills.service`. |
 | Source PR changed during a batch | The changed head is made draft. Finish its update and mark it ready again. |
-| Exact head rejected | Read the bot's evidence and fix the existing branch. A new head can re-enter; removing the label does not establish a fix. |
+| Exact head rejected | The bot comments and labels that head. Read its evidence and fix the existing branch; a new head can re-enter without a draft-state change. Removing the label does not establish a fix. |
+| GitHub comment, label, or draft write pending | The supervisor stores the request in `automerge_github_outbox` and retries with backoff, including after the batch ends. Check `last_error` and `next_attempt_at`; repeated failures send a top-level Slack alert. Agents should keep working and never retry these writes with `gh`. |
 | Fixer issue not selected | Check assignment, `agent-in-progress`, and `Escalated`. Respect other people's work; escalations go to `DavidBakerEffendi`. |
 | CI run, baseline, or ancestry lookup unavailable | Read the top-level Slack alert. The batch remains pending and retries automatically; inspect the exact SHA and GitHub availability. |
 | Master advanced or ancestry mismatch confirmed | The agent updates/rebuilds the integration branch and retests before landing. |

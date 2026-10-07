@@ -199,7 +199,188 @@ def async_local_report(verdict: str = "pass") -> str:
             "Baseline failures: none")
 
 
+class GithubOutboxTests(TestCase):
+    def setUp(self):
+        self.conn = make_db()
+        self.addCleanup(self.conn.close)
+        self.transport = monitor.SlackTransport("webhook", webhook="x")
+
+    def retry_now(self):
+        with self.conn:
+            self.conn.execute("UPDATE automerge_github_outbox SET next_attempt_at=NULL")
+        automerge.retry_github_outbox(self.conn, self.transport)
+
+    def test_rejection_comment_is_not_duplicated_after_label_failure(self):
+        with self.conn:
+            automerge.enqueue_github_write(self.conn, "batch-test", "reject_head", 7, HEAD_ONE,
+                                          {"reason": "isolated regression", "evidence": "test A fails"})
+        comments = []
+        labels = []
+        label_calls = 0
+
+        def write(endpoint, method, payload=None):
+            nonlocal label_calls
+            if endpoint.endswith("/comments"):
+                comments.append({"body": payload["body"],
+                                 "user": {"login": automerge.TRUSTED_REJECTION_LOGIN}})
+            elif endpoint.endswith("/labels"):
+                label_calls += 1
+                if label_calls == 1:
+                    raise OSError("GitHub 500")
+                labels.append({"name": automerge.REJECTED_LABEL})
+            else:
+                raise AssertionError(endpoint)
+
+        with (mock.patch.object(automerge, "github_api_write", side_effect=write),
+              mock.patch.object(automerge, "list_pull_comments", side_effect=lambda _n: comments),
+              mock.patch.object(automerge, "gh_json", side_effect=lambda _args: {
+                  "head": {"sha": HEAD_ONE}, "labels": labels,
+              })):
+            automerge.retry_github_outbox(self.conn, self.transport)
+            pending = self.conn.execute("SELECT attempts,delivered_at FROM automerge_github_outbox").fetchone()
+            self.assertEqual(pending["attempts"], 1)
+            self.assertIsNone(pending["delivered_at"])
+            self.retry_now()
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(label_calls, 2)
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT delivered_at FROM automerge_github_outbox").fetchone()[0])
+
+    def test_rejection_does_not_draft_the_rejected_head(self):
+        with self.conn:
+            automerge.enqueue_github_write(self.conn, "batch-test", "reject_head", 7, HEAD_ONE,
+                                          {"reason": "regression", "evidence": "test fails"})
+        comment = {"body": f"automerge-rejected-head: {HEAD_ONE}",
+                   "user": {"login": automerge.TRUSTED_REJECTION_LOGIN}}
+        detail = {"state": "open", "head": {"sha": HEAD_ONE}, "draft": False,
+                  "labels": [{"name": automerge.REJECTED_LABEL}]}
+        with (mock.patch.object(automerge, "list_pull_comments", return_value=[comment]),
+              mock.patch.object(automerge, "gh_json", side_effect=lambda _args: detail),
+              mock.patch.object(automerge, "run_gh") as gh):
+            automerge.retry_github_outbox(self.conn, self.transport)
+        gh.assert_not_called()
+        self.assertFalse(detail["draft"])
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT delivered_at FROM automerge_github_outbox").fetchone()[0])
+
+    def test_rejection_does_not_label_a_newer_head(self):
+        with self.conn:
+            automerge.enqueue_github_write(self.conn, "batch-test", "reject_head", 7, HEAD_ONE,
+                                          {"reason": "regression", "evidence": "test fails"})
+        detail = {"state": "open", "head": {"sha": HEAD_TWO}, "draft": False,
+                  "labels": []}
+        with (mock.patch.object(automerge, "list_pull_comments", return_value=[]),
+              mock.patch.object(automerge, "gh_json", return_value=detail),
+              mock.patch.object(automerge, "github_api_write") as write,
+              mock.patch.object(automerge, "run_gh") as gh):
+            automerge.retry_github_outbox(self.conn, self.transport)
+        self.assertEqual([call.args[0] for call in write.call_args_list], ["issues/7/comments"])
+        gh.assert_not_called()
+
+    def test_lost_comment_response_is_reconciled_without_duplicate_post(self):
+        with self.conn:
+            automerge.enqueue_github_write(self.conn, "batch-test", "issue_comment", 4519, "",
+                                          {"body": "Diagnosis."})
+        comments = []
+        calls = 0
+
+        def write(endpoint, method, payload=None):
+            nonlocal calls
+            calls += 1
+            comments.append({"body": payload["body"],
+                             "user": {"login": automerge.TRUSTED_REJECTION_LOGIN}})
+            raise OSError("response lost")
+
+        with (mock.patch.object(automerge, "github_api_write", side_effect=write),
+              mock.patch.object(automerge, "list_pull_comments", side_effect=lambda _n: comments)):
+            automerge.retry_github_outbox(self.conn, self.transport)
+            self.retry_now()
+        self.assertEqual(calls, 1)
+        self.assertEqual(len(comments), 1)
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT delivered_at FROM automerge_github_outbox").fetchone()[0])
+
+    def test_lost_draft_response_is_reconciled_from_current_pr_state(self):
+        with self.conn:
+            automerge.enqueue_github_write(self.conn, "batch-test", "draft_changed_head", 7, HEAD_TWO,
+                                          {"selected_head": HEAD_ONE})
+        detail = {"state": "open", "head": {"sha": HEAD_TWO}, "draft": False}
+        calls = 0
+
+        def draft(_args, timeout=30):
+            nonlocal calls
+            calls += 1
+            detail["draft"] = True
+            raise OSError("response lost")
+
+        with (mock.patch.object(automerge, "gh_json", side_effect=lambda _args: detail),
+              mock.patch.object(automerge, "run_gh", side_effect=draft)):
+            automerge.retry_github_outbox(self.conn, self.transport)
+            self.retry_now()
+        self.assertEqual(calls, 1)
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT delivered_at FROM automerge_github_outbox").fetchone()[0])
+
+    def test_integration_metadata_retries_label_without_repeating_accepted_update(self):
+        with self.conn:
+            automerge.enqueue_github_write(
+                self.conn, "batch-test", "integration_metadata", 211, HEAD_ONE,
+                {"title": "Merge batch: #7", "body": "first body"},
+            )
+            automerge.enqueue_github_write(
+                self.conn, "batch-test", "integration_metadata", 211, HEAD_ONE,
+                {"title": "Merge batch: #7 #8", "body": "latest body"},
+            )
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM automerge_github_outbox").fetchone()[0], 1)
+        detail = {"state": "open", "head": {"sha": HEAD_ONE}, "title": "old",
+                  "body": "old", "labels": []}
+        patches = []
+        label_calls = 0
+
+        def write(endpoint, method, payload=None):
+            nonlocal label_calls
+            if method == "PATCH":
+                patches.append(payload)
+                detail.update(payload)
+            elif endpoint.endswith("/labels"):
+                label_calls += 1
+                if label_calls == 1:
+                    raise OSError("GitHub 500")
+                detail["labels"].append({"name": automerge.INTEGRATION_LABEL})
+
+        with (mock.patch.object(automerge, "gh_json", side_effect=lambda _args: detail),
+              mock.patch.object(automerge, "github_api_write", side_effect=write)):
+            automerge.retry_github_outbox(self.conn, self.transport)
+            self.retry_now()
+        self.assertEqual(patches, [{"title": "Merge batch: #7 #8", "body": "latest body"}])
+        self.assertEqual(label_calls, 2)
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT delivered_at FROM automerge_github_outbox").fetchone()[0])
+
+
 class SelectionTests(TestCase):
+    def test_recorded_rejection_excludes_exact_head_before_github_label_arrives(self):
+        conn = make_db()
+        with conn:
+            automerge.enqueue_github_write(conn, "batch-test", "reject_head", 7, HEAD_ONE,
+                                          {"reason": "regression", "evidence": "test fails"})
+        with mock.patch.object(automerge, "list_open_pull_requests", return_value=[api_pull(7)]):
+            self.assertEqual(automerge.select_eligible_pull_requests(conn=conn), [])
+        with mock.patch.object(automerge, "list_open_pull_requests",
+                               return_value=[api_pull(7, head_sha=HEAD_TWO)]):
+            self.assertEqual([p.number for p in automerge.select_eligible_pull_requests(conn=conn)], [7])
+        conn.close()
+
+    def test_pending_draft_excludes_pr_while_github_write_retries(self):
+        conn = make_db()
+        with conn:
+            automerge.enqueue_github_write(conn, "batch-test", "draft_changed_head", 7, HEAD_TWO,
+                                          {"selected_head": HEAD_ONE})
+        with mock.patch.object(automerge, "list_open_pull_requests",
+                               return_value=[api_pull(7, head_sha=HEAD_TWO)]):
+            self.assertEqual(automerge.select_eligible_pull_requests(conn=conn), [])
+        conn.close()
+
     def test_drafts_rejected_heads_and_integration_prs_are_filtered(self):
         rows = [
             api_pull(1),
@@ -492,7 +673,7 @@ class IdentityAndPromptTests(TestCase):
             "Baseline failures:",
             "automerge-local: pass",
             "Never wait for CI",
-            "Do not open/update the integration PR before the local gate passes",
+            "Do not publish before the local gate passes",
         ):
             self.assertIn(expected, prompt)
         self.assertNotIn("CI is red, the supervisor will resume", prompt)
@@ -506,7 +687,7 @@ class IdentityAndPromptTests(TestCase):
         prompt = str(row_for(conn)["pending_prompt"])
         self.assertIn("local targeted-test gate passed", prompt)
         self.assertIn("No rebuild or test rerun is needed for an unchanged tested tree", prompt)
-        self.assertIn("otherwise open it with the required title and label", prompt)
+        self.assertIn("use mm-autopr to reconcile the existing integration PR or create it if absent", prompt)
         self.assertNotIn("do not open/update", prompt)
         conn.close()
 
@@ -562,7 +743,7 @@ class IdentityAndPromptTests(TestCase):
         conn.close()
 
     # Hard-won: fa474db8: gh pr list --head owner:branch silently misses the PR.
-    def test_discovered_integration_pr_gets_required_title_and_existing_label(self):
+    def test_discovered_integration_pr_lookup_does_not_write_metadata(self):
         conn = make_db(phase="building")
         row = row_for(conn)
         with (
@@ -576,11 +757,7 @@ class IdentityAndPromptTests(TestCase):
         self.assertEqual(result["number"], 211)
         lookup_args = lookup.call_args.args[0]
         self.assertEqual(lookup_args[lookup_args.index("--head") + 1], row["branch"])
-        args = gh.call_args.args[0]
-        self.assertIn("--title", args)
-        self.assertEqual(args[args.index("--title") + 1], "Merge batch: #7")
-        self.assertIn("--add-label", args)
-        self.assertEqual(args[args.index("--add-label") + 1], automerge.INTEGRATION_LABEL)
+        gh.assert_not_called()
         conn.close()
 
 
@@ -1026,7 +1203,9 @@ class CiSupervisionTests(TestCase):
             mock.patch.object(automerge, "_wait_agent_turn", return_value=False),
         ):
             automerge.process_batch(conn, monitor.SlackTransport("webhook", webhook="x"), "batch-test")
-        self.assertEqual(events, ["prompt:Investigate the red checks"])
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0].startswith("prompt:Investigate the red checks"))
+        self.assertIn("Do not run gh commands", events[0])
         mj.assert_not_called()
         self.assertEqual(row_for(conn)["prompt_delivered"], 1)
         conn.close()
@@ -1591,7 +1770,9 @@ class PublicationGateTests(TestCase):
         ):
             automerge._merge_integration(conn, monitor.SlackTransport("webhook", webhook="x"), row)
         rebuild.assert_called_once()
-        gh.assert_called_once_with(["pr", "ready", "7", "--undo", "--repo", automerge.REPO_NAME])
+        self.assertFalse(any(call.args[0][:2] == ["pr", "ready"] for call in gh.call_args_list))
+        intent = conn.execute("SELECT kind,number,head_sha FROM automerge_github_outbox").fetchone()
+        self.assertEqual(tuple(intent), ("draft_changed_head", 7, HEAD_TWO))
         self.assertEqual(post_status.call_args.args[2:4], (HEAD_ONE, "pending"))
         conn.close()
 
@@ -1798,10 +1979,7 @@ class PublicationGateTests(TestCase):
         prompt = row_for(conn)["pending_prompt"]
         self.assertIn("Rebuild `mergemarshall/batch-batch-test`", prompt)
         self.assertIn("Do not use revert commits", prompt)
-        self.assertIn(
-            "git push --force-with-lease origin HEAD:refs/heads/mergemarshall/batch-batch-test",
-            prompt,
-        )
+        self.assertIn("use mm-autopr --rebuild for the leased push", prompt)
         self.assertNotIn("git revert", prompt)
         self.assertNotIn("refs/heads/master", prompt)
         self.assertEqual([p.number for p in automerge.row_pulls(row_for(conn))], [8])
@@ -2329,11 +2507,10 @@ class DirectMergeTests(TestCase):
             automerge.process_batch(
                 conn, monitor.SlackTransport("webhook", webhook="x"), "batch-test",
             )
-        comment = next(args for args in calls if args[:2] == ["pr", "comment"])
-        self.assertIn(f"automerge-rejected-head: {HEAD_ONE}", comment[comment.index("--body") + 1])
-        self.assertIn("crate::new_failure", comment[comment.index("--body") + 1])
-        label = next(args for args in calls if args[:2] == ["pr", "edit"])
-        self.assertEqual(label[label.index("--add-label") + 1], automerge.REJECTED_LABEL)
+        intent = conn.execute("SELECT kind,number,head_sha,payload_json FROM automerge_github_outbox").fetchone()
+        self.assertEqual(tuple(intent[:3]), ("reject_head", 7, HEAD_ONE))
+        self.assertIn("crate::new_failure", json.loads(intent["payload_json"])["evidence"])
+        self.assertFalse(any(args[:2] in (["pr", "comment"], ["pr", "edit"]) for args in calls))
         self.assertFalse(any(args[:2] == ["pr", "merge"] for args in calls))
         self.assertTrue(any(call.args[3:5] == (HEAD_ONE, "failure")
                             for call in status.call_args_list))
@@ -2949,10 +3126,12 @@ class AbortBatchTests(TestCase):
         self.assertEqual(post.call_args.args[2:4], (HEAD_TWO, "failure"))
         close = next(call.args[0] for call in gh.call_args_list
                      if call.args[0][:2] == ["pr", "close"])
-        self.assertEqual(close[close.index("--comment") + 1], "operator stop: test reason")
-        self.assertTrue(any(call.args[0][:2] == ["pr", "edit"]
-                            and "--remove-label" in call.args[0]
-                            for call in gh.call_args_list))
+        self.assertNotIn("--comment", close)
+        note = conn.execute("SELECT payload_json FROM automerge_github_outbox "
+                            "WHERE kind='issue_comment'").fetchone()
+        self.assertEqual(json.loads(note[0])["body"], "operator stop: test reason")
+        self.assertFalse(any(call.args[0][:2] == ["pr", "edit"]
+                             for call in gh.call_args_list))
         self.assertFalse(any("--add-label" in call.args[0]
                              or "automerge-rejected-head:" in call.args[0]
                              for call in gh.call_args_list))
@@ -2967,6 +3146,25 @@ class AbortBatchTests(TestCase):
 
     def test_abort_without_session_closes_pr_and_releases_queue(self):
         self._run_abort("building", None)
+
+    def test_abort_cancels_pending_rejection_and_queues_label_cleanup(self):
+        conn = make_db(phase="aborting", session_id=None, integration_pr_number=None)
+        with conn:
+            automerge.enqueue_github_write(conn, "batch-test", "reject_head", 7, HEAD_ONE,
+                                          {"reason": "regression", "evidence": "test fails"})
+        with mock.patch.object(automerge, "finish_batch"):
+            automerge._complete_abort(conn, monitor.SlackTransport("webhook", webhook="x"), row_for(conn))
+        intents = conn.execute("SELECT kind,cancelled_at FROM automerge_github_outbox "
+                               "ORDER BY kind").fetchall()
+        self.assertEqual([row["kind"] for row in intents], ["clear_rejection_label", "reject_head"])
+        self.assertIsNotNone(intents[1]["cancelled_at"])
+        rejected_comment = {"id": 1, "user": {"login": automerge.TRUSTED_REJECTION_LOGIN},
+                            "body": f"automerge-rejected-head: {HEAD_ONE}"}
+        with (mock.patch.object(automerge, "list_open_pull_requests", return_value=[
+                  api_pull(7, labels=[automerge.REJECTED_LABEL])]),
+              mock.patch.object(automerge, "list_pull_comments", return_value=[rejected_comment])):
+            self.assertEqual([p.number for p in automerge.select_eligible_pull_requests(conn=conn)], [7])
+        conn.close()
 
     def test_abort_lock_wait_retries_the_cron_lock(self):
         handle = mock.Mock()

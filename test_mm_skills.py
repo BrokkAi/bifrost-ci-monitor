@@ -235,21 +235,42 @@ class StateTests(unittest.TestCase):
             updated = self.call("publish", revision=current["revision"], head=HEAD_ONE, notes="resolved conflict")
         self.assertEqual(reconcile.call_args.args[0]["sources"], current["sources"])
         self.assertEqual(updated["publication"], publication)
+        self.assertEqual(updated["pending_github_writes"],
+                         [{"kind": "integration_metadata", "number": 211, "head_sha": HEAD_ONE}])
         self.assertEqual(row_for(self.conn)["integration_pr_number"], 211)
         self.assertEqual(automerge._async_local_result(db.render_report(updated)), "pass")
 
-    def test_rejected_source_is_persisted_before_github_retry(self):
+    def test_rejected_source_is_recorded_without_waiting_for_github(self):
         current = self.state()
-        with mock.patch.object(mm_service, "rejection", side_effect=OSError("temporary failure")):
-            with self.assertRaises(OSError):
-                self.call("exclude", revision=current["revision"], number=7, head=HEAD_ONE,
-                          kind="rejected", reason="isolated failure", evidence="base passes; base plus PR fails")
-        updated = self.state()
+        with mock.patch.object(automerge, "run_gh", side_effect=AssertionError("network write")):
+            updated = self.call("exclude", revision=current["revision"], number=7, head=HEAD_ONE,
+                                kind="rejected", reason="isolated failure",
+                                evidence="base passes; base plus PR fails")
         self.assertEqual([p["number"] for p in updated["sources"]], [8])
-        with mock.patch.object(mm_service, "rejection") as rejection:
-            self.call("exclude", revision=updated["revision"], number=7, head=HEAD_ONE,
-                      kind="rejected", reason="isolated failure", evidence="base passes; base plus PR fails")
-        rejection.assert_called_once()
+        self.assertEqual(updated["pending_github_writes"],
+                         [{"kind": "reject_head", "number": 7, "head_sha": HEAD_ONE}])
+        self.call("exclude", revision=updated["revision"], number=7, head=HEAD_ONE,
+                  kind="rejected", reason="isolated failure", evidence="base passes; base plus PR fails")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM automerge_github_outbox").fetchone()[0], 1)
+
+    def test_comment_is_recorded_once_and_does_not_change_batch_revision(self):
+        current = self.state()
+        updated = self.call("comment", revision=current["revision"], number=4519,
+                            body="New diagnosis for this batch.")
+        self.assertEqual(updated["revision"], current["revision"])
+        self.assertEqual(updated["pending_github_writes"][0]["kind"], "issue_comment")
+        self.call("comment", revision=current["revision"], number=4519,
+                  body="New diagnosis for this batch.")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM automerge_github_outbox").fetchone()[0], 1)
+
+    def test_inspect_reads_pr_through_supervisor_identity(self):
+        with (mock.patch.object(automerge, "gh_json", return_value={"number": 7, "body": "Intent"}) as read,
+              mock.patch.object(automerge, "list_pull_comments", return_value=[]) as comments):
+            result = self.call("inspect", number=7, kind="pull")
+        self.assertEqual(result["item"]["body"], "Intent")
+        self.assertEqual(read.call_args.args[0],
+                         ["api", f"repos/{automerge.REPO_NAME}/pulls/7"])
+        comments.assert_called_once_with(7)
 
     def test_terminal_batch_rejects_updates(self):
         with self.conn:
@@ -266,7 +287,7 @@ class StateTests(unittest.TestCase):
     def test_rebuild_cannot_overwrite_an_exclusion_recorded_during_rescan(self):
         original = row_for(self.conn)
 
-        def rescan():
+        def rescan(**_kwargs):
             automerge._persist_excluded_source_heads(self.conn, original,
                                                      [{"number": 7, "head_sha": HEAD_ONE, "kind": "removed"}])
             return []
@@ -296,9 +317,10 @@ class StateTests(unittest.TestCase):
         with mock.patch.object(mm_service, "gh_api", side_effect=api):
             result = mm_service.reconcile_publication(current, HEAD_ONE, "notes")
         self.assertEqual(result["number"], 211)
-        edits = [kwargs["payload"] for endpoint, kwargs in calls if kwargs.get("method") == "PATCH"]
-        self.assertEqual(edits[0]["title"], "Merge batch: #7 #8")
-        self.assertIn(HEAD_TWO, edits[0]["body"])
+        metadata = mm_service.integration_metadata(current, HEAD_ONE, "notes")
+        self.assertEqual(metadata["title"], "Merge batch: #7 #8")
+        self.assertIn(HEAD_TWO, metadata["body"])
+        self.assertFalse(any(kwargs.get("method") == "PATCH" for _, kwargs in calls))
         self.assertFalse(any(endpoint == "pulls" and kwargs.get("method") == "POST" for endpoint, kwargs in calls))
 
 

@@ -79,6 +79,10 @@ def main():
     config.add_argument("--connection-file", required=True, type=Path)
     sub.add_parser("state")
     sub.add_parser("report")
+    inspect_pr = sub.add_parser("pr")
+    inspect_pr.add_argument("--pr", required=True, type=int)
+    inspect_issue = sub.add_parser("issue")
+    inspect_issue.add_argument("--issue", required=True, type=int)
     exclude = sub.add_parser("exclude")
     exclude.add_argument("--revision", required=True)
     exclude.add_argument("--pr", required=True, type=int)
@@ -86,6 +90,10 @@ def main():
     exclude.add_argument("--kind", required=True, choices=["removed", "rejected"])
     exclude.add_argument("--reason", required=True)
     exclude.add_argument("--evidence-file", type=Path)
+    comment = sub.add_parser("comment")
+    comment.add_argument("--revision", required=True)
+    comment.add_argument("--issue", required=True, type=int)
+    comment.add_argument("--body-file", required=True, type=Path)
     tests = sub.add_parser("tests")
     tests.add_argument("--revision", required=True)
     tests.add_argument("--head", required=True)
@@ -106,6 +114,13 @@ def main():
         path = args.pop("evidence_file")
         args["evidence"] = path.read_text() if path else ""
         args["number"] = args.pop("pr")
+    if operation == "comment":
+        args["number"] = args.pop("issue")
+        args["body"] = args.pop("body_file").read_text()
+    if operation in {"pr", "issue"}:
+        args["number"] = args.pop(operation)
+        args["kind"] = "pull" if operation == "pr" else "issue"
+        operation = "inspect"
     print(json.dumps(client.call(operation, **args), indent=2))
 
 

@@ -25,6 +25,7 @@ def ensure_schema(conn):
         payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
         PRIMARY KEY (batch_id,event_id)
     )""")
+    automerge.ensure_github_outbox_schema(conn)
     conn.commit()
 
 
@@ -62,6 +63,13 @@ def state(conn, batch_id):
     result["tests"] = tests if tests and tests["source_revision"] == result["source_revision"] else None
     result["publication"] = latest(conn, batch_id, "publication")
     result["revision"] = digest(result)
+    result["pending_github_writes"] = [
+        {"kind": row["kind"], "number": row["number"], "head_sha": row["head_sha"]}
+        for row in conn.execute(
+            "SELECT kind,number,head_sha FROM automerge_github_outbox "
+            "WHERE batch_id=? AND delivered_at IS NULL ORDER BY created_at", (batch_id,)
+        )
+    ]
     return result
 
 
@@ -96,17 +104,17 @@ def gh_api(endpoint, *, method="GET", payload=None):
         return json.loads(automerge.run_gh(args + ["--input", handle.name]))
 
 
-def rejection(number, head, reason, evidence):
-    # Use REST and the supervisor's App token, so markers have its trusted identity.
-    gh_api("labels/" + quote(automerge.REJECTED_LABEL, safe=""))
-    gh_api(f"issues/{number}/labels", method="POST", payload={"labels": [automerge.REJECTED_LABEL]})
-    marker = "automerge-rejected-head: " + head
-    if any(re.search(r"(?m)^" + re.escape(marker) + r"\s*$", comment.get("body", "")) and
-           (comment.get("user") or {}).get("login") == automerge.TRUSTED_REJECTION_LOGIN
-           for comment in automerge.list_pull_comments(number)):
-        return
-    gh_api(f"issues/{number}/comments", method="POST",
-           payload={"body": reason + "\n\n" + evidence + "\n\n" + marker})
+def integration_metadata(current, head, notes):
+    title = "Merge batch: " + " ".join(f"#{p['number']}" for p in current["sources"])
+    body = f"MergeMarshall batch `{current['batch_id']}`\n\nBase: `{current['base_sha']}`\n\nIncluded source heads:\n"
+    body += "\n".join(f"- #{p['number']} `{p['head_sha']}`: {p['title']}" for p in current["sources"])
+    body += "\n\nRemoved source heads:\n" + ("\n".join(
+        f"- #{p['number']} `{p['head_sha']}` ({p['kind']})" for p in current["excluded"]) or "None.")
+    evidence = current["tests"]
+    body += f"\n\nTested head: `{head}`\nTests run: {evidence['tests']}\nBaseline failures: {evidence['baseline']}\n"
+    if notes:
+        body += "\nConflict resolutions and fixes:\n" + notes
+    return {"title": title, "body": body}
 
 
 def reconcile_publication(current, head, notes):
@@ -117,32 +125,22 @@ def reconcile_publication(current, head, notes):
     pulls = gh_api("pulls?state=open&head=" + quote(automerge.GH_OWNER + ":" + branch, safe=""))
     if not isinstance(pulls, list) or len(pulls) > 1:
         raise ValueError("expected at most one open integration PR")
-    title = "Merge batch: " + " ".join(f"#{p['number']}" for p in current["sources"])
-    body = f"MergeMarshall batch `{current['batch_id']}`\n\nBase: `{current['base_sha']}`\n\nIncluded source heads:\n"
-    body += "\n".join(f"- #{p['number']} `{p['head_sha']}`: {p['title']}" for p in current["sources"])
-    body += "\n\nRemoved source heads:\n" + ("\n".join(
-        f"- #{p['number']} `{p['head_sha']}` ({p['kind']})" for p in current["excluded"]) or "None.")
-    evidence = current["tests"]
-    body += f"\n\nTested head: `{head}`\nTests run: {evidence['tests']}\nBaseline failures: {evidence['baseline']}\n"
-    if notes:
-        body += "\nConflict resolutions and fixes:\n" + notes
-    gh_api("labels/" + quote(automerge.INTEGRATION_LABEL, safe=""))
+    metadata = integration_metadata(current, head, notes)
     if pulls:
         pr = pulls[0]
         if pr["base"]["ref"] != automerge.BASE_BRANCH or pr.get("draft"):
             raise ValueError("existing integration PR must be ready and based on master")
-        pr = gh_api(f"pulls/{pr['number']}", method="PATCH", payload={"title": title, "body": body})
     else:
         try:
-            pr = gh_api("pulls", method="POST", payload={"title": title, "body": body,
+            pr = gh_api("pulls", method="POST", payload={"title": metadata["title"],
+                                                        "body": metadata["body"],
                                                         "base": automerge.BASE_BRANCH, "head": branch})
         except automerge.monitor.CommandError:
             # Recover creation accepted before an ambiguous response. Never create a second PR.
             pulls = gh_api("pulls?state=open&head=" + quote(automerge.GH_OWNER + ":" + branch, safe=""))
             if not isinstance(pulls, list) or len(pulls) != 1:
                 raise
-            pr = gh_api(f"pulls/{pulls[0]['number']}", method="PATCH", payload={"title": title, "body": body})
-    gh_api(f"issues/{pr['number']}/labels", method="POST", payload={"labels": [automerge.INTEGRATION_LABEL]})
+            pr = pulls[0]
     pr = gh_api(f"pulls/{pr['number']}")
     if pr["head"]["sha"] != head or pr["head"]["ref"] != branch or pr["state"] != "open":
         raise ValueError("published integration PR head/state does not match")
@@ -152,13 +150,30 @@ def reconcile_publication(current, head, notes):
 def dispatch(conn, batch_id, operation, payload):
     if operation == "state":
         return state(conn, batch_id)
-    if operation not in {"exclude", "tests", "publish"}:
+    if operation == "inspect":
+        state(conn, batch_id)  # Authenticate against an existing batch.
+        number = payload.get("number")
+        kind = payload.get("kind")
+        if type(number) is not int or number <= 0 or kind not in {"pull", "issue"}:
+            raise ValueError("inspect needs a positive number and pull or issue kind")
+        resource = "pulls" if kind == "pull" else "issues"
+        return {"item": automerge.gh_json(["api", f"repos/{automerge.REPO_NAME}/{resource}/{number}"]),
+                "comments": automerge.list_pull_comments(number)}
+    if operation not in {"exclude", "tests", "publish", "comment"}:
         raise ValueError("unknown operation")
     conn.execute("BEGIN IMMEDIATE")
     try:
         current = checked(conn, batch_id, payload.get("revision"))
-        head = sha(payload.get("head"))
-        if operation == "exclude":
+        if operation == "comment":
+            number = payload.get("number")
+            if type(number) is not int or number <= 0:
+                raise ValueError("issue number must be positive")
+            body = text(payload.get("body"), "body")
+            automerge.enqueue_github_write(conn, batch_id, "issue_comment", number, "",
+                                           {"body": body})
+            conn.commit()
+        elif operation == "exclude":
+            head = sha(payload.get("head"))
             number = payload.get("number")
             row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
             if type(number) is not int or not any(p.number == number and p.head_sha == head
@@ -174,10 +189,14 @@ def dispatch(conn, batch_id, operation, payload):
             automerge._persist_excluded_source_heads(conn, row, [{"number": number, "head_sha": head, "kind": kind}])
             record(conn, batch_id, "exclusion", {"number": number, "head": head, "kind": kind,
                                                 "reason": reason, "evidence": evidence})
-            conn.commit()
             if kind == "rejected":
-                rejection(number, head, reason, evidence)
+                automerge.enqueue_github_write(
+                    conn, batch_id, "reject_head", number, head,
+                    {"reason": reason, "evidence": evidence},
+                )
+            conn.commit()
         elif operation == "tests":
+            head = sha(payload.get("head"))
             verdict = payload.get("verdict")
             if verdict not in {"pass", "fail"}:
                 raise ValueError("verdict must be pass or fail")
@@ -189,6 +208,7 @@ def dispatch(conn, batch_id, operation, payload):
                                             "baseline": baseline, "source_revision": current["source_revision"]})
             conn.commit()
         else:
+            head = sha(payload.get("head"))
             if not current["sources"] or not current["tests"] or current["tests"]["head"] != head or current["tests"]["verdict"] != "pass":
                 raise ValueError("publication requires a passing assessment for this exact head and source set")
             notes = payload.get("notes", "")
@@ -199,6 +219,10 @@ def dispatch(conn, batch_id, operation, payload):
             conn.execute("BEGIN IMMEDIATE")
             checked(conn, batch_id, current["revision"])
             record(conn, batch_id, "publication", publication)
+            automerge.enqueue_github_write(
+                conn, batch_id, "integration_metadata", publication["number"], head,
+                integration_metadata(current, head, notes),
+            )
             conn.execute("UPDATE automerge_batches SET integration_pr_number=?,integration_pr_url=? WHERE batch_id=?",
                          (publication["number"], publication["url"], batch_id))
             conn.commit()
