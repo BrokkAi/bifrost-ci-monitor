@@ -736,13 +736,15 @@ class IdentityAndPromptTests(TestCase):
         argv = automerge.new_session_argv(row, "/tmp/prompt")
         self.assertEqual(monitor.MJ_CPUS, 32)
         self.assertEqual(monitor.MJ_MEMORY_GIB, 28)
-        self.assertEqual(automerge.AUTOMERGE_MODEL, "deepseek-flash")
-        self.assertEqual(automerge.AUTOMERGE_AGENT_LABEL, "DeepSeek Flash (mj)")
+        self.assertEqual(automerge.AUTOMERGE_MODEL, "opus")
+        self.assertEqual(automerge.AUTOMERGE_AGENT_LABEL, "Opus 5.5 + Luna 6 (mj)")
         self.assertEqual(argv, [
             "new", "--workspace", monitor.MJ_WORKSPACE,
-            "--target", monitor.MJ_TARGET, "--bundle", monitor.MJ_BUNDLE,
+            "--target", "bedrock-podman", "--bundle", monitor.MJ_BUNDLE,
             "--cpus", "32", "--memory-gib", "28",
-            "--model", "deepseek-flash", "--subagents", "none",
+            "--model", "opus", "--subagents", "single-model",
+            "--subagent-model", "global.openai.gpt-6-luna",
+            "--subagent-effort", "high",
             "--at", BASE_SHA, "--branch", "mergemarshall/batch-batch-test",
             "--title", "Bifrost automerge batch batch-test",
             "--prompt-file", "/tmp/prompt", "--json",

@@ -31,10 +31,12 @@ BASE_BRANCH = monitor.BRANCH
 DB_PATH = monitor.DB_PATH
 GH_BIN = monitor.GH_BIN
 MJ_WORKSPACE = monitor.MJ_WORKSPACE
-MJ_TARGET = monitor.MJ_TARGET
+MJ_TARGET = "bedrock-podman"
 MJ_BUNDLE = monitor.MJ_BUNDLE
-AUTOMERGE_MODEL = "deepseek-flash"
-AUTOMERGE_AGENT_LABEL = "DeepSeek Flash (mj)"
+AUTOMERGE_MODEL = "opus"
+AUTOMERGE_SUBAGENT_MODEL = "global.openai.gpt-6-luna"
+AUTOMERGE_SUBAGENT_EFFORT = "high"
+AUTOMERGE_AGENT_LABEL = "Opus 5.5 + Luna 6 (mj)"
 MJ_WAIT_POLL_SECONDS = monitor.MJ_WAIT_POLL_SECONDS
 SLACK_MESSAGE_LIMIT = monitor.SLACK_MESSAGE_LIMIT
 
@@ -74,13 +76,23 @@ GITHUB_WRITE_RETRY_MAX_SECONDS = 10 * 60
 VERDICT_CONTEXT = "mergemarshall/verdict"
 VERDICT_APP_ID = 5203169
 TURN_TICK_SECONDS = 50
-SESSION_RECOVERY_GUIDANCE = """You are the sole writer to this session's checkout and integration branch. Other agents' commits elsewhere do not change your local files. Work against the captured base until the supervisor requests an update. The supervisor owns final master and source-head freshness checks; follow the batch skills, revision checks, and mode-specific validation/publication gates below.
+SESSION_RECOVERY_GUIDANCE = """Ownership and recovery: the primary coordinates this checkout and integration branch and owns Git operations, batch-state mutations, test assessment, and publication. Subagents work within assigned file ownership. Work against the captured base until the supervisor requests an update; it owns final master and source-head freshness checks. Follow the batch skills and revision checks.
 
-Maintain a short local progress note outside tracked files, at the path returned by `git rev-parse --git-path mergemarshall-progress.md`. Update it at meaningful milestones with current HEAD and pending edits, completed checks and log paths, settled decisions and supporting evidence, unresolved questions, any running command/session ID, and the next concrete action. Keep credentials and connection contents out of it.
+Keep a short private progress note at `git rev-parse --git-path mergemarshall-progress.md`. At meaningful milestones record HEAD, pending edits, decisions and evidence/log paths, unresolved work, running command/session IDs, and the next action. Keep credentials out of it.
 
-After compaction, read that note and perform one brief recovery check: current HEAD, working-tree status, batch revision, and any running command. If they match the recorded state, continue the next action. Uncommitted edits may be your own saved work; preserve them. Investigate a mismatch only far enough to determine what actually changed.
-
-Reopen a settled question or repeat a completed check only when relevant inputs changed, evidence is missing, or new evidence contradicts the conclusion. State that trigger before reinvestigating. Compaction alone calls for recovering recorded evidence, not repeating the investigation. Requirements to reproduce new failures at the exact base and validate changed candidates still apply."""
+After compaction or an interrupted turn, read the note and reconcile HEAD, working-tree status, batch revision, and running commands once. Preserve pending edits and reuse recorded evidence when the state matches. Investigate actual mismatches; compaction alone does not reopen settled work. Repeat an investigation or completed check when relevant inputs changed, evidence is missing, or new evidence contradicts it, and briefly record that reason."""
+MERGE_DELEGATION_GUIDANCE = (
+    "Delegation and build cost: use the configured Luna 6 Mjolnir subagents for "
+    "bounded independent investigation, review, or implementation. Divide large "
+    "merges into independent PR groups or conflict clusters with explicit file "
+    "ownership; the primary combines and assesses their work. "
+    "Builds are expensive. Normally consolidate changes and validation through "
+    "the primary; subagents propose the smallest useful check and run builds only "
+    "when assigned a check whose result will resolve a specific decision. "
+    "Concurrent builds are appropriate when independent useful checks justify "
+    "their compilation cost and use the existing mbx configuration. Throttling "
+    "controls resource contention; avoid duplicate or speculative builds."
+)
 SKILLS_GUIDANCE = (
     "Use the installed mm-merge, mm-db, mm-autopr, and mm-compare skills for "
     "batch mechanics. Use mm-db pr/issue for GitHub reads and mm-db exclude/comment "
@@ -113,12 +125,6 @@ REJECTION_TOOL_GUIDANCE = (
     "The supervisor posts the trusted comment and label asynchronously and retries failures. "
     "Do not post comments, edit labels, or change PR state with gh yourself. "
     "For changed or closed PRs, record `mm-db exclude --kind removed` instead."
-)
-GITHUB_AGENT_POLICY = (
-    "Use mm-db pr/issue for GitHub reads and mm-db exclude/comment for source "
-    "rejections and issue comments. The supervisor handles labels, drafts, and "
-    "delivery retries. Use mm-autopr for integration PR publication. Do not run "
-    "gh commands or GitHub API writes yourself. Do not merge the integration PR."
 )
 
 
@@ -1240,48 +1246,44 @@ def _validation_guidance(base_sha: str, impact: dict[str, Any] | None = None) ->
             "changes. The supervisor will independently classify the published candidate."
         )
     return (
-        f"The supervisor's Bifrost `ci-impact` classification is mode={mode}. "
+        f"Validation: the supervisor's Bifrost `ci-impact` classification is mode={mode}. "
         "Do not rerun ci-impact. Use your best judgment to choose useful targeted tests "
-        "locally for the changed code, interactions between PRs, and conflict resolutions. "
-        "Read AGENTS.md and `.github/workflows/` for test commands and environment guidance. "
-        "This supervisor policy takes precedence over repository instructions requiring "
-        "the full ci-impact scope: no full suite is mandatory. Expand testing when failures "
-        "or specific unresolved concerns warrant it. Workflow definitions are command "
-        "references, not a checklist to reproduce locally; mode=full does not require "
-        "every CI lane, doctests, Clippy, or every other workflow check. Before starting "
-        "an additional check, name the specific unresolved concern and how the check "
-        "will resolve it. Before an expensive build or test, briefly record in the "
-        "progress note the pending decision, the smallest check that distinguishes "
-        "plausible explanations, what each result would justify doing next, and whether "
-        "existing evidence or an already-built tree can answer it. Include compilation "
-        "cost when choosing experiments. Choose from the diff, dependencies, interactions, "
-        "and results already collected; broad or grouped checks are appropriate when "
-        "that evidence warrants them. For source attribution, prefer comparing the "
-        "captured base with that same base plus suspected exact source heads, using "
-        "real merges and consistent test settings. A PR head based on older master is "
-        "a different comparison; account for that difference before drawing conclusions. "
-        "These are defaults with reasoned exceptions, not a fixed experiment sequence "
-        "or limit. Patch reversals can suggest hypotheses; acceptance or rejection "
-        "requires evidence from the committed trees required by the batch contract. "
-        "When results contradict earlier evidence, first verify the trees, changes, "
-        "commands, and settings actually tested before another build or rerun. Record "
-        "the evidence and its conclusion in the progress note. Once evidence supports "
-        "fixing an interaction or ejecting an independently broken source, take that "
-        "action and validate the resulting candidate. "
-        "Baseline reproduction is limited to failures actually observed in the "
-        "candidate's selected checks. Do not rerun passing tests at base to prove they "
-        "used to fail, or reproduce ledger failures absent from the candidate. "
+        "locally from the diff, dependencies, PR interactions, conflict resolutions, "
+        "and existing results. Use AGENTS.md and `.github/workflows/` for commands "
+        "and environment conventions. This supervisor policy takes precedence over "
+        "repository requirements for the full ci-impact scope: no full suite is "
+        "mandatory, including for mode=full. Expand testing for failures or specific "
+        "unresolved concerns; broad or grouped checks are appropriate when warranted. "
+        "Workflow definitions supply commands; choose checks to resolve those concerns.\n\n"
+        + MERGE_DELEGATION_GUIDANCE + "\n\n"
+        "Failure diagnosis: prefer git blame, git log -p, focused diffs, and tracing "
+        "the failing assertion through data/control flow. Here inspection is almost "
+        "always faster than bisecting Rust variants that each need another build. "
+        "Before an expensive experiment, briefly record the pending decision, "
+        "smallest useful check, what its results would change, and reusable evidence "
+        "or built trees. Bisect or subtraction/rebuild experiments remain available "
+        "when inspection cannot distinguish specific alternatives and the build "
+        "justifies its cost. For source attribution, prefer the captured base versus "
+        "that same base plus suspected exact heads through real merges with "
+        "consistent settings; account for an older PR-head base. Patch reversals "
+        "may suggest hypotheses; acceptance/rejection evidence must describe the "
+        "required committed trees. On contradictory results, reconcile tested "
+        "trees, commands, and settings first. Act on sufficient fix/eject evidence.\n\n"
+        "Baseline and completion: reproduce only failures observed in the "
+        "candidate's selected checks, reusing existing exact-tree evidence where "
+        "available. Passing tests and ledger failures absent from the candidate "
+        "need no baseline runs. "
         f"Compare failures with the exact base commit {base_sha}. Rerun each failing test "
-        "at that base in a separate worktree or checkout. Test candidate and base as "
-        "committed, without temporary source edits or validation shims. A failure "
-        "reproduced at the base is baseline; any new failure must be fixed or its "
-        "responsible PR removed. If a baseline build failure blocks dependent tests, "
-        "report those checks as blocked and run unaffected useful checks; do not claim "
-        "blocked checks passed. Baseline summaries list candidate failures reproduced "
-        "at base; tests repaired by the batch belong in fix notes instead. Reassess "
-        "affected testing after each change. When useful selected checks pass or only "
-        "reproduced baseline failures remain, proceed to this mode's publication and "
-        "reporting step. Do not delay it merely to exhaust the workflow checklist.\n"
+        "at that base in a separate worktree or checkout if it has not already been "
+        "reproduced there. Test committed candidate/base trees without temporary "
+        "source edits or validation shims. Every new failure must be fixed or its "
+        "responsible PR removed. Report baseline build blockers as blocked, run "
+        "unaffected useful checks, and never claim blocked checks passed. Baseline "
+        "summaries contain candidate failures reproduced at base; repaired tests "
+        "belong in fix notes. After changes, reassess affected validation and make "
+        "the final assessment describe the resulting committed candidate. When "
+        "selected checks pass or only reproduced baseline failures remain, proceed "
+        "to this mode's publication/reporting step.\n\n"
         + monitor.CARGO_TEST_ENV_GUIDANCE
     )
 
@@ -1350,7 +1352,7 @@ Process these PRs in the order listed:
 
 {SKILLS_GUIDANCE}
 
-For each PR, fetch its head with `git fetch origin pull/<N>/head`. Verify the fetched commit is the listed full head SHA before merging. If the fetched SHA differs, do not merge or reject that PR: remove it from this batch and rebuild from the original {base_sha} using only the remaining listed heads. Merge each expected head into the integration branch with a merge commit (no squash and no rebase), so GitHub can recognize the PR as merged when the integration PR lands. Resolve every conflict yourself. Never eject or send a PR back because it conflicts: read the PR description and commits, preserve both sides' intent, and finish the merge. Every commit you create, including each merge commit and any conflict-resolution or fix commit, must carry the trailer `Automerge-Batch: {batch_id}`.
+Use mm-merge to fetch and verify the listed exact heads and retain their ancestry through a merge commit (no squash and no rebase). If a fetched SHA differs, remove that source without rejection and rebuild from {base_sha} with the recorded remainder. Resolve every conflict yourself, using delegated inspection or edits where useful and preserving both sides' intent. Every commit you create, including merge, conflict-resolution, and fix commits, must carry `Automerge-Batch: {batch_id}`.
 
 After all listed PRs are merged into the integration branch, follow this validation policy:
 {_validation_guidance(base_sha, validation_impact)}
@@ -1424,7 +1426,7 @@ Process these PRs in the order listed:
 
 {SKILLS_GUIDANCE}
 
-For each PR, fetch its head with `git fetch origin pull/<N>/head`. Verify the fetched commit is the listed full head SHA before merging. If the fetched SHA differs, do not merge or reject that PR: remove it from this batch and rebuild from the original {base_sha} using only the remaining listed heads. Merge each expected head into the integration branch with a merge commit (no squash and no rebase). Resolve every conflict yourself, preserving both sides' intent using PR descriptions and commits. Every commit you create, including merge, conflict-resolution, and fix commits, must carry `Automerge-Batch: {batch_id}`.
+Use mm-merge to fetch and verify the listed exact heads and retain their ancestry through a merge commit (no squash and no rebase). If a fetched SHA differs, remove that source without rejection and rebuild from {base_sha} with the recorded remainder. Resolve every conflict yourself, using delegated inspection or edits where useful and preserving both sides' intent. Every commit you create, including merge, conflict-resolution, and fix commits, must carry `Automerge-Batch: {batch_id}`.
 
 This batch uses async CI mode. The supervisor does not wait for CI and does not use GitHub CI results to authorize this batch. Before publishing, follow this validation policy:
 {_validation_guidance(base_sha, validation_impact)}
@@ -1452,7 +1454,9 @@ def new_session_argv(
         "--cpus", str(monitor.MJ_CPUS),
         "--memory-gib", str(monitor.MJ_MEMORY_GIB),
         "--model", AUTOMERGE_MODEL,
-        "--subagents", "none",
+        "--subagents", "single-model",
+        "--subagent-model", AUTOMERGE_SUBAGENT_MODEL,
+        "--subagent-effort", AUTOMERGE_SUBAGENT_EFFORT,
         "--at", str(row["base_sha"]),
         "--branch", str(row["branch"]),
         "--title", str(row["title"]),
@@ -1471,7 +1475,7 @@ def skills_connection_prompt(row: sqlite3.Row | dict[str, Any]) -> str:
     batch_id = str(row["batch_id"])
     connection = {"url": "http://host.containers.internal:8769", "batch_id": batch_id,
                   "token": hmac.new(key, batch_id.encode(), hashlib.sha256).hexdigest()}
-    return ("\n\n" + SKILLS_GUIDANCE + "\nConfigure mm-db in this checkout using this "
+    return ("\n\nConfigure mm-db in this checkout using this "
             "batch-scoped connection: save the following JSON to a private temporary "
             "file and run the mm-db script's configure --connection-file FILE command. "
             "Remove the temporary file afterward. Keep its token out of reports.\n" +
@@ -3118,7 +3122,7 @@ def deliver_pending_prompt(conn: sqlite3.Connection, transport: monitor.SlackTra
                              (utc_now(), row["batch_id"]))
         else:
             monitor.send_session_prompt(
-                session_id, str(prompt) + "\n\n" + GITHUB_AGENT_POLICY + skills_connection_prompt(row)
+                session_id, str(prompt) + "\n\n" + SKILLS_GUIDANCE + skills_connection_prompt(row)
             )
             with conn:
                 conn.execute("UPDATE automerge_batches SET prompt_delivered=1, "

@@ -9,6 +9,11 @@ Supply the check yourself; this helper makes no test selection or diagnosis:
 python3 <this skill>/scripts/mm_compare.py --a BASE_SHA --b CANDIDATE_SHA --script /tmp/check.sh
 ```
 
+Use this helper when fresh runs at both commits are needed. Reuse existing
+exact-tree evidence when available; baseline checks cover failures observed in
+the candidate. The primary schedules expensive comparisons and may assign a
+specific check to a subagent.
+
 It snapshots the supplied script, runs both sides concurrently in temporary
 detached worktrees, saves stdout/stderr and their diffs, and removes the worktrees.
 The active checkout is untouched. Results survive in the printed output directory.
