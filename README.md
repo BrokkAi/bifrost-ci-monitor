@@ -135,6 +135,19 @@ head, test evidence, and outcome. The pinned `Known CI failures on master`
 issue is the generated view of unresolved failures; individual `buildfailure`
 issues are repair targets.
 
+Infrastructure incidents such as runner acquisition/loss, provider quota, or
+external outages appear as new top-level Slack threads, rather than Bifrost
+product tickets. Notices include the observed failure, uncertainty, and run
+links. Flaky product tests still create repair tickets. Failed Slack/GitHub
+publication retries the prepared result from SQLite on the next poll without
+another investigation; unrelated triage and repair work can continue.
+
+For RunsOn incidents, inspect `/aws/ecs/runs-on/runs-on-worker` in the CI AWS
+account's `us-east-1` CloudWatch logs, filtering by job ID and failure time.
+An EC2 launch quota error warrants a quota review; a successfully launched
+runner later reclaimed as Spot is an interruption, which a quota increase
+does not prevent. Preserve the intentional `spot=true/retry=false` policy.
+
 ```sh
 journalctl -t bifrost-ci-automerge -t bifrost-ci-monitor -t bifrost-ci-triage --since '1 hour ago'
 systemctl --user status mm-skills.service

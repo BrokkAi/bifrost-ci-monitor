@@ -64,9 +64,13 @@ issue is a generated summary, not a repair task or an authoritative data source.
 
 Triage groups new observations into an investigation, reads evidence and
 repository history without building/fixing, and proposes one `buildfailure`
-issue per cause. It searches existing work, reuses/reopens matching issues,
+issue per product defect. Infrastructure incidents instead produce channel-visible
+Slack notices without tickets or fixer sessions. It searches existing work, reuses/reopens matching issues,
 and distinguishes observations already fixed on master. Report publication
 and resolved-observation cleanup survive interrupted polls and lost replies.
+Unpublished results stay in SQLite and retry without repeating investigation;
+pending delivery does not prevent triage of other observations. Reporting an
+infrastructure incident does not itself mark the CI failure fixed.
 
 ## Issue-scoped repair
 

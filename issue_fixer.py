@@ -238,7 +238,12 @@ otherwise reuse this failure ticket and tag the commit author in a comment.
 Record evidence and the revert PR link on this target ticket too.
 If later commits make reverting nontrivial, abort the revert, leave no speculative
 changes, and escalate on THIS ticket with buildfailure and evidence of dependencies.
-Flaky/infrastructure failures or an unpinned cause also escalate on THIS ticket.
+Runner/provider/quota/network infrastructure failures are operational incidents,
+not Bifrost product defects. If this ticket is infrastructure, leave the evidence
+and any recovery in a useful comment, release your own claim, and report outcome
+infrastructure with pr:null. Do not assign David or create another ticket. The
+supervisor closes this misplaced ticket and sends a channel-visible Slack notice.
+Flaky product tests or an unpinned product cause may still escalate on THIS ticket.
 Do not file duplicate tickets. Handle no unrelated failure as part of this repair;
 record unrelated validation failures as limitations with evidence.
 
@@ -258,11 +263,11 @@ When standing down without a submitted repair, remove only YOUR agent-in-progres
 label and `{ASSIGNEE}` assignment. Leave a useful issue comment. Keep the claim
 while a submitted PR awaits merge; do not close the issue before the PR lands.
 No hard runtime limit applies. Finish this one issue's work and report the outcome.
-For escalation or a revert, include the Slack mention tokens
+For infrastructure, escalation or a revert, include the Slack mention tokens
 {' '.join(f'<@{m}>' for m in monitor.ESCALATION_SLACK_MEMBER_IDS)} in your closing
 summary; it is relayed by the supervisor. Do not call Slack yourself.
 End with one standalone line (valid JSON):
-fixer-result: {{"issue":{number},"outcome":"submitted|deferred|escalated|resolved|claimed_elsewhere|blocked","pr":null,"summary":"evidence, action and validation"}}
+fixer-result: {{"issue":{number},"outcome":"submitted|deferred|escalated|infrastructure|resolved|claimed_elsewhere|blocked","pr":null,"summary":"evidence, action and validation"}}
 Set pr to the integer PR number when submitted or deferred. Before that line you
 may include known-failure diagnoses for this issue using the monitor's format.
 
@@ -408,13 +413,15 @@ def parse_report(text, number):
         raise ValueError("finish with one fixer-result JSON line")
     result = json.loads(matches[0])
     if result.get("issue") != number or result.get("outcome") not in {
-        "submitted", "deferred", "escalated", "resolved", "claimed_elsewhere", "blocked"
+        "submitted", "deferred", "escalated", "infrastructure", "resolved", "claimed_elsewhere", "blocked"
     }:
         raise ValueError("report must name the target issue and a supported outcome")
     if not isinstance(result.get("summary"), str) or not result["summary"].strip():
         raise ValueError("report needs an evidence summary")
     if result["outcome"] == "submitted" and (type(result.get("pr")) is not int or result["pr"] <= 0):
         raise ValueError("submitted outcome needs its PR number")
+    if result['outcome'] == 'infrastructure' and result.get('pr') is not None:
+        raise ValueError('infrastructure outcome cannot submit a product PR')
     return result
 
 
@@ -451,6 +458,16 @@ def collect(conn, transport, job):
 def finish(conn, job):
     report = json.loads(job["report_json"])
     pr = None
+    if report['outcome'] == 'infrastructure':
+        issue = api(f"issues/{job['issue_number']}")
+        owners = {a['login'] for a in issue.get('assignees', [])}
+        if issue['state'] == 'open':
+            if owners or 'agent-in-progress' in labels(issue):
+                raise ValueError('release your infrastructure claim without taking another person\'s ticket')
+            monitor.run_gh(['issue', 'close', str(job['issue_number']), '--repo', monitor.REPO_NAME,
+                            '--reason', 'not_planned'])
+            if api(f"issues/{job['issue_number']}")['state'] != 'closed':
+                raise RuntimeError('infrastructure ticket closure pending; retry cached report')
     if report["outcome"] == "escalated":
         issue = api(f"issues/{job['issue_number']}")
         owners = {a["login"] for a in issue.get("assignees", [])}
@@ -486,7 +503,8 @@ def cleanup(conn, transport):
             report = json.loads(job["report_json"])
             ok, _ = monitor.slack_send(transport,
                 f"Issue <{job['issue_url']}|#{job['issue_number']}>: {report['outcome']}. "
-                f"{report['summary']} " + (job["repair_pr_url"] or ""), thread_ts=job["thread_ts"])
+                f"{report['summary']} " + (job["repair_pr_url"] or ""),
+                thread_ts=None if report['outcome'] == 'infrastructure' else job['thread_ts'])
             if ok:
                 with conn:
                     conn.execute("UPDATE issue_repairs SET outcome_sent=1 WHERE id=?", (job["id"],))

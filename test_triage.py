@@ -61,6 +61,8 @@ class TriageTests(TestCase):
         self.patch(monitor, "run_gh", side_effect=AssertionError("unexpected real GitHub call"))
         self.patch(monitor, "mj_command", side_effect=AssertionError("unexpected real mj call"))
         self.patch(monitor, "_sync_known_failure_issue")
+        self.patch(monitor, 'load_slack_transport', return_value=monitor.SlackTransport('chat', token='test', channel='test'))
+        self.slack = self.patch(monitor, 'slack_send', return_value=(True, 'notice'))
         self.conn = monitor.connect_db()
         self.addCleanup(lambda: self.conn.close())
         triage.ensure_schema(self.conn)
@@ -92,6 +94,7 @@ class TriageTests(TestCase):
     def make_job(self, status="publishing", existing=None, resolved=False, job_id="job"):
         observations = triage.pending(self.conn)
         report = {"findings": [{"failure_ids": [o["failure_id"] for o in observations],
+            'outcome': 'resolved' if resolved else 'product',
             "diagnosis": "Missing import", "evidence": "run 1: unresolved symbol at src/lib.rs:2",
             "issue": None if resolved else {"title": "Fix missing import", "body": "Compiler failed; restore import.",
                                           "existing_number": existing}}]}
@@ -101,6 +104,129 @@ class TriageTests(TestCase):
                               (job_id, f"Bifrost CI triage {job_id}", "a" * 40, "2026-01-01", status,
                                json.dumps(observations), "session", json.dumps(report)))
         return report
+
+    def infrastructure_job(self):
+        report = self.make_job()
+        finding = report['findings'][0]
+        finding.update(outcome='infrastructure', issue=None, diagnosis='Runner was not acquired',
+                       evidence='run 1: runner_id=0, no steps; quota/capacity cause unconfirmed')
+        with self.conn:
+            self.conn.execute('UPDATE triage_jobs SET report_json=?', (json.dumps(report),))
+        return report
+
+    def test_infrastructure_is_reported_once_without_a_ticket_or_false_resolution(self):
+        self.add_failure()
+        self.infrastructure_job()
+        triage.publish(self.conn, self.job())
+        self.reopen()
+        triage.publish(self.conn, self.job())
+        self.slack.assert_called_once()
+        self.assertIsNone(self.slack.call_args.kwargs.get('thread_ts'))
+        self.assertIn('Runner was not acquired', self.slack.call_args.args[1])
+        self.assertEqual(self.github.calls, [])
+        row = self.conn.execute('SELECT * FROM known_failures').fetchone()
+        self.assertEqual(row['status'], 'open')
+        self.assertIsNone(row['fixed_at'])
+        self.assertIsNone(row['triage_issue_url'])
+        self.assertIsNone(self.conn.execute('SELECT resolved_run_id FROM triage_observations').fetchone()[0])
+        self.assertEqual(triage.reconcile_resolved(self.conn), 0)
+        self.assertEqual(triage.pending(self.conn), [])
+
+    def test_slack_retry_reuses_cached_notice_after_restart_and_recovery(self):
+        self.add_failure()
+        self.infrastructure_job()
+        self.slack.return_value = (False, None)
+        with self.assertRaisesRegex(RuntimeError, 'cached report'):
+            triage.publish(self.conn, self.job())
+        cached = json.loads(self.job()['report_json'])['findings'][0]['slack_text']
+        self.assertEqual(self.job()['status'], 'publishing')
+        self.assertEqual(triage.pending(self.conn), [])
+        self.reopen()
+        with self.conn:
+            self.conn.execute("UPDATE known_failures SET status='fixed',diagnosis='later pass'")
+        self.slack.return_value = (True, 'notice')
+        triage.publish(self.conn, self.job())
+        self.assertEqual([c.args[1] for c in self.slack.call_args_list], [cached, cached])
+        self.assertEqual(self.job()['status'], 'completed')
+        self.assertEqual(self.conn.execute('SELECT status FROM known_failures').fetchone()[0], 'fixed')
+        self.assertEqual(self.github.calls, [])
+
+    def test_partial_publication_retry_does_not_repeat_an_infrastructure_notice(self):
+        self.add_failure()
+        self.add_failure('Other failure')
+        report = self.infrastructure_job()
+        observations = json.loads(self.job()['observations_json'])
+        report['findings'][0]['failure_ids'] = [observations[0]['failure_id']]
+        report['findings'].append(dict(failure_ids=[observations[1]['failure_id']], outcome='product',
+            diagnosis='Product regression', evidence='assertion failed',
+            issue=dict(title='Fix regression', body='Failure evidence', existing_number=None)))
+        with self.conn:
+            self.conn.execute('UPDATE triage_jobs SET report_json=?', (json.dumps(report),))
+        self.github.lose_response_to = ('POST', 'issues')
+        with self.assertRaises(RuntimeError):
+            triage.publish(self.conn, self.job())
+        self.reopen()
+        triage.publish(self.conn, self.job())
+        self.slack.assert_called_once()
+        self.assertEqual(len(self.github.issues), 1)
+        self.assertEqual(self.job()['status'], 'completed')
+
+    def test_issue_retry_uses_prepared_body_even_if_a_later_run_arrives(self):
+        self.add_failure()
+        self.make_job()
+        with mock.patch.object(triage, 'publish_issue', side_effect=RuntimeError('GitHub unavailable')):
+            with self.assertRaises(RuntimeError):
+                triage.publish(self.conn, self.job())
+        cached = json.loads(self.job()['report_json'])['findings'][0]['issue_body']
+        self.reopen()
+        with self.conn:
+            self.conn.execute("UPDATE known_failures SET last_seen_run_id=2,last_seen_run_url='https://github.test/run/2'")
+        with mock.patch.object(triage, 'issue_body', side_effect=AssertionError('must not render on retry')):
+            triage.publish(self.conn, self.job())
+        self.assertEqual(self.github.issues[101]['body'], cached)
+        self.assertIn('https://github.test/run/1', cached)
+        self.assertNotIn('https://github.test/run/2', cached)
+
+    def test_publication_outage_does_not_reinvestigate_or_block_other_observations(self):
+        self.add_failure()
+        self.infrastructure_job()
+        self.add_failure('New product failure')
+        self.slack.return_value = (False, None)
+        self.patch(monitor, 'update_known_failures')
+        self.patch(triage.uuid, 'uuid4', return_value=SimpleNamespace(hex='next'))
+        self.patch(triage, 'gh_api', side_effect=lambda endpoint, **kwargs:
+                   {'sha': 'a' * 40} if endpoint == 'commits/master' else self.github(endpoint, **kwargs))
+        mj = self.patch(monitor, 'require_mj_success', side_effect=lambda args, **kwargs:
+                        '{"sessions":[]}' if args[0] == 'sessions' else '{"session_id":"next-session"}')
+        triage.tick(self.conn)
+        self.assertEqual(self.job()['status'], 'publishing')
+        self.assertEqual(self.job('next')['status'], 'running')
+        self.assertEqual([o['identity'] for o in json.loads(self.job('next')['observations_json'])], ['New product failure'])
+        self.assertEqual([c.args[0][0] for c in mj.call_args_list], ['sessions', 'new'])
+
+    def test_old_unclassified_report_is_corrected_before_any_issue_write(self):
+        self.add_failure()
+        report = self.make_job()
+        del report['findings'][0]['outcome']
+        with self.conn:
+            self.conn.execute('UPDATE triage_jobs SET report_json=?', (json.dumps(report),))
+        prompt = self.patch(monitor, 'send_session_prompt')
+        triage.publish(self.conn, self.job())
+        prompt.assert_called_once()
+        self.assertIn('do not repeat the', prompt.call_args.args[1])
+        self.assertEqual(self.job()['status'], 'running')
+        self.assertEqual(self.github.calls, [])
+
+    def test_report_enforces_routing_instead_of_accepting_infrastructure_issue_drafts(self):
+        self.add_failure()
+        report = self.make_job()
+        observations = json.loads(self.job()['observations_json'])
+        for outcome, ticket in [('infrastructure', report['findings'][0]['issue']),
+                                ('resolved', report['findings'][0]['issue']), ('product', None), ('unknown', None)]:
+            invalid = copy.deepcopy(report)
+            invalid['findings'][0].update(outcome=outcome, issue=ticket)
+            with self.subTest(outcome=outcome), self.assertRaises(ValueError):
+                triage.parse_report('triage-result: ' + json.dumps(invalid), observations)
 
     def test_schema_migrates_existing_ledger_additively(self):
         self.add_failure()
@@ -416,7 +542,7 @@ class TriageTests(TestCase):
                          '{"sessions":[]}' if args[0] == "sessions" else '{"session_id":"session"}')
         triage.tick(self.conn)
         self.assertEqual(self.job()["status"], "running")
-        report = {"findings": [{"failure_ids": [1], "diagnosis": "Missing import",
+        report = {"findings": [{"failure_ids": [1], 'outcome': 'product', "diagnosis": "Missing import",
             "evidence": "Compiler log at run 1", "issue": {"title": "Fix import",
             "body": "Restore the import.", "existing_number": None}}]}
         self.patch(monitor, "wait_once", return_value=monitor.TurnResult("completed", "finished"))

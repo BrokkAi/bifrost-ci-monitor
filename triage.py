@@ -68,11 +68,17 @@ def fingerprint(row) -> str:
 
 
 def pending(conn) -> list[dict]:
+    # Cached publications own their observations even while GitHub/Slack is down.
+    claimed = {o['fingerprint'] for job in conn.execute(
+        "SELECT observations_json FROM triage_jobs WHERE status!='completed'")
+        for o in json.loads(job['observations_json'])}
     rows = conn.execute("SELECT * FROM known_failures WHERE status='open' "
                         "ORDER BY last_seen_at DESC,workflow,job_name,identity").fetchall()
     result = []
     for row in rows:
         digest = fingerprint(row)
+        if digest in claimed:
+            continue
         prior = conn.execute("SELECT resolved_run_id FROM triage_observations WHERE fingerprint=?", (digest,)).fetchone()
         if prior and (prior["resolved_run_id"] is None or prior["resolved_run_id"] == row["last_seen_run_id"]):
             continue
@@ -106,8 +112,9 @@ def build_prompt(job) -> str:
     return f"""Diagnose master CI failures in {monitor.REPO_NAME}. This is triage job {job['id']}.
 Your checkout starts at master {job['base_sha']}. You have {CPUS} CPUs and {MEMORY_GIB} GiB RAM.
 Investigate logs, source, history, existing issues and repair PRs. Do not run builds or
-test suites, modify source, commit, push, or write to GitHub. The supervisor will publish
-your issue drafts. Keep the session running until your investigation is finished.
+test suites, modify source, commit, push, or write to GitHub or Slack. The supervisor
+publishes product issue drafts and channel-visible infrastructure notices.
+Keep the session running until your investigation is finished.
 
 Read the failed jobs' logs, not just their step names. Group observations that have
 the same cause into one finding. A prior diagnosis is a lead, not established evidence;
@@ -116,23 +123,33 @@ source locations. Distinguish confirmed facts from hypotheses. You can file a us
 failure ticket without proving the root cause: say what remains unknown and the next
 useful diagnostic step. Avoid prescribing fixes unsupported by the evidence.
 
-Check current origin/master and the latest completed run for each affected job before
-finishing. If the recorded failure has already been fixed, return issue:null with
-concrete evidence (fix commit or passing run); do not file stale work. A repair PR alone
-is not proof that master is fixed. Infrastructure failures also deserve actionable
-tickets. Search open AND closed issues and the linked tickets below before drafting.
+Classify each finding's outcome as product, infrastructure, or resolved. Product
+defects include code regressions and flaky product tests. Infrastructure means runner
+acquisition/loss, provider capacity/quota, or external service failures; report those
+as infrastructure with issue:null, never a Bifrost ticket or a request to change the
+owner's Spot policy. State the observed mechanism, uncertainty, impact and useful
+operator diagnostic step. Do not claim capacity or quota without provider evidence.
+An unpinned introducing commit alone is not evidence of infrastructure.
+
+Check current origin/master and the latest completed result for each affected job,
+even if its containing workflow is still running. For a recovered product failure,
+return outcome:resolved and issue:null with concrete evidence (fix commit or passing
+run). For infrastructure, include any later recovery in the notice and still use
+outcome:infrastructure. A repair PR alone is not proof of recovery.
+Search open AND closed issues and the linked tickets before drafting product tickets.
 Reuse an existing issue only for the same cause; it will be reopened if closed.
-Never reuse the aggregate 'Known CI failures on master' issue. An unresolved failure
-needs a ticket even when you cannot determine its cause from the available logs.
+Never reuse the aggregate 'Known CI failures on master' issue. An observed product
+failure can need a ticket even when its root cause remains unknown.
 
 Return your complete result in your final message as `triage-result: ` followed by a
 JSON object (no prose after it). The schema is:
-{{"findings":[{{"failure_ids":[1,2],"diagnosis":"concise cause or observed failure",
+{{"findings":[{{"failure_ids":[1,2],"outcome":"product|infrastructure|resolved",
+"diagnosis":"concise cause or observed failure",
 "evidence":"specific log/run/commit evidence and uncertainty",
 "issue":{{"title":"specific actionable title","body":"Markdown: evidence, impact, next steps",
 "existing_number":null}}}}]}}
 Use an integer existing_number for a matching existing issue, null for a new issue.
-Use issue:null ONLY when evidence demonstrates the failure is already resolved.
+Product requires an issue object; infrastructure and resolved require issue:null.
 Every supplied failure_id must appear exactly once. Include all findings in this
 one final report, even if they concern different workflows. Do not guess missing evidence.
 
@@ -166,9 +183,16 @@ def parse_report(text: str, observations: list[dict]) -> dict:
         for name in ("diagnosis", "evidence"):
             if not isinstance(finding.get(name), str) or not finding[name].strip():
                 raise ValueError(f"each finding needs {name}")
+        outcome = finding.get('outcome')
+        if outcome not in {'product', 'infrastructure', 'resolved'}:
+            raise ValueError("each finding needs outcome: product, infrastructure, or resolved")
         if "issue" not in finding:
-            raise ValueError("each finding needs issue (null only for resolved failures)")
+            raise ValueError("each finding needs issue")
         issue = finding["issue"]
+        if outcome == 'product' and issue is None:
+            raise ValueError("product findings require an issue")
+        if outcome != 'product' and issue is not None:
+            raise ValueError("infrastructure/resolved findings must not publish an issue")
         if issue is not None:
             if not isinstance(issue, dict):
                 raise ValueError("issue must be an object or null")
@@ -220,6 +244,22 @@ def launch(conn, job) -> None:
     monitor.log(f"triage {job['id']}: running mj session {session_id}")
 
 
+def request_report_correction(conn, job, final, problem) -> None:
+    digest = hashlib.sha256((str(problem) + final).encode()).hexdigest()
+    if digest == job['feedback_digest']:
+        raise RuntimeError('waiting for corrected report; correction already submitted')
+    with conn:
+        conn.execute("UPDATE triage_jobs SET status='running',feedback_digest=? WHERE id=?",
+                     (digest, job['id']))
+    monitor.send_session_prompt(job['session_id'],
+        f"Your report needs correction: {problem}. Return the complete triage-result JSON "
+        "with all original failure_ids. Each finding needs outcome product, infrastructure, "
+        "or resolved. Product requires an issue object; the other outcomes require issue:null. "
+        "Use the evidence already collected to classify your findings; do not repeat the "
+        "investigation or write to GitHub/Slack. Infrastructure findings are channel notices, "
+        "never product tickets, including when a later job has recovered.")
+
+
 def collect_report(conn, job) -> None:
     turn = monitor.wait_once(job["session_id"], 1)
     if turn.status == "running":
@@ -230,16 +270,7 @@ def collect_report(conn, job) -> None:
     try:
         report = parse_report(final, json.loads(job["observations_json"]))
     except (ValueError, TypeError, KeyError) as exc:
-        digest = hashlib.sha256(final.encode()).hexdigest()
-        if digest == job["feedback_digest"]:
-            raise RuntimeError("waiting for corrected report; correction already submitted") from exc
-        # Save intent before sending: an ambiguous CLI response must not cause repeated prompts.
-        with conn:
-            conn.execute("UPDATE triage_jobs SET feedback_digest=? WHERE id=?", (digest, job["id"]))
-        monitor.send_session_prompt(job["session_id"],
-            f"Your report could not be parsed: {exc}. Return the complete triage-result JSON "
-            "using the original schema and all original failure_ids. Reuse your findings; "
-            "do not repeat the investigation or write to GitHub.")
+        request_report_correction(conn, job, final, exc)
         return
     with conn:
         conn.execute("UPDATE triage_jobs SET status='publishing',report_json=?,last_error=NULL WHERE id=?",
@@ -249,6 +280,15 @@ def collect_report(conn, job) -> None:
 def existing_number(url) -> int | None:
     match = re.fullmatch(rf"https://github\.com/{re.escape(monitor.REPO_NAME)}/issues/(\d+)", url or "")
     return int(match[1]) if match else None
+
+
+def issue_body(job, index, finding, observations) -> str:
+    return (finding['issue']['body'] + '\n\n### Triage evidence\n\n' + finding['diagnosis']
+            + '\n\n' + finding['evidence'] + '\n\n' + '\n'.join(
+                f"- {row['workflow']} / {row['job_name']} / `{row['identity']}`: "
+                f"{row['last_seen_run_url']} (`{row['last_seen_sha']}`)" for row in observations)
+            + f"\n\nTriage session: `{job['session_id']}`.\n\n"
+            + f"<!-- mergemarshall-triage:{job['id']}:{index} -->")
 
 
 def publish_issue(conn, job, index, finding, observations) -> str:
@@ -263,11 +303,7 @@ def publish_issue(conn, job, index, finding, observations) -> str:
         if len(linked) > 1:
             raise ValueError("finding spans multiple escalation tickets; review grouping before publication")
         number = next(iter(linked))
-    body = (finding["issue"]["body"] + "\n\n### Triage evidence\n\n" + finding["diagnosis"]
-            + "\n\n" + finding["evidence"] + "\n\n" + "\n".join(
-                f"- {row['workflow']} / {row['job_name']} / `{row['identity']}`: "
-                f"{row['last_seen_run_url']} (`{row['last_seen_sha']}`)" for row in observations)
-            + f"\n\nTriage session: `{job['session_id']}`.\n\n{marker}")
+    body = finding['issue_body']
     if not number:
         # REST enumeration also finds a successful POST whose response was lost.
         issues = gh_api("issues?state=all&labels=buildfailure&per_page=100", pages=True)
@@ -307,7 +343,8 @@ def record_observation(conn, job, finding, observation, url):
                  "ON CONFLICT(fingerprint) DO UPDATE SET job_id=excluded.job_id,diagnosis=excluded.diagnosis,"
                  "issue_url=excluded.issue_url,completed_at=excluded.completed_at,resolved_run_id=excluded.resolved_run_id",
                  (observation["fingerprint"], job["id"], finding["diagnosis"], url, monitor.utc_now(),
-                  observation["last_seen_run_id"] if finding["issue"] is None else None))
+                  observation["last_seen_run_id"] if finding.get('outcome',
+                      'resolved' if finding['issue'] is None else 'product') == 'resolved' else None))
 
 
 def retire_resolved_observation(conn, job, finding, observation) -> bool:
@@ -335,7 +372,7 @@ def reconcile_resolved(conn) -> int:
         for job in jobs:
             observations = {o["failure_id"]: o for o in json.loads(job["observations_json"])}
             for finding in json.loads(job["report_json"])["findings"]:
-                if finding["issue"] is not None:
+                if finding["issue"] is not None or finding.get('outcome', 'resolved') != 'resolved':
                     continue
                 for number in finding["failure_ids"]:
                     observation = observations[number]
@@ -349,6 +386,29 @@ def reconcile_resolved(conn) -> int:
 
 
 def publish(conn, job) -> None:
+    observations = {o['failure_id']: o for o in json.loads(job['observations_json'])}
+    try:
+        report = parse_report('triage-result: ' + job['report_json'], list(observations.values()))
+    except (ValueError, TypeError, KeyError) as exc:
+        # Old in-flight reports must classify existing findings before any issue write.
+        request_report_correction(conn, job, job['report_json'], exc)
+        return
+    prepared = False
+    for index, finding in enumerate(report['findings']):
+        captured = [observations[n] for n in finding['failure_ids']]
+        if finding['outcome'] == 'product' and 'issue_body' not in finding:
+            finding['issue_body'] = issue_body(job, index, finding, captured)
+            prepared = True
+        if finding['outcome'] == 'infrastructure' and 'slack_text' not in finding:
+            runs = list(dict.fromkeys(o['last_seen_run_url'] for o in captured))[:5]
+            title = ':warning: CI infrastructure incident: ' + finding['diagnosis'][:400]
+            links = '\n'.join(runs)
+            budget = max(0, monitor.SLACK_MESSAGE_LIMIT - len(title) - len(links) - 2)
+            finding['slack_text'] = title + '\n' + finding['evidence'][:budget] + '\n' + links
+            prepared = True
+    if prepared:
+        with conn:
+            conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=?', (json.dumps(report), job['id']))
     # The fixer can investigate concurrently; serialize ticket ownership decisions.
     with lock(monitor.LOCK_PATH) as acquired:
         if not acquired:
@@ -357,16 +417,23 @@ def publish(conn, job) -> None:
                         "('claimed','launching','running','pr_detection_pending') LIMIT 1").fetchone():
             monitor.log("triage publication waiting for an active fixer invocation")
             return
-        observations = {o["failure_id"]: o for o in json.loads(job["observations_json"])}
-        for index, finding in enumerate(json.loads(job["report_json"])["findings"]):
+        for index, finding in enumerate(report['findings']):
+            captured = [observations[n] for n in finding['failure_ids']]
+            if all(conn.execute('SELECT 1 FROM triage_observations WHERE fingerprint=? AND job_id=?',
+                                (o['fingerprint'], job['id'])).fetchone() for o in captured):
+                continue
             active = [(observations[n], current_observation(conn, observations[n])) for n in finding["failure_ids"]]
             active = [(o, row) for o, row in active if row is not None]
+            if finding['outcome'] == 'infrastructure':
+                posted, _ = monitor.slack_send(monitor.load_slack_transport(), finding['slack_text'])
+                if not posted:
+                    raise RuntimeError('infrastructure Slack notice pending; retry cached report next poll')
             url = publish_issue(conn, job, index, finding, [row for _, row in active]) if active and finding["issue"] else None
             with conn:
                 for n in finding["failure_ids"]:
                     o = observations[n]
                     record_observation(conn, job, finding, o, url)
-                    if finding["issue"] is None:
+                    if finding['outcome'] == 'resolved':
                         retire_resolved_observation(conn, job, finding, o)
                     elif current_observation(conn, o) is not None:
                         # Recheck inside the write transaction: ledger polling can run during GitHub calls.
@@ -400,7 +467,16 @@ def tick(conn) -> None:
     if reconcile_resolved(conn):
         monitor._sync_known_failure_issue(conn)
     cleanup(conn)
-    job = conn.execute("SELECT * FROM triage_jobs WHERE status!='completed' ORDER BY created_at LIMIT 1").fetchone()
+    # Retry cached publications without occupying the investigation slot.
+    for publication in conn.execute("SELECT * FROM triage_jobs WHERE status='publishing' ORDER BY created_at").fetchall():
+        try:
+            publish(conn, publication)
+        except Exception as exc:
+            with conn:
+                conn.execute('UPDATE triage_jobs SET last_error=? WHERE id=?', (str(exc), publication['id']))
+            monitor.log(f"triage {publication['id']}: cached publication will retry: {exc}")
+    cleanup(conn)
+    job = conn.execute("SELECT * FROM triage_jobs WHERE status IN ('queued','launching','running') ORDER BY created_at LIMIT 1").fetchone()
     if job is None:
         observations = pending(conn)
         if not observations:
@@ -418,8 +494,6 @@ def tick(conn) -> None:
             launch(conn, job)
         elif job["status"] == "running":
             collect_report(conn, job)
-        elif job["status"] == "publishing":
-            publish(conn, job)
     except Exception as exc:
         with conn:
             conn.execute("UPDATE triage_jobs SET last_error=? WHERE id=?", (str(exc), job["id"]))

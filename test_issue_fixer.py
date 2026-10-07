@@ -164,6 +164,64 @@ class IssueFixerTests(TestCase):
             fixer.finish(self.conn, job)
         self.assertEqual(self.conn.execute("SELECT status FROM issue_repairs").fetchone()[0], "completed")
 
+    def test_infrastructure_prompt_routes_to_channel_notice_instead_of_david(self):
+        prompt = self.job()['prompt']
+        self.assertIn('report outcome\ninfrastructure with pr:null', prompt)
+        self.assertIn('Do not assign David or create another ticket', prompt)
+        self.assertIn('Flaky product tests', prompt)
+        self.assertNotIn('Flaky/infrastructure failures', prompt)
+
+    def test_infrastructure_report_cannot_submit_a_product_pr(self):
+        report = dict(issue=12, outcome='infrastructure', pr=None, summary='Runner not acquired')
+        self.assertEqual(fixer.parse_report('fixer-result: ' + json.dumps(report), 12), report)
+        report['pr'] = 30
+        with self.assertRaisesRegex(ValueError, 'product PR'):
+            fixer.parse_report('fixer-result: ' + json.dumps(report), 12)
+
+    def test_infrastructure_closes_released_ticket_and_posts_at_channel_level(self):
+        job = dict(self.job(), report_json=json.dumps(dict(issue=12, outcome='infrastructure', pr=None,
+            summary='Runner never acquired; next hourly job passed')))
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='finishing',session_id='session',thread_ts='old-thread',report_json=? WHERE id=?",
+                              (job['report_json'], job['id']))
+        closed = dict(issue(), state='closed')
+        with mock.patch.object(fixer, 'api', side_effect=[issue(), closed]), \
+             mock.patch.object(monitor, 'run_gh') as gh:
+            fixer.finish(self.conn, job)
+        gh.assert_called_once_with(['issue', 'close', '12', '--repo', monitor.REPO_NAME, '--reason', 'not_planned'])
+        with mock.patch.object(monitor, 'slack_send', side_effect=[(False, None), (True, 'notice')]) as slack, \
+             mock.patch.object(monitor, 'require_mj_success', return_value='{}') as mj:
+            fixer.cleanup(self.conn, self.transport)
+            self.assertEqual(self.conn.execute('SELECT outcome_sent FROM issue_repairs').fetchone()[0], 0)
+            fixer.cleanup(self.conn, self.transport)
+            self.assertEqual(slack.call_count, 2)
+            self.assertEqual(slack.call_args_list[0], slack.call_args_list[1])
+            self.assertIsNone(slack.call_args.kwargs['thread_ts'])
+            mj.assert_called_once()
+        self.assertEqual(self.conn.execute('SELECT outcome_sent FROM issue_repairs').fetchone()[0], 1)
+
+    def test_lost_infrastructure_close_response_retries_without_recomputing_report(self):
+        job = dict(self.job(), report_json=json.dumps(dict(issue=12, outcome='infrastructure', pr=None,
+                                                         summary='External capacity failure')))
+        with mock.patch.object(fixer, 'api', return_value=issue()), \
+             mock.patch.object(monitor, 'run_gh', side_effect=monitor.CommandError('lost response')):
+            with self.assertRaises(monitor.CommandError):
+                fixer.finish(self.conn, job)
+        with mock.patch.object(fixer, 'api', return_value=dict(issue(), state='closed')), \
+             mock.patch.object(monitor, 'run_gh') as gh:
+            fixer.finish(self.conn, job)
+        gh.assert_not_called()
+        self.assertEqual(self.conn.execute('SELECT status FROM issue_repairs').fetchone()[0], 'completed')
+
+    def test_infrastructure_does_not_close_another_persons_ticket(self):
+        job = dict(self.job(), report_json=json.dumps(dict(issue=12, outcome='infrastructure', pr=None,
+                                                         summary='Runner failure')))
+        with mock.patch.object(fixer, 'api', return_value=issue(assignees=['dave'])), \
+             mock.patch.object(monitor, 'run_gh') as gh:
+            with self.assertRaisesRegex(ValueError, 'another person'):
+                fixer.finish(self.conn, job)
+        gh.assert_not_called()
+
     def test_dossier_has_only_target_issue_and_related_observations(self):
         with mock.patch.object(fixer, "api", return_value=[]):
             data = fixer.dossier(self.conn, issue(), [pr()])

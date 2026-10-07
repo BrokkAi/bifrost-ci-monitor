@@ -154,6 +154,13 @@ limitations, not additional repair tasks. Submitted work uses a `ci-fix` PR,
 master before readying it; keep it draft while editing. The fixer neither
 merges its PR nor pushes master.
 
+Infrastructure is operational work, not a Bifrost product defect. The fixer
+reports `infrastructure` with no PR, records evidence on the misplaced ticket,
+and releases its own claim. The supervisor closes that ticket as not planned
+only after checking it has no remaining owner/claim, then posts the cached
+summary at channel level. Do not assign David or create another product ticket
+for runner/provider/quota/network failures. Flaky product tests remain defects.
+
 A rejection retry requires the recorded fixer association and a trusted
 `automerge-rejected-head` comment exactly matching the current head. Stale
 labels and another author's PR are not retries; another person's assignment
@@ -323,7 +330,10 @@ existing observed identity; it never creates evidence.
 SQLite is authoritative. The pinned `Known CI failures on master` issue is a
 generated view, never parsed back as state. Update only changed renders and
 continue if pinning is denied. Update its stored issue number through REST;
-failed idempotent updates retry on later upkeep without discarding that number.
+failed idempotent updates retain the prepared body in
+`known_failure_state.issue_pending_body` and retry on the next poll, including
+when run ingestion is rate-limited. Retry that exact body before rendering a
+new view; never repeat an investigation or CI-log parse just to retry a write.
 Title search is only for initial setup. Triage issue links do not suppress the fixer;
 it reuses those issues. A repair PR associates observations with proposed
 work, but is not evidence that failures are fixed.
@@ -333,6 +343,21 @@ failed steps and commit, not repeated runs of the same observation. Its
 2-CPU/4-GiB session reads logs/source/history but does not build or fix code.
 Validate final JSON, deduplicate causes against open/closed issues, reopen
 matching issues, and persist publication markers to recover lost replies.
+Every finding declares `outcome: product|infrastructure|resolved`. Only product
+findings may contain issue drafts. Infrastructure publishes one top-level Slack
+notice; issue bodies and Slack text are prepared once and cached in
+`triage_jobs.report_json`. Infrastructure checkpoints
+handled observations in the existing `triage_observations` table. Handled
+infrastructure remains open in the CI ledger until normal completed-run upkeep
+observes recovery; it is never treated as resolved merely because it was reported.
+Publication outages leave the cached report available for later polls without
+occupying the investigation slot or allowing duplicate investigation of its
+captured fingerprints. Accepted findings are checkpointed independently so a
+later finding's failed write does not republish earlier Slack messages. Failed
+Slack sends retry the cached text; an accepted send whose reply is lost can still
+produce a duplicate notice. Old in-flight reports lacking outcome must classify
+their existing findings in a correction turn before any issue write, using their
+captured evidence rather than repeating investigation.
 Skip findings fixed/superseded during investigation. A resolved finding can
 retire only its unchanged captured commit/steps/run; a later failure reopens
 the ledger. `--reconcile-resolved` reconciles historical completed reports

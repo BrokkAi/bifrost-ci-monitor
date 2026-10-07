@@ -773,12 +773,18 @@ def _update_known_failure_issue(number: int, body: str) -> None:
 
 
 def _sync_known_failure_issue(conn: sqlite3.Connection) -> None:
-    body = _known_failure_issue_body(conn)
-    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    number_value = _known_failure_state(conn, "issue_number")
-    if (number_value and _known_failure_state(conn, "issue_labeled")
-            and _known_failure_state(conn, "issue_body_sha256") == digest):
-        return
+    # Keep the prepared view across publication failures. A retry is a write of
+    # the cached result, not another render or investigation of the old runs.
+    with conn:
+        conn.execute("INSERT OR IGNORE INTO known_failure_state(key,value) VALUES ('issue_pending_body','')")
+        body = _known_failure_state(conn, 'issue_pending_body') or _known_failure_issue_body(conn)
+        digest = hashlib.sha256(body.encode('utf-8')).hexdigest()
+        number_value = _known_failure_state(conn, 'issue_number')
+        if (number_value and _known_failure_state(conn, 'issue_labeled')
+                and _known_failure_state(conn, 'issue_body_sha256') == digest):
+            conn.execute("DELETE FROM known_failure_state WHERE key='issue_pending_body' AND value=?", (body,))
+            return
+        conn.execute("UPDATE known_failure_state SET value=? WHERE key='issue_pending_body'", (body,))
     created = False
     if number_value:
         number = int(number_value)
@@ -823,7 +829,10 @@ def _sync_known_failure_issue(conn: sqlite3.Connection) -> None:
             _set_known_failure_state(conn, "issue_pinned", "1")
         except CommandError as exc:
             log(f"could not pin known-failures issue #{number}: {exc}")
-    _set_known_failure_state(conn, "issue_body_sha256", digest)
+    with conn:
+        conn.execute("INSERT INTO known_failure_state(key,value) VALUES ('issue_body_sha256',?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (digest,))
+        conn.execute("DELETE FROM known_failure_state WHERE key='issue_pending_body' AND value=?", (body,))
 
 
 def _record_known_failure_error(
@@ -968,6 +977,8 @@ def update_known_failures(
         prior = _failure_datetime(_known_failure_state(conn, "last_upkeep_at"))
         if not force and prior and (current_time - prior).total_seconds() < KNOWN_FAILURE_UPKEEP_SECONDS:
             conn.rollback()
+            if _known_failure_state(conn, 'issue_pending_body'):
+                _sync_known_failure_issue(conn)
             return False
         conn.execute(
             "INSERT INTO known_failure_state(key,value) VALUES ('last_upkeep_at',?) "

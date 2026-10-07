@@ -2304,6 +2304,35 @@ class KnownFailureLedgerTests(unittest.TestCase):
             hashlib.sha256(desired.encode()).hexdigest(),
         )
 
+    def test_failed_ledger_publication_retries_cached_body_without_rendering(self):
+        monitor._set_known_failure_state(self.conn, 'issue_number', '4519')
+        monitor._set_known_failure_state(self.conn, 'issue_labeled', '1')
+        monitor._set_known_failure_state(self.conn, 'issue_pinned', '1')
+        desired = monitor._known_failure_issue_body(self.conn)
+        with mock.patch.object(monitor, 'run_gh', side_effect=monitor.CommandError('HTTP 503')):
+            with self.assertRaises(monitor.CommandError):
+                monitor._sync_known_failure_issue(self.conn)
+        self.assertEqual(monitor._known_failure_state(self.conn, 'issue_pending_body'), desired)
+        with mock.patch.object(monitor, '_known_failure_issue_body', side_effect=AssertionError('must use cached body')), \
+             mock.patch.object(monitor, 'run_gh', return_value='4519') as gh:
+            monitor._sync_known_failure_issue(self.conn)
+        self.assertIn('body=' + desired, gh.call_args.args[0])
+        self.assertFalse(monitor._known_failure_state(self.conn, 'issue_pending_body'))
+
+    def test_rate_limited_upkeep_still_retries_cached_publication_without_processing_runs(self):
+        now = dt.datetime.now(dt.timezone.utc)
+        monitor._set_known_failure_state(self.conn, 'last_upkeep_at', now.isoformat())
+        monitor._set_known_failure_state(self.conn, 'issue_number', '4519')
+        monitor._set_known_failure_state(self.conn, 'issue_labeled', '1')
+        monitor._set_known_failure_state(self.conn, 'issue_pinned', '1')
+        monitor._set_known_failure_state(self.conn, 'issue_pending_body', 'cached ledger view')
+        with mock.patch.object(monitor, '_known_failure_issue_body', side_effect=AssertionError('must not render')), \
+             mock.patch.object(monitor, '_known_failure_runs', side_effect=AssertionError('must not refetch runs')), \
+             mock.patch.object(monitor, 'run_gh', return_value='4519') as gh:
+            self.assertFalse(monitor.update_known_failures(self.conn, self.transport, now=now))
+        gh.assert_called_once()
+        self.assertIn('body=cached ledger view', gh.call_args.args[0])
+
     def test_missing_issue_is_created_labeled_stored_and_pinned(self):
         with mock.patch.object(
             monitor, "run_gh",
