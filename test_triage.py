@@ -126,6 +126,13 @@ class TriageTests(TestCase):
         self.assertEqual(self.github.calls, [])
         row = self.conn.execute('SELECT * FROM known_failures').fetchone()
         self.assertEqual(row['status'], 'open')
+        self.assertEqual(row['triage_outcome'], 'infrastructure')
+        context = automerge._known_failures_prompt(self.conn)
+        self.assertIn('infrastructure (diagnostic only', context)
+        prompt = automerge.build_async_prompt('batch', [automerge.PullRequest(7, 'Change', 'b' * 40, 'url')],
+                                             'a' * 40, known_failures_context=context)
+        self.assertIn('Do not investigate them again', prompt)
+        self.assertNotIn('triage issue (available for repair)', context)
         self.assertIsNone(row['fixed_at'])
         self.assertIsNone(row['triage_issue_url'])
         self.assertIsNone(self.conn.execute('SELECT resolved_run_id FROM triage_observations').fetchone()[0])
@@ -232,6 +239,7 @@ class TriageTests(TestCase):
         self.add_failure()
         self.conn.execute("ALTER TABLE known_failures DROP COLUMN triage_issue_url")
         self.conn.execute("ALTER TABLE known_failures DROP COLUMN triage_issue_state")
+        self.conn.execute("ALTER TABLE known_failures DROP COLUMN triage_outcome")
         self.conn.execute("ALTER TABLE triage_observations DROP COLUMN resolved_run_id")
         self.conn.commit()
         self.reopen()
@@ -239,7 +247,34 @@ class TriageTests(TestCase):
         self.assertEqual(row["identity"], "Cargo nextest")
         self.assertIsNone(row["triage_issue_url"])
         self.assertEqual(row["triage_issue_state"], "OPEN")
+        self.assertIsNone(row["triage_outcome"])
         self.assertIn("resolved_run_id", {r["name"] for r in self.conn.execute("PRAGMA table_info(triage_observations)")})
+
+    def test_upgrade_reuses_cached_infrastructure_classification_without_publication(self):
+        self.add_failure()
+        self.infrastructure_job()
+        triage.publish(self.conn, self.job())
+        with self.conn:
+            self.conn.execute('ALTER TABLE known_failures DROP COLUMN triage_outcome')
+            self.conn.execute("DELETE FROM known_failure_state WHERE key='triage_outcomes_v1'")
+        self.reopen()
+        self.assertEqual(self.conn.execute('SELECT triage_outcome FROM known_failures').fetchone()[0], 'infrastructure')
+        triage.ensure_schema(self.conn)
+        self.slack.assert_called_once()
+        self.assertEqual(self.github.calls, [])
+
+    def test_cached_classification_does_not_apply_to_changed_observations(self):
+        self.add_failure()
+        self.infrastructure_job()
+        triage.publish(self.conn, self.job())
+        for changed in ["last_seen_sha='b'", "last_seen_failed_steps_json='[\"New step\"]'"]:
+            with self.subTest(changed=changed), self.conn:
+                self.conn.execute("UPDATE known_failures SET last_seen_sha=?,last_seen_failed_steps_json='[]',triage_outcome=NULL",
+                                  ('a' * 40,))
+                self.conn.execute('UPDATE known_failures SET ' + changed)
+                self.conn.execute("DELETE FROM known_failure_state WHERE key='triage_outcomes_v1'")
+            triage.backfill_outcomes(self.conn)
+            self.assertIsNone(self.conn.execute('SELECT triage_outcome FROM known_failures').fetchone()[0])
 
     def test_groups_shared_cause_into_one_issue_and_preserves_repair_eligibility(self):
         self.add_failure()
@@ -251,6 +286,7 @@ class TriageTests(TestCase):
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(r["triage_issue_url"].endswith("/101") for r in rows))
         self.assertTrue(all(r["status"] == "open" and r["diagnosis_source"] == "triage session session" for r in rows))
+        self.assertTrue(all(r['triage_outcome'] == 'product' for r in rows))
         with self.conn:
             self.conn.execute("UPDATE known_failures SET linked_issue_url='human-owned'")
         self.assertEqual(monitor._failure_rows_for_prompt(self.conn, omit_linked=True)[0], [])

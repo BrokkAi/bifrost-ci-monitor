@@ -614,6 +614,7 @@ def ensure_known_failure_schema(conn: sqlite3.Connection) -> None:
     # Triage supplies context, rather than claiming a repair for a human.
     ensure_column(conn, "known_failures", "triage_issue_url", "TEXT")
     ensure_column(conn, "known_failures", "triage_issue_state", "TEXT NOT NULL DEFAULT 'OPEN'")
+    ensure_column(conn, "known_failures", "triage_outcome", "TEXT")
     _migrate_known_failure_job_names(conn)
 
 
@@ -707,13 +708,19 @@ def render_known_failures_prompt(
             f"- {row['workflow']} / {row['job_name']} / {row['identity_kind']}: "
             f"{row['identity']} (first seen at {row['first_seen_sha'][:12]})"
         )
+        if row["triage_outcome"] == "infrastructure":
+            item += (
+                "; infrastructure (diagnostic only: do not reproduce or repair it, "
+                "reject a PR for it, or count it as a product-test baseline; "
+                "interrupted checks are unvalidated)"
+            )
         if row["diagnosis"]:
             item += f"; diagnosis: {row['diagnosis']}"
         if row["linked_pr_url"]:
             item += f"; PR: {row['linked_pr_url']}"
         if row["linked_issue_url"]:
             item += f"; issue: {row['linked_issue_url']}"
-        if row["triage_issue_url"]:
+        if row["triage_issue_url"] and row["triage_outcome"] != "infrastructure":
             item += f"; triage issue (available for repair): {row['triage_issue_url']}"
         lines.append(item)
     if overflow:
@@ -868,6 +875,25 @@ def _record_known_failure_error(
             log(f"could not send known-failure upkeep notice: {exc}")
 
 
+def _failure_absence_proves_recovery(row, detail, successful_steps, *, incomplete: bool) -> bool:
+    """Require evidence from the relevant steps before retiring an absent failure."""
+    try:
+        recorded = json.loads(row["last_seen_failed_steps_json"] or "[]")
+        steps = set(recorded) if isinstance(recorded, list) else set()
+    except (TypeError, ValueError):
+        steps = set()
+    if not steps and row["identity_kind"] == "step" and row["identity"] != "unknown failure":
+        steps = {row["identity"]}
+    if not steps:
+        return False
+    if steps <= successful_steps:
+        return True
+    # A completed failing test step can replace an earlier failure with other
+    # parsed test identities. Checkout/build failure or interrupted output cannot.
+    return bool(not incomplete and detail and detail.tests
+                and steps <= (detail.failed_steps | successful_steps))
+
+
 def _process_known_failure_run(
     conn: sqlite3.Connection, workflow: str, item: dict[str, Any]
 ) -> None:
@@ -915,16 +941,26 @@ def _process_known_failure_run(
                     "last_seen_sha=excluded.last_seen_sha,last_seen_run_id=excluded.last_seen_run_id,"
                     "last_seen_run_url=excluded.last_seen_run_url,last_seen_at=excluded.last_seen_at,"
                     "last_seen_failed_steps_json=excluded.last_seen_failed_steps_json,"
-                    "diagnosis=CASE WHEN known_failures.status='fixed' THEN NULL ELSE known_failures.diagnosis END,"
-                    "diagnosis_source=CASE WHEN known_failures.status='fixed' THEN NULL ELSE known_failures.diagnosis_source END,"
+                    "diagnosis=CASE WHEN known_failures.status='fixed' OR (known_failures.triage_outcome='infrastructure' "
+                    "AND (known_failures.last_seen_sha<>excluded.last_seen_sha "
+                    "OR known_failures.last_seen_failed_steps_json<>excluded.last_seen_failed_steps_json)) "
+                    "THEN NULL ELSE known_failures.diagnosis END,"
+                    "diagnosis_source=CASE WHEN known_failures.status='fixed' OR (known_failures.triage_outcome='infrastructure' "
+                    "AND (known_failures.last_seen_sha<>excluded.last_seen_sha "
+                    "OR known_failures.last_seen_failed_steps_json<>excluded.last_seen_failed_steps_json)) "
+                    "THEN NULL ELSE known_failures.diagnosis_source END,"
+                    "triage_outcome=CASE WHEN known_failures.status='fixed' "
+                    "OR known_failures.last_seen_sha<>excluded.last_seen_sha "
+                    "OR known_failures.last_seen_failed_steps_json<>excluded.last_seen_failed_steps_json "
+                    "THEN NULL ELSE known_failures.triage_outcome END,"
                     "status='open',fixed_at=NULL,fixed_by_sha=NULL,updated_at=excluded.updated_at",
                     (workflow, entry["job"], entry["kind"], entry["identity"],
                      sha, run_id, url, now, sha, run_id, url, now,
                      json.dumps(entry["steps"]), now),
                 )
             # A completed passing job clears every open row for that workflow/job.
-            # For a failed job, a previously known identity absent from this run's
-            # deterministic parsed failures is also fixed.
+            # A failed/interrupted job only retires absent failures when their
+            # own steps provide completed evidence, never from missing output.
             seen_jobs = {
                 normalize_ci_job_name(key.split("/", 1)[-1])
                 for key in (*report.failed_jobs, *report.successful_jobs)
@@ -935,16 +971,32 @@ def _process_known_failure_run(
                 normalize_ci_job_name(key.split("/", 1)[-1])
                 for key in report.successful_jobs
             }
+            incomplete_jobs = {
+                normalize_ci_job_name(key.split("/", 1)[-1])
+                for key in report.incomplete_jobs
+            }
+            details_by_job = {
+                normalize_ci_job_name(key.split("/", 1)[-1]): detail
+                for key, detail in report.details.items()
+            }
+            successful_steps = {
+                normalize_ci_job_name(key.split("/", 1)[-1]): steps
+                for key, steps in report.successful_steps.items()
+            }
             for job_name in seen_jobs:
                 succeeded = job_name in successful_jobs
                 existing = conn.execute(
-                    "SELECT job_name,identity_kind,identity FROM known_failures "
+                    "SELECT job_name,identity_kind,identity,last_seen_failed_steps_json FROM known_failures "
                     "WHERE workflow=? AND job_name=? AND status='open'",
                     (workflow, job_name),
                 ).fetchall()
                 for row in existing:
                     key = (job_name, row["identity_kind"], row["identity"])
-                    if succeeded or key not in observed:
+                    if succeeded or (key not in observed and _failure_absence_proves_recovery(
+                        row, details_by_job.get(job_name),
+                        successful_steps.get(job_name, frozenset()),
+                        incomplete=job_name in incomplete_jobs,
+                    )):
                         conn.execute(
                             "UPDATE known_failures SET status='fixed',fixed_at=?,fixed_by_sha=?,updated_at=? "
                             "WHERE workflow=? AND job_name=? AND identity_kind=? AND identity=?",

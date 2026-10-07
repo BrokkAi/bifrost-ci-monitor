@@ -71,6 +71,9 @@ and resolved-observation cleanup survive interrupted polls and lost replies.
 Unpublished results stay in SQLite and retry without repeating investigation;
 pending delivery does not prevent triage of other observations. Reporting an
 infrastructure incident does not itself mark the CI failure fixed.
+Interrupted jobs preserve prior product-failure evidence; completed relevant
+test steps or a passing job are needed to retire it. Classified infrastructure
+appears as diagnostic context for merge agents, rather than a repair target.
 
 ## Issue-scoped repair
 

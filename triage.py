@@ -59,6 +59,31 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         );
     """)
     monitor.ensure_column(conn, "triage_observations", "resolved_run_id", "INTEGER")
+    backfill_outcomes(conn)
+
+
+def backfill_outcomes(conn) -> None:
+    """Reuse classifications in completed reports when upgrading an existing ledger."""
+    migration = 'triage_outcomes_v1'
+    if monitor._known_failure_state(conn, migration):
+        return
+    with conn:
+        conn.execute('BEGIN IMMEDIATE')
+        for job in conn.execute("SELECT observations_json,report_json FROM triage_jobs "
+                                "WHERE status='completed' AND report_json IS NOT NULL "
+                                "ORDER BY finished_at DESC,created_at DESC").fetchall():
+            observations = {o['failure_id']: o for o in json.loads(job['observations_json'])}
+            for finding in json.loads(job['report_json'])['findings']:
+                outcome = finding.get('outcome')
+                if outcome not in {'product', 'infrastructure'}:
+                    continue  # Old unclassified reports cannot establish infrastructure.
+                for number in finding['failure_ids']:
+                    observation = observations[number]
+                    if current_observation(conn, observation) is not None:
+                        conn.execute(f"UPDATE known_failures SET triage_outcome=? "
+                                     f"WHERE {WHERE_KEY} AND triage_outcome IS NULL",
+                                     (outcome, *(observation[k] for k in KEY)))
+        conn.execute("INSERT OR REPLACE INTO known_failure_state(key,value) VALUES (?, '1')", (migration,))
 
 
 def fingerprint(row) -> str:
@@ -437,12 +462,12 @@ def publish(conn, job) -> None:
                         retire_resolved_observation(conn, job, finding, o)
                     elif current_observation(conn, o) is not None:
                         # Recheck inside the write transaction: ledger polling can run during GitHub calls.
-                        conn.execute(f"UPDATE known_failures SET diagnosis=?,diagnosis_source=?,"
+                        conn.execute(f"UPDATE known_failures SET diagnosis=?,diagnosis_source=?,triage_outcome=?,"
                                      f"triage_issue_url=COALESCE(?,triage_issue_url),triage_issue_state="
                                      f"CASE WHEN ? IS NULL THEN triage_issue_state ELSE 'OPEN' END,updated_at=? "
                                      f"WHERE {WHERE_KEY}",
                                      ((finding["diagnosis"] + " Evidence: " + finding["evidence"])[:500],
-                                      f"triage session {job['session_id']}", url, url, monitor.utc_now(),
+                                      f"triage session {job['session_id']}", finding['outcome'], url, url, monitor.utc_now(),
                                       *(o[k] for k in KEY)))
         with conn:
             conn.execute("UPDATE triage_jobs SET status='completed',finished_at=?,last_error=NULL WHERE id=?",
