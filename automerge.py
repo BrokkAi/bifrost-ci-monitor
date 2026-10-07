@@ -23,6 +23,7 @@ from typing import Any
 from urllib.parse import quote
 
 import monitor
+import pr_dependencies
 
 
 REPO_NAME = monitor.REPO_NAME
@@ -84,7 +85,10 @@ SKILLS_GUIDANCE = (
     "batch mechanics. Use mm-db pr/issue for GitHub reads and mm-db exclude/comment "
     "for comments, labels, and source PR state changes. Do not run gh commands "
     "or GitHub API writes yourself; the supervisor delivers and retries recorded "
-    "intents. Read mm-db state before changing membership. Try one "
+    "intents. Read mm-db state before changing membership. "
+    "The supervisor orders prerequisite PRs before dependents and captures their exact heads. "
+    "Removing a prerequisite also removes its descendants; refresh mm-db state and "
+    "rebuild the recorded remainder without rejecting those descendants. Try one "
     "octopus merge of the verified heads first; if it fails, resolve sequential "
     "merges manually. One octopus merge commit retaining every source head is "
     "allowed. Record removals and test evidence through mm-db, publish through "
@@ -155,6 +159,8 @@ class PullRequest:
     url: str
     priority: bool = False
     immediate: bool = False
+    base_ref: str = BASE_BRANCH
+    dependencies: tuple[pr_dependencies.Dependency, ...] = ()
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -164,6 +170,8 @@ class PullRequest:
             "url": self.url,
             "priority": self.priority,
             "immediate": self.immediate,
+            "base_ref": self.base_ref,
+            "dependencies": [dep.as_json() for dep in self.dependencies],
         }
 
 
@@ -320,7 +328,7 @@ def newest_trusted_rejection(
 
 def list_open_pull_requests() -> list[dict[str, Any]]:
     endpoint = (
-        f"repos/{REPO_NAME}/pulls?state=open&base={BASE_BRANCH}&per_page=100"
+        f"repos/{REPO_NAME}/pulls?state=open&per_page=100"
     )
     payload = gh_json(["api", "--paginate", "--slurp", endpoint], timeout=90)
     return _paginated_objects(payload, context="open pull request listing")
@@ -358,13 +366,13 @@ def enqueue_github_write(conn: sqlite3.Connection, batch_id: str, kind: str,
                          number: int, head_sha: str, payload: dict[str, Any]) -> str:
     """Record a GitHub intent in the caller's transaction, without doing I/O."""
     if kind not in {"reject_head", "draft_changed_head", "clear_rejection_label",
-                    "issue_comment", "integration_metadata"}:
+                    "issue_comment", "integration_metadata", "promote_dependency"}:
         raise ValueError("unknown GitHub write intent")
     if type(number) is not int or number <= 0 or not re.fullmatch(r"[0-9a-f]{40}|", head_sha):
         raise ValueError("invalid GitHub write target")
     ensure_github_outbox_schema(conn)
     identity = [batch_id, kind, number, head_sha]
-    if kind == "issue_comment":
+    if kind in {"issue_comment", "promote_dependency"}:
         identity.append(payload)
     intent_id = hashlib.sha256(json.dumps(
         identity, sort_keys=True, separators=(",", ":")
@@ -459,6 +467,23 @@ def deliver_github_write(row: sqlite3.Row | dict[str, Any]) -> None:
                 raise AutomergeError(f"PR #{number} draft update not confirmed",
                                      reason="github_write_unconfirmed")
         return
+    if kind == "promote_dependency":
+        if (current_head != head or str(detail.get('state')).lower() != 'open'
+                or detail.get('base', {}).get('ref') == BASE_BRANCH):
+            return
+        if detail.get('base', {}).get('ref') != payload['base_ref']:
+            return  # A later discovery owns a changed dependency relationship.
+        master = current_master_sha()
+        for dep in payload['dependencies']:
+            if (not compare_commit_ancestry(dep['head_sha'], master)
+                    or not compare_commit_ancestry(dep['head_sha'], head)):
+                raise AutomergeError(f"PR #{number} promotion prerequisite #{dep['number']} is not in master/head",
+                                     reason='dependency_promotion_pending')
+        github_api_write(f'pulls/{number}', 'PATCH', {'base': BASE_BRANCH})
+        confirmed = gh_json(['api', f'repos/{REPO_NAME}/pulls/{number}'])
+        if not isinstance(confirmed, dict) or confirmed.get('base', {}).get('ref') != BASE_BRANCH:
+            raise AutomergeError(f'PR #{number} promotion not confirmed', reason='github_write_unconfirmed')
+        return
     if kind == "clear_rejection_label":
         if current_head != head or REJECTED_LABEL not in _labels(detail):
             return
@@ -522,88 +547,197 @@ def retry_github_outbox(conn: sqlite3.Connection, transport: monitor.SlackTransp
             )
 
 
-def select_eligible_pull_requests(*, dry_run: bool = False,
-                                  conn: sqlite3.Connection | None = None) -> list[PullRequest]:
-    """Select eligible PRs, restricting the lane to priority PRs when present."""
-    eligible: list[PullRequest] = []
+def _is_integration_pull(item):
+    head = item.get('head') or {}
+    ref = str(head.get('ref') or item.get('headRefName') or '')
+    return ref.startswith('mergemarshall/batch-') or INTEGRATION_LABEL in _labels(item)
+
+
+def _queue_ready(item, *, conn=None, dry_run=False):
+    """Readiness belongs to a PR head; dependency eligibility is separate."""
+    number = int(item['number'])
+    head = item.get('head', {})
+    head_sha = head.get('sha') or item.get('headRefOid')
+    head_ref = head.get('ref') or item.get('headRefName') or f'feature-{number}'
+    if (str(item.get('state', 'open')).lower() != 'open'
+            or item.get('draft', item.get('isDraft', False))
+            or _is_integration_pull(item)):
+        return False
     has_outbox = bool(conn is not None and conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='automerge_github_outbox'"
     ).fetchone())
-    for item in list_open_pull_requests():
-        base = item.get("base")
-        head = item.get("head")
-        base_name = base.get("ref") if isinstance(base, dict) else item.get("baseRefName")
-        head_sha = head.get("sha") if isinstance(head, dict) else item.get("headRefOid")
-        head_ref = head.get("ref") if isinstance(head, dict) else item.get("headRefName")
-        if (
-            str(item.get("state", "open")).lower() != "open"
-            or item.get("draft", item.get("isDraft", False))
-            or base_name != BASE_BRANCH
-            or (isinstance(head_ref, str) and head_ref.startswith("mergemarshall/batch-"))
-            or INTEGRATION_LABEL in _labels(item)
-        ):
-            continue
-        try:
-            number = int(item["number"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise AutomergeError("GitHub returned a PR without a valid number",
-                                 reason="github_invalid_response") from exc
-        if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha):
-            raise AutomergeError(f"GitHub returned an invalid head SHA for PR #{number}",
-                                 reason="github_invalid_response")
-
-        if has_outbox:
-            intent = conn.execute(
+    if has_outbox:
+        intent = conn.execute(
                 "SELECT 1 FROM automerge_github_outbox WHERE number=? AND "
                 "((kind='reject_head' AND head_sha=? AND cancelled_at IS NULL) OR "
-                "(kind='draft_changed_head' AND delivered_at IS NULL)) LIMIT 1",
+                "(kind='draft_changed_head' AND delivered_at IS NULL AND cancelled_at IS NULL)) LIMIT 1",
                 (number, head_sha.lower()),
             ).fetchone()
-            if intent:
-                continue
-
-        labels = _labels(item)
-        if REJECTED_LABEL in labels:
-            comments = list_pull_comments(number)
-            rejected = newest_trusted_rejection(comments)
-            current_sha = head_sha.lower()
-            if rejected is not None and current_sha == rejected.head_sha:
-                released = bool(has_outbox and conn.execute(
+        if intent:
+            return False
+    if REJECTED_LABEL in _labels(item):
+        rejected = newest_trusted_rejection(list_pull_comments(number))
+        if rejected is not None:
+            released = bool(has_outbox and conn.execute(
                     "SELECT 1 FROM automerge_github_outbox WHERE kind='reject_head' "
                     "AND number=? AND head_sha=? AND cancelled_at IS NOT NULL LIMIT 1",
-                    (number, current_sha),
+                    (number, rejected.head_sha),
                 ).fetchone())
-                if not released:
-                    continue
-            # A newer head clears the recorded rejection. A malformed label
-            # without a matching machine-readable comment is not a rejection.
-            if not dry_run:
-                if conn is None:
-                    remove_rejection_label(number)
-                else:
-                    with conn:
-                        enqueue_github_write(conn, "__queue__", "clear_rejection_label",
-                                             number, head_sha.lower(), {})
-
-        if READY_POLICY == "approved":
-            review = gh_json(["pr", "view", str(number), "--repo", REPO_NAME,
+            item['_mm_rejection'] = {'head_sha': rejected.head_sha, 'evidence': rejected.evidence,
+                                     'active': not released}
+            if not released and head_sha.lower() == rejected.head_sha:
+                return False
+        if not dry_run:
+            if conn is None:
+                remove_rejection_label(number)
+            else:
+                with conn:
+                    enqueue_github_write(conn, '__queue__', 'clear_rejection_label', number, head_sha.lower(), {})
+    if READY_POLICY == 'approved':
+        review = gh_json(["pr", "view", str(number), "--repo", REPO_NAME,
                               "--json", "reviewDecision"])
-            if not isinstance(review, dict) or review.get("reviewDecision") != "APPROVED":
-                continue
+        return isinstance(review, dict) and review.get('reviewDecision') == 'APPROVED'
+    return True
 
-        priority, immediate = _priority_flags(labels)
-        eligible.append(
-            PullRequest(
-                number=number,
-                title=str(item.get("title") or f"PR #{number}"),
-                head_sha=head_sha.lower(),
-                url=str(item.get("html_url") or f"https://github.com/{REPO_NAME}/pull/{number}"),
-                priority=priority,
-                immediate=immediate,
-            )
-        )
-    priority = [pull for pull in eligible if pull.priority]
-    return sorted(priority or eligible, key=lambda pull: pull.number)
+
+def _dependency_node(item, *, conn=None, dry_run=False):
+    number = int(item['number'])
+    head, base = item.get('head') or {}, item.get('base') or {}
+    sha = str(head.get('sha') or item.get('headRefOid') or '').lower()
+    if not re.fullmatch(r'[0-9a-f]{40}', sha):
+        raise AutomergeError(f'GitHub returned an invalid head SHA for PR #{number}', reason='github_invalid_response')
+    priority, immediate = _priority_flags(_labels(item))
+    return pr_dependencies.Node(number, sha, base.get('ref') or item.get('baseRefName') or '',
+        head.get('ref') or item.get('headRefName') or f'feature-{number}',
+        (head.get('repo') or {}).get('full_name') or REPO_NAME,
+        (base.get('repo') or {}).get('full_name') or REPO_NAME, item,
+        _queue_ready(item, conn=conn, dry_run=dry_run), priority, immediate)
+
+
+def dependency_graph(conn=None, *, dry_run=False, master=None):
+    """Refresh open heads and durable prerequisites, then verify their ancestry."""
+    cached = pr_dependencies.inventory(conn)
+    items = {int(p['number']): p for p in list_open_pull_requests() if not _is_integration_pull(p)}
+    histories = {number: history for number, (_, history) in cached.items()}
+    required = set()
+    if pr_dependencies.has_table(conn, 'automerge_pr_dependencies'):
+        required.update(row[0] for row in conn.execute('SELECT DISTINCT prerequisite_number FROM automerge_pr_dependencies'))
+    if pr_dependencies.has_table(conn, 'automerge_github_outbox'):
+        for row in conn.execute("SELECT number,head_sha FROM automerge_github_outbox "
+                                "WHERE kind='reject_head' AND cancelled_at IS NULL"):
+            required.add(row['number'])
+            histories.setdefault(row['number'], []).append(row['head_sha'])
+    for number, (item, _) in cached.items():
+        if _is_integration_pull(item):
+            continue
+        if number not in items:
+            items[number] = item
+            if str(item.get('state')).lower() == 'open':
+                required.add(number)  # It disappeared from the open listing.
+    for number in sorted(required):
+        if number not in items or (number in cached and items[number] is cached[number][0]):
+            items[number] = gh_json(['api', f'repos/{REPO_NAME}/pulls/{number}'])
+    nodes = {number: _dependency_node(item, conn=conn, dry_run=dry_run) for number, item in items.items()
+             if not _is_integration_pull(item)}
+    # A non-master base may point to a closed PR never observed by this host.
+    searched = set()
+    unresolved = list(nodes.values())
+    while unresolved:
+        node = unresolved.pop()
+        key = (node.base_repo.casefold(), node.base)
+        if node.base == BASE_BRANCH or key in searched or str(node.data.get('state')).lower() != 'open':
+            continue
+        searched.add(key)
+        if any((p.repo.casefold(), p.branch) == key for p in nodes.values()):
+            continue
+        owner = node.base_repo.split('/')[0]
+        endpoint = f'repos/{REPO_NAME}/pulls?state=all&head={quote(owner + ":" + node.base, safe="")}&per_page=100'
+        result = gh_json(['api', '--paginate', '--slurp', endpoint], timeout=90)
+        for item in _paginated_objects(result, context='prerequisite branch lookup'):
+            if _is_integration_pull(item):
+                continue
+            prior = _dependency_node(item, conn=conn, dry_run=dry_run)
+            if prior.number not in nodes:
+                unresolved.append(prior)
+            nodes[prior.number] = prior
+    for number, node in nodes.items():
+        rejected = node.data.get('_mm_rejection')
+        heads = [node.head] + ([rejected['head_sha']] if rejected else [])
+        histories[number] = list(dict.fromkeys(histories.get(number, []) + heads))
+    graph = pr_dependencies.Graph(nodes, histories, master or current_master_sha(), compare_commit_ancestry,
+                                  conn=conn, base_branch=BASE_BRANCH).discover()
+    graph.select(priority=False)  # Establish block reasons for ready descendants.
+    if conn is not None and not dry_run:
+        with conn:
+            pr_dependencies.ensure_schema(conn)
+            graph.save()
+            for number, node in nodes.items():
+                rejected = node.data.get('_mm_rejection')
+                if (rejected and rejected['active'] and not conn.execute(
+                        "SELECT 1 FROM automerge_github_outbox WHERE kind='reject_head' "
+                        "AND number=? AND head_sha=? LIMIT 1", (number, rejected['head_sha'])).fetchone()):
+                    enqueue_github_write(conn, '__discovered_rejections__', 'reject_head', number,
+                        rejected['head_sha'], {'reason': 'MergeMarshall recorded a trusted rejection.',
+                                               'evidence': REJECTION_MARKER.sub('', rejected['evidence']).strip()})
+                deps = graph.dependencies[number]
+                if (node.base != BASE_BRANCH and str(node.data.get('state')).lower() == 'open'
+                        and deps and number not in graph.problems
+                        and all(graph.landed(dep.head_sha) for dep in deps)):
+                    enqueue_github_write(conn, '__dependencies__', 'promote_dependency', number, node.head,
+                                         {'base_ref': node.base, 'dependencies': [dep.as_json() for dep in deps]})
+    return graph
+
+
+def dependency_pull(graph, number):
+    node = graph.nodes[number]
+    return PullRequest(number, str(node.data.get('title') or f'PR #{number}'), node.head,
+                       str(node.data.get('html_url') or node.data.get('url') or f'https://github.com/{REPO_NAME}/pull/{number}'),
+                       node.priority, node.immediate, node.base, graph.dependencies[number])
+
+
+def dependency_order(pulls):
+    selected = {p.number: p for p in pulls}
+    ordered, visiting = [], set()
+    def include(pull):
+        if pull in ordered:
+            return
+        if pull.number in visiting:
+            raise AutomergeError('cyclic captured dependencies', reason='dependency_cycle')
+        visiting.add(pull.number)
+        for dep in pull.dependencies:
+            if dep.number in selected:
+                include(selected[dep.number])
+        visiting.remove(pull.number)
+        ordered.append(pull)
+    for pull in pulls:
+        include(pull)
+    return ordered
+
+
+def check_source_dependencies(pulls, conn=None, *, master=None):
+    graph = dependency_graph(conn, master=master)
+    blocked = graph.validate(pulls)
+    return [dependency_pull(graph, p.number) for p in pulls if p.number not in blocked], blocked
+
+
+DEPENDENCY_BLOCKS = []
+
+
+def select_eligible_pull_requests(*, dry_run: bool = False,
+                                  conn: sqlite3.Connection | None = None) -> list[PullRequest]:
+    global DEPENDENCY_BLOCKS
+    graph = dependency_graph(conn, dry_run=dry_run)
+    DEPENDENCY_BLOCKS = [{'number': n, 'head_sha': graph.nodes[n].head, 'reason': reason}
+                         for n, reason in sorted(graph.blocked.items()) if graph.nodes[n].ready]
+    return [dependency_pull(graph, number) for number in graph.select()]
+
+
+def report_dependency_blocks(conn, transport):
+    for item in DEPENDENCY_BLOCKS:
+        reason_key = hashlib.sha256(item['reason'].encode()).hexdigest()[:12]
+        notify_blocked_once(conn, transport, f"dependency-{item['number']}-{item['head_sha']}",
+                            f'dependency_blocked-{reason_key}',
+                            f"PR #{item['number']} is waiting: {item['reason']}. Unrelated eligible work continues.")
 
 
 def current_master_sha() -> str:
@@ -744,6 +878,7 @@ def connect_db() -> sqlite3.Connection:
         """
     )
     ensure_github_outbox_schema(conn)
+    pr_dependencies.ensure_schema(conn)
     ensure_column(conn, "automerge_batches", "launch_attempted_at", "TEXT")
     ensure_column(conn, "automerge_batches", "agent_final_message", "TEXT NOT NULL DEFAULT ''")
     prior_columns = {
@@ -898,7 +1033,7 @@ def create_selected_batch(
 ) -> str:
     """Use direct landing only for one PR whose head already contains master."""
     kind = "batch"
-    if len(pulls) == 1:
+    if len(pulls) == 1 and pulls[0].base_ref == BASE_BRANCH:
         try:
             if compare_pr_behind_by(pulls[0].head_sha) == 0:
                 kind = "direct"
@@ -1078,6 +1213,9 @@ def row_pulls(row: sqlite3.Row | dict[str, Any]) -> list[PullRequest]:
                 url=str(item["url"]),
                 priority=bool(item.get("priority", False)),
                 immediate=bool(item.get("immediate", False)),
+                base_ref=str(item.get('base_ref') or BASE_BRANCH),
+                dependencies=tuple(pr_dependencies.Dependency(int(dep['number']), str(dep['head_sha']))
+                                   for dep in item.get('dependencies', [])),
             )
             for item in data
             if isinstance(item, dict)
@@ -3062,6 +3200,18 @@ def _persist_excluded_source_heads_locked(
         return False
     active = _active_sources(row)
     excluded_numbers = {entry["number"] for entry in by_key.values()}
+    # Ejecting a prerequisite removes its descendants too. Their work is
+    # blocked by membership, not independently rejected.
+    changed = True
+    while changed:
+        changed = False
+        for pull in active:
+            if pull.number not in excluded_numbers and any(dep.number in excluded_numbers for dep in pull.dependencies):
+                excluded_numbers.add(pull.number)
+                by_key[(pull.number, pull.head_sha)] = {
+                    'number': pull.number, 'head_sha': pull.head_sha, 'kind': 'blocked',
+                }
+                changed = True
     active = [pull for pull in active if pull.number not in excluded_numbers]
     ejected = _load_json_list(row["ejected_pull_requests_json"])
     for entry in entries:
@@ -3161,7 +3311,7 @@ def compare_commit_ancestry(ancestor_sha: str, descendant_sha: str) -> bool:
 
 def verify_source_ancestry(
     row: sqlite3.Row | dict[str, Any], integration_head: str,
-    *, base_sha: str | None = None,
+    *, base_sha: str | None = None, conn=None,
 ) -> tuple[bool, str]:
     excluded = _excluded_source_heads(row)
     excluded_keys = {(entry["number"], entry["head_sha"]) for entry in excluded}
@@ -3179,6 +3329,15 @@ def verify_source_ancestry(
             if compare_commit_ancestry(entry["head_sha"], base_sha or str(row["base_sha"])):
                 continue
             return False, f"excluded PR #{entry['number']} head is still an ancestor of the integration head"
+    if pr_dependencies.has_table(conn, 'automerge_github_outbox'):
+        for entry in conn.execute("SELECT DISTINCT number,head_sha FROM automerge_github_outbox "
+                                  "WHERE kind='reject_head' AND cancelled_at IS NULL"):
+            head = entry['head_sha']
+            if not compare_commit_ancestry(head, integration_head) or compare_commit_ancestry(head, base_sha or str(row['base_sha'])):
+                continue
+            repaired = next((p for p in included if p.number == entry['number']), None)
+            if repaired is None or repaired.head_sha == head or not compare_commit_ancestry(head, repaired.head_sha):
+                return False, f"rejected prerequisite PR #{entry['number']} is imported without its eligible repaired head"
     return True, "all included and excluded source heads match the integration tree"
 
 
@@ -3327,6 +3486,7 @@ def _agent_turn_finished(conn: sqlite3.Connection, transport: monitor.SlackTrans
     row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                        (row["batch_id"],)).fetchone()
     keep, removed = _recheck_sources(_active_sources(row), conn=conn, batch_id=str(row["batch_id"]))
+    row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
     if removed:
         _append_removed(conn, str(row["batch_id"]), removed)
         latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
@@ -3515,7 +3675,7 @@ def _recheck_sources(pulls: list[PullRequest], *, conn: sqlite3.Connection | Non
             reason = "closed"
         elif bool(state.get("isDraft")):
             reason = "draft"
-        elif state.get("baseRefName") != BASE_BRANCH:
+        elif state.get('baseRefName') not in {BASE_BRANCH, pull.base_ref}:
             reason = f"base changed to {state.get('baseRefName')}"
         elif str(state.get("headRefOid", "")).lower() != pull.head_sha.lower():
             reason = "head changed"
@@ -3523,7 +3683,39 @@ def _recheck_sources(pulls: list[PullRequest], *, conn: sqlite3.Connection | Non
             removed.append(f"PR #{pull.number} {pull.title}: {reason}")
         else:
             keep.append(pull)
+    if keep:
+        verified, blocked = check_source_dependencies(keep, conn)
+        for pull in keep:
+            if pull.number in blocked:
+                removed.append(f'PR #{pull.number} {pull.title}: {blocked[pull.number]}')
+        keep = verified
+        if conn is not None and batch_id is not None:
+            _capture_batch_dependencies(conn, batch_id, keep)
     return keep, removed
+
+
+def _capture_batch_dependencies(conn, batch_id, pulls):
+    metadata = {(p.number, p.head_sha): p for p in pulls}
+    with conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch_id,)).fetchone()
+        if row is None:
+            return
+        values = {}
+        for name in ('pull_requests_json', 'active_pull_requests_json'):
+            raw = row[name]
+            if not raw:
+                continue
+            captured = json.loads(raw)
+            for item in captured:
+                pull = metadata.get((item['number'], item['head_sha']))
+                if pull:
+                    item['dependencies'] = [dep.as_json() for dep in pull.dependencies]
+                    item['base_ref'] = pull.base_ref
+            values[name] = json.dumps(captured)
+        for name, value in values.items():
+            if row[name] != value:
+                conn.execute(f'UPDATE automerge_batches SET {name}=? WHERE batch_id=?', (value, batch_id))
 
 
 def _draft_changed_source(pull: PullRequest, state: dict[str, Any], *,
@@ -3581,6 +3773,7 @@ def _request_rebuild(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]
     excluded = {entry["number"] for entry in _excluded_source_heads(row)}
     pulls = [pull for pull in pulls if pull.number not in excluded]
     pulls, removed = _recheck_sources(pulls, conn=conn, batch_id=str(row["batch_id"]))
+    row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
     if removed:
         _append_removed(conn, str(row["batch_id"]), removed)
         row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
@@ -3589,14 +3782,40 @@ def _request_rebuild(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]
     seen = {pull.number for pull in original}
     additions = []
     if int(row["expansion_count"]) < MAX_BATCH_EXPANSIONS:
-        additions = [pull for pull in select_eligible_pull_requests(conn=conn)
-                     if pull.number not in seen and pull.priority == _batch_priority(row)]
+        selected = select_eligible_pull_requests(conn=conn)
+        lane_matches = bool(any(p.priority for p in selected)) == _batch_priority(row)
+        if lane_matches and _batch_priority(row):
+            by_number = {p.number: p for p in selected}
+            closure = {p.number for p in selected if p.priority}
+            pending = list(closure)
+            while pending:
+                number = pending.pop()
+                for dep in by_number[number].dependencies:
+                    if dep.number in by_number and dep.number not in closure:
+                        closure.add(dep.number)
+                        pending.append(dep.number)
+            selected = [p for p in selected if p.number in closure]
+        additions = [pull for pull in selected if pull.number not in seen] if lane_matches else []
+        # A priority seed may require an ordinary prerequisite. Exclusions and
+        # the expansion cap still govern the whole dependency closure.
+        candidate = {p.number: p for p in pulls + additions}
+        changed = True
+        while changed:
+            changed = False
+            for number, pull in list(candidate.items()):
+                if any(not compare_commit_ancestry(dep.head_sha, str(row['base_sha']))
+                       and (dep.number not in candidate or candidate[dep.number].head_sha != dep.head_sha)
+                       for dep in pull.dependencies):
+                    del candidate[number]
+                    changed = True
+        additions = [p for p in additions if p.number in candidate and p.number not in excluded]
     if only_if_expanded and not additions and not removed:
         with conn:
             conn.execute("UPDATE automerge_batches SET retry_rescan_pending=0 WHERE batch_id=?",
                          (row["batch_id"],))
         return False
     pulls += additions
+    pulls = dependency_order(pulls)
     if not pulls:
         return False
     if additions:
@@ -3885,7 +4104,8 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
         _terminal(conn, transport, row, "empty_batch", "No source PRs remain to land.")
         return
     try:
-        ancestry_ok, ancestry_reason = verify_source_ancestry(row, tested, base_sha=master)
+        row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
+        ancestry_ok, ancestry_reason = verify_source_ancestry(row, tested, base_sha=master, conn=conn)
     except (AutomergeError, monitor.CommandError) as exc:
         _try_post_verdict_status(conn, transport, row, tested, "pending",
                                  "source ancestry verification pending")
@@ -4068,6 +4288,9 @@ def _direct_premerge_check(
             return "rejected", view
     if compare_pr_behind_by(pull.head_sha) != 0:
         return "master_advanced", view
+    _, blocked = check_source_dependencies([pull], conn)
+    if blocked:
+        return 'dependency_blocked', view
     return "ready", view
 
 
@@ -4819,6 +5042,7 @@ def check_only() -> int:
         "mode": CI_MODE,
         "base_sha": base_sha,
         "selected_prs": [pull.as_json() for pull in pulls],
+        "dependency_blocks": DEPENDENCY_BLOCKS,
         "would_do": (
             "create a direct landing or integration batch for the selected PRs"
             if pulls else "wait for eligible PRs"
@@ -4938,14 +5162,14 @@ def run_land_now(number: int) -> int:
                     return 2
                 base_sha = current_master_sha()
                 priority, immediate = _priority_flags(_labels(view))
-                pull = PullRequest(
-                    number=number,
-                    title=str(view.get("title") or f"PR #{number}"),
-                    head_sha=head,
-                    url=str(view.get("url") or f"https://github.com/{REPO_NAME}/pull/{number}"),
-                    priority=priority,
-                    immediate=immediate,
-                )
+                pull = PullRequest(number, str(view.get('title') or f'PR #{number}'), head,
+                                   str(view.get('url') or f'https://github.com/{REPO_NAME}/pull/{number}'),
+                                   priority, immediate)
+                verified, blocked = check_source_dependencies([pull], conn, master=base_sha)
+                if blocked:
+                    log(f'PR #{number} cannot land alone: {blocked[number]}')
+                    return 2
+                pull = verified[0]
                 existing = conn.execute(
                     "SELECT batch_id FROM automerge_batches WHERE source='operator' "
                     "AND kind='direct' AND integration_pr_number=? AND ci_head_sha=? "
@@ -5014,14 +5238,17 @@ def run_automerge() -> int:
                 pulls: list[PullRequest] | None = None
                 if row is not None:
                     pulls = select_eligible_pull_requests(conn=conn)
+                    report_dependency_blocks(conn, transport)
                     if preempt_batch_for_priority(conn, transport, row, pulls):
                         row = active_batch(conn)
                         if row is None:
                             # Re-read labels and heads after aborting the prior batch.
                             pulls = select_eligible_pull_requests(conn=conn)
+                            report_dependency_blocks(conn, transport)
                 if row is None:
                     if pulls is None:
                         pulls = select_eligible_pull_requests(conn=conn)
+                        report_dependency_blocks(conn, transport)
                     if not pulls:
                         return 0
                     base_sha = current_master_sha()

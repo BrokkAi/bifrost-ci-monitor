@@ -24,6 +24,8 @@ class MergeRetryTests(TestCase):
         self.source = self.patch(automerge, "_source_pr_state", side_effect=lambda p:
                                  dict(self.states.get(p.number, direct_view(head_sha=p.head_sha))))
         self.select = self.patch(automerge, "select_eligible_pull_requests", return_value=[])
+        self.patch(automerge, 'check_source_dependencies',
+                   side_effect=lambda pulls, *args, **kwargs: (pulls, {}))
         self.gh = self.patch(automerge, "run_gh", side_effect=self.github_write)
         self.patch(monitor, "run_gh", side_effect=AssertionError("unexpected real GitHub call"))
         self.patch(monitor, "mj_command", side_effect=AssertionError("unexpected real mj call"))

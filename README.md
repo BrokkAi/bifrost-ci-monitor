@@ -135,6 +135,27 @@ head, test evidence, and outcome. The pinned `Known CI failures on master`
 issue is the generated view of unresolved failures; individual `buildfailure`
 issues are repair targets.
 
+Dependent PRs may target the prerequisite branch and become ready before it
+lands. MergeMarshall orders prerequisites before dependents and can land them
+in one integration batch. A priority PR brings its eligible prerequisites into
+the priority batch. Draft, rejected, changed, or closed-unmerged prerequisites
+block descendants; unrelated work continues. Rejection of a prerequisite does
+not reject its descendants.
+
+MergeMarshall retargets dependents to master after their prerequisites land,
+using commit ancestry and durable GitHub retries. Authors update changed
+prerequisites with merges on draft branches, validate, and ready their PRs again.
+They do not need to poll or promote submissions. `--land-now` also enforces
+dependencies and refuses a PR that cannot land alone.
+
+When a PR waits on a dependency, inspect its Slack notice or the next idle
+`automerge.py --check` selection's `dependency_blocks`. Confirm the prerequisite
+PR's readiness and that the dependent contains its current submitted head.
+Ambiguous branch ownership, cycles, and an unresolved base require correcting
+the PR relationship. Promotion writes appear as `promote_dependency` in the
+outbox and retry automatically; preserve the database across restarts so
+retargeting cannot erase captured dependencies.
+
 Infrastructure incidents such as runner acquisition/loss, provider quota, or
 external outages appear as short top-level Slack notices with diagnosis,
 evidence, uncertainty, and run links in the thread, rather than Bifrost product

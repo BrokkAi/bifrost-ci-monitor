@@ -67,6 +67,10 @@ All three entry points share `monitor.DB_PATH` and its additive
 `automerge_relayed_messages`, `automerge_blocked_notifications`, and
 `automerge_skill_events`. `automerge_github_outbox` holds App-owned GitHub
 comments, labels, integration-PR metadata, and changed-head draft requests.
+It also holds dependency promotion requests. `automerge_pr_inventory` retains
+observed branch identities and head history, `automerge_pr_dependencies` retains
+relationships for each exact dependent head, and `automerge_commit_ancestry`
+caches only successful comparisons of immutable commit pairs.
 The merger agent records intents with `mm-db` and publishes through `mm-autopr`;
 it must not make direct `gh` writes. The supervisor retries outbox delivery after
 ambiguous or failed responses. Queue selection honors recorded exact-head
@@ -189,16 +193,48 @@ active repair just to prioritize another one.
 
 ## Selection and membership
 
-Select open, non-draft PRs based on master, excluding integration PRs and
+Read all open PRs, including non-master bases, excluding integration PRs and
 heads rejected by a trusted exact-head marker. `READY_POLICY=non-draft` is
 the default; `approved` additionally requires `APPROVED`. A stale rejection
 label on a new head is not a permanent exclusion.
+
+Dependency discovery belongs to the supervisor (`pr_dependencies.py` and the
+GitHub adapter in `automerge.py`). Resolve base branches against head branches
+in the same repository, including closed prerequisites when needed. Verify
+ancestry and infer inherited work from observed/current/rejected PR heads even
+when the dependent already targets master. Descriptions are not dependency
+authority. Capture prerequisite numbers and full head SHAs in SQLite and batch
+source JSON; retain relationships across retargeting and restarts. A new
+descendant head retains prior relationships; unrelated replacement work does not.
+
+Admit each source only when every prerequisite is in current master by actual
+commit ancestry, or is ready at its exact captured head and included earlier in
+the same batch. Apply the closure at selection, priority/preemption, expansion,
+retries, direct landing, and `--land-now`. Changed, draft, rejected, withdrawn,
+or closed-unmerged prerequisites block descendants while unrelated work proceeds.
+A repair unblocks descendants after they contain the new eligible prerequisite
+head. Ambiguous branches/shared heads, cycles, and unresolved relationships are
+reported through dependency block notices and `--check`.
+
+Ejection removes dependent descendants with exclusion kind `blocked`; only the
+standalone-broken prerequisite receives a rejection. Recheck captured dependency
+heads before landing. Global recorded rejections also prevent a candidate from
+importing a rejected head outside the batch; its eligible repaired PR must be
+included, or that ancestry must already be in master.
+
+Queue `promote_dependency` intents when all captured prerequisites land, including
+combined integration merges. Verify prerequisite ancestry in current master and
+the unchanged dependent head before retargeting it to master. Promotion is
+independent of readiness and GitHub's indirect-merge bookkeeping. Reconcile
+already accepted retargets after lost replies/restarts through the outbox. Never
+rewrite author branches, rebase, or require authors to promote/poll their PRs.
 
 Priority labels are case-insensitive. `mergemarshall:high` and
 `mergemarshall-priority:high`, plus legacy `mergemarshall-priority`, select the
 high tier. `mergemarshall:immediate` and
 `mergemarshall-priority:immediate` select immediate. If either tier is ready,
-select all eligible high/immediate PRs and no ordinary PRs. `high` waits for
+select all eligible high/immediate PRs and their prerequisite closure. Ordinary
+PRs enter that lane only as prerequisites. `high` waits for
 current work. A newly eligible immediate PR preempts an active batch through
 the durable abort path, even if the batch is high, unless already included;
 never preempt after success is posted or merging starts. Source PRs from an
@@ -206,7 +242,7 @@ abort remain eligible. `ci-fix` is ordinary unless labeled explicitly.
 
 On interruption, removals, or rebuild/retest requests, rescan membership.
 Allow three expansions per batch; an empty scan consumes none. Priority
-batches admit only priority PRs, and removed heads never reenter the same
+batches admit only priority PRs and their prerequisites; removed heads never reenter the same
 batch. Commit membership/counter with the follow-up prompt so restarts cannot
 reset the limit. A finished passing tree is not rebuilt just for new arrivals.
 A source head changed during processing is made draft. Remove changed/closed
@@ -405,7 +441,9 @@ Slack/GitHub messages without user authorization.
 
 This is a Python repository. Pick the relevant existing modules:
 `test_automerge`, `test_merge_retries`, `test_mm_skills`, `test_issue_fixer`,
-`test_repair_dossier`, `test_triage`, and `test_monitor`. For Python changes,
+`test_repair_dossier`, `test_triage`, and `test_monitor`. Dependency changes also
+use `test_pr_dependencies`, with temporary Git histories and mocked external
+writes. Never validate scheduling against the live queue. For Python changes,
 run the affected suites, `python3 -m py_compile` on changed files, and
 `git diff --check`. Do not run Bifrost/Mjolnir Rust crate suites for monitor
 changes. For documentation-only changes, verify local links, described CLI

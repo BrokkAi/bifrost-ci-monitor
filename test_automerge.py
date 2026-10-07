@@ -73,6 +73,14 @@ def api_pull(
     }
 
 
+def independent_dependency_fixture(test):
+    """These phase tests use independent heads; graph behavior has Git fixtures."""
+    patcher = mock.patch.object(automerge, 'check_source_dependencies',
+                                side_effect=lambda pulls, *args, **kwargs: (pulls, {}))
+    test.addCleanup(patcher.stop)
+    patcher.start()
+
+
 @contextmanager
 def unchanged_queue():
     """Unchanged GitHub source heads and no arrivals for unrelated phase tests."""
@@ -80,6 +88,8 @@ def unchanged_queue():
         mock.patch.object(automerge, "_source_pr_state",
                           side_effect=lambda p: direct_view(head_sha=p.head_sha)),
         mock.patch.object(automerge, "select_eligible_pull_requests", return_value=[]),
+        mock.patch.object(automerge, 'check_source_dependencies',
+                          side_effect=lambda pulls, *args, **kwargs: (pulls, {})),
         mock.patch.object(automerge, "run_ci_impact", side_effect=lambda base, heads: {
             "base_sha": base, "heads": sorted(set(heads)), "mode": "impact",
         }),
@@ -359,6 +369,13 @@ class GithubOutboxTests(TestCase):
 
 
 class SelectionTests(TestCase):
+    def setUp(self):
+        for name, kwargs in [('current_master_sha', {'return_value': BASE_SHA}),
+                             ('compare_commit_ancestry', {'side_effect': lambda a, b: a == b})]:
+            patcher = mock.patch.object(automerge, name, **kwargs)
+            self.addCleanup(patcher.stop)
+            patcher.start()
+
     def test_recorded_rejection_excludes_exact_head_before_github_label_arrives(self):
         conn = make_db()
         with conn:
@@ -384,10 +401,10 @@ class SelectionTests(TestCase):
     def test_drafts_rejected_heads_and_integration_prs_are_filtered(self):
         rows = [
             api_pull(1),
-            api_pull(2, draft=True),
-            api_pull(3, labels=[automerge.REJECTED_LABEL]),
-            api_pull(4, labels=[automerge.INTEGRATION_LABEL]),
-            api_pull(5, head_ref="mergemarshall/batch-old"),
+            api_pull(2, head_sha=HEAD_TWO, draft=True),
+            api_pull(3, head_sha=HEAD_THREE, labels=[automerge.REJECTED_LABEL]),
+            api_pull(4, head_sha='4' * 40, labels=[automerge.INTEGRATION_LABEL]),
+            api_pull(5, head_sha='5' * 40, head_ref="mergemarshall/batch-old"),
         ]
 
         def fake_gh(args: list[str], *, timeout: int = 60) -> str:
@@ -395,7 +412,7 @@ class SelectionTests(TestCase):
                 return json.dumps([[
                     {"id": 10, "created_at": "2026-10-05T10:00:00Z",
                      "user": {"login": automerge.TRUSTED_REJECTION_LOGIN},
-                     "body": f"automerge-rejected-head: {HEAD_ONE}\nKnown regression."}
+                     "body": f"automerge-rejected-head: {HEAD_THREE}\nKnown regression."}
                 ]])
             if args[:2] == ["pr", "edit"]:
                 return ""
@@ -455,8 +472,8 @@ class SelectionTests(TestCase):
         self.assertFalse(any(args[:2] == ["pr", "edit"] for args in calls))
 
     def test_high_and_immediate_selection_excludes_other_eligible_prs(self):
-        rows = [api_pull(1), api_pull(2, labels=["mergemarshall:high"]),
-                api_pull(3, labels=["mergemarshall:immediate"])]
+        rows = [api_pull(1), api_pull(2, head_sha=HEAD_TWO, labels=["mergemarshall:high"]),
+                api_pull(3, head_sha=HEAD_THREE, labels=["mergemarshall:immediate"])]
         with mock.patch.object(automerge, "run_gh", return_value=json.dumps([rows])):
             selected = automerge.select_eligible_pull_requests()
         self.assertEqual([item.number for item in selected], [2, 3])
@@ -464,15 +481,15 @@ class SelectionTests(TestCase):
 
     def test_priority_aliases_are_accepted(self):
         rows = [api_pull(1, labels=["mergemarshall-priority:high"]),
-                api_pull(2, labels=["mergemarshall-priority:immediate"]),
-                api_pull(3, labels=[automerge.PRIORITY_LABEL])]
+                api_pull(2, head_sha=HEAD_TWO, labels=["mergemarshall-priority:immediate"]),
+                api_pull(3, head_sha=HEAD_THREE, labels=[automerge.PRIORITY_LABEL])]
         with mock.patch.object(automerge, "run_gh", return_value=json.dumps([rows])):
             selected = automerge.select_eligible_pull_requests()
         self.assertEqual([item.number for item in selected], [1, 2, 3])
         self.assertEqual([item.immediate for item in selected], [False, True, False])
 
     def test_ci_fix_label_does_not_make_a_pr_priority(self):
-        rows = [api_pull(1, labels=["ci-fix"]), api_pull(2)]
+        rows = [api_pull(1, labels=["ci-fix"]), api_pull(2, head_sha=HEAD_TWO)]
         with mock.patch.object(automerge, "run_gh", return_value=json.dumps([rows])):
             selected = automerge.select_eligible_pull_requests()
         self.assertEqual([item.number for item in selected], [1, 2])
@@ -762,6 +779,9 @@ class IdentityAndPromptTests(TestCase):
 
 
 class CiSupervisionTests(TestCase):
+    def setUp(self):
+        independent_dependency_fixture(self)
+
     def test_pr_verification_ignores_wrong_path_head_or_event_runs(self):
         rows = [
             {"path": ".github/workflows/other.yml", "head_sha": HEAD_ONE,
@@ -1531,6 +1551,9 @@ class RulesetScriptTests(TestCase):
 
 
 class PublicationGateTests(TestCase):
+    def setUp(self):
+        independent_dependency_fixture(self)
+
     def test_async_local_pass_lands_without_querying_ci(self):
         conn = make_db(phase="building", ci_mode="async")
         with conn:
@@ -2286,6 +2309,9 @@ class PublicationGateTests(TestCase):
 
 
 class DirectMergeTests(TestCase):
+    def setUp(self):
+        independent_dependency_fixture(self)
+
     def _empty_db(self) -> sqlite3.Connection:
         conn = make_db()
         conn.execute("DELETE FROM automerge_batches WHERE batch_id='batch-test'")
@@ -2672,6 +2698,9 @@ class DirectMergeTests(TestCase):
 
 
 class PriorityLaneTests(TestCase):
+    def setUp(self):
+        independent_dependency_fixture(self)
+
     def _preempt(self, phase: str) -> sqlite3.Connection:
         conn = make_db(phase=phase, kind="batch")
 
@@ -3073,6 +3102,9 @@ class PriorityLaneTests(TestCase):
 
 
 class AbortBatchTests(TestCase):
+    def setUp(self):
+        SelectionTests.setUp(self)
+
     def _run_abort(self, phase: str, session_id: str | None) -> None:
         conn = make_db(phase=phase, session_id=session_id)
         with conn:
@@ -3186,6 +3218,9 @@ class AbortBatchTests(TestCase):
 
 
 class LaunchAndLifecycleTests(TestCase):
+    def setUp(self):
+        independent_dependency_fixture(self)
+
     def test_session_idle_check_only_observes_explicit_idle_or_stopped_state(self):
         conn = make_db()
         for session, idle in (

@@ -24,11 +24,21 @@ def assemble(state, *, manual=False, rebuild=False):
         raise ValueError("cannot merge an empty batch")
     refs = [f"refs/mm/{state['batch_id']}/{p['number']}" for p in sources]
     git("fetch", "origin", *[f"+pull/{p['number']}/head:{ref}" for p, ref in zip(sources, refs)])
+    selected = {p['number']: p['head_sha'] for p in sources}
+    def in_base(head):
+        return git('merge-base', '--is-ancestor', head, state['base_sha'], check=False).returncode == 0
     for p, ref in zip(sources, refs):
         fetched = git("rev-parse", ref).stdout.strip()
         if fetched != p["head_sha"]:
             raise ValueError(f"PR #{p['number']} head changed: expected {p['head_sha']}, fetched {fetched}; remove without rejection")
+        for dep in p.get('dependencies', []):
+            if git('merge-base', '--is-ancestor', dep['head_sha'], fetched, check=False).returncode:
+                raise ValueError(f"PR #{p['number']} does not contain captured prerequisite #{dep['number']}")
+            if not in_base(dep['head_sha']) and selected.get(dep['number']) != dep['head_sha']:
+                raise ValueError(f"PR #{p['number']} needs prerequisite #{dep['number']} in this batch")
         for excluded in state["excluded"]:
+            if in_base(excluded['head_sha']):
+                continue
             if not git("merge-base", "--is-ancestor", excluded["head_sha"], fetched, check=False).returncode:
                 raise ValueError(f"PR #{p['number']} contains excluded PR #{excluded['number']}; reconsider membership before merging")
     if rebuild:
@@ -36,7 +46,7 @@ def assemble(state, *, manual=False, rebuild=False):
     if not ancestor(state["base_sha"]):
         raise ValueError("captured base is not an ancestor of HEAD; rebuild explicitly")
     for p in state["excluded"]:
-        if ancestor(p["head_sha"]):
+        if ancestor(p["head_sha"]) and not in_base(p['head_sha']):
             raise ValueError(f"excluded PR #{p['number']} is still present; rebuild explicitly")
     missing = [p for p in sources if not ancestor(p["head_sha"])]
     trailer = "Automerge-Batch: " + state["batch_id"]

@@ -8,7 +8,12 @@ for agents maintaining this repository are in [AGENTS.md](../AGENTS.md).
 
 ## PR integration and landing
 
-Eligible source PRs are open, ready, and based on master. A rejection applies
+Eligible source PRs are open and ready. Dependent work can target its prerequisite
+branch and enter the queue before that prerequisite lands. The supervisor
+discovers dependencies from branch relationships and commit ancestry, orders
+prerequisites first, and admits a dependent only when its prerequisites are in
+master or included in the same batch. It retargets dependents to master after
+their prerequisites land. A rejection applies
 to the exact head that failed, so a corrected branch can re-enter the queue.
 The optional approved-review policy can require an approval before selection.
 
@@ -46,7 +51,8 @@ local test run; sync also verifies PR CI. An operator fast-track is an explicit
 direct async landing. These paths and their tradeoffs are documented in README.
 
 `mergemarshall:high` gives next-batch priority; `mergemarshall:immediate` can
-preempt active work before landing. Both select the eligible high/immediate set.
+preempt active work before landing. Both select the eligible high/immediate set
+and any ordinary prerequisites needed by those PRs.
 CI repair PRs have no automatic priority. Current master has no special human
 review hold for changes to CI workflow/action files.
 

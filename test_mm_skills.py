@@ -114,6 +114,35 @@ class GitFixture(unittest.TestCase):
 
 
 class MergeTests(GitFixture):
+    def test_dependent_head_requires_prerequisite_in_batch_or_base(self):
+        a = self.source(1, 'one', 'one\n')
+        self.run_git('reset', '--hard', a)
+        (self.repo / 'two').write_text('two\n')
+        self.run_git('add', 'two')
+        tree = self.run_git('write-tree')
+        b = self.run_git('commit-tree', tree, '-p', a, '-m', 'Dependent source')
+        self.run_git('push', 'origin', b + ':refs/pull/2/head')
+        self.run_git('reset', '--hard', self.base)
+        child = {'number': 2, 'head_sha': b, 'title': 'Dependent source',
+                 'dependencies': [{'number': 1, 'head_sha': a}]}
+        self.state['sources'].append(child)
+        original = self.state['sources'][:]
+        self.state['sources'] = [child]
+        with self.assertRaisesRegex(ValueError, 'needs prerequisite #1'):
+            self.assemble()
+        self.assertEqual(self.run_git('rev-parse', 'HEAD'), self.base)
+        self.state['sources'] = original
+        self.assertFalse(self.assemble()['manual_required'])
+        self.assertIn(a, self.run_git('rev-list', 'HEAD'))
+
+    def test_declared_dependency_missing_from_source_head_stops_before_merge(self):
+        a = self.source(1, 'one', 'one\n')
+        self.source(2, 'two', 'two\n')
+        self.state['sources'][1]['dependencies'] = [{'number': 1, 'head_sha': a}]
+        with self.assertRaisesRegex(ValueError, 'does not contain captured prerequisite'):
+            self.assemble()
+        self.assertEqual(self.run_git('rev-parse', 'HEAD'), self.base)
+
     def test_octopus_retains_heads_trailer_and_repeated_call_is_noop(self):
         a = self.source(1, "one", "one\n")
         b = self.source(2, "two", "two\n")
