@@ -113,7 +113,8 @@ def select_work(conn, issues, prs):
         if not available(issue):
             continue
         rows = observations(conn, issue["html_url"])
-        if any(r["linked_pr_state"] == "OPEN" or r["linked_issue_state"] == "OPEN" for r in rows):
+        if any((r["linked_pr_url"] and r["linked_pr_state"] == "OPEN")
+               or (r["linked_issue_url"] and r["linked_issue_state"] == "OPEN") for r in rows):
             continue
         key = initial_work_key(issue, rows)
         candidates.append(dict(issue=issue, pr=None, rejection=None, work_key=key,

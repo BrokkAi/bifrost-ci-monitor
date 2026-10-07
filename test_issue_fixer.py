@@ -55,6 +55,16 @@ class IssueFixerTests(TestCase):
         selected = fixer.select_work(self.conn, [issue(2), issue(1)], [])
         self.assertEqual(selected[0]["number"], 1)
 
+    def test_default_open_link_states_without_urls_do_not_claim_the_issue(self):
+        row = dict(workflow="CI", job_name="linux", identity_kind="step", identity="test",
+                   last_seen_sha="a" * 40, last_seen_run_id=42,
+                   linked_pr_url=None, linked_pr_state="OPEN", linked_issue_url=None, linked_issue_state="OPEN")
+        with mock.patch.object(fixer, "observations", return_value=[row]):
+            self.assertIsNotNone(fixer.select_work(self.conn, [issue()], []))
+        row["linked_pr_url"] = pr()["html_url"]
+        with mock.patch.object(fixer, "observations", return_value=[row]):
+            self.assertIsNone(fixer.select_work(self.conn, [issue()], []))
+
     def test_aggregate_and_pr_shaped_issues_are_never_work(self):
         aggregate = issue()
         aggregate["title"] = monitor.KNOWN_FAILURE_ISSUE_TITLE
