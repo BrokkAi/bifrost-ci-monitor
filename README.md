@@ -38,8 +38,11 @@ through pull requests.
 Install Python 3.11 or later, Node.js 18 or later, Git, GitHub CLI (`gh`), Mjolnir (`mj`), Podman,
 and SQLite's CLI for inspection/backups. The Python programs use the standard
 library; the merger uses host Node.js to run Bifrost's CI impact classifier.
-Configure Mjolnir's `CI` workspace, `podman` target, `bifrost` bundle,
-and `deepseek-flash` profile before enabling cron.
+Configure Mjolnir's `CI` workspace, `bifrost` bundle, and the `podman` and
+`bedrock-podman` targets before enabling cron. Merge sessions use the configured
+Opus 5.5 model (`opus`) with Luna 6 subagents (`global.openai.gpt-6-luna`, high
+effort); make the Luna profile eligible under `[subagents.eligible_profiles]`.
+Fixer and triage sessions use the `deepseek-flash` model.
 
 Merger/fixer sessions each use 32 CPUs and 28 GiB RAM; triage uses 2 CPUs and
 4 GiB RAM. Provision capacity for overlapping work. The published Mjolnir

@@ -31,10 +31,12 @@ BASE_BRANCH = monitor.BRANCH
 DB_PATH = monitor.DB_PATH
 GH_BIN = monitor.GH_BIN
 MJ_WORKSPACE = monitor.MJ_WORKSPACE
-MJ_TARGET = monitor.MJ_TARGET
+MJ_TARGET = "bedrock-podman"
 MJ_BUNDLE = monitor.MJ_BUNDLE
-AUTOMERGE_MODEL = "deepseek-flash"
-AUTOMERGE_AGENT_LABEL = "DeepSeek Flash (mj)"
+AUTOMERGE_MODEL = "opus"
+AUTOMERGE_SUBAGENT_MODEL = "global.openai.gpt-6-luna"
+AUTOMERGE_SUBAGENT_EFFORT = "high"
+AUTOMERGE_AGENT_LABEL = "Opus 5.5 + Luna 6 (mj)"
 MJ_WAIT_POLL_SECONDS = monitor.MJ_WAIT_POLL_SECONDS
 SLACK_MESSAGE_LIMIT = monitor.SLACK_MESSAGE_LIMIT
 
@@ -74,7 +76,7 @@ GITHUB_WRITE_RETRY_MAX_SECONDS = 10 * 60
 VERDICT_CONTEXT = "mergemarshall/verdict"
 VERDICT_APP_ID = 5203169
 TURN_TICK_SECONDS = 50
-SESSION_RECOVERY_GUIDANCE = """You are the sole writer to this session's checkout and integration branch. Other agents' commits elsewhere do not change your local files. Work against the captured base until the supervisor requests an update. The supervisor owns final master and source-head freshness checks; follow the batch skills, revision checks, and mode-specific validation/publication gates below.
+SESSION_RECOVERY_GUIDANCE = """This session owns its checkout and integration branch. Other agents' commits elsewhere do not change your local files. Use the configured Luna 6 Mjolnir subagents for bounded independent investigation, review, or implementation tasks with explicit file ownership. Coordinate their work; the primary owns Git operations, batch-state mutations, test assessment, and publication. Work against the captured base until the supervisor requests an update. The supervisor owns final master and source-head freshness checks; follow the batch skills, revision checks, and mode-specific validation/publication gates below.
 
 Maintain a short local progress note outside tracked files, at the path returned by `git rev-parse --git-path mergemarshall-progress.md`. Update it at meaningful milestones with current HEAD and pending edits, completed checks and log paths, settled decisions and supporting evidence, unresolved questions, any running command/session ID, and the next concrete action. Keep credentials and connection contents out of it.
 
@@ -1462,7 +1464,9 @@ def new_session_argv(
         "--cpus", str(monitor.MJ_CPUS),
         "--memory-gib", str(monitor.MJ_MEMORY_GIB),
         "--model", AUTOMERGE_MODEL,
-        "--subagents", "none",
+        "--subagents", "single-model",
+        "--subagent-model", AUTOMERGE_SUBAGENT_MODEL,
+        "--subagent-effort", AUTOMERGE_SUBAGENT_EFFORT,
         "--at", str(row["base_sha"]),
         "--branch", str(row["branch"]),
         "--title", str(row["title"]),

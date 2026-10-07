@@ -129,8 +129,11 @@ Manual abort and immediate-priority preemption deliberately interrupt work.
 After a verified terminal outcome, checkpoint/suspend through the existing
 cleanup path; supervision errors leave sessions available for later polls.
 
-Integration launch prompts establish sole ownership of the session checkout and
-branch. Agents keep a private progress note in the Git directory with pending
+Integration sessions use Opus 5.5 (`opus`) on `bedrock-podman` with Mjolnir Luna 6
+(`global.openai.gpt-6-luna`, high effort) subagents. Delegate bounded tasks with
+explicit file ownership; the primary owns Git, batch mutations, test assessment,
+and publication. Integration launch prompts establish ownership of the checkout
+and branch. Agents keep a private progress note in the Git directory with pending
 work, decisions, test evidence, and the next action. After compaction, reconcile
 that note once with HEAD, working-tree status, batch revision, and running
 commands; continue when they match. Reopen decisions or repeat completed checks
