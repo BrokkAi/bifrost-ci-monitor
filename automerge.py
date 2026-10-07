@@ -9,6 +9,7 @@ import argparse
 import fcntl
 import hashlib
 import hmac
+import html
 import json
 import re
 import sqlite3
@@ -436,6 +437,7 @@ def connect_db() -> sqlite3.Connection:
             session_id TEXT,
             thread_ts TEXT,
             start_notification_sent INTEGER NOT NULL DEFAULT 0,
+            start_pr_list_sent INTEGER NOT NULL DEFAULT 0,
             transcript_after_seq INTEGER NOT NULL DEFAULT 0,
             terminal_status TEXT,
             agent_transcript TEXT NOT NULL DEFAULT '',
@@ -510,6 +512,10 @@ def connect_db() -> sqlite3.Connection:
     )
     ensure_column(conn, "automerge_batches", "launch_attempted_at", "TEXT")
     ensure_column(conn, "automerge_batches", "agent_final_message", "TEXT NOT NULL DEFAULT ''")
+    prior_columns = {
+        column[1] for column in conn.execute("PRAGMA table_info(automerge_batches)")
+    }
+    had_start_pr_list = "start_pr_list_sent" in prior_columns
     for column, declaration in (
         ("kind", "TEXT NOT NULL DEFAULT 'batch'"),
         ("source", "TEXT NOT NULL DEFAULT 'queue'"),
@@ -557,8 +563,17 @@ def connect_db() -> sqlite3.Connection:
         ("pending_prompt", "TEXT"),
         ("prompt_delivered", "INTEGER NOT NULL DEFAULT 0"),
         ("turn_started_at", "TEXT"),
+        ("start_pr_list_sent", "INTEGER NOT NULL DEFAULT 0"),
     ):
         ensure_column(conn, "automerge_batches", column, declaration)
+    if not had_start_pr_list and "start_notification_sent" in prior_columns:
+        # Existing start messages already carried their PR lists. Do not post
+        # a second list into old or completed batch threads during migration.
+        with conn:
+            conn.execute(
+                "UPDATE automerge_batches SET start_pr_list_sent=1 "
+                "WHERE start_notification_sent=1"
+            )
     # Old supervisors requested suspension between turns. Those requests must
     # never be retried against a batch that is still doing work.
     with conn:
@@ -1041,39 +1056,70 @@ def launch_batch_session(
     ) from launch_error
 
 
+def _slack_pr_title(title: str) -> str:
+    escaped = html.escape(" ".join(title.splitlines()), quote=False)
+    return re.sub(
+        r"(?<![\w/#])#([1-9][0-9]*)\b",
+        lambda match: (
+            f"<https://github.com/{REPO_NAME}/issues/{match.group(1)}|#{match.group(1)}>"
+        ),
+        escaped,
+    )
+
+
 def send_start_notification(
     conn: sqlite3.Connection,
     transport: monitor.SlackTransport,
     row: sqlite3.Row | dict[str, Any],
 ) -> None:
-    if row["start_notification_sent"]:
+    if row["start_notification_sent"] and row["start_pr_list_sent"]:
         return
     pulls = row_pulls(row)
-    details = ", ".join(f"#{pull.number} {pull.title}" for pull in pulls)
+    only_pull = pulls[0] if len(pulls) == 1 else None
+    list_in_thread = only_pull is None and transport.kind == "chat"
+    inline = (f"<{only_pull.url}|#{only_pull.number}> "
+              f"{_slack_pr_title(only_pull.title)}"
+              if only_pull else f"{len(pulls)} PRs")
     lane = "PRIORITY " if _batch_priority(row) else ""
     if _batch_source(row) == "operator":
         lane = "OPERATOR FAST-TRACK "
     if _batch_kind(row) == "direct":
         message = (
-            f":arrows_counterclockwise: Bifrost {lane}direct merge {row['batch_id']} "
-            f"starting from {row['base_sha'][:8]} with PR #{pulls[0].number}: {details}"
+            f":arrows_counterclockwise: Bifrost {lane}direct merge {row['batch_id']}: "
+            f"{inline}"
         )
     else:
         message = (
             f":arrows_counterclockwise: Bifrost {lane}{AUTOMERGE_AGENT_LABEL} batch "
-            f"{row['batch_id']} starting from {row['base_sha'][:8]} "
-            f"with {len(pulls)} PRs: {details}"
+            f"{row['batch_id']}: {inline}"
         )
-    ok, thread_ts = monitor.slack_send(
-        transport,
-        message,
+    thread_ts = row["thread_ts"]
+    if not row["start_notification_sent"]:
+        ok, thread_ts = monitor.slack_send(transport, message)
+        if not ok:
+            return
+        with conn:
+            conn.execute(
+                "UPDATE automerge_batches SET start_notification_sent = 1, "
+                "start_pr_list_sent = ?, thread_ts = ? "
+                "WHERE batch_id = ?",
+                (int(not list_in_thread), thread_ts, row["batch_id"]),
+            )
+    if not list_in_thread or row["start_pr_list_sent"]:
+        return
+    items = "\n".join(
+        f"• <{pull.url}|#{pull.number}> "
+        f"{_slack_pr_title(pull.title)}"
+        for pull in pulls
+    )
+    ok, _ = monitor.slack_send(
+        transport, f"PRs in this batch:\n{items}", thread_ts=thread_ts,
     )
     if ok:
         with conn:
             conn.execute(
-                "UPDATE automerge_batches SET start_notification_sent = 1, thread_ts = ? "
-                "WHERE batch_id = ?",
-                (thread_ts, row["batch_id"]),
+                "UPDATE automerge_batches SET start_pr_list_sent=1 WHERE batch_id=?",
+                (row["batch_id"],),
             )
 
 
@@ -1169,6 +1215,7 @@ def retry_pending_notifications(
         )
     rows = conn.execute(
         "SELECT * FROM automerge_batches WHERE start_notification_sent = 0 "
+        "OR start_pr_list_sent = 0 "
         "ORDER BY created_at"
     ).fetchall()
     for row in rows:
@@ -4044,6 +4091,7 @@ def process_batch(conn: sqlite3.Connection, transport: monitor.SlackTransport,
     if row is None:
         raise AutomergeError(f"automerge batch {batch_id} disappeared", reason="database_state_invalid")
     send_start_notification(conn, transport, row)
+    row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
     phase = str(row["phase"] or "building")
     if phase == "terminal":
         finish_batch(conn, transport, row)
@@ -4213,6 +4261,7 @@ def abort_batch_locked(
         "SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,),
     ).fetchone()
     send_start_notification(conn, transport, latest)
+    latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
     _complete_abort(conn, transport, latest)
 
 

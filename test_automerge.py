@@ -25,10 +25,10 @@ HEAD_THREE = "3" * 40
 
 def pull(
     number: int = 7, head_sha: str = HEAD_ONE, *, priority: bool = False,
-    immediate: bool = False,
+    immediate: bool = False, title: str | None = None,
 ) -> automerge.PullRequest:
     return automerge.PullRequest(
-        number, f"Change {number}", head_sha,
+        number, title if title is not None else f"Change {number}", head_sha,
         f"https://github.com/{automerge.REPO_NAME}/pull/{number}",
         priority or immediate,
         immediate,
@@ -111,6 +111,7 @@ def make_db(
             branch TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
             launch_attempted INTEGER NOT NULL DEFAULT 0, launch_attempted_at TEXT,
             session_id TEXT, thread_ts TEXT, start_notification_sent INTEGER NOT NULL DEFAULT 0,
+            start_pr_list_sent INTEGER NOT NULL DEFAULT 0,
             transcript_after_seq INTEGER NOT NULL DEFAULT 0, terminal_status TEXT,
             agent_transcript TEXT NOT NULL DEFAULT '', agent_final_message TEXT NOT NULL DEFAULT '',
             suspend_pending INTEGER NOT NULL DEFAULT 0, suspend_verify_failures INTEGER NOT NULL DEFAULT 0,
@@ -163,7 +164,8 @@ def make_db(
     )
     conn.execute(
         "UPDATE automerge_batches SET phase=?, status=?, session_id=?, thread_ts=?, "
-        "start_notification_sent=1, integration_pr_number=?, ci_round=?, ci_head_sha=?, "
+        "start_notification_sent=1, start_pr_list_sent=1, "
+        "integration_pr_number=?, ci_round=?, ci_head_sha=?, "
         "turn_started_at=? WHERE batch_id=?",
         (phase, status, session_id, "slack-thread", integration_pr_number,
          ci_round, ci_head_sha, automerge.utc_now(), batch_id),
@@ -2633,6 +2635,100 @@ class PriorityLaneTests(TestCase):
             self.assertIn(outcome_marker, messages[1])
             conn.close()
 
+    def test_batch_start_posts_count_then_bulleted_prs_in_thread(self):
+        conn = make_db(pulls=[pull(7, title="Fix #4519 & #4520"), pull(8, HEAD_TWO)])
+        with conn:
+            conn.execute(
+                "UPDATE automerge_batches SET start_notification_sent=0, "
+                "start_pr_list_sent=0, thread_ts=NULL WHERE batch_id='batch-test'"
+            )
+        with mock.patch.object(monitor, "slack_send", side_effect=[
+            (True, "root-ts"), (True, "list-ts"),
+        ]) as send:
+            automerge.send_start_notification(
+                conn, monitor.SlackTransport("chat", token="token", channel="channel"),
+                row_for(conn),
+            )
+        self.assertEqual(send.call_count, 2)
+        root = send.call_args_list[0]
+        self.assertIn("2 PRs", root.args[1])
+        self.assertNotIn("#7", root.args[1])
+        self.assertNotIn("#8", root.args[1])
+        self.assertNotIn("thread_ts", root.kwargs)
+        reply = send.call_args_list[1]
+        self.assertEqual(reply.kwargs["thread_ts"], "root-ts")
+        self.assertEqual(reply.args[1], (
+            "PRs in this batch:\n"
+            "• <https://github.com/BrokkAi/bifrost-dev/pull/7|#7> Fix "
+            "<https://github.com/BrokkAi/bifrost-dev/issues/4519|#4519> &amp; "
+            "<https://github.com/BrokkAi/bifrost-dev/issues/4520|#4520>\n"
+            "• <https://github.com/BrokkAi/bifrost-dev/pull/8|#8> Change 8"
+        ))
+        self.assertEqual(row_for(conn)["start_notification_sent"], 1)
+        self.assertEqual(row_for(conn)["start_pr_list_sent"], 1)
+        conn.close()
+
+    def test_single_pr_start_inlines_pr_without_a_second_message(self):
+        conn = make_db(pulls=[pull(title="Fix #4519")])
+        with conn:
+            conn.execute(
+                "UPDATE automerge_batches SET start_notification_sent=0, "
+                "start_pr_list_sent=0, thread_ts=NULL WHERE batch_id='batch-test'"
+            )
+        with mock.patch.object(monitor, "slack_send", return_value=(True, "root-ts")) as send:
+            automerge.send_start_notification(
+                conn, monitor.SlackTransport("chat", token="token", channel="channel"),
+                row_for(conn),
+            )
+        send.assert_called_once()
+        self.assertIn(
+            "<https://github.com/BrokkAi/bifrost-dev/pull/7|#7>",
+            send.call_args.args[1],
+        )
+        self.assertIn(
+            "Fix <https://github.com/BrokkAi/bifrost-dev/issues/4519|#4519>",
+            send.call_args.args[1],
+        )
+        self.assertNotIn("1 PRs", send.call_args.args[1])
+        self.assertEqual(row_for(conn)["start_pr_list_sent"], 1)
+        conn.close()
+
+    def test_failed_pr_list_retries_without_reposting_start(self):
+        conn = make_db(pulls=[pull(7), pull(8, HEAD_TWO)])
+        with conn:
+            conn.execute(
+                "UPDATE automerge_batches SET start_notification_sent=0, "
+                "start_pr_list_sent=0, thread_ts=NULL WHERE batch_id='batch-test'"
+            )
+        with mock.patch.object(monitor, "slack_send", side_effect=[
+            (True, "root-ts"), (False, None), (True, "reply-ts"),
+        ]) as send:
+            transport = monitor.SlackTransport("chat", token="token", channel="channel")
+            automerge.send_start_notification(conn, transport, row_for(conn))
+            self.assertEqual(row_for(conn)["start_notification_sent"], 1)
+            self.assertEqual(row_for(conn)["start_pr_list_sent"], 0)
+            automerge.retry_pending_notifications(conn, transport)
+        self.assertEqual(send.call_count, 3)
+        self.assertEqual(send.call_args_list[2].kwargs["thread_ts"], "root-ts")
+        self.assertEqual(row_for(conn)["start_pr_list_sent"], 1)
+        conn.close()
+
+    def test_webhook_start_does_not_post_an_unthreaded_pr_list(self):
+        conn = make_db(pulls=[pull(7), pull(8, HEAD_TWO)])
+        with conn:
+            conn.execute(
+                "UPDATE automerge_batches SET start_notification_sent=0, "
+                "start_pr_list_sent=0, thread_ts=NULL WHERE batch_id='batch-test'"
+            )
+        with mock.patch.object(monitor, "slack_send", return_value=(True, None)) as send:
+            automerge.send_start_notification(
+                conn, monitor.SlackTransport("webhook", webhook="x"), row_for(conn),
+            )
+        send.assert_called_once()
+        self.assertIn("2 PRs", send.call_args.args[1])
+        self.assertEqual(row_for(conn)["start_pr_list_sent"], 1)
+        conn.close()
+
     def test_preemption_starts_priority_batch_on_the_same_tick(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "activity.db"
@@ -2951,6 +3047,36 @@ class LaunchAndLifecycleTests(TestCase):
             self.assertIn("github_write_retry_after", columns)
             self.assertIn("suspend_pending", columns)
             self.assertIn("suspend_verify_failures", columns)
+            self.assertIn("start_pr_list_sent", columns)
+            conn.close()
+
+    def test_existing_start_notice_is_not_reposted_after_list_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "activity.db"
+            legacy = sqlite3.connect(path)
+            legacy.execute(
+                "CREATE TABLE automerge_batches (batch_id TEXT PRIMARY KEY, status TEXT NOT NULL, "
+                "base_sha TEXT NOT NULL, pull_requests_json TEXT NOT NULL, title TEXT NOT NULL, "
+                "branch TEXT NOT NULL, created_at TEXT NOT NULL, "
+                "start_notification_sent INTEGER NOT NULL DEFAULT 0, thread_ts TEXT)"
+            )
+            legacy.execute(
+                "INSERT INTO automerge_batches (batch_id, status, base_sha, pull_requests_json, "
+                "title, branch, created_at, start_notification_sent, thread_ts) "
+                "VALUES (?, 'running', ?, ?, 'batch title', 'batch-branch', 'now', 1, 'old-thread')",
+                ("old-batch", BASE_SHA, json.dumps([pull(7).as_json(), pull(8, HEAD_TWO).as_json()])),
+            )
+            legacy.commit()
+            legacy.close()
+            with mock.patch.object(automerge, "DB_PATH", path):
+                conn = automerge.connect_db()
+            row = conn.execute(
+                "SELECT start_pr_list_sent FROM automerge_batches WHERE batch_id='old-batch'"
+            ).fetchone()
+            self.assertEqual(row["start_pr_list_sent"], 1)
+            with mock.patch.object(monitor, "slack_send") as send:
+                automerge.retry_pending_notifications(conn, mock.Mock())
+            send.assert_not_called()
             conn.close()
 
     @unchanged_queue()
