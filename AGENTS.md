@@ -130,7 +130,8 @@ After a verified terminal outcome, checkpoint/suspend through the existing
 cleanup path; supervision errors leave sessions available for later polls.
 
 Integration sessions use Opus 5.5 (`opus`) on `bedrock-podman` with Mjolnir Luna 6
-(`global.openai.gpt-6-luna`, high effort) subagents. Delegate bounded tasks with
+(`global.openai.gpt-6-luna`, high effort) subagents. The CI Mjolnir configuration
+allows up to 16 concurrent subagents per session. Delegate bounded tasks with
 explicit file ownership; the primary owns Git, batch mutations, test assessment,
 and publication. Integration launch prompts establish ownership of the checkout
 and branch. Agents keep a private progress note in the Git directory with pending
