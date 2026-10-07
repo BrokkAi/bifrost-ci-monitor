@@ -263,6 +263,14 @@ class StateTests(unittest.TestCase):
                   body="New diagnosis for this batch.")
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM automerge_github_outbox").fetchone()[0], 1)
 
+    def test_cancelled_write_is_not_reported_as_pending(self):
+        self.call("comment", revision=self.state()["revision"], number=4519,
+                  body="New diagnosis for this batch.")
+        self.conn.execute("UPDATE automerge_github_outbox SET cancelled_at=?",
+                          (automerge.utc_now(),))
+        self.conn.commit()
+        self.assertEqual(self.state()["pending_github_writes"], [])
+
     def test_inspect_reads_pr_through_supervisor_identity(self):
         with (mock.patch.object(automerge, "gh_json", return_value={"number": 7, "body": "Intent"}) as read,
               mock.patch.object(automerge, "list_pull_comments", return_value=[]) as comments):
