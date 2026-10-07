@@ -57,7 +57,7 @@ def render_report(state):
     evidence = state.get("tests")
     if not evidence:
         raise ValueError("no local test assessment has been recorded")
-    lines = ["automerge-local: " + evidence["verdict"],
+    lines = ["mergemarshall:local: " + evidence["verdict"],
              "Tests run: " + evidence["tests"],
              "Baseline failures: " + evidence["baseline"],
              "Tested head: " + evidence["head"]]
@@ -68,7 +68,7 @@ def render_report(state):
         lines.append("Integration PR: " + publication["url"])
     for entry in state["excluded"]:
         if entry["kind"] in {"rejected", "ejected"}:
-            lines.append(f"automerge-ejected-pr: {entry['number']} {entry['head_sha']}")
+            lines.append(f"mergemarshall:ejected-pr: {entry['number']} {entry['head_sha']}")
     return "\n".join(lines)
 
 

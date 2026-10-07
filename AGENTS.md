@@ -91,6 +91,18 @@ the repository label if absent. This label is informational: failures retain
 backoff/retries without blocking selection, validation, landing, or changing
 agent revisions. These tooling intents are omitted from agent pending writes.
 
+New rejection and integration labels are `mergemarshall:rejected` and
+`mergemarshall:batch`. Read the old `automerge-rejected` and `mergemarshall-batch`
+names as aliases during migration across selection, operator landing, fixer
+retries, and outcome reporting. Stale-rejection cleanup removes whichever old/new
+labels are present. Renaming repository labels preserves existing PR memberships;
+queued writes resolve the current canonical names at delivery. Machine-readable
+markers now use `mergemarshall:rejected-head`, `mergemarshall:ejected-pr`,
+`mergemarshall:local`, and `mergemarshall:verdict`; accept the previous
+`automerge-*` forms when reading live sessions and stored evidence. Reconcile
+trusted rejection comments across both spellings before posting, so a delivery
+retry never duplicates an accepted legacy comment.
+
 Each entry point takes its own non-blocking file lock. Operator abort and
 fast-track commands wait up to 120 seconds for the merger's same lock.
 Triage publication also coordinates with the fixer lock before deciding
@@ -199,7 +211,7 @@ summary at channel level. Do not assign David or create another product ticket
 for runner/provider/quota/network failures. Flaky product tests remain defects.
 
 A rejection retry requires the recorded fixer association and a trusted
-`automerge-rejected-head` comment exactly matching the current head. Stale
+`mergemarshall:rejected-head` comment exactly matching the current head. Stale
 labels and another author's PR are not retries; another person's assignment
 still blocks selection. The new session uses the existing branch/PR, makes it
 draft before pushing, appends corrections and readies it again. Each rejected
@@ -355,7 +367,7 @@ limitation only for that exact assertion; in async, reproduce it at the base
 and report it. Other failures require normal investigation.
 
 Publish one ready integration PR named `Merge batch: #...` with
-`mergemarshall-batch`, exact source heads, tested head, and conflict/fix notes.
+`mergemarshall:batch`, exact source heads, tested head, and conflict/fix notes.
 Async publication requires local pass first. Publication retries can reuse
 evidence only while committed HEAD, remote head, and clean working tree still
 describe the same tested candidate. Look up the PR using the bare head branch
@@ -367,7 +379,7 @@ Persist `CI_MODE` at batch creation; the Bifrost default is async. Migrated
 old batches without a mode remain sync. A later setting edit never changes
 an active batch's mode.
 
-Async requires one standalone `automerge-local: pass|fail` line, `Tests run:`
+Async requires one standalone `mergemarshall:local: pass|fail` line, `Tests run:`
 and `Baseline failures:` in the final agent report, with the tested full HEAD.
 Only pass proceeds. `Tests run: none` is accepted only for a supervisor-confirmed
 docs candidate; baseline/test summaries remain required. Any new failure must be fixed or the exact responsible
@@ -383,7 +395,7 @@ Before querying CI or a baseline, compare the captured base and PR base with
 current master; an advance requires merging current master and retesting.
 On red, compare failed tests AND failed steps independently within each same
 failed job against the exact base. A newly failing job is worse. The agent's
-`automerge-verdict` is advice, not authorization. Choose the newest master CI
+`mergemarshall:verdict` is advice, not authorization. Choose the newest master CI
 for the exact base, or prior integration CI only with identical Git trees.
 Pending baseline CI waits. Missing/cancelled CI can use open parser-derived
 ledger identities last seen at/equal-to-an-ancestor-of the base; otherwise

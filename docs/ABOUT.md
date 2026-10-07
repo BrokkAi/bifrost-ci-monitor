@@ -22,7 +22,7 @@ source heads into an integration branch and resolves conflicts. The supervisor
 runs Bifrost's ci-impact: docs batches skip all local tests and builds; otherwise
 the agent uses its judgment to choose useful checks and expands testing when
 needed. A full impact classification does not mandate a full local CI run. It opens one
-`mergemarshall-batch` PR with source heads, test evidence, and conflict/fix notes.
+`mergemarshall:batch` PR with source heads, test evidence, and conflict/fix notes.
 Merge commits preserve the source PRs' history. Integration fixes can address
 mechanical updates and interactions; a PR broken on its own is returned to
 its author with exact-head evidence. Conflicts alone are not rejections.
