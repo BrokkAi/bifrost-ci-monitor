@@ -209,6 +209,35 @@ def async_local_report(verdict: str = "pass") -> str:
             "Baseline failures: none")
 
 
+class RepositoryLabelTests(TestCase):
+    def test_new_labels_are_created_only_when_missing(self):
+        for name in (automerge.REJECTED_LABEL, automerge.INTEGRATION_LABEL):
+            with (self.subTest(name=name),
+                  mock.patch.object(automerge, 'gh_json', side_effect=monitor.CommandError('HTTP 404')) as read,
+                  mock.patch.object(automerge, 'github_api_write') as write):
+                automerge.ensure_repository_label(name, '1d76db', 'description')
+                self.assertEqual(read.call_args.args[0],
+                                 ['api', f'repos/{automerge.REPO_NAME}/labels/{name.replace(":", "%3A")}'])
+                write.assert_called_once_with('labels', 'POST', {
+                    'name': name, 'color': '1d76db', 'description': 'description',
+                })
+
+    def test_existing_labels_are_not_edited(self):
+        for name in (automerge.REJECTED_LABEL, automerge.INTEGRATION_LABEL):
+            with (self.subTest(name=name),
+                  mock.patch.object(automerge, 'gh_json', return_value={'name': name, 'color': 'abcdef'}),
+                  mock.patch.object(automerge, 'github_api_write') as write):
+                automerge.ensure_repository_label(name, '1d76db', 'description')
+                write.assert_not_called()
+
+    def test_lookup_outage_does_not_try_to_create_a_label(self):
+        with (mock.patch.object(automerge, 'gh_json', side_effect=monitor.CommandError('HTTP 503')),
+              mock.patch.object(automerge, 'github_api_write') as write,
+              self.assertRaises(monitor.CommandError)):
+            automerge.ensure_repository_label(automerge.REJECTED_LABEL, 'b60205', 'description')
+        write.assert_not_called()
+
+
 class GithubOutboxTests(TestCase):
     def setUp(self):
         self.conn = make_db()
@@ -221,6 +250,9 @@ class GithubOutboxTests(TestCase):
         patcher = mock.patch.object(automerge, "run_gh", side_effect=AssertionError("unexpected external command"))
         patcher.start()
         self.addCleanup(patcher.stop)
+        label_patcher = mock.patch.object(automerge, "ensure_repository_label")
+        self.ensure_label = label_patcher.start()
+        self.addCleanup(label_patcher.stop)
         self.transport = monitor.SlackTransport("webhook", webhook="x")
 
     def retry_now(self):
@@ -308,6 +340,7 @@ class GithubOutboxTests(TestCase):
         self.assertIn(f'mergemarshall:rejected-head: {HEAD_ONE}', comment.args[2]['body'])
         self.assertNotIn('automerge-rejected-head:', comment.args[2]['body'])
         self.assertEqual(label.args, ('issues/7/labels', 'POST', {'labels': ['mergemarshall:rejected']}))
+        self.assertEqual(self.ensure_label.call_args.args[0], 'mergemarshall:rejected')
 
     def test_stale_rejection_cleanup_removes_both_label_spellings(self):
         with self.conn:
