@@ -62,6 +62,14 @@ ci-repair/<run-id>-<attempt> at that full master SHA and receives the prompt
 from a temporary file. Its agent label is `DeepSeek Flash (mj)`. The container's Git and gh
 commands use the session's injected GitHub token.
 
+Each new repair also receives a timestamped dossier: the observed run and checkout
+SHA, open ledger failures with diagnosis provenance, recent triage jobs, every
+open issue, and every open PR targeting master (including drafts and PRs without
+`ci-fix`). Failure-ticket bodies and PR bodies are bounded excerpts with explicit
+truncation flags. The fixer judges relevance, reads full bodies and comments,
+and checks current master before acting. Inventory failures are recorded in the
+dossier so the agent can retry them; they do not prevent launching a repair.
+
 While a turn runs, the monitor polls mj wait and the finished-only transcript
 about every five seconds. The bot transport relays each completed agent message
 into the Slack thread. The transcript cursor and captured text are saved after

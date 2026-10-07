@@ -466,6 +466,9 @@ def insert_invocation(
 
 class MjRunnerTests(unittest.TestCase):
     def setUp(self):
+        dossier = mock.patch.object(monitor, "repair_dossier", return_value="test repair dossier")
+        self.dossier = dossier.start()
+        self.addCleanup(dossier.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.db_patch = mock.patch.object(
@@ -534,11 +537,14 @@ class MjRunnerTests(unittest.TestCase):
         def fake_mj(args, *, timeout=60):
             if args[0] == "sessions":
                 return completed('{"sessions":[]}')
+            prompt = Path(args[args.index("--prompt-file") + 1]).read_text()
+            self.assertIn("test repair dossier", prompt)
             return completed('{"session_id":"s-42"}')
 
         with mock.patch.object(monitor, "mj_command", side_effect=fake_mj) as command:
             session_id, branch = monitor.launch_mj_session(run, "b" * 40, 1, None)
         self.assertEqual((session_id, branch), ("s-42", "ci-repair/42-1"))
+        self.dossier.assert_called_once_with(run, "b" * 40)
         argv = command.call_args_list[-1].args[0]
         self.assertEqual(
             argv[:17],
