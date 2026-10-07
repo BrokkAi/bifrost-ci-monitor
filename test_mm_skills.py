@@ -29,6 +29,34 @@ merge = load("mm_merge", "skills/mm-merge/scripts/mm_merge.py")
 autopr = load("mm_autopr", "skills/mm-autopr/scripts/mm_autopr.py")
 compare = load("mm_compare", "skills/mm-compare/scripts/mm_compare.py")
 db = load("mm_db_client", "skills/mm-db/scripts/mm_db.py")
+installer = load("mm_installer", "scripts/install-mm-skills.py")
+
+
+class InstallerTests(unittest.TestCase):
+    def test_service_directory_is_an_absolute_path_without_quotes(self):
+        unit = installer.service_unit(ROOT, "172.31.3.117")
+        self.assertIn(f"\nWorkingDirectory={ROOT}\n", unit)
+        self.assertIn(f'ExecStart=/usr/bin/python3 "{ROOT}/mm_service.py"', unit)
+
+    def test_service_rejects_public_or_unspecified_addresses(self):
+        for address in ["0.0.0.0", "8.8.8.8"]:
+            with self.assertRaises(ValueError):
+                installer.service_unit(ROOT, address)
+
+    def test_install_is_idempotent_and_preserves_existing_skills(self):
+        with tempfile.TemporaryDirectory() as root:
+            profile = Path(root) / "profile"
+            config = Path(root) / "config.toml"
+            config.write_text(f'[profiles.test]\nhome = "{profile}"\n')
+            installed = installer.install(config, ROOT)
+            self.assertEqual(len(installed), 4)
+            self.assertEqual(installer.install(config, ROOT), [])
+            target = profile / "skills/mm-db"
+            self.assertEqual(target.resolve(), ROOT / "skills/mm-db")
+            target.unlink()
+            target.mkdir()
+            with self.assertRaisesRegex(ValueError, "refusing to overwrite"):
+                installer.install(config, ROOT)
 
 
 class GitFixture(unittest.TestCase):
