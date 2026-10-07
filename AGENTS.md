@@ -279,6 +279,19 @@ Do not use temporary source edits, validation shims, or a different tree as proo
 baseline build failure can block dependent checks; report those as blocked
 and run unaffected checks. No local test command registry is implemented.
 
+Before expensive builds/tests, record the pending decision, smallest
+discriminating check, actions justified by its possible results, and reusable
+evidence or built trees in the private progress note. Include compilation cost
+when choosing experiments from the diff, dependencies, interactions, and prior
+results. Source attribution prefers the captured base versus that base plus
+suspected exact source heads through real merges with consistent test settings.
+An older PR-head base requires accounting for that difference. Broad/grouped
+checks and reasoned exceptions remain available; no fixed experiment sequence
+or limit is imposed. Patch reversals suggest hypotheses, not acceptance/rejection
+evidence. On contradictory results, verify tested trees, changes, commands, and
+settings before another build/rerun. Record conclusions, then act on sufficient
+fix/eject evidence and validate the resulting candidate.
+
 Persist classification in `validation_impact_json` with the exact base and
 heads. Reclassify when the source set, base, or candidate changes; reuse the
 result for unchanged retries. Fetch the classifier and diffs through the normal
