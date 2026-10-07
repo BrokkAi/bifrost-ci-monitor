@@ -288,6 +288,16 @@ Do not use temporary source edits, validation shims, or a different tree as proo
 baseline build failure can block dependent checks; report those as blocked
 and run unaffected checks. No local test command registry is implemented.
 
+Start root-cause attribution with blame, history, and code inspection; this is
+almost always faster here than bisecting variants that each require a Rust
+build. Trace the failing assertion through data/control flow, use git blame,
+git log -p and focused diffs, and explain the causal connection to source PRs.
+Confirm concrete hypotheses with the smallest useful checks, reusing built
+trees where possible. Reserve bisect or subtraction/rebuild experiments for
+alternatives inspection cannot distinguish; explain what inspection established,
+what remains ambiguous, and why the build is the cheaper decisive step.
+Same-base comparison requirements do not require building every suspect.
+
 Before expensive builds/tests, record the pending decision, smallest
 discriminating check, actions justified by its possible results, and reusable
 evidence or built trees in the private progress note. Include compilation cost
