@@ -48,27 +48,25 @@ Unchanged from the current job, with one policy setting:
 
 ## Priority lane and operator fast-track
 
-Anyone with write access can apply the `mergemarshall-priority` label. When at
-least one otherwise eligible PR has that label, the next selection contains
-only eligible priority PRs; every other PR waits. The label is not assigned
-automatically to CI monitor `ci-fix` PRs. If the selected priority set is one
-up-to-date PR, the existing direct-landing path applies.
+Anyone with write access can apply `mergemarshall:high` or
+`mergemarshall:immediate`. The `mergemarshall-priority:` prefix is also accepted
+for either tier; the old `mergemarshall-priority` label counts as high. When an
+eligible PR has either tier, the next selection contains only eligible high and
+immediate PRs. CI monitor `ci-fix` PRs receive no automatic priority. If the
+selected set has one up-to-date PR, the direct-landing path applies.
 
-On each cron tick, if an eligible priority PR is not already in an active
-non-priority batch, the supervisor preempts that batch through the same
-persisted abort path as `--abort-batch`, with reason `preempted by priority PR
-#N`. No source PR is rejected. It starts the priority selection that tick when
-the abort completes, or on the next tick if it cannot finish immediately. A
-priority batch is never preempted by another priority PR. A batch whose success
-status has been posted or whose merge phase has started is allowed to finish
-before priority work starts.
+`high` waits for the current batch. An eligible `immediate` PR preempts an
+active batch through the persisted `--abort-batch` path, even when the active
+batch is high priority, unless the immediate PR is already in that priority
+batch. No source PR is rejected. The next batch includes all eligible high and
+immediate PRs. A batch whose success status has been posted or whose merge
+phase has started is allowed to finish first.
 
 An operator can use `python automerge.py --land-now <PR-number>` to fast-track
 one PR. This waits up to two minutes for the cron lock, requires the PR to be
 open, non-draft, based on `master`, unrejected at its current head, and up to
 date with master (`behind_by == 0`). A behind PR is refused with instructions
-to update its branch. The normal CI-workflow-change hold applies unless the
-operator explicitly adds `--allow-workflow-changes`. The supervisor records a
+to update its branch. The supervisor records a
 direct batch with source `operator`, posts
 `mergemarshall/verdict: success` on the exact head with description
 `fast-track by operator`, and merges with
@@ -191,10 +189,9 @@ If master is already red, async mode uses those local exact-base test results
   by opening `ci-fix` PRs, which enter later batches. The Slack outcome links
   the integration PR so people can watch its CI.
 
-Both modes use the same pre-merge freshness, source-PR state/head, included and
-excluded ancestry, and CI-workflow-change human-review checks. A change under
-`.github/workflows/` or `.github/actions/` remains held for a person in either
-mode.
+Both modes use the same pre-merge freshness, source-PR state/head, and included
+and excluded ancestry checks. Workflow and local-action changes use those gates
+without an extra human hold.
 
 ## Sync mode: waiting for CI (supervisor, not the agent)
 
@@ -262,29 +259,14 @@ batch aborted, and releases the queue. The abort phase is persisted so cron can
 finish the operation after a process restart; an aborted Slack outcome is
 retried independently if delivery fails.
 
-## Human review for CI workflow changes
+## GitHub write failures
 
-The supervisor inspects the integration PR's changed files before landing. If
-any path is under `.github/workflows/` or `.github/actions/`, it leaves
-`mergemarshall/verdict` pending with `needs human review: CI workflow changes`, sends
-one Slack notice, and keeps the batch held. This is necessary because
-`pull_request` CI runs the workflow definitions from the PR being tested.
-
-A maintainer has two paths:
-
-- To land the workflow change, review the integration PR's workflow/action diff
-  and its CI evidence. An authorized operator then posts
-  `mergemarshall/verdict: success` on the exact reviewed head through the supervisor
-  App's status-writing path and merges with
-  `gh pr merge <n> --merge --match-head-commit <sha>`. The automerge job does
-  not post that success automatically.
-- To land the other batch PRs first, mark the workflow-changing source PR as a
-  draft. The existing source-state gate removes it and asks the batch session
-  to rebuild the integration branch without it. After the other PRs land, the
-  source PR can be marked ready again for separate human handling. Alternatively,
-  its owner can push a follow-up restoring the workflow/action files to their
-  master contents; the changed head triggers the normal rebuild, and automatic
-  landing resumes once the integration diff no longer changes those paths.
+If GitHub refuses the verdict status or merge while the candidate is current,
+the supervisor keeps the PR open, sends a top-level Slack alert, and retries
+with delays of 1, 2, 4, 8, then 10 minutes. Retries continue every 10 minutes
+until the PR lands or an operator aborts the batch. Master movement still
+requires a refreshed candidate and its normal test gate. The supervisor also
+confirms the PR is merged before recording a landed batch.
 
 ## Sync mode: when CI is green
 

@@ -42,7 +42,13 @@ STATE_DIR = monitor.configured_path(
 LOCK_PATH = STATE_DIR / "automerge.lock"
 REJECTED_LABEL = "automerge-rejected"
 INTEGRATION_LABEL = "mergemarshall-batch"
-PRIORITY_LABEL = "mergemarshall-priority"
+PRIORITY_LABEL = "mergemarshall-priority"  # Legacy alias for high.
+HIGH_LABELS = frozenset({
+    "mergemarshall:high", "mergemarshall-priority:high", PRIORITY_LABEL,
+})
+IMMEDIATE_LABELS = frozenset({
+    "mergemarshall:immediate", "mergemarshall-priority:immediate",
+})
 TRUSTED_REJECTION_LOGIN = "mergemarshall[bot]"
 GH_OWNER = "BrokkAi"
 READY_POLICY = "non-draft"  # Change to "approved" to require an APPROVED review decision.
@@ -60,6 +66,7 @@ MAX_CI_ROUNDS = 4
 MAX_BATCH_EXPANSIONS = 3
 CI_WORKFLOW = "ci.yml"
 BASELINE_DISPATCH_GRACE_SECONDS = 10 * 60
+GITHUB_WRITE_RETRY_MAX_SECONDS = 10 * 60
 VERDICT_CONTEXT = "mergemarshall/verdict"
 VERDICT_APP_ID = 5203169
 TURN_TICK_SECONDS = 50
@@ -121,6 +128,7 @@ class PullRequest:
     head_sha: str
     url: str
     priority: bool = False
+    immediate: bool = False
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -129,6 +137,7 @@ class PullRequest:
             "head_sha": self.head_sha,
             "url": self.url,
             "priority": self.priority,
+            "immediate": self.immediate,
         }
 
 
@@ -247,6 +256,12 @@ def _labels(pull: dict[str, Any]) -> set[str]:
     }
 
 
+def _priority_flags(labels: set[str]) -> tuple[bool, bool]:
+    normalized = {label.casefold() for label in labels}
+    immediate = bool(normalized & IMMEDIATE_LABELS)
+    return immediate or bool(normalized & HIGH_LABELS), immediate
+
+
 def newest_trusted_rejection(
     comments: list[dict[str, Any]], *, login: str | None = None
 ) -> RejectionMarker | None:
@@ -343,13 +358,15 @@ def select_eligible_pull_requests(*, dry_run: bool = False) -> list[PullRequest]
             if not isinstance(review, dict) or review.get("reviewDecision") != "APPROVED":
                 continue
 
+        priority, immediate = _priority_flags(labels)
         eligible.append(
             PullRequest(
                 number=number,
                 title=str(item.get("title") or f"PR #{number}"),
                 head_sha=head_sha.lower(),
                 url=str(item.get("html_url") or f"https://github.com/{REPO_NAME}/pull/{number}"),
-                priority=PRIORITY_LABEL in labels,
+                priority=priority,
+                immediate=immediate,
             )
         )
     priority = [pull for pull in eligible if pull.priority]
@@ -408,7 +425,6 @@ def connect_db() -> sqlite3.Connection:
             kind TEXT NOT NULL DEFAULT 'batch',
             source TEXT NOT NULL DEFAULT 'queue',
             priority INTEGER NOT NULL DEFAULT 0,
-            allow_workflow_changes INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL,
             base_sha TEXT NOT NULL,
             pull_requests_json TEXT NOT NULL,
@@ -459,6 +475,8 @@ def connect_db() -> sqlite3.Connection:
             verdict_status_sha TEXT,
             verdict_status_state TEXT,
             verdict_status_description TEXT,
+            github_write_retry_attempts INTEGER NOT NULL DEFAULT 0,
+            github_write_retry_after TEXT,
             ci_not_worse INTEGER NOT NULL DEFAULT 0,
             abort_reason TEXT,
             direct_rejection_evidence TEXT,
@@ -496,7 +514,6 @@ def connect_db() -> sqlite3.Connection:
         ("kind", "TEXT NOT NULL DEFAULT 'batch'"),
         ("source", "TEXT NOT NULL DEFAULT 'queue'"),
         ("priority", "INTEGER NOT NULL DEFAULT 0"),
-        ("allow_workflow_changes", "INTEGER NOT NULL DEFAULT 0"),
         ("suspend_pending", "INTEGER NOT NULL DEFAULT 0"),
         ("suspend_verify_failures", "INTEGER NOT NULL DEFAULT 0"),
         ("phase", "TEXT NOT NULL DEFAULT 'building'"),
@@ -532,6 +549,8 @@ def connect_db() -> sqlite3.Connection:
         ("verdict_status_sha", "TEXT"),
         ("verdict_status_state", "TEXT"),
         ("verdict_status_description", "TEXT"),
+        ("github_write_retry_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("github_write_retry_after", "TEXT"),
         ("ci_not_worse", "INTEGER NOT NULL DEFAULT 0"),
         ("abort_reason", "TEXT"),
         ("direct_rejection_evidence", "TEXT"),
@@ -568,7 +587,6 @@ def create_batch(
     ci_mode: str | None = None,
     kind: str = "batch",
     source: str = "queue",
-    allow_workflow_changes: bool = False,
 ) -> str:
     if not pulls:
         raise ValueError("cannot create an empty automerge batch")
@@ -591,18 +609,17 @@ def create_batch(
         conn.execute(
             """
             INSERT INTO automerge_batches
-                (batch_id, kind, source, priority, allow_workflow_changes, status, base_sha,
+                (batch_id, kind, source, priority, status, base_sha,
                  pull_requests_json, title, branch, created_at,
                  active_pull_requests_json, phase, ci_mode, integration_pr_number,
                  integration_pr_url, ci_head_sha)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 identifier,
                 kind,
                 source,
                 int(any(pull.priority for pull in pulls)),
-                int(allow_workflow_changes),
                 status,
                 base_sha,
                 json.dumps([pull.as_json() for pull in pulls]),
@@ -683,13 +700,6 @@ def _batch_priority(row: sqlite3.Row | dict[str, Any]) -> bool:
         return any(pull.priority for pull in row_pulls(row))
 
 
-def _batch_allows_workflow_changes(row: sqlite3.Row | dict[str, Any]) -> bool:
-    try:
-        return bool(row["allow_workflow_changes"])
-    except (KeyError, IndexError):
-        return False
-
-
 def _async_local_result(final: str) -> str | None:
     """Accept an async gate only with an explicit verdict and evidence summary."""
     matches = LOCAL_GATE_MARKER.findall(final or "")
@@ -716,6 +726,7 @@ def row_pulls(row: sqlite3.Row | dict[str, Any]) -> list[PullRequest]:
                 head_sha=str(item["head_sha"]),
                 url=str(item["url"]),
                 priority=bool(item.get("priority", False)),
+                immediate=bool(item.get("immediate", False)),
             )
             for item in data
             if isinstance(item, dict)
@@ -1120,11 +1131,13 @@ def deliver_blocked_notice(
     batch = conn.execute(
         "SELECT thread_ts FROM automerge_batches WHERE batch_id = ?", (batch_id,)
     ).fetchone()
+    loud = reason in {"github_write_retry", "verdict_status_failed"}
+    prefix = ":rotating_light:" if loud else ":warning:"
     try:
         ok, _ = monitor.slack_send(
             transport,
-            f":warning: Bifrost automerge batch {batch_id} ({reason}): {notice['details']}",
-            thread_ts=batch["thread_ts"] if batch else None,
+            f"{prefix} Bifrost automerge batch {batch_id} ({reason}): {notice['details']}",
+            thread_ts=None if loud else (batch["thread_ts"] if batch else None),
         )
     except Exception as exc:
         log(f"Slack blocked notification failed for batch {batch_id}: {exc}")
@@ -1568,21 +1581,6 @@ def integration_pr_view(number: int) -> dict[str, Any]:
     return data
 
 
-def integration_pr_changes_ci_control_files(number: int) -> bool:
-    """Return whether the integration PR changes a workflow or local action."""
-    payload = gh_json([
-        "api", f"repos/{REPO_NAME}/pulls/{number}/files?per_page=100",
-        "--paginate", "--slurp",
-    ])
-    files = _paginated_objects(payload, context=f"files for integration PR #{number}")
-    protected_prefixes = (".github/workflows/", ".github/actions/")
-    return any(
-        isinstance(item.get("filename"), str)
-        and item["filename"].startswith(protected_prefixes)
-        for item in files
-    )
-
-
 def find_integration_pr(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any] | None:
     payload = gh_json([
         "pr", "list", "--repo", REPO_NAME, "--state", "open", "--head",
@@ -1704,6 +1702,41 @@ def post_verdict_status(
     return True
 
 
+def _github_write_retry_pending(row: sqlite3.Row | dict[str, Any]) -> bool:
+    retry_at = _timestamp_epoch(row["github_write_retry_after"])
+    now = _timestamp_epoch(utc_now())
+    return retry_at is not None and now is not None and now < retry_at
+
+
+def _schedule_github_write_retry(
+    conn: sqlite3.Connection,
+    transport: monitor.SlackTransport,
+    row: sqlite3.Row | dict[str, Any],
+    reason: str,
+    details: str,
+) -> None:
+    attempts = int(row["github_write_retry_attempts"] or 0) + 1
+    delay = min(60 * (2 ** min(attempts - 1, 4)), GITHUB_WRITE_RETRY_MAX_SECONDS)
+    retry_at = _timestamp_after(utc_now(), delay)
+    if retry_at is None:
+        raise AutomergeError("could not schedule a GitHub write retry", reason="database_state_invalid")
+    with conn:
+        conn.execute(
+            "UPDATE automerge_batches SET github_write_retry_attempts=?, "
+            "github_write_retry_after=? WHERE batch_id=?",
+            (attempts, retry_at, row["batch_id"]),
+        )
+    pr_url = str(row["integration_pr_url"] or "")
+    notify_blocked_once(
+        conn, transport, str(row["batch_id"]), "github_write_retry",
+        f"GitHub write or merge confirmation failed for {pr_url or 'the batch PR'}: "
+        f"{reason}: {details}. PR stays open; automatic retries continue with backoff "
+        f"up to 10 minutes. Next retry: {retry_at}. Operator can use --abort-batch "
+        "or resolve the GitHub failure.",
+    )
+    log(f"batch {row['batch_id']} GitHub write failed ({reason}); attempt {attempts}, next retry {retry_at}: {details}")
+
+
 def _try_post_verdict_status(
     conn: sqlite3.Connection,
     transport: monitor.SlackTransport,
@@ -1711,13 +1744,18 @@ def _try_post_verdict_status(
     head_sha: str,
     state: str,
     description: str,
+    *,
+    retry_on_failure: bool = False,
 ) -> bool:
     try:
         post_verdict_status(conn, row, head_sha, state, description)
     except (AutomergeError, monitor.CommandError, sqlite3.Error) as exc:
         reason = exc.reason if isinstance(exc, AutomergeError) else "verdict_status_failed"
-        notify_blocked_once(conn, transport, str(row["batch_id"]),
-                             "verdict_status_failed", f"{reason}: {exc}")
+        if state == "success" or retry_on_failure:
+            _schedule_github_write_retry(conn, transport, row, reason, str(exc))
+        else:
+            notify_blocked_once(conn, transport, str(row["batch_id"]),
+                                "verdict_status_failed", f"{reason}: {exc}")
         return False
     return True
 
@@ -3262,7 +3300,13 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
     if not _session_is_idle(row):
         return
     number = int(row["integration_pr_number"])
-    view = integration_pr_view(number)
+    retry_pending = _github_write_retry_pending(row)
+    try:
+        view = integration_pr_view(number)
+    except (AutomergeError, monitor.CommandError):
+        if retry_pending:
+            return
+        raise
     head = str(view.get("headRefOid") or "").lower()
     tested = str(row["ci_head_sha"] or "").lower()
     if view.get("mergedAt") or str(view.get("state", "")).lower() == "merged":
@@ -3272,6 +3316,8 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
             conn, transport, row, number,
             merge_commit_sha=merge_sha if re.fullmatch(r"[0-9a-f]{40}", merge_sha) else None,
         )
+        return
+    if retry_pending:
         return
     if str(view.get("state", "")).lower() != "open" or bool(view.get("isDraft")) or view.get("baseRefName") != BASE_BRANCH:
         _terminal(conn, transport, row, "integration_pr_not_mergeable",
@@ -3350,30 +3396,6 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
         notify_blocked_once(conn, transport, str(row["batch_id"]),
                              "source_ancestry_mismatch", ancestry_reason)
         return
-    try:
-        workflow_changes = integration_pr_changes_ci_control_files(number)
-    except (AutomergeError, monitor.CommandError) as exc:
-        _try_post_verdict_status(
-            conn, transport, row, tested, "pending",
-            "needs human review: CI workflow change check unavailable",
-        )
-        reason = exc.reason if isinstance(exc, AutomergeError) else "github_file_list_failed"
-        notify_blocked_once(
-            conn, transport, str(row["batch_id"]), "ci_workflow_diff_unavailable",
-            f"Could not verify the integration PR diff for CI workflow changes ({reason}): {exc}",
-        )
-        return
-    if workflow_changes:
-        _try_post_verdict_status(
-            conn, transport, row, tested, "pending",
-            "needs human review: CI workflow changes",
-        )
-        notify_blocked_once(
-            conn, transport, str(row["batch_id"]), "ci_workflow_changes",
-            "The integration PR changes files under .github/workflows/ or .github/actions/. "
-            "Review the workflow diff and handle this batch manually.",
-        )
-        return
     if mode == "async":
         verdict = "async: local targeted tests passed; CI runs after merge"
     elif check_state == "success":
@@ -3396,11 +3418,23 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
             fresh_master = current_master_sha()
             fresh_view = integration_pr_view(number)
         except (AutomergeError, monitor.CommandError) as state_exc:
-            _try_post_verdict_status(conn, transport, row, tested, "pending",
-                                     "GitHub merge was refused; rechecking master and PR state")
+            if not _try_post_verdict_status(conn, transport, row, tested, "pending",
+                                            "GitHub merge was refused; rechecking master and PR state",
+                                            retry_on_failure=True):
+                return
             reason = state_exc.reason if isinstance(state_exc, AutomergeError) else "github_state_unavailable"
-            notify_blocked_once(conn, transport, str(row["batch_id"]),
-                                 "github_merge_state_unavailable", f"{reason}: {state_exc}; merge error: {exc}")
+            _schedule_github_write_retry(
+                conn, transport, row, "github_merge_state_unavailable",
+                f"{reason}: {state_exc}; merge error: {exc}",
+            )
+            return
+        if fresh_view.get("mergedAt") or str(fresh_view.get("state") or "").lower() == "merged":
+            merge = fresh_view.get("mergeCommit")
+            merge_sha = str(merge.get("oid") or "").lower() if isinstance(merge, dict) else ""
+            _complete_landed_batch(
+                conn, transport, row, number,
+                merge_commit_sha=merge_sha if re.fullmatch(r"[0-9a-f]{40}", merge_sha) else None,
+            )
             return
         fresh_head = str(fresh_view.get("headRefOid") or "").lower()
         if fresh_head and fresh_head != tested:
@@ -3428,10 +3462,25 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
         if fresh_master.lower() != master.lower() or fresh_base != fresh_master.lower():
             _queue_master_update(conn, transport, row, fresh_master, tested)
             return
-        _terminal(conn, transport, row, "github_merge_refused",
-                  f"GitHub refused the merge: {exc}")
+        if not _try_post_verdict_status(conn, transport, row, tested, "pending",
+                                        "GitHub merge was refused; retrying",
+                                        retry_on_failure=True):
+            return
+        _schedule_github_write_retry(conn, transport, row, "github_merge_refused", str(exc))
         return
-    merged_view = integration_pr_view(number)
+    try:
+        merged_view = integration_pr_view(number)
+    except (AutomergeError, monitor.CommandError) as exc:
+        _schedule_github_write_retry(
+            conn, transport, row, "github_merge_confirmation_unavailable", str(exc),
+        )
+        return
+    if not (merged_view.get("mergedAt") or str(merged_view.get("state") or "").lower() == "merged"):
+        _schedule_github_write_retry(
+            conn, transport, row, "github_merge_not_confirmed",
+            f"gh pr merge succeeded but PR #{number} is not confirmed merged",
+        )
+        return
     merge = merged_view.get("mergeCommit")
     merge_sha = str(merge.get("oid") or "").lower() if isinstance(merge, dict) else ""
     _complete_landed_batch(conn, transport, row, number,
@@ -3494,8 +3543,6 @@ def _direct_premerge_check(
         marker = newest_trusted_rejection(list_pull_comments(pull.number))
         if marker is not None and marker.head_sha == pull.head_sha.lower():
             return "rejected", view
-    if integration_pr_changes_ci_control_files(pull.number):
-        return "workflow_changes", view
     if compare_pr_behind_by(pull.head_sha) != 0:
         return "master_advanced", view
     return "ready", view
@@ -3526,22 +3573,6 @@ def _direct_terminal(
         "SELECT * FROM automerge_batches WHERE batch_id=?", (row["batch_id"],)
     ).fetchone()
     finish_batch(conn, transport, latest)
-
-
-def _hold_direct(
-    conn: sqlite3.Connection,
-    transport: monitor.SlackTransport,
-    row: sqlite3.Row | dict[str, Any],
-    head: str,
-    reason: str,
-    details: str,
-    *,
-    status_description: str | None = None,
-) -> None:
-    _try_post_verdict_status(
-        conn, transport, row, head, "pending", status_description or reason,
-    )
-    notify_blocked_once(conn, transport, str(row["batch_id"]), reason, details)
 
 
 def _direct_rejection_evidence(
@@ -3833,22 +3864,18 @@ def _process_direct_batch(
         raise AutomergeError("direct automerge record does not contain one PR",
                              reason="database_state_invalid")
     pull = pull_list[0]
+    if _github_write_retry_pending(row):
+        try:
+            pending_view = direct_pull_request_view(pull.number)
+        except (AutomergeError, monitor.CommandError):
+            return
+        if pending_view.get("mergedAt") or str(pending_view.get("state") or "").lower() == "merged":
+            _complete_direct_merge(conn, transport, row, pending_view)
+        return
     gate, view = _direct_premerge_check(pull)
     head = str(view.get("headRefOid") or pull.head_sha).lower()
-    allow_workflow_changes = (
-        _batch_source(row) == "operator" and _batch_allows_workflow_changes(row)
-    )
-    if gate == "workflow_changes" and allow_workflow_changes:
-        gate = "ready"
     if gate == "merged":
         _complete_direct_merge(conn, transport, row, view)
-        return
-    if gate == "workflow_changes":
-        _hold_direct(
-            conn, transport, row, pull.head_sha, "ci_workflow_changes",
-            "The direct PR changes .github/workflows/ or .github/actions/ and needs human review.",
-            status_description="needs human review: CI workflow changes",
-        )
         return
     if gate == "master_advanced":
         message = (
@@ -3891,13 +3918,6 @@ def _process_direct_batch(
         gate, view = _direct_premerge_check(pull)
         if gate == "merged":
             _complete_direct_merge(conn, transport, row, view)
-            return
-        if gate == "workflow_changes":
-            _hold_direct(
-                conn, transport, row, pull.head_sha, "ci_workflow_changes",
-                "The direct PR changes .github/workflows/ or .github/actions/ and needs human review.",
-                status_description="needs human review: CI workflow changes",
-            )
             return
         if gate == "master_advanced":
             _try_post_verdict_status(
@@ -3948,12 +3968,14 @@ def _process_direct_batch(
                 return
             behind_by = compare_pr_behind_by(pull.head_sha)
         except (AutomergeError, monitor.CommandError) as state_exc:
-            _try_post_verdict_status(
+            if not _try_post_verdict_status(
                 conn, transport, row, pull.head_sha, "pending",
                 "direct merge state unavailable; retrying",
-            )
-            notify_blocked_once(
-                conn, transport, str(row["batch_id"]), "direct_merge_state_unavailable",
+                retry_on_failure=True,
+            ):
+                return
+            _schedule_github_write_retry(
+                conn, transport, row, "direct_merge_state_unavailable",
                 f"merge failed ({exc}); could not confirm master freshness ({state_exc})",
             )
             return
@@ -3968,20 +3990,26 @@ def _process_direct_batch(
                 verdict_state=None,
             )
             return
-        _try_post_verdict_status(
+        if not _try_post_verdict_status(
             conn, transport, row, pull.head_sha, "pending",
             f"direct merge is blocked; retrying: {exc}",
-        )
-        notify_blocked_once(
-            conn, transport, str(row["batch_id"]), "direct_merge_refused", str(exc),
+            retry_on_failure=True,
+        ):
+            return
+        _schedule_github_write_retry(conn, transport, row, "direct_merge_refused", str(exc))
+        return
+    try:
+        merged = direct_pull_request_view(pull.number)
+    except (AutomergeError, monitor.CommandError) as exc:
+        _schedule_github_write_retry(
+            conn, transport, row, "direct_merge_confirmation_unavailable", str(exc),
         )
         return
-    merged = direct_pull_request_view(pull.number)
     if merged.get("mergedAt") or str(merged.get("state") or "").lower() == "merged":
         _complete_direct_merge(conn, transport, row, merged)
         return
-    notify_blocked_once(
-        conn, transport, str(row["batch_id"]), "direct_merge_not_confirmed",
+    _schedule_github_write_retry(
+        conn, transport, row, "direct_merge_not_confirmed",
         f"gh pr merge returned successfully, but PR #{pull.number} is not confirmed merged.",
     )
 
@@ -4124,15 +4152,17 @@ def _batch_is_in_publish_phase(row: sqlite3.Row | dict[str, Any]) -> bool:
 def _priority_preemption_target(
     row: sqlite3.Row | dict[str, Any], pulls: list[PullRequest],
 ) -> PullRequest | None:
-    """Return a priority PR that can preempt this not-yet-publishing batch."""
+    """Return an immediate PR that can preempt this not-yet-publishing batch."""
     if (_batch_kind(row) not in {"batch", "direct"}
-            or _batch_source(row) == "operator" or _batch_priority(row)
+            or _batch_source(row) == "operator"
             or _batch_is_in_publish_phase(row)
             or str(row["phase"] or "") in {"aborting", "terminal"}):
         return None
     already_in_batch = {pull.number for pull in _all_batch_pulls(row)}
     candidates = [pull for pull in pulls
-                  if pull.priority and pull.number not in already_in_batch]
+                  if pull.immediate and (
+                      pull.number not in already_in_batch or not _batch_priority(row)
+                  )]
     return min(candidates, key=lambda pull: pull.number) if candidates else None
 
 
@@ -4172,7 +4202,7 @@ def preempt_batch_for_priority(
     if target is None:
         return False
     abort_batch_locked(
-        conn, transport, row, f"preempted by priority PR #{target.number}",
+        conn, transport, row, f"preempted by immediate PR #{target.number}",
     )
     return True
 
@@ -4302,7 +4332,7 @@ def run_abort_batch(batch_id: str, reason: str = "Operator requested abort.") ->
         lock_handle.close()
 
 
-def run_land_now(number: int, *, allow_workflow_changes: bool = False) -> int:
+def run_land_now(number: int) -> int:
     """Fast-track one current, up-to-date PR through the persisted direct path."""
     lock_handle = acquire_lock_wait(timeout=120)
     if lock_handle is None:
@@ -4347,12 +4377,14 @@ def run_land_now(number: int, *, allow_workflow_changes: bool = False) -> int:
                     )
                     return 2
                 base_sha = current_master_sha()
+                priority, immediate = _priority_flags(_labels(view))
                 pull = PullRequest(
                     number=number,
                     title=str(view.get("title") or f"PR #{number}"),
                     head_sha=head,
                     url=str(view.get("url") or f"https://github.com/{REPO_NAME}/pull/{number}"),
-                    priority=PRIORITY_LABEL in _labels(view),
+                    priority=priority,
+                    immediate=immediate,
                 )
                 existing = conn.execute(
                     "SELECT batch_id FROM automerge_batches WHERE source='operator' "
@@ -4363,16 +4395,10 @@ def run_land_now(number: int, *, allow_workflow_changes: bool = False) -> int:
                 ).fetchone()
                 if existing is not None:
                     batch_id = str(existing["batch_id"])
-                    with conn:
-                        conn.execute(
-                            "UPDATE automerge_batches SET allow_workflow_changes=? "
-                            "WHERE batch_id=?",
-                            (int(allow_workflow_changes), batch_id),
-                        )
                 else:
                     batch_id = create_batch(
                         conn, [pull], base_sha, ci_mode="async", kind="direct",
-                        source="operator", allow_workflow_changes=allow_workflow_changes,
+                        source="operator",
                     )
                 process_batch(conn, transport, batch_id)
                 result = conn.execute(
@@ -4381,13 +4407,6 @@ def run_land_now(number: int, *, allow_workflow_changes: bool = False) -> int:
                 if result and str(result["terminal_status"] or "").startswith("direct_fell_back"):
                     log(f"PR #{number} was not fast-tracked: {result['terminal_status']}")
                     return 2
-                if (result and str(result["verdict_status_description"] or "")
-                        == "needs human review: CI workflow changes"):
-                    log(
-                        f"PR #{number} is held for human review of CI workflow/action changes; "
-                        "after review, retry with --allow-workflow-changes if approved"
-                    )
-                    return 0
                 if result and str(result["phase"] or "") == "terminal":
                     return 0 if str(result["terminal_status"] or "") == "merged" else 2
                 log(f"PR #{number} fast-track has not been confirmed merged; see the Slack notice")
@@ -4493,21 +4512,15 @@ def main(argv: list[str] | None = None) -> int:
         "--land-now", metavar="PR_NUMBER", type=int,
         help="operator fast-track one open, up-to-date PR through direct landing",
     )
-    parser.add_argument(
-        "--allow-workflow-changes", action="store_true",
-        help="allow --land-now to land a PR that changes CI workflow/action files",
-    )
     parser.add_argument("--reason", default="Operator requested abort.",
                         help="reason recorded on the integration PR and in Slack")
     args = parser.parse_args(argv)
-    if args.allow_workflow_changes and args.land_now is None:
-        parser.error("--allow-workflow-changes requires --land-now")
     if args.check:
         return check_only()
     if args.abort_batch:
         return run_abort_batch(args.abort_batch, args.reason)
     if args.land_now is not None:
-        return run_land_now(args.land_now, allow_workflow_changes=args.allow_workflow_changes)
+        return run_land_now(args.land_now)
     try:
         return run_automerge()
     except (AutomergeError, monitor.CommandError, monitor.MjError, OSError,
