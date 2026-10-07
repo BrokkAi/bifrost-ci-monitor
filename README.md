@@ -136,9 +136,9 @@ issue is the generated view of unresolved failures; individual `buildfailure`
 issues are repair targets.
 
 Infrastructure incidents such as runner acquisition/loss, provider quota, or
-external outages appear as new top-level Slack threads, rather than Bifrost
-product tickets. Notices include the observed failure, uncertainty, and run
-links. Flaky product tests still create repair tickets. Failed Slack/GitHub
+external outages appear as short top-level Slack notices with diagnosis,
+evidence, uncertainty, and run links in the thread, rather than Bifrost product
+tickets. Flaky product tests still create repair tickets. Failed Slack/GitHub
 publication retries the prepared result from SQLite on the next poll without
 another investigation; unrelated triage and repair work can continue.
 An interrupted job preserves earlier product failures until completed results

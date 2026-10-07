@@ -356,8 +356,9 @@ failed steps and commit, not repeated runs of the same observation. Its
 Validate final JSON, deduplicate causes against open/closed issues, reopen
 matching issues, and persist publication markers to recover lost replies.
 Every finding declares `outcome: product|infrastructure|resolved`. Only product
-findings may contain issue drafts. Infrastructure publishes one top-level Slack
-notice; issue bodies and Slack text are prepared once and cached in
+findings may contain issue drafts. Infrastructure publishes a short top-level
+Slack notice and the details in its thread; issue bodies and Slack text are
+prepared once and cached in
 `triage_jobs.report_json`. Infrastructure checkpoints
 handled observations in the existing `triage_observations` table. Handled
 infrastructure remains open in the CI ledger until normal completed-run upkeep

@@ -120,9 +120,15 @@ class TriageTests(TestCase):
         triage.publish(self.conn, self.job())
         self.reopen()
         triage.publish(self.conn, self.job())
-        self.slack.assert_called_once()
-        self.assertIsNone(self.slack.call_args.kwargs.get('thread_ts'))
-        self.assertIn('Runner was not acquired', self.slack.call_args.args[1])
+        self.assertEqual(self.slack.call_count, 2)
+        summary, detail = self.slack.call_args_list
+        self.assertIsNone(summary.kwargs.get('thread_ts'))
+        self.assertIn('CI infrastructure incident: linux', summary.args[1])
+        self.assertNotIn('runner_id=0', summary.args[1])
+        self.assertEqual(detail.kwargs['thread_ts'], 'notice')
+        self.assertIn('Runner was not acquired', detail.args[1])
+        self.assertIn('runner_id=0', detail.args[1])
+        self.assertIn('https://github.test/run/1', detail.args[1])
         self.assertEqual(self.github.calls, [])
         row = self.conn.execute('SELECT * FROM known_failures').fetchone()
         self.assertEqual(row['status'], 'open')
@@ -145,7 +151,7 @@ class TriageTests(TestCase):
         self.slack.return_value = (False, None)
         with self.assertRaisesRegex(RuntimeError, 'cached report'):
             triage.publish(self.conn, self.job())
-        cached = json.loads(self.job()['report_json'])['findings'][0]['slack_text']
+        cached = json.loads(self.job()['report_json'])['findings'][0]
         self.assertEqual(self.job()['status'], 'publishing')
         self.assertEqual(triage.pending(self.conn), [])
         self.reopen()
@@ -153,10 +159,27 @@ class TriageTests(TestCase):
             self.conn.execute("UPDATE known_failures SET status='fixed',diagnosis='later pass'")
         self.slack.return_value = (True, 'notice')
         triage.publish(self.conn, self.job())
-        self.assertEqual([c.args[1] for c in self.slack.call_args_list], [cached, cached])
+        self.assertEqual([c.args[1] for c in self.slack.call_args_list],
+                         [cached['slack_text'], cached['slack_text'], cached['slack_detail']])
+        self.assertEqual(self.slack.call_args_list[-1].kwargs['thread_ts'], 'notice')
         self.assertEqual(self.job()['status'], 'completed')
         self.assertEqual(self.conn.execute('SELECT status FROM known_failures').fetchone()[0], 'fixed')
         self.assertEqual(self.github.calls, [])
+
+    def test_slack_detail_retry_uses_cached_thread_without_reposting_summary(self):
+        self.add_failure()
+        self.infrastructure_job()
+        self.slack.side_effect = [(True, 'parent-ts'), (False, None), (True, 'reply-ts')]
+        with self.assertRaisesRegex(RuntimeError, 'detail pending'):
+            triage.publish(self.conn, self.job())
+        cached = json.loads(self.job()['report_json'])['findings'][0]
+        self.assertEqual(cached['slack_thread_ts'], 'parent-ts')
+        self.reopen()
+        triage.publish(self.conn, self.job())
+        self.assertEqual(self.slack.call_count, 3)
+        self.assertEqual([c.kwargs.get('thread_ts') for c in self.slack.call_args_list],
+                         [None, 'parent-ts', 'parent-ts'])
+        self.assertEqual(self.job()['status'], 'completed')
 
     def test_partial_publication_retry_does_not_repeat_an_infrastructure_notice(self):
         self.add_failure()
@@ -174,7 +197,7 @@ class TriageTests(TestCase):
             triage.publish(self.conn, self.job())
         self.reopen()
         triage.publish(self.conn, self.job())
-        self.slack.assert_called_once()
+        self.assertEqual(self.slack.call_count, 2)
         self.assertEqual(len(self.github.issues), 1)
         self.assertEqual(self.job()['status'], 'completed')
 
@@ -260,7 +283,7 @@ class TriageTests(TestCase):
         self.reopen()
         self.assertEqual(self.conn.execute('SELECT triage_outcome FROM known_failures').fetchone()[0], 'infrastructure')
         triage.ensure_schema(self.conn)
-        self.slack.assert_called_once()
+        self.assertEqual(self.slack.call_count, 2)
         self.assertEqual(self.github.calls, [])
 
     def test_cached_classification_does_not_apply_to_changed_observations(self):

@@ -410,6 +410,50 @@ def reconcile_resolved(conn) -> int:
     return retired
 
 
+def infrastructure_slack_text(finding, captured) -> tuple[str, str]:
+    jobs = list(dict.fromkeys(str(o['job_name']) for o in captured))
+    summary = ':warning: CI infrastructure incident: ' + jobs[0][:180]
+    if len(jobs) > 1:
+        summary += f' (+{len(jobs) - 1} related jobs)'
+    runs = list(dict.fromkeys(o['last_seen_run_url'] for o in captured))[:5]
+    links = '\n'.join(runs)
+    diagnosis = finding['diagnosis'].strip()[:1200]
+    prefix = '*Diagnosis*\n' + diagnosis + '\n\n*Evidence*\n'
+    suffix = '\n\n*Runs*\n' + links
+    budget = max(0, monitor.SLACK_MESSAGE_LIMIT - len(prefix) - len(suffix))
+    detail = prefix + finding['evidence'].strip()[:budget] + suffix
+    return summary, detail
+
+
+def cache_report(conn, job, report) -> None:
+    with conn:
+        conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=?',
+                     (json.dumps(report), job['id']))
+
+
+def publish_infrastructure_slack(conn, job, report, finding) -> None:
+    transport = monitor.load_slack_transport()
+    if transport.kind != 'chat':
+        combined = (finding['slack_text'] + '\n' + finding['slack_detail'])[:monitor.SLACK_MESSAGE_LIMIT]
+        posted, _ = monitor.slack_send(transport, combined)
+        if not posted:
+            raise RuntimeError('infrastructure Slack notice pending; retry cached report next poll')
+        return
+    thread_ts = finding.get('slack_thread_ts')
+    if not thread_ts:
+        posted, thread_ts = monitor.slack_send(transport, finding['slack_text'])
+        if not posted or not thread_ts:
+            raise RuntimeError('infrastructure Slack notice pending; retry cached report next poll')
+        finding['slack_thread_ts'] = thread_ts
+        cache_report(conn, job, report)
+    if not finding.get('slack_detail_posted'):
+        posted, _ = monitor.slack_send(transport, finding['slack_detail'], thread_ts=thread_ts)
+        if not posted:
+            raise RuntimeError('infrastructure Slack detail pending; retry cached report next poll')
+        finding['slack_detail_posted'] = True
+        cache_report(conn, job, report)
+
+
 def publish(conn, job) -> None:
     observations = {o['failure_id']: o for o in json.loads(job['observations_json'])}
     try:
@@ -424,16 +468,13 @@ def publish(conn, job) -> None:
         if finding['outcome'] == 'product' and 'issue_body' not in finding:
             finding['issue_body'] = issue_body(job, index, finding, captured)
             prepared = True
-        if finding['outcome'] == 'infrastructure' and 'slack_text' not in finding:
-            runs = list(dict.fromkeys(o['last_seen_run_url'] for o in captured))[:5]
-            title = ':warning: CI infrastructure incident: ' + finding['diagnosis'][:400]
-            links = '\n'.join(runs)
-            budget = max(0, monitor.SLACK_MESSAGE_LIMIT - len(title) - len(links) - 2)
-            finding['slack_text'] = title + '\n' + finding['evidence'][:budget] + '\n' + links
+        if finding['outcome'] == 'infrastructure' and 'slack_detail' not in finding:
+            summary, detail = infrastructure_slack_text(finding, captured)
+            finding['slack_detail'] = finding.get('slack_text', detail)
+            finding['slack_text'] = summary
             prepared = True
     if prepared:
-        with conn:
-            conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=?', (json.dumps(report), job['id']))
+        cache_report(conn, job, report)
     # The fixer can investigate concurrently; serialize ticket ownership decisions.
     with lock(monitor.LOCK_PATH) as acquired:
         if not acquired:
@@ -450,9 +491,7 @@ def publish(conn, job) -> None:
             active = [(observations[n], current_observation(conn, observations[n])) for n in finding["failure_ids"]]
             active = [(o, row) for o, row in active if row is not None]
             if finding['outcome'] == 'infrastructure':
-                posted, _ = monitor.slack_send(monitor.load_slack_transport(), finding['slack_text'])
-                if not posted:
-                    raise RuntimeError('infrastructure Slack notice pending; retry cached report next poll')
+                publish_infrastructure_slack(conn, job, report, finding)
             url = publish_issue(conn, job, index, finding, [row for _, row in active]) if active and finding["issue"] else None
             with conn:
                 for n in finding["failure_ids"]:
