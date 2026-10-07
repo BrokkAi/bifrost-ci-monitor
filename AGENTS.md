@@ -131,16 +131,20 @@ cleanup path; supervision errors leave sessions available for later polls.
 
 Integration sessions use Opus 5.5 (`opus`) on `bedrock-podman` with Mjolnir Luna 6
 (`global.openai.gpt-6-luna`, high effort) subagents. The CI Mjolnir configuration
-allows up to 16 concurrent subagents per session. Delegate bounded tasks with
-explicit file ownership; the primary owns Git, batch mutations, test assessment,
-and publication. Integration launch prompts establish ownership of the checkout
-and branch. Agents keep a private progress note in the Git directory with pending
-work, decisions, test evidence, and the next action. After compaction, reconcile
-that note once with HEAD, working-tree status, batch revision, and running
-commands; continue when they match. Reopen decisions or repeat completed checks
-only for changed inputs, missing evidence, or contradictory evidence. The
-supervisor retains final master/source freshness checks and required update
-instructions; recovery does not weaken validation or publication gates.
+allows up to 16 concurrent subagents per session. The primary coordinates the
+checkout and branch and owns Git operations, batch mutations, test assessment,
+and publication; subagents edit assigned files. Work against the captured base
+until the supervisor requests an update; it owns final master/source freshness
+checks. Follow the batch skills and revision checks.
+
+Keep a short private progress note in the Git directory with HEAD, pending edits,
+decisions and evidence/log paths, unresolved work, running command/session IDs,
+and the next action. Update it at meaningful milestones. After compaction or an
+interrupted turn, reconcile it once with HEAD, working-tree status, batch revision,
+and running commands, preserving pending edits and reusing matching evidence.
+Investigate actual mismatches; reopen settled work for changed inputs, missing
+evidence, or contradictory evidence, and record that reason. Keep credentials
+out of the note.
 
 Persist the exact launch title/intent before a request may create a session.
 On an ambiguous result, list the CI workspace and adopt the matching title;
@@ -279,41 +283,41 @@ unavailable classification) tells the agent to use its best judgment to choose
 useful local checks and expand testing when failures or specific unresolved
 concerns warrant it. A `full` result does not require the full CI suite locally.
 The agent uses Bifrost's AGENTS and workflow definitions for commands and
-environment conventions, without rerunning ci-impact. Run chosen checks, then
-rerun failures observed in the candidate at the exact base to establish baseline
-evidence. Do not reproduce passing tests or ledger failures absent from the
-candidate to prove historical breakage. Baseline summaries include only candidate
-failures reproduced at base; repaired tests belong in fix notes. Workflow
-definitions are command references, not a local checklist. Before an additional
-check, name the unresolved concern and how it will resolve it. Broad checks may
-cover broad concerns; when selected checks satisfy the gate, proceed to the
-mode's publication/reporting step without exhausting the workflow inventory.
-Do not use temporary source edits, validation shims, or a different tree as proof. A
-baseline build failure can block dependent checks; report those as blocked
-and run unaffected checks. No local test command registry is implemented.
+environment conventions, without rerunning ci-impact. Select useful targeted or
+broad/grouped checks from the diff, dependencies, interactions, conflict
+resolutions, existing results, and specific unresolved concerns.
 
-Start root-cause attribution with blame, history, and code inspection; this is
-almost always faster here than bisecting variants that each require a Rust
-build. Trace the failing assertion through data/control flow, use git blame,
-git log -p and focused diffs, and explain the causal connection to source PRs.
-Confirm concrete hypotheses with the smallest useful checks, reusing built
-trees where possible. Reserve bisect or subtraction/rebuild experiments for
-alternatives inspection cannot distinguish; explain what inspection established,
-what remains ambiguous, and why the build is the cheaper decisive step.
-Same-base comparison requirements do not require building every suspect.
+Delegate bounded investigation, review, or implementation to Luna. Divide large
+merges into independent PR groups or conflict clusters with explicit ownership;
+the primary combines and assesses the work. Builds are expensive: normally
+consolidate changes and validation through the primary. Subagents propose the
+smallest useful check and build only when assigned a check that resolves a
+specific decision. Concurrent builds are appropriate when independent useful
+checks justify their cost and use the existing mbx configuration. Throttling
+controls resource contention; avoid duplicate or speculative builds.
 
-Before expensive builds/tests, record the pending decision, smallest
-discriminating check, actions justified by its possible results, and reusable
-evidence or built trees in the private progress note. Include compilation cost
-when choosing experiments from the diff, dependencies, interactions, and prior
-results. Source attribution prefers the captured base versus that base plus
-suspected exact source heads through real merges with consistent test settings.
-An older PR-head base requires accounting for that difference. Broad/grouped
-checks and reasoned exceptions remain available; no fixed experiment sequence
-or limit is imposed. Patch reversals suggest hypotheses, not acceptance/rejection
-evidence. On contradictory results, verify tested trees, changes, commands, and
-settings before another build/rerun. Record conclusions, then act on sufficient
-fix/eject evidence and validate the resulting candidate.
+Prefer blame, history, focused diffs, and tracing the failing assertion through
+data/control flow; inspection is almost always faster here than rebuilding Rust
+bisect variants. Before an expensive experiment, record the pending decision,
+smallest useful check, what results would change, and reusable evidence or built
+trees. Use bisect or subtraction/rebuild experiments when inspection cannot
+distinguish specific alternatives and the build justifies its cost. Attribution
+prefers captured base versus that base plus suspected exact heads through real
+merges with consistent settings; account for an older PR-head base. Patch
+reversals may suggest hypotheses; acceptance/rejection requires evidence from
+the required committed trees. On contradictory results, reconcile tested trees,
+commands, and settings first. Act on sufficient fix/eject evidence.
+
+Reproduce only failures observed in the candidate's selected checks at the exact
+base, reusing existing exact-tree evidence where available. Passing tests and
+ledger failures absent from the candidate need no baseline runs. Test committed
+trees without temporary source edits or validation shims. Baseline build failures
+may block dependent checks; report those as blocked and run unaffected useful
+checks. Baseline summaries contain candidate failures reproduced at base;
+repaired tests belong in fix notes. After changes, reassess affected validation
+and make the final assessment describe the resulting committed candidate. When
+selected checks pass or only reproduced baseline failures remain, proceed to
+the mode's publication/reporting step. No local test command registry is implemented.
 
 Persist classification in `validation_impact_json` with the exact base and
 heads. Reclassify when the source set, base, or candidate changes; reuse the
