@@ -79,14 +79,14 @@ class TriageTests(TestCase):
         self.conn = monitor.connect_db()
         triage.ensure_schema(self.conn)
 
-    def add_failure(self, identity="Cargo nextest", sha="a" * 40):
+    def add_failure(self, identity="Cargo nextest", sha="a" * 40, job_name="linux"):
         with self.conn:
             self.conn.execute(
                 "INSERT INTO known_failures(workflow,job_name,identity_kind,identity,"
                 "first_seen_sha,first_seen_run_id,first_seen_run_url,first_seen_at,"
                 "last_seen_sha,last_seen_run_id,last_seen_run_url,last_seen_at,updated_at) "
-                "VALUES ('CI','linux','step',?,?,1,'https://github.test/run/1','2026-01-01',"
-                "?,1,'https://github.test/run/1','2026-01-01','2026-01-01')", (identity, sha, sha))
+                "VALUES ('CI',?,'step',?,?,1,'https://github.test/run/1','2026-01-01',"
+                "?,1,'https://github.test/run/1','2026-01-01','2026-01-01')", (job_name, identity, sha, sha))
 
     def job(self, job_id="job"):
         return self.conn.execute("SELECT * FROM triage_jobs WHERE id=?", (job_id,)).fetchone()
@@ -105,13 +105,15 @@ class TriageTests(TestCase):
                                json.dumps(observations), "session", json.dumps(report)))
         return report
 
-    def infrastructure_job(self):
-        report = self.make_job()
+    def infrastructure_job(self, job_id="job", separate=False):
+        report = self.make_job(job_id=job_id)
         finding = report['findings'][0]
         finding.update(outcome='infrastructure', issue=None, diagnosis='Runner was not acquired',
                        evidence='run 1: runner_id=0, no steps; quota/capacity cause unconfirmed')
+        if separate:
+            report['findings'] = [dict(finding, failure_ids=[number]) for number in finding['failure_ids']]
         with self.conn:
-            self.conn.execute('UPDATE triage_jobs SET report_json=?', (json.dumps(report),))
+            self.conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=?', (json.dumps(report), job_id))
         return report
 
     def test_infrastructure_is_reported_once_without_a_ticket_or_false_resolution(self):
@@ -123,9 +125,10 @@ class TriageTests(TestCase):
         self.assertEqual(self.slack.call_count, 2)
         summary, detail = self.slack.call_args_list
         self.assertIsNone(summary.kwargs.get('thread_ts'))
-        self.assertIn('CI infrastructure incident: linux', summary.args[1])
+        self.assertIn('CI infrastructure incidents', summary.args[1])
         self.assertNotIn('runner_id=0', summary.args[1])
         self.assertEqual(detail.kwargs['thread_ts'], 'notice')
+        self.assertIn('CI infrastructure incident: linux', detail.args[1])
         self.assertIn('Runner was not acquired', detail.args[1])
         self.assertIn('runner_id=0', detail.args[1])
         self.assertIn('https://github.test/run/1', detail.args[1])
@@ -145,6 +148,105 @@ class TriageTests(TestCase):
         self.assertEqual(triage.reconcile_resolved(self.conn), 0)
         self.assertEqual(triage.pending(self.conn), [])
 
+    def test_infrastructure_cluster_has_one_parent_and_a_reply_for_each_job(self):
+        jobs = ['os matrix / Pi package', 'os matrix / extension boundary',
+                'os matrix / python (x86_64-pc-windows-msvc)',
+                'os matrix / rust (aarch64-unknown-linux-gnu)']
+        for name in jobs:
+            self.add_failure(job_name=name)
+        self.infrastructure_job(separate=True)
+        triage.publish(self.conn, self.job())
+        self.reopen()
+        triage.publish(self.conn, self.job())
+        parent, *replies = self.slack.call_args_list
+        self.assertIsNone(parent.kwargs.get('thread_ts'))
+        self.assertEqual(len(replies), len(jobs))
+        for name, reply in zip(sorted(jobs), replies):
+            self.assertEqual(reply.kwargs['thread_ts'], 'notice')
+            self.assertIn(name, reply.args[1])
+            self.assertIn('runner_id=0', reply.args[1])
+        self.assertEqual(self.github.calls, [])
+        self.assertEqual(triage.pending(self.conn), [])
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM known_failures WHERE status='open' "
+                                           "AND triage_outcome='infrastructure'").fetchone()[0], len(jobs))
+
+    def test_nearby_reports_reuse_thread_across_restart_and_extend_quiet_window(self):
+        with mock.patch.object(monitor, 'utc_now', return_value='2026-10-07T17:00:00+00:00'):
+            self.add_failure()
+            self.infrastructure_job()
+            triage.publish(self.conn, self.job())
+        self.reopen()
+        for minute, job_id in [(10, 'second'), (20, 'third')]:
+            with mock.patch.object(monitor, 'utc_now', return_value=f'2026-10-07T17:{minute}:00+00:00'):
+                self.add_failure(identity=job_id, job_name=job_id)
+                self.infrastructure_job(job_id=job_id)
+                triage.publish(self.conn, self.job(job_id))
+        self.assertEqual([c.kwargs.get('thread_ts') for c in self.slack.call_args_list],
+                         [None, 'notice', 'notice', 'notice'])
+        for job_id, reply in zip(['second', 'third'], self.slack.call_args_list[2:]):
+            self.assertIn(job_id, reply.args[1])
+
+    def test_infrastructure_reports_start_new_thread_after_quiet_gap_or_in_new_channel(self):
+        with mock.patch.object(monitor, 'utc_now', return_value='2026-10-07T17:00:00+00:00'):
+            self.add_failure()
+            self.infrastructure_job()
+            triage.publish(self.conn, self.job())
+        with mock.patch.object(monitor, 'utc_now', return_value='2026-10-07T17:15:00+00:00'):
+            self.add_failure(identity='second')
+            self.infrastructure_job(job_id='second')
+            self.slack.return_value = (True, 'new-thread')
+            triage.publish(self.conn, self.job('second'))
+            self.add_failure(identity='third')
+            self.infrastructure_job(job_id='third')
+            transport = monitor.SlackTransport('chat', token='test', channel='other')
+            with mock.patch.object(monitor, 'load_slack_transport', return_value=transport):
+                self.slack.return_value = (True, 'other-channel-thread')
+                triage.publish(self.conn, self.job('third'))
+        self.assertEqual([c.kwargs.get('thread_ts') for c in self.slack.call_args_list],
+                         [None, 'notice', None, 'new-thread', None, 'other-channel-thread'])
+
+    def test_partial_cluster_retry_keeps_thread_after_window_without_repeating_accepted_reply(self):
+        self.add_failure()
+        self.add_failure(identity='second', job_name='windows')
+        self.add_failure(identity='third', job_name='macos')
+        self.infrastructure_job(separate=True)
+        self.slack.side_effect = [(True, 'parent-ts'), (True, 'first-reply'), (False, None),
+                                  (True, 'retry'), (True, 'last-reply')]
+        with mock.patch.object(monitor, 'utc_now', return_value='2026-10-07T17:00:00+00:00'):
+            with self.assertRaisesRegex(RuntimeError, 'detail pending'):
+                triage.publish(self.conn, self.job())
+        self.reopen()
+        with mock.patch.object(monitor, 'utc_now', return_value='2026-10-07T18:00:00+00:00'), \
+             mock.patch.object(triage, 'infrastructure_slack_text', side_effect=AssertionError('already cached')):
+            triage.publish(self.conn, self.job())
+        self.assertEqual([c.kwargs.get('thread_ts') for c in self.slack.call_args_list],
+                         [None, 'parent-ts', 'parent-ts', 'parent-ts', 'parent-ts'])
+        self.assertEqual(self.slack.call_args_list[2], self.slack.call_args_list[3])
+        self.assertEqual(self.job()['status'], 'completed')
+
+    def test_long_infrastructure_reply_keeps_job_and_run_link_within_slack_limit(self):
+        self.add_failure()
+        report = self.infrastructure_job()
+        report['findings'][0]['evidence'] = 'Runner unavailable. ' * 1000
+        with self.conn:
+            self.conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=?', (json.dumps(report), 'job'))
+        triage.publish(self.conn, self.job())
+        reply = self.slack.call_args.args[1]
+        self.assertLessEqual(len(reply), monitor.SLACK_MESSAGE_LIMIT)
+        self.assertIn('CI infrastructure incident: linux', reply)
+        self.assertIn('https://github.test/run/1', reply)
+
+    def test_webhook_fallback_preserves_infrastructure_summary_and_detail(self):
+        self.add_failure()
+        self.infrastructure_job()
+        transport = monitor.SlackTransport('webhook', webhook='test')
+        with mock.patch.object(monitor, 'load_slack_transport', return_value=transport):
+            triage.publish(self.conn, self.job())
+        self.slack.assert_called_once()
+        self.assertIn('CI infrastructure incident: linux', self.slack.call_args.args[1])
+        self.assertIn('runner_id=0', self.slack.call_args.args[1])
+        self.assertEqual(self.job()['status'], 'completed')
+
     def test_slack_retry_reuses_cached_notice_after_restart_and_recovery(self):
         self.add_failure()
         self.infrastructure_job()
@@ -160,7 +262,8 @@ class TriageTests(TestCase):
         self.slack.return_value = (True, 'notice')
         triage.publish(self.conn, self.job())
         self.assertEqual([c.args[1] for c in self.slack.call_args_list],
-                         [cached['slack_text'], cached['slack_text'], cached['slack_detail']])
+                         [triage.INFRASTRUCTURE_SLACK_SUMMARY, triage.INFRASTRUCTURE_SLACK_SUMMARY,
+                          cached['slack_text'] + '\n\n' + cached['slack_detail']])
         self.assertEqual(self.slack.call_args_list[-1].kwargs['thread_ts'], 'notice')
         self.assertEqual(self.job()['status'], 'completed')
         self.assertEqual(self.conn.execute('SELECT status FROM known_failures').fetchone()[0], 'fixed')
@@ -264,6 +367,7 @@ class TriageTests(TestCase):
         self.conn.execute("ALTER TABLE known_failures DROP COLUMN triage_issue_state")
         self.conn.execute("ALTER TABLE known_failures DROP COLUMN triage_outcome")
         self.conn.execute("ALTER TABLE triage_observations DROP COLUMN resolved_run_id")
+        self.conn.execute("DROP TABLE triage_infrastructure_threads")
         self.conn.commit()
         self.reopen()
         row = self.conn.execute("SELECT * FROM known_failures").fetchone()
@@ -272,6 +376,7 @@ class TriageTests(TestCase):
         self.assertEqual(row["triage_issue_state"], "OPEN")
         self.assertIsNone(row["triage_outcome"])
         self.assertIn("resolved_run_id", {r["name"] for r in self.conn.execute("PRAGMA table_info(triage_observations)")})
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM triage_infrastructure_threads').fetchone()[0], 0)
 
     def test_upgrade_reuses_cached_infrastructure_classification_without_publication(self):
         self.add_failure()

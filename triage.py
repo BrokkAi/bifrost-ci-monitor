@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime as dt
 import fcntl
 import hashlib
 import json
@@ -21,6 +22,8 @@ WHERE_KEY = " AND ".join(f"{name}=?" for name in KEY)
 CPUS = 2
 MEMORY_GIB = 4
 MODEL = "deepseek-flash"
+INFRASTRUCTURE_CLUSTER_SECONDS = 15 * 60
+INFRASTRUCTURE_SLACK_SUMMARY = ':warning: CI infrastructure incidents'
 
 
 @contextlib.contextmanager
@@ -56,6 +59,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             job_id TEXT NOT NULL, group_index INTEGER NOT NULL,
             issue_number INTEGER NOT NULL,
             PRIMARY KEY (job_id, group_index)
+        );
+        CREATE TABLE IF NOT EXISTS triage_infrastructure_threads (
+            channel TEXT NOT NULL, thread_ts TEXT NOT NULL,
+            last_notice_at TEXT NOT NULL,
+            PRIMARY KEY (channel, thread_ts)
         );
     """)
     monitor.ensure_column(conn, "triage_observations", "resolved_run_id", "INTEGER")
@@ -420,7 +428,7 @@ def infrastructure_slack_text(finding, captured) -> tuple[str, str]:
     diagnosis = finding['diagnosis'].strip()[:1200]
     prefix = '*Diagnosis*\n' + diagnosis + '\n\n*Evidence*\n'
     suffix = '\n\n*Runs*\n' + links
-    budget = max(0, monitor.SLACK_MESSAGE_LIMIT - len(prefix) - len(suffix))
+    budget = max(0, monitor.SLACK_MESSAGE_LIMIT - len(summary) - 2 - len(prefix) - len(suffix))
     detail = prefix + finding['evidence'].strip()[:budget] + suffix
     return summary, detail
 
@@ -431,25 +439,45 @@ def cache_report(conn, job, report) -> None:
                      (json.dumps(report), job['id']))
 
 
+def record_infrastructure_thread(conn, channel, thread_ts) -> None:
+    with conn:
+        conn.execute('INSERT INTO triage_infrastructure_threads(channel,thread_ts,last_notice_at) VALUES (?,?,?) '
+                     'ON CONFLICT(channel,thread_ts) DO UPDATE SET last_notice_at=excluded.last_notice_at',
+                     (channel, thread_ts, monitor.utc_now()))
+
+
 def publish_infrastructure_slack(conn, job, report, finding) -> None:
     transport = monitor.load_slack_transport()
+    combined = (finding['slack_text'] + '\n\n' + finding['slack_detail'])[:monitor.SLACK_MESSAGE_LIMIT]
     if transport.kind != 'chat':
-        combined = (finding['slack_text'] + '\n' + finding['slack_detail'])[:monitor.SLACK_MESSAGE_LIMIT]
         posted, _ = monitor.slack_send(transport, combined)
         if not posted:
             raise RuntimeError('infrastructure Slack notice pending; retry cached report next poll')
         return
     thread_ts = finding.get('slack_thread_ts')
     if not thread_ts:
-        posted, thread_ts = monitor.slack_send(transport, finding['slack_text'])
-        if not posted or not thread_ts:
-            raise RuntimeError('infrastructure Slack notice pending; retry cached report next poll')
+        # A report stays together even when a publication retry outlasts the window.
+        thread_ts = next((f['slack_thread_ts'] for f in report['findings']
+                          if f['outcome'] == 'infrastructure' and f.get('slack_thread_ts')), None)
+        if not thread_ts:
+            cutoff = (dt.datetime.fromisoformat(monitor.utc_now()) -
+                      dt.timedelta(seconds=INFRASTRUCTURE_CLUSTER_SECONDS)).isoformat(timespec='seconds')
+            recent = conn.execute('SELECT thread_ts FROM triage_infrastructure_threads '
+                                  'WHERE channel=? AND last_notice_at>? ORDER BY last_notice_at DESC LIMIT 1',
+                                  (transport.channel, cutoff)).fetchone()
+            thread_ts = recent['thread_ts'] if recent else None
+        if not thread_ts:
+            posted, thread_ts = monitor.slack_send(transport, INFRASTRUCTURE_SLACK_SUMMARY)
+            if not posted or not thread_ts:
+                raise RuntimeError('infrastructure Slack notice pending; retry cached report next poll')
+            record_infrastructure_thread(conn, transport.channel, thread_ts)
         finding['slack_thread_ts'] = thread_ts
         cache_report(conn, job, report)
     if not finding.get('slack_detail_posted'):
-        posted, _ = monitor.slack_send(transport, finding['slack_detail'], thread_ts=thread_ts)
+        posted, _ = monitor.slack_send(transport, combined, thread_ts=thread_ts)
         if not posted:
             raise RuntimeError('infrastructure Slack detail pending; retry cached report next poll')
+        record_infrastructure_thread(conn, transport.channel, thread_ts)
         finding['slack_detail_posted'] = True
         cache_report(conn, job, report)
 

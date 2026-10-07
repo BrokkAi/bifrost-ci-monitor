@@ -433,7 +433,12 @@ Every finding declares `outcome: product|infrastructure|resolved`. Only product
 findings may contain issue drafts. Infrastructure publishes a short top-level
 Slack notice and the details in its thread; issue bodies and Slack text are
 prepared once and cached in
-`triage_jobs.report_json`. Infrastructure checkpoints
+`triage_jobs.report_json`. Infrastructure findings in one report share a thread;
+nearby reports reuse that channel's thread until a 15-minute gap between successful
+notices. `triage_infrastructure_threads` persists the window across restarts, while
+cached report thread IDs keep publication retries together even after the window.
+Each reply includes the finding's job summary. Publication's existing fixer lock serializes
+thread selection. Infrastructure checkpoints
 handled observations in the existing `triage_observations` table. Handled
 infrastructure remains open in the CI ledger until normal completed-run upkeep
 observes recovery; it is never treated as resolved merely because it was reported.
