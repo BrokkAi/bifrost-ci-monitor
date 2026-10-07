@@ -387,8 +387,13 @@ The poller validates the final JSON report, creates or updates `buildfailure`
 issues, reopens matching closed issues, and records their links and diagnoses in
 the ledger. Persisted publication markers recover successful GitHub writes whose
 responses were lost. Failures fixed or superseded during the investigation are
-skipped. Only CI clears a ledger entry; an agent's claim of resolution is context.
-The aggregate known-failures issue remains the generated index.
+skipped. A resolved finding (`issue: null`, with concrete evidence) retires only
+the captured observation when its commit, failed steps, and run still match.
+The row and diagnosis remain in SQLite as history; the aggregate issue and repair
+prompts show only open rows. A later failed run reopens the row and can trigger
+fresh triage even on the same commit. Completed historical reports are reconciled
+on polling; `python3 triage.py --reconcile-resolved` applies that cleanup and
+refreshes the issue immediately without launching a session.
 
 Triage issue links are separate from human escalation links: a triage ticket does
 not suppress the fixer. The fixer is instructed to reuse it. Publication waits
