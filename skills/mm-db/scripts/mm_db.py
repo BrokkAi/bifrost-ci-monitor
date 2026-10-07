@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Client for the batch-scoped MergeMarshall state service."""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+
+def git(*args, cwd=None, check=True):
+    return subprocess.run(["git", *args], cwd=cwd, text=True, capture_output=True, check=check)
+
+
+def context_path():
+    return Path(git("rev-parse", "--absolute-git-dir").stdout.strip()) / "mm-connection.json"
+
+
+def configure(connection):
+    if set(connection) != {"url", "batch_id", "token"}:
+        raise ValueError("connection needs url, batch_id, and token")
+    if not all(isinstance(v, str) and v for v in connection.values()):
+        raise ValueError("connection values must be nonempty strings")
+    path = context_path()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump(connection, handle)
+
+
+class Client:
+    def __init__(self, connection=None):
+        self.connection = connection or json.loads(context_path().read_text())
+
+    def call(self, operation, **payload):
+        c = self.connection
+        request = urllib.request.Request(
+            c["url"].rstrip("/") + "/batch/" + c["batch_id"] + "/" + operation,
+            data=json.dumps(payload).encode(),
+            headers={"Authorization": "Bearer " + c["token"], "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            try:
+                message = json.loads(exc.read()).get("error", str(exc))
+            except (ValueError, AttributeError):
+                message = "state service returned HTTP " + str(exc.code)
+            raise RuntimeError(message) from None
+
+
+def render_report(state):
+    evidence = state.get("tests")
+    if not evidence:
+        raise ValueError("no local test assessment has been recorded")
+    lines = ["automerge-local: " + evidence["verdict"],
+             "Tests run: " + evidence["tests"],
+             "Baseline failures: " + evidence["baseline"],
+             "Tested head: " + evidence["head"]]
+    publication = state.get("publication")
+    if publication:
+        if publication["head"] != evidence["head"]:
+            raise ValueError("publication and recorded test heads differ")
+        lines.append("Integration PR: " + publication["url"])
+    for entry in state["excluded"]:
+        if entry["kind"] in {"rejected", "ejected"}:
+            lines.append(f"automerge-ejected-pr: {entry['number']} {entry['head_sha']}")
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="operation", required=True)
+    config = sub.add_parser("configure")
+    config.add_argument("--connection-file", required=True, type=Path)
+    sub.add_parser("state")
+    sub.add_parser("report")
+    exclude = sub.add_parser("exclude")
+    exclude.add_argument("--revision", required=True)
+    exclude.add_argument("--pr", required=True, type=int)
+    exclude.add_argument("--head", required=True)
+    exclude.add_argument("--kind", required=True, choices=["removed", "rejected"])
+    exclude.add_argument("--reason", required=True)
+    exclude.add_argument("--evidence-file", type=Path)
+    tests = sub.add_parser("tests")
+    tests.add_argument("--revision", required=True)
+    tests.add_argument("--head", required=True)
+    tests.add_argument("--verdict", required=True, choices=["pass", "fail"])
+    tests.add_argument("--tests", required=True)
+    tests.add_argument("--baseline", required=True)
+    args = vars(parser.parse_args())
+    operation = args.pop("operation")
+    if operation == "configure":
+        configure(json.loads(args["connection_file"].read_text()))
+        print("Configured MergeMarshall connection.")
+        return
+    client = Client()
+    if operation == "report":
+        print(render_report(client.call("state")))
+        return
+    if operation == "exclude":
+        path = args.pop("evidence_file")
+        args["evidence"] = path.read_text() if path else ""
+        args["number"] = args.pop("pr")
+    print(json.dumps(client.call(operation, **args), indent=2))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)

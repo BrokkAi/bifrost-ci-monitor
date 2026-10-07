@@ -210,6 +210,31 @@ file under `$HOME/.config/bifrost-ci-monitor/` by default.
 
 ## PR automerge
 
+Automerge agents have four scripted skills, maintained in this repository:
+`mm-merge` attempts an octopus merge of verified source heads, then supports
+manual sequential merges when it fails; `mm-db` reads shared batch state and
+records exact-head exclusions and explicit local test assessments; `mm-autopr`
+pushes the tested branch and reconciles one integration PR through REST;
+`mm-compare` runs a supplied Bash check at two commits in detached worktrees and
+returns raw output diffs and exit codes. Check selection and diagnosis remain
+the agent's responsibility. The CI command registry is deferred.
+
+Install them into enabled Mjolnir profile homes and start the batch state service:
+
+```sh
+python3 scripts/install-mm-skills.py --service-listen <host-private-IP>
+```
+
+Mjolnir stages those skills into container sessions. The user systemd service
+`mm-skills.service` listens on port 8769 at the specified private interface;
+rootless Podman agents reach it through `host.containers.internal`. The supervisor
+supplies a token scoped to that batch in initial and follow-up prompts. Its key
+is generated mode 0600 under the automerge state directory. Agent updates check
+a state revision; finished batches refuse mutations. The additive
+`automerge_skill_events` table stores assessments, exclusions, and publication
+evidence. Exclusions update the existing supervisor membership immediately;
+publication does not merge or bypass the common landing checks.
+
 Agents, including the CI repair agent, open pull requests instead of pushing
 to master. `automerge.py` batches eligible PRs into one integration PR and
 merges after the selected CI mode's gate and common pre-merge checks pass. Run

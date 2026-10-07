@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
+import hmac
 import json
 import re
 import sqlite3
@@ -61,6 +63,15 @@ BASELINE_DISPATCH_GRACE_SECONDS = 10 * 60
 VERDICT_CONTEXT = "mergemarshall/verdict"
 VERDICT_APP_ID = 5203169
 TURN_TICK_SECONDS = 50
+SKILLS_GUIDANCE = (
+    "Use the installed mm-merge, mm-db, mm-autopr, and mm-compare skills for "
+    "batch mechanics. Read mm-db state before changing membership. Try one "
+    "octopus merge of the verified heads first; if it fails, resolve sequential "
+    "merges manually. One octopus merge commit retaining every source head is "
+    "allowed. Record removals and test evidence through mm-db, publish through "
+    "mm-autopr, and render the final evidence with mm-db report. mm-compare runs "
+    "a supplied Bash check at two commits; choose the checks and assess failures yourself."
+)
 FIX_VS_EJECT_GUIDANCE = (
     "Fix versus eject: fix in the batch with an appended commit when the failure "
     "comes from an interaction between PRs, or is a mechanical update with a "
@@ -471,6 +482,12 @@ def connect_db() -> sqlite3.Connection:
             slack_notification_attempted INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (batch_id, reason)
         );
+
+        CREATE TABLE IF NOT EXISTS automerge_skill_events (
+            batch_id TEXT NOT NULL, event_id TEXT NOT NULL, kind TEXT NOT NULL,
+            payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY (batch_id, event_id)
+        );
         """
     )
     ensure_column(conn, "automerge_batches", "launch_attempted_at", "TEXT")
@@ -740,6 +757,8 @@ def build_prompt(
 Process these PRs in the order listed:
 {pr_list}
 
+{SKILLS_GUIDANCE}
+
 For each PR, fetch its head with `git fetch origin pull/<N>/head`. Verify the fetched commit is the listed full head SHA before merging. If the fetched SHA differs, do not merge or reject that PR: remove it from this batch and rebuild from the original {base_sha} using only the remaining listed heads. Merge each expected head into the integration branch with a merge commit (no squash and no rebase), so GitHub can recognize the PR as merged when the integration PR lands. Resolve every conflict yourself. Never eject or send a PR back because it conflicts: read the PR description and commits, preserve both sides' intent, and finish the merge. Every commit you create, including each merge commit and any conflict-resolution or fix commit, must carry the trailer `Automerge-Batch: {batch_id}`.
 
 After all listed PRs are merged into the integration branch, run targeted tests locally: read this repository's AGENTS.md and use its `ci-impact` logic and `.github/workflows` files to choose the affected checks. Run the full selected scope when `ci-impact` selects full; otherwise run the selected affected checks. Test the committed tree without temporary source edits or validation shims. CI on the integration PR is authoritative.
@@ -818,6 +837,8 @@ def build_async_prompt(
 Process these PRs in the order listed:
 {pr_list}
 
+{SKILLS_GUIDANCE}
+
 For each PR, fetch its head with `git fetch origin pull/<N>/head`. Verify the fetched commit is the listed full head SHA before merging. If the fetched SHA differs, do not merge or reject that PR: remove it from this batch and rebuild from the original {base_sha} using only the remaining listed heads. Merge each expected head into the integration branch with a merge commit (no squash and no rebase). Resolve every conflict yourself, preserving both sides' intent using PR descriptions and commits. Every commit you create, including merge, conflict-resolution, and fix commits, must carry `Automerge-Batch: {batch_id}`.
 
 This batch uses async CI mode. The supervisor does not wait for CI and does not use GitHub CI results to authorize this batch. Before publishing, {_async_test_guidance(base_sha)}
@@ -853,6 +874,23 @@ def new_session_argv(
         "--prompt-file", prompt_file,
         "--json",
     ]
+
+
+def skills_connection_prompt(row: sqlite3.Row | dict[str, Any]) -> str:
+    key_path = STATE_DIR / "skill-service.key"
+    if not key_path.is_file():
+        return ""
+    key = key_path.read_bytes()
+    if len(key) != 32:
+        raise AutomergeError("invalid skill service key", reason="skill_service_invalid")
+    batch_id = str(row["batch_id"])
+    connection = {"url": "http://host.containers.internal:8769", "batch_id": batch_id,
+                  "token": hmac.new(key, batch_id.encode(), hashlib.sha256).hexdigest()}
+    return ("\n\n" + SKILLS_GUIDANCE + "\nConfigure mm-db in this checkout using this "
+            "batch-scoped connection: save the following JSON to a private temporary "
+            "file and run the mm-db script's configure --connection-file FILE command. "
+            "Remove the temporary file afterward. Keep its token out of reports.\n" +
+            json.dumps(connection) + "\n")
 
 
 def lookup_batch_session(row: sqlite3.Row | dict[str, Any]) -> str | None:
@@ -928,6 +966,7 @@ def launch_batch_session(
         ci_mode=_batch_ci_mode(row),
         known_failures_context=_known_failures_prompt(conn) if conn is not None else "",
     )
+    prompt += skills_connection_prompt(row)
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", prefix="bifrost-automerge-",
         suffix=".prompt", delete=False,
@@ -2391,7 +2430,7 @@ def deliver_pending_prompt(conn: sqlite3.Connection, transport: monitor.SlackTra
                              "turn_started_at=COALESCE(turn_started_at, ?) WHERE batch_id=?",
                              (utc_now(), row["batch_id"]))
         else:
-            monitor.send_session_prompt(session_id, str(prompt))
+            monitor.send_session_prompt(session_id, str(prompt) + skills_connection_prompt(row))
             with conn:
                 conn.execute("UPDATE automerge_batches SET prompt_delivered=1, "
                              "turn_started_at=?, suspend_pending=0 WHERE batch_id=?",
@@ -2525,6 +2564,24 @@ def _persist_excluded_source_heads(
 ) -> bool:
     if not entries:
         return False
+    # Skills and the cron supervisor can record exclusions concurrently. Read
+    # membership only after acquiring the SQLite writer lock.
+    if conn.in_transaction:
+        latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                              (row["batch_id"],)).fetchone()
+        return _persist_excluded_source_heads_locked(conn, latest or row, entries)
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                              (row["batch_id"],)).fetchone()
+        return _persist_excluded_source_heads_locked(conn, latest or row, entries)
+
+
+def _persist_excluded_source_heads_locked(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row | dict[str, Any],
+    entries: list[dict[str, Any]],
+) -> bool:
     original = {pull.number: pull for pull in _all_batch_pulls(row)}
     existing = _excluded_source_heads(row)
     by_key = {(entry["number"], entry["head_sha"]): entry for entry in existing}
@@ -2552,15 +2609,14 @@ def _persist_excluded_source_heads(
             display = f"PR #{pull.number} {pull.title} ejected at {str(entry.get('head_sha', '')).lower()}"
             if display not in ejected:
                 ejected.append(display)
-    with conn:
-        conn.execute(
-            "UPDATE automerge_batches SET excluded_source_heads_json=?, "
-            "active_pull_requests_json=?, ejected_pull_requests_json=?, "
-            "retry_rescan_pending=MAX(retry_rescan_pending,?) WHERE batch_id=?",
-            (json.dumps(sorted(by_key.values(), key=lambda entry: (entry["number"], entry["head_sha"]))),
-             json.dumps([pull.as_json() for pull in active]), json.dumps(ejected),
-             int(set(by_key) != previous_keys), row["batch_id"]),
-        )
+    conn.execute(
+        "UPDATE automerge_batches SET excluded_source_heads_json=?, "
+        "active_pull_requests_json=?, ejected_pull_requests_json=?, "
+        "retry_rescan_pending=MAX(retry_rescan_pending,?) WHERE batch_id=?",
+        (json.dumps(sorted(by_key.values(), key=lambda entry: (entry["number"], entry["head_sha"]))),
+         json.dumps([pull.as_json() for pull in active]), json.dumps(ejected),
+         int(set(by_key) != previous_keys), row["batch_id"]),
+    )
     return set(by_key) != previous_keys
 
 
@@ -3042,6 +3098,14 @@ Do not use revert commits. Do not reject removed PRs. Open or update one integra
 Do not merge the integration PR. Reason for rebuild: {reason}.
 """
     with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                               (row["batch_id"],)).fetchone()
+        if any(current[name] != row[name] for name in (
+            "base_sha", "pull_requests_json", "active_pull_requests_json", "excluded_source_heads_json",
+        )):
+            raise AutomergeError("batch membership changed while preparing rebuild; retry with current state",
+                                 reason="batch_state_changed")
         conn.execute("UPDATE automerge_batches SET active_pull_requests_json=?, ci_head_sha=?, "
                      "pull_requests_json=?, expansion_count=expansion_count+?, "
                      "retry_rescan_pending=0, "
