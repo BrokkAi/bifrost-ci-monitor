@@ -55,6 +55,7 @@ LOCAL_GATE_MARKER = re.compile(r"(?mi)^automerge-local:\s*(pass|fail)\s*$")
 INTERRUPTION_GRACE_SECONDS = 60
 AMBIGUOUS_LAUNCH_GRACE_SECONDS = 10 * 60
 MAX_CI_ROUNDS = 4
+MAX_BATCH_EXPANSIONS = 3
 CI_WORKFLOW = "ci.yml"
 BASELINE_DISPATCH_GRACE_SECONDS = 10 * 60
 VERDICT_CONTEXT = "mergemarshall/verdict"
@@ -488,6 +489,8 @@ def connect_db() -> sqlite3.Connection:
         ("active_pull_requests_json", "TEXT"),
         ("ejected_pull_requests_json", "TEXT NOT NULL DEFAULT '[]'"),
         ("excluded_source_heads_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("expansion_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("retry_rescan_pending", "INTEGER NOT NULL DEFAULT 0"),
         ("ci_round", "INTEGER NOT NULL DEFAULT 0"),
         ("ci_head_sha", "TEXT"),
         ("ci_failed_jobs_json", "TEXT NOT NULL DEFAULT '[]'"),
@@ -2453,6 +2456,10 @@ def _wait_agent_turn(conn: sqlite3.Connection, transport: monitor.SlackTransport
                           TURN_TICK_SECONDS)
     if turn.timed_out:
         return False
+    if turn.outcome in {"interrupted", "cancelled", "canceled"}:
+        _rebuild_or_finish(conn, transport, row, _active_sources(row),
+                           "the agent turn was interrupted; continue in the same live session")
+        return False
     return turn.status == "completed" or turn.outcome == "finished"
 
 
@@ -2543,9 +2550,11 @@ def _persist_excluded_source_heads(
     with conn:
         conn.execute(
             "UPDATE automerge_batches SET excluded_source_heads_json=?, "
-            "active_pull_requests_json=?, ejected_pull_requests_json=? WHERE batch_id=?",
+            "active_pull_requests_json=?, ejected_pull_requests_json=?, "
+            "retry_rescan_pending=MAX(retry_rescan_pending,?) WHERE batch_id=?",
             (json.dumps(sorted(by_key.values(), key=lambda entry: (entry["number"], entry["head_sha"]))),
-             json.dumps([pull.as_json() for pull in active]), json.dumps(ejected), row["batch_id"]),
+             json.dumps([pull.as_json() for pull in active]), json.dumps(ejected),
+             int(set(by_key) != previous_keys), row["batch_id"]),
         )
     return set(by_key) != previous_keys
 
@@ -2658,6 +2667,10 @@ def _queue_async_gate_retry(
     final: str,
     reason: str,
 ) -> None:
+    if _async_local_result(final) != "pass" and _request_rebuild(
+        conn, row, _active_sources(row), reason, only_if_expanded=True,
+    ):
+        return
     evidence = json.dumps(final or "(missing local-gate report)", ensure_ascii=True)
     ledger_context = _format_known_failure_prompt(_known_failures_prompt(conn))
     if _async_local_result(final) == "pass":
@@ -2693,14 +2706,15 @@ def _finish_async_agent_turn(
     row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                        (row["batch_id"],)).fetchone()
     local_result = _async_local_result(final)
+    if row["retry_rescan_pending"] and _request_rebuild(
+        conn, row, _active_sources(row), "a source PR was ejected; include newly ready PRs",
+        only_if_expanded=True,
+    ):
+        return
     if local_result != "pass":
         if exclusions_changed:
             remaining = _active_sources(row)
-            if not remaining:
-                _terminal(conn, transport, row, "no_sources_remain",
-                          "The async local gate failed and every source PR was removed.")
-                return
-            _request_rebuild(conn, row, remaining,
+            _rebuild_or_finish(conn, transport, row, remaining,
                              "the async local targeted-test gate failed or reported a source removal")
             return
         _queue_async_gate_retry(
@@ -2739,10 +2753,27 @@ def _agent_turn_finished(conn: sqlite3.Connection, transport: monitor.SlackTrans
     final = _store_agent_result(conn, transport, row, session_id)
     row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                        (row["batch_id"],)).fetchone()
+    keep, removed = _recheck_sources(_active_sources(row))
+    if removed:
+        _append_removed(conn, str(row["batch_id"]), removed)
+        latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                              (row["batch_id"],)).fetchone()
+        _record_agent_exclusions(conn, latest, final)
+        _rebuild_or_finish(conn, transport, row, keep,
+                           "source state/head changed during the agent turn: " + "; ".join(removed))
+        return
     if _batch_ci_mode(row) == "async":
         _finish_async_agent_turn(conn, transport, row, final)
         return
-    if row["phase"] == "building":
+    reported_exclusions = _record_agent_exclusions(conn, row, final)
+    row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                       (row["batch_id"],)).fetchone()
+    if row["retry_rescan_pending"] and _request_rebuild(
+        conn, row, _active_sources(row), "a source PR was ejected; include newly ready PRs",
+        only_if_expanded=True,
+    ):
+        return
+    if row["phase"] == "building" or not row["integration_pr_number"]:
         integration = find_integration_pr(row)
         if integration is None:
             _terminal(conn, transport, row, "integration_pr_missing",
@@ -2762,17 +2793,10 @@ def _agent_turn_finished(conn: sqlite3.Connection, transport: monitor.SlackTrans
     if row["phase"] != "fixing":
         raise AutomergeError(f"agent turn completed in unexpected phase {row['phase']}",
                              reason="database_state_invalid")
-    reported_exclusions = _record_agent_exclusions(conn, row, final)
-    row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
-                       (row["batch_id"],)).fetchone()
     number, head, base = _integration_head(row)
     if reported_exclusions and head == str(row["ci_head_sha"] or "").lower():
         remaining = _active_sources(row)
-        if not remaining:
-            _terminal(conn, transport, row, "no_sources_remain",
-                      "The agent excluded every source PR from the batch.")
-            return
-        _request_rebuild(conn, row, remaining,
+        _rebuild_or_finish(conn, transport, row, remaining,
                          "the agent reported an ejected or rejected source head")
         return
     if head != str(row["ci_head_sha"] or "").lower():
@@ -2878,6 +2902,9 @@ def _poll_ci(conn: sqlite3.Connection, transport: monitor.SlackTransport,
         )
     row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                        (row["batch_id"],)).fetchone()
+    if _request_rebuild(conn, row, _active_sources(row),
+                        "CI failed; retry with newly ready PRs", only_if_expanded=True):
+        return
     queue_agent_prompt(conn, row, build_ci_feedback(
         row, failed_jobs, base_jobs, report.logs, base_logs,
         _known_failures_prompt(conn),
@@ -2898,6 +2925,7 @@ def _recheck_sources(pulls: list[PullRequest]) -> tuple[list[PullRequest], list[
     removed: list[str] = []
     for pull in pulls:
         state = _source_pr_state(pull)
+        _draft_changed_source(pull, state)
         reason = None
         if str(state.get("state", "")).lower() != "open":
             reason = "closed"
@@ -2912,6 +2940,26 @@ def _recheck_sources(pulls: list[PullRequest]) -> tuple[list[PullRequest], list[
         else:
             keep.append(pull)
     return keep, removed
+
+
+def _draft_changed_source(pull: PullRequest, state: dict[str, Any]) -> None:
+    head = str(state.get("headRefOid", "")).lower()
+    if str(state.get("state", "")).lower() == "open" and not re.fullmatch(r"[0-9a-f]{40}", head):
+        raise AutomergeError(f"PR #{pull.number} returned an invalid source head",
+                             reason="github_invalid_response")
+    if (str(state.get("state", "")).lower() == "open"
+            and not state.get("isDraft")
+            and head != pull.head_sha.lower()):
+        run_gh(["pr", "ready", str(pull.number), "--undo", "--repo", REPO_NAME])
+        log(f"PR #{pull.number} changed from its selected head; marked draft")
+
+
+def _rebuild_or_finish(conn, transport, row, pulls, reason) -> None:
+    if not _request_rebuild(conn, row, pulls, reason):
+        latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                              (row["batch_id"],)).fetchone()
+        _terminal(conn, transport, latest, "no_sources_remain",
+                  "No source PRs remain after rescan: " + reason)
 
 
 def _append_removed(conn: sqlite3.Connection, batch_id: str, removed: list[str],
@@ -2936,7 +2984,33 @@ def _append_removed(conn: sqlite3.Connection, batch_id: str, removed: list[str],
 
 
 def _request_rebuild(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, Any],
-                     pulls: list[PullRequest], reason: str) -> None:
+                     pulls: list[PullRequest], reason: str, *,
+                     only_if_expanded: bool = False) -> bool:
+    row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                       (row["batch_id"],)).fetchone()
+    excluded = {entry["number"] for entry in _excluded_source_heads(row)}
+    pulls = [pull for pull in pulls if pull.number not in excluded]
+    pulls, removed = _recheck_sources(pulls)
+    if removed:
+        _append_removed(conn, str(row["batch_id"]), removed)
+        row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                           (row["batch_id"],)).fetchone()
+    original = _all_batch_pulls(row)
+    seen = {pull.number for pull in original}
+    additions = []
+    if int(row["expansion_count"]) < MAX_BATCH_EXPANSIONS:
+        additions = [pull for pull in select_eligible_pull_requests()
+                     if pull.number not in seen and pull.priority == _batch_priority(row)]
+    if only_if_expanded and not additions and not removed:
+        with conn:
+            conn.execute("UPDATE automerge_batches SET retry_rescan_pending=0 WHERE batch_id=?",
+                         (row["batch_id"],))
+        return False
+    pulls += additions
+    if not pulls:
+        return False
+    if additions:
+        reason += "; added newly ready " + ", ".join(f"#{p.number}" for p in additions)
     pull_lines = "\n".join(f"- PR #{p.number} {p.title} at {p.head_sha}" for p in pulls) or "- no source PRs remain"
     ledger_context = _format_known_failure_prompt(_known_failures_prompt(conn))
     if _batch_ci_mode(row) == "async":
@@ -2945,7 +3019,7 @@ def _request_rebuild(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]
 
 {ledger_context}
 
-Do not use revert commits or reject removed PRs. Preserve prior fixes/conflict resolutions when they still apply. Every commit has trailer `Automerge-Batch: {row['batch_id']}`.
+Do not use revert commits or reject removed PRs. The supervisor marks source PRs draft when their heads change. Preserve prior fixes/conflict resolutions when they still apply. Every commit has trailer `Automerge-Batch: {row['batch_id']}`.
 {_async_test_guidance(str(row['base_sha']))}
 {monitor.CARGO_TEST_ENV_GUIDANCE}
 {FIX_VS_EJECT_GUIDANCE}
@@ -2957,16 +3031,23 @@ Repeat until the local gate passes. Reject only an exact included head proven to
 
 {ledger_context}
 
-Do not use revert commits. Do not reject removed PRs. Keep one integration PR (same branch), update its body and label `{INTEGRATION_LABEL}`, and set its title to `Merge batch: {" ".join(f"#{p.number}" for p in pulls)}`. Preserve conflict-resolution/fix intent. Every commit you create has trailer `Automerge-Batch: {row['batch_id']}`. Run targeted tests using AGENTS.md/ci-impact and CI workflow guidance, including the full selected scope if required. Test the committed tree without temporary source edits or validation shims. After testing, push only `{row['branch']}`; for this rebuild the only permitted force-push is exactly `git push --force-with-lease origin HEAD:refs/heads/{row['branch']}`.
+Do not use revert commits. Do not reject removed PRs. Open or update one integration PR (same branch), update its body and label `{INTEGRATION_LABEL}`, and set its title to `Merge batch: {" ".join(f"#{p.number}" for p in pulls)}`. Preserve conflict-resolution/fix intent. Every commit you create has trailer `Automerge-Batch: {row['batch_id']}`. Run targeted tests using AGENTS.md/ci-impact and CI workflow guidance, including the full selected scope if required. Test the committed tree without temporary source edits or validation shims. After testing, push only `{row['branch']}`; for this rebuild the only permitted force-push is exactly `git push --force-with-lease origin HEAD:refs/heads/{row['branch']}`.
 {monitor.CARGO_TEST_ENV_GUIDANCE}
 {FIX_VS_EJECT_GUIDANCE}
 Do not merge the integration PR. Reason for rebuild: {reason}.
 """
     with conn:
         conn.execute("UPDATE automerge_batches SET active_pull_requests_json=?, ci_head_sha=?, "
+                     "pull_requests_json=?, expansion_count=expansion_count+?, "
+                     "retry_rescan_pending=0, "
                      "phase='fixing', pending_prompt=?, prompt_delivered=0, turn_started_at=NULL "
                      "WHERE batch_id=?", (json.dumps([p.as_json() for p in pulls]),
-                                           row["ci_head_sha"], prompt, row["batch_id"]))
+                                           row["ci_head_sha"], json.dumps([p.as_json() for p in original + additions]),
+                                           int(bool(additions)), prompt, row["batch_id"]))
+    if additions:
+        log(f"batch {row['batch_id']} expansion {int(row['expansion_count']) + 1}/{MAX_BATCH_EXPANSIONS}: "
+            + ", ".join(f"#{p.number}" for p in additions))
+    return True
 
 
 def _queue_master_update(
@@ -3014,6 +3095,9 @@ def _queue_master_update(
         )
     latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                           (row["batch_id"],)).fetchone()
+    if _request_rebuild(conn, latest, _active_sources(latest),
+                        "master advanced; retry with newly ready PRs", only_if_expanded=True):
+        return
     queue_agent_prompt(conn, latest, prompt)
 
 
@@ -3162,17 +3246,13 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
     new_trusted_rejections = _record_trusted_rejection_markers(conn, row)
     row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                        (row["batch_id"],)).fetchone()
-    if new_trusted_rejections:
+    if new_trusted_rejections or row["retry_rescan_pending"]:
         remaining = _active_sources(row)
         _try_post_verdict_status(
             conn, transport, row, tested, "pending",
             "source PR rejected; integration branch must be rebuilt and re-tested",
         )
-        if not remaining:
-            _terminal(conn, transport, row, "no_sources_remain",
-                      "A newly trusted rejection removed the last source PR.")
-            return
-        _request_rebuild(conn, row, remaining,
+        _rebuild_or_finish(conn, transport, row, remaining,
                          "a new trusted rejection marker appeared before landing")
         return
     pulls = _active_sources(row)
@@ -3181,10 +3261,7 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
         _try_post_verdict_status(conn, transport, row, tested, "pending",
                                  "source PR changed; integration branch must be rebuilt and re-tested")
         _append_removed(conn, str(row["batch_id"]), removed, pulls)
-        if not keep:
-            _terminal(conn, transport, row, "no_sources_remain", "Every source PR changed or closed before landing.")
-            return
-        _request_rebuild(conn, row, keep, "source state/head gate changed: " + "; ".join(removed))
+        _rebuild_or_finish(conn, transport, row, keep, "source state/head gate changed: " + "; ".join(removed))
         return
     if not pulls:
         _terminal(conn, transport, row, "empty_batch", "No source PRs remain to land.")
@@ -3339,6 +3416,7 @@ def _direct_premerge_check(
 ) -> tuple[str, dict[str, Any]]:
     """Recheck every state and diff gate before a direct PR can land."""
     view = direct_pull_request_view(pull.number)
+    _draft_changed_source(pull, view)
     state = str(view.get("state") or "").lower()
     if view.get("mergedAt") or state == "merged":
         return "merged", view
@@ -3859,6 +3937,10 @@ def process_batch(conn: sqlite3.Connection, transport: monitor.SlackTransport,
     if phase == "aborting":
         _complete_abort(conn, transport, row)
         return
+    if phase in {"building", "fixing", "waiting_ci"}:
+        # Draft changed heads promptly, without interrupting the agent. Membership
+        # changes are applied at its next completed/interrupted turn or merge gate.
+        _recheck_sources(_active_sources(row))
     if phase == "waiting_ci":
         if _batch_ci_mode(row) == "async":
             if (_async_local_result(str(row["agent_final_message"] or "")) == "pass"
@@ -4053,6 +4135,8 @@ def read_active_batch_for_check() -> dict[str, Any] | None:
             "mode": str(row["ci_mode"]),
             "integration_pr_number": row["integration_pr_number"],
             "session_id": row["session_id"],
+            "expansions": int(row["expansion_count"]) if "expansion_count" in row.keys() else 0,
+            "expansion_limit": MAX_BATCH_EXPANSIONS,
         }
     finally:
         conn.close()

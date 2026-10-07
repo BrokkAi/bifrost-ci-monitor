@@ -281,6 +281,10 @@ def publish_issue(conn, job, index, finding, observations) -> str:
     aggregate = monitor._known_failure_state(conn, "issue_number")
     if "pull_request" in issue or str(number) == aggregate or issue["title"] == monitor.KNOWN_FAILURE_ISSUE_TITLE:
         raise ValueError(f"#{number} is not an individual failure issue")
+    # Pin an existing ticket before commenting too, so a restart keeps the same
+    # publication target even if another component changes a ledger link.
+    with conn:
+        conn.execute("INSERT OR REPLACE INTO triage_publications VALUES (?,?,?)", (job["id"], index, number))
     if marker not in (issue.get("body") or ""):
         comments = gh_api(f"issues/{number}/comments?per_page=100", pages=True)
         if not any(marker in (comment.get("body") or "") for comment in comments):
@@ -319,7 +323,7 @@ def publish(conn, job) -> None:
                                      f"triage_issue_url=COALESCE(?,triage_issue_url),triage_issue_state="
                                      f"CASE WHEN ? IS NULL THEN triage_issue_state ELSE 'OPEN' END,updated_at=? "
                                      f"WHERE {WHERE_KEY}",
-                                     ((finding["diagnosis"] + " Evidence: " + finding["evidence"])[:4000],
+                                     ((finding["diagnosis"] + " Evidence: " + finding["evidence"])[:500],
                                       f"triage session {job['session_id']}", url, url, monitor.utc_now(),
                                       *(o[k] for k in KEY)))
         with conn:

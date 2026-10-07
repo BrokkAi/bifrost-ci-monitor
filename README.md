@@ -240,6 +240,22 @@ starts priority work on the same tick when possible. A priority batch is never
 preempted by another priority PR. Once the supervisor has posted success or
 entered the merge phase, the current batch finishes first.
 
+When an agent turn is interrupted, a source PR is removed, or a retry requires
+rebuilding/retesting, the supervisor rescans for newly ready PRs. Each batch can
+expand **three times**; scans with no additions do not consume an expansion.
+After that its membership can only shrink until it lands. Priority batches
+only admit new priority PRs, and previously removed PRs cannot reenter that
+same batch. The counter and updated membership are committed with the retry
+prompt, so restarting the poller does not reset the limit. `--check` shows the
+counter. A completed, passing tree is not rebuilt just to collect new arrivals.
+
+If a selected source PR's head changes while the batch runs, the supervisor
+marks it **draft**. The author must mark it ready again when finished. The
+agent's current turn continues; removal and any expansion take effect at the
+next attempt. Changed heads are also drafted on the single-PR direct path.
+An interrupted agent turn continues in the same live session with the refreshed
+source list; it is not suspended and restored between attempts.
+
 When exactly one PR is eligible and GitHub compare reports
 `behind_by == 0` against current `master`, the supervisor records a `direct`
 attempt and lands that PR without an Mjolnir session or integration branch.
