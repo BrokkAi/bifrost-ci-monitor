@@ -180,10 +180,49 @@ class IssueFixerTests(TestCase):
         with mock.patch.object(fixer, "api", return_value=[]):
             data = fixer.dossier(self.conn, target, pulls)
         prompt = fixer.build_prompt(job, data)
+        self.assertLessEqual(len(prompt), fixer.MAX_PROMPT_CHARS)
         self.assertLessEqual(len(json.dumps({"prompt": prompt}).encode()), fixer.MAX_PROMPT_BYTES)
         self.assertGreater(data["prs_omitted"], 0)
         self.assertTrue(data["target_issue"]["body"]["truncated"])
         self.assertEqual(data["target_issue"]["number"], 12)
+
+    def oversized_ascii_prompt(self, job):
+        pulls = [dict(pr(n), body="x" * 600) for n in range(80)]
+        with mock.patch.object(fixer, "api", return_value=[]):
+            context = fixer.dossier(self.conn, issue(), pulls)
+        prefix, separator, _ = job["prompt"].rpartition("\n## Issue dossier\n")
+        return prefix + separator + json.dumps(context, separators=(",", ":"))
+
+    def test_ascii_prompt_respects_character_limit_below_the_request_byte_limit(self):
+        job = self.job()
+        oversized = self.oversized_ascii_prompt(job)
+        self.assertGreater(len(oversized), fixer.MAX_PROMPT_CHARS)
+        self.assertLess(len(json.dumps({"prompt": oversized}).encode()), fixer.MAX_PROMPT_BYTES)
+        context = json.loads(oversized.rpartition("\n## Issue dossier\n")[2])
+        prompt = fixer.build_prompt(dict(job), context)
+        self.assertLessEqual(len(prompt), fixer.MAX_PROMPT_CHARS)
+        self.assertGreater(context["prs_omitted"], 0)
+        self.assertEqual(context["target_issue"]["body"]["text"], "Failure evidence")
+
+    def test_launch_compacts_and_persists_an_older_selected_prompt_before_sending(self):
+        job = self.job()
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET prompt=? WHERE id=?",
+                              (self.oversized_ascii_prompt(job), job["id"]))
+        job = self.conn.execute("SELECT * FROM issue_repairs WHERE id=?", (job["id"],)).fetchone()
+        sent = []
+        def mj(args, **kwargs):
+            if args[0] == "sessions":
+                return '{"sessions":[]}'
+            sent.append(Path(args[args.index("--prompt-file") + 1]).read_text())
+            self.assertLessEqual(len(sent[0]), fixer.MAX_PROMPT_CHARS)
+            return '{"session_id":"session"}'
+        with mock.patch.object(monitor, "require_mj_success", side_effect=mj), \
+             mock.patch.object(fixer, "api", return_value=issue()):
+            fixer.launch(self.conn, job)
+        saved = self.conn.execute("SELECT prompt,status FROM issue_repairs").fetchone()
+        self.assertEqual(saved["prompt"], sent[0])
+        self.assertEqual(saved["status"], "running")
 
     def test_launch_checks_ownership_again_and_does_not_start_claimed_issue(self):
         job = self.job()
@@ -192,6 +231,16 @@ class IssueFixerTests(TestCase):
             fixer.launch(self.conn, job)
         self.assertEqual(mj.call_count, 1)
         self.assertEqual(self.conn.execute("SELECT status FROM issue_repairs").fetchone()[0], "cancelled")
+
+    def test_prompt_file_failure_does_not_leave_an_ambiguous_launch(self):
+        job = self.job()
+        with mock.patch.object(monitor, "require_mj_success", return_value='{"sessions":[]}') as mj, \
+             mock.patch.object(fixer, "api", return_value=issue()), \
+             mock.patch.object(fixer.tempfile, "NamedTemporaryFile", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                fixer.launch(self.conn, job)
+        self.assertEqual(mj.call_count, 1)
+        self.assertEqual(self.conn.execute("SELECT status FROM issue_repairs").fetchone()[0], "selected")
 
     def test_retry_launch_checks_out_existing_branch_without_at(self):
         job = self.job(retry=pr(rejected=True))
@@ -208,6 +257,39 @@ class IssueFixerTests(TestCase):
             fixer.launch(self.conn, job)
         self.assertEqual(mj.call_count, 1)
         self.assertEqual(self.conn.execute("SELECT session_id FROM issue_repairs").fetchone()[0], "existing")
+
+    def test_explicit_prompt_rejection_is_retryable_without_waiting_for_a_session(self):
+        for rejection in ["400 Bad Request: prompt must contain 1-65536 characters",
+                          "413 Payload Too Large: body limit exceeded"]:
+            with self.subTest(rejection=rejection):
+                job = self.job(number=12 if rejection.startswith("400") else 13)
+                error = monitor.MjError("mj new --workspace exited 1: Error: the Mjolnir API answered " + rejection)
+                with mock.patch.object(monitor, "require_mj_success", side_effect=['{"sessions":[]}', error]), \
+                     mock.patch.object(fixer, "api", return_value=issue()):
+                    with self.assertRaises(monitor.MjError):
+                        fixer.launch(self.conn, job)
+                saved = self.conn.execute("SELECT * FROM issue_repairs WHERE id=?", (job["id"],)).fetchone()
+                self.assertEqual(saved["status"], "selected")
+                self.assertEqual(saved["last_error"], str(error))
+                with mock.patch.object(monitor, "require_mj_success", side_effect=['{"sessions":[]}', '{"session_id":"session"}']), \
+                     mock.patch.object(fixer, "api", return_value=issue()):
+                    fixer.launch(self.conn, saved)
+                self.assertEqual(self.conn.execute("SELECT status FROM issue_repairs WHERE id=?", (job["id"],)).fetchone()[0], "running")
+
+    def test_ambiguous_launch_keeps_original_error_and_never_recreates(self):
+        job = self.job()
+        error = monitor.MjError("mj new timed out while provisioning", reason="daemon_unreachable")
+        with mock.patch.object(monitor, "require_mj_success", side_effect=['{"sessions":[]}', error]), \
+             mock.patch.object(fixer, "api", return_value=issue()):
+            with self.assertRaises(monitor.MjError):
+                fixer.launch(self.conn, job)
+        saved = self.conn.execute("SELECT * FROM issue_repairs WHERE id=?", (job["id"],)).fetchone()
+        self.assertEqual(saved["status"], "launching")
+        with mock.patch.object(monitor, "require_mj_success", return_value='{"sessions":[]}') as mj:
+            fixer.launch(self.conn, saved)
+        self.assertEqual(mj.call_count, 1)
+        self.assertEqual(mj.call_args.args[0][0], "sessions")
+        self.assertEqual(self.conn.execute("SELECT last_error FROM issue_repairs WHERE id=?", (job["id"],)).fetchone()[0], str(error))
 
     def test_running_session_is_left_live(self):
         job = dict(self.job(), session_id="session")

@@ -52,8 +52,9 @@ of open PRs targeting master. The agent judges PR relevance. A rejection retry
 also includes the merger's rejection evidence. There is no dump of every open
 issue or directive to fix every red test.
 
-Bodies are excerpts with explicit truncation flags. The final JSON-encoded
-prompt is capped at 96 KiB, leaving room within mj's 128 KiB request limit. If
+Bodies are excerpts with explicit truncation flags. The prompt is capped at
+65,536 Unicode characters and its JSON-encoded request at 96 KiB, leaving room
+within mj's 128 KiB request limit. Both independent limits are checked. If
 necessary, general PR inventory entries are omitted first, followed by older
 comments; counts tell the agent what to retrieve with `gh`. Target issue and
 rejection evidence take precedence.
@@ -98,6 +99,10 @@ An ambiguous `mj new` result is reconciled by the job's exact persisted title;
 the poller adopts a matching session instead of starting a duplicate. If it
 remains `launching`, inspect workspace CI before resetting that job to `selected`.
 Never retry creation while the original request may still be provisioning.
+Explicit prompt-validation or request-size rejections return the job to
+`selected` for retry; they do not wait for session discovery. The original error
+is retained while an ambiguous launch is pending. Selected jobs saved by an older
+scheduler are compacted to the current prompt limits before launch.
 
 ## Agent selection
 

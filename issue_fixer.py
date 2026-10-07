@@ -14,6 +14,7 @@ import monitor
 ASSIGNEE = "brokk-service"
 ESCALATION_ASSIGNEE = "DavidBakerEffendi"
 ESCALATION_LABEL = "Escalated"
+MAX_PROMPT_CHARS = 64 * 1024  # mj validates Unicode characters separately from its body limit.
 MAX_PROMPT_BYTES = 96 * 1024  # Leave room in mj's 128 KiB JSON request envelope.
 
 
@@ -266,11 +267,21 @@ Set pr to the integer PR number when submitted or deferred. Before that line you
 may include known-failure diagnoses for this issue using the monitor's format.
 
 ## Issue dossier\n"""
-    # Bound the encoded request, including JSON escaping, before invoking mj.
+    return render_prompt(prompt, context)
+
+
+def prompt_fits(prompt):
+    return (len(prompt) <= MAX_PROMPT_CHARS
+            and len(json.dumps({"prompt": prompt}).encode()) <= MAX_PROMPT_BYTES)
+
+
+def render_prompt(prefix, context):
+    # mj has independent character and encoded-request limits. ASCII evidence
+    # can exceed the former while fitting comfortably inside the latter.
     # Keep the target and rejection evidence; trim the general inventory first.
     while True:
-        rendered = prompt + json.dumps(context, ensure_ascii=False, separators=(",", ":"))
-        if len(json.dumps({"prompt": rendered}).encode()) <= MAX_PROMPT_BYTES:
+        rendered = prefix + json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+        if prompt_fits(rendered):
             return rendered
         if context["open_pr_inventory"]:
             context["open_pr_inventory"].pop()
@@ -284,6 +295,23 @@ may include known-failure diagnoses for this issue using the monitor's format.
             body["truncated"] = True
         else:
             raise ValueError("issue evidence alone exceeds mj prompt budget")
+
+
+def bounded_stored_prompt(prompt):
+    """Apply current limits to a job selected before a scheduler upgrade."""
+    if prompt_fits(prompt):
+        return prompt
+    prefix, separator, context = prompt.rpartition("\n## Issue dossier\n")
+    if not separator:
+        raise ValueError("oversized repair prompt has no issue dossier to compact")
+    return render_prompt(prefix + separator, json.loads(context))
+
+
+def prompt_request_rejected(error):
+    """Only recognize rejections known to happen before session creation."""
+    return bool(re.search(
+        r"the Mjolnir API answered (?:400 Bad Request: prompt must contain\b"
+        r"|413 (?:Payload Too Large|Content Too Large)\b)", str(error)))
 
 
 def create_job(conn, issue, pr, rejection, key, prs, base_sha):
@@ -311,7 +339,11 @@ def launch(conn, job):
         session_id = found["id"]
     else:
         if job["status"] == "launching":
-            raise RuntimeError("mj launch outcome unknown; waiting for session discovery")
+            # Preserve the original error for diagnosis. An absent session is
+            # not enough to retry a request that may still be provisioning.
+            monitor.log(f"issue #{job['issue_number']}: mj launch outcome unknown; "
+                        f"waiting for session discovery (last error: {job['last_error']})")
+            return
         # Recheck immediately before giving an agent this ticket.
         issue = api(f"issues/{job['issue_number']}")
         if not available(issue, own_retry=job["retry_pr_number"] is not None):
@@ -319,10 +351,9 @@ def launch(conn, job):
                 conn.execute("UPDATE issue_repairs SET status='cancelled',finished_at=?,cleanup_done=1 "
                              "WHERE id=?", (monitor.utc_now(), job["id"]))
             return
-        with conn:
-            conn.execute("UPDATE issue_repairs SET status='launching' WHERE id=?", (job["id"],))
+        prompt = bounded_stored_prompt(job["prompt"])
         with tempfile.NamedTemporaryFile(mode="w", suffix=".prompt") as handle:
-            handle.write(job["prompt"])
+            handle.write(prompt)
             handle.flush()
             args = ["new", "--workspace", monitor.MJ_WORKSPACE, "--target", monitor.MJ_TARGET,
                     "--bundle", monitor.MJ_BUNDLE, "--model", monitor.MJ_MODEL,
@@ -333,7 +364,18 @@ def launch(conn, job):
             # remote branch; the prompt verifies its exact rejected head.
             if job["retry_pr_number"] is None:
                 args += ["--at", job["base_sha"]]
-            response = json.loads(monitor.require_mj_success(args, timeout=180))
+            with conn:
+                conn.execute("UPDATE issue_repairs SET status='launching',prompt=? WHERE id=?",
+                             (prompt, job["id"]))
+            try:
+                raw = monitor.require_mj_success(args, timeout=180)
+            except monitor.MjError as exc:
+                status = "selected" if prompt_request_rejected(exc) else "launching"
+                with conn:
+                    conn.execute("UPDATE issue_repairs SET status=?,last_error=? WHERE id=?",
+                                 (status, str(exc), job["id"]))
+                raise
+            response = json.loads(raw)
             session_id = response["session_id"]
     with conn:
         conn.execute("UPDATE issue_repairs SET status='running',session_id=?,last_error=NULL WHERE id=?",
