@@ -8,8 +8,10 @@ is never a repair target. Issues assigned to another person are left to them.
 
 Each session handles only its selected issue. It reads Bifrost's `AGENTS.md`,
 claims the issue with `agent-in-progress`, and posts a MergeMarshall claim comment
-containing its session and branch. GitHub rejects assigning this App bot (403),
-so the user authorized label/comment ownership; bot assignment is not required.
+containing its session and branch. The requested assignee is `brokk-service`.
+The agent checks its assignability and assigns it when repository access permits;
+otherwise the user-authorized label/comment claim suffices. GitHub rejects
+assigning `mergemarshall[bot]` itself, so it is not used as an assignee.
 It refreshes ownership before
 claiming and publishing. On standing down without a submitted repair, it removes
 only its own claim. A failed label/comment claim does not permit work to begin.

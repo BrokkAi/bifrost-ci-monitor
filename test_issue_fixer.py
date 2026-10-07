@@ -21,7 +21,7 @@ def pr(number=30, *, rejected=False, sha="a" * 40):
                 labels=[{"name": "ci-fix"}] + ([{"name": "automerge-rejected"}] if rejected else []))
 
 
-def rejection(sha="a" * 40, login=fixer.ASSIGNEE):
+def rejection(sha="a" * 40, login="mergemarshall[bot]"):
     return dict(user={"login": login}, created_at="2026-10-07T01:00:00Z", id=1,
                 body=f"Broken test: abc\nautomerge-rejected-head: {sha}")
 
@@ -132,11 +132,13 @@ class IssueFixerTests(TestCase):
     def test_prompt_is_one_issue_and_claims_then_rechecks_ownership(self):
         job = self.job()
         prompt = job["prompt"]
-        for text in ["Repair ONLY issue #12", "Read AGENTS.md", "mergemarshall[bot]", "--add-label agent-in-progress",
+        for text in ["Repair ONLY issue #12", "Read AGENTS.md", "brokk-service", "--add-label agent-in-progress",
                      "Recheck ownership before publishing", "When standing down", "No hard runtime limit",
                      "Fixes #12", "Never rebase", "do not\nexpand into repairing every failure"]:
             self.assertIn(text, prompt)
         self.assertNotIn("Classify EACH failing test independently", prompt)
+        self.assertIn("user explicitly permits proceeding with agent-in-progress", prompt)
+        self.assertIn("Do not try assigning mergemarshall[bot]", prompt)
 
     def test_retry_prompt_uses_same_pr_and_draft_before_pushing(self):
         job = self.job(retry=pr(rejected=True))

@@ -11,8 +11,7 @@ import uuid
 import automerge
 import monitor
 
-ASSIGNEE = "mergemarshall[bot]"
-CLAIM_MODE = "comment"
+ASSIGNEE = "brokk-service"
 ESCALATION_ASSIGNEE = "DavidBakerEffendi"
 ESCALATION_LABEL = "Escalated"
 MAX_PROMPT_BYTES = 96 * 1024  # Leave room in mj's 128 KiB JSON request envelope.
@@ -168,14 +167,14 @@ def dossier(conn, issue, prs, *, rejection=None):
 
 def build_prompt(job, context):
     number, branch = job["issue_number"], job["branch"]
-    claim = (f"Assign it to `{ASSIGNEE}` and add `agent-in-progress` with "
-             f"`gh issue edit {number} --repo {monitor.REPO_NAME} --add-assignee '{ASSIGNEE}' --add-label agent-in-progress`. "
-             "Verify BOTH fields in the returned issue; a successful command alone does not prove assignment.")
-    if CLAIM_MODE == "comment":
-        claim = (f"Add `agent-in-progress` with `gh issue edit {number} --repo {monitor.REPO_NAME} "
-                 "--add-label agent-in-progress`. GitHub does not accept this App as an assignee; "
-                 f"the user authorized a label plus the claim comment below as `{ASSIGNEE}`'s ownership record. "
-                 "Do not attempt bot assignment or remove other people's assignments.")
+    claim = (f"The requested assignee is `{ASSIGNEE}`, a normal service account. Check "
+             f"`gh api repos/{monitor.REPO_NAME}/issues/{number}/assignees/{ASSIGNEE}`. "
+             f"If assignable, use `gh issue edit {number} --repo {monitor.REPO_NAME} "
+             f"--add-assignee {ASSIGNEE} --add-label agent-in-progress` and verify both fields. "
+             "If GitHub reports it cannot be assigned (the account may lack repository access), "
+             "the user explicitly permits proceeding with agent-in-progress plus the claim comment below. "
+             f"In that case run `gh issue edit {number} --repo {monitor.REPO_NAME} --add-label agent-in-progress` "
+             "and note the unavailable assignment. Do not try assigning mergemarshall[bot].")
     retry = ""
     if job.get("retry_pr_number"):
         retry = f"""
@@ -224,7 +223,7 @@ exhaust an unproductive investigation or pin a commit before this escalation.
 Explain the conflicting requirements or concrete blocker, evidence, what you tried,
 and the decision or next step needed on THIS issue. Add label `{ESCALATION_LABEL}`
 and assign `{ESCALATION_ASSIGNEE}` (David), then release your own agent-in-progress
-label and MergeMarshall assignment. Verify the handoff on GitHub and report escalated.
+label and `{ASSIGNEE}` assignment. Verify the handoff on GitHub and report escalated.
 This same handoff applies to every escalation path below. If the label does not
 exist, create it with `gh label create {ESCALATION_LABEL} --repo {monitor.REPO_NAME} --color D93F0B --description 'Needs human decision or investigation'`.
 Leave any unfinished PR as a draft when handing work to David.
@@ -255,7 +254,7 @@ and `Fixes #{number}` when the change resolves the ticket. Mark ready only after
 validation; do not push more commits to a ready PR without making it draft first.
 
 When standing down without a submitted repair, remove only YOUR agent-in-progress
-label and MergeMarshall assignment. Leave a useful issue comment. Keep the claim
+label and `{ASSIGNEE}` assignment. Leave a useful issue comment. Keep the claim
 while a submitted PR awaits merge; do not close the issue before the PR lands.
 No hard runtime limit applies. Finish this one issue's work and report the outcome.
 For escalation or a revert, include the Slack mention tokens
