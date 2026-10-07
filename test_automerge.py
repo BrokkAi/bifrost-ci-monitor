@@ -7,7 +7,7 @@ import os
 import sqlite3
 import subprocess
 import tempfile
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -71,6 +71,17 @@ def api_pull(
     }
 
 
+@contextmanager
+def unchanged_queue():
+    """Unchanged GitHub source heads and no arrivals for unrelated phase tests."""
+    with (
+        mock.patch.object(automerge, "_source_pr_state",
+                          side_effect=lambda p: direct_view(head_sha=p.head_sha)),
+        mock.patch.object(automerge, "select_eligible_pull_requests", return_value=[]),
+    ):
+        yield
+
+
 def make_db(
     *,
     phase: str = "building",
@@ -108,6 +119,8 @@ def make_db(
             integration_pr_url TEXT, active_pull_requests_json TEXT,
             ejected_pull_requests_json TEXT NOT NULL DEFAULT '[]',
             excluded_source_heads_json TEXT NOT NULL DEFAULT '[]',
+            expansion_count INTEGER NOT NULL DEFAULT 0,
+            retry_rescan_pending INTEGER NOT NULL DEFAULT 0,
             ci_round INTEGER NOT NULL DEFAULT 0,
             ci_head_sha TEXT, ci_failed_jobs_json TEXT NOT NULL DEFAULT '[]',
             ci_failure_details_json TEXT NOT NULL DEFAULT '{}',
@@ -383,6 +396,7 @@ class IdentityAndPromptTests(TestCase):
         ):
             self.assertIn(expected, prompt)
 
+    @unchanged_queue()
     def test_fix_versus_eject_guidance_is_present_in_mode_and_rebuild_prompts(self):
         pulls = [pull(7), pull(8, HEAD_TWO)]
         prompts = [
@@ -503,6 +517,7 @@ class IdentityAndPromptTests(TestCase):
         ])
         conn.close()
 
+    @unchanged_queue()
     def test_build_turn_discovers_and_persists_integration_pr(self):
         conn = make_db(phase="building")
         row = row_for(conn)
@@ -646,6 +661,7 @@ class CiSupervisionTests(TestCase):
         view.assert_not_called()
         conn.close()
 
+    @unchanged_queue()
     def test_red_ci_is_persisted_and_handed_back_with_both_logs(self):
         conn = make_db(phase="waiting_ci")
         transport = monitor.SlackTransport("webhook", webhook="x")
@@ -936,6 +952,7 @@ class CiSupervisionTests(TestCase):
         gh.assert_not_called()
         conn.close()
 
+    @unchanged_queue()
     def test_fix_round_restart_delivers_prompt_without_resuming(self):
         conn = make_db(phase="fixing")
         with conn:
@@ -955,6 +972,7 @@ class CiSupervisionTests(TestCase):
         self.assertEqual(row_for(conn)["prompt_delivered"], 1)
         conn.close()
 
+    @unchanged_queue()
     def test_supervisor_not_worse_does_not_require_agent_verdict(self):
         conn = make_db(phase="fixing", ci_head_sha=HEAD_ONE)
         final = "CI remains red; test_existing_failure is present on both runs."
@@ -979,6 +997,7 @@ class CiSupervisionTests(TestCase):
         self.assertEqual(row_for(conn)["ci_not_worse"], 1)
         conn.close()
 
+    @unchanged_queue()
     def test_not_worse_claim_with_new_test_in_existing_job_does_not_land(self):
         conn = make_db(phase="fixing", ci_head_sha=HEAD_ONE)
         final = "automerge-verdict: not-worse\nBaseline failures: old_test"
@@ -1323,6 +1342,7 @@ class PublicationGateTests(TestCase):
         complete.assert_called_once()
         conn.close()
 
+    @unchanged_queue()
     def test_async_local_fail_with_ejection_rebuilds_and_does_not_merge(self):
         conn = make_db(phase="building", ci_mode="async", pulls=[pull(7), pull(8, HEAD_TWO)])
         final = ("automerge-local: fail\nTests run: cargo test -p bifrost-core\n"
@@ -1349,6 +1369,7 @@ class PublicationGateTests(TestCase):
                              for call in gh.call_args_list))
         conn.close()
 
+    @unchanged_queue()
     def test_async_source_change_premerge_gate_rebuilds_without_ci(self):
         conn = make_db(phase="merging", ci_mode="async", pulls=[pull(7), pull(8, HEAD_TWO)])
         with conn:
@@ -1381,6 +1402,7 @@ class PublicationGateTests(TestCase):
                              for call in gh.call_args_list))
         conn.close()
 
+    @unchanged_queue()
     def test_async_master_advance_rechecks_locally_without_ci(self):
         conn = make_db(phase="merging", ci_mode="async")
         with conn:
@@ -1431,6 +1453,7 @@ class PublicationGateTests(TestCase):
         terminal.assert_not_called()
         conn.close()
 
+    @unchanged_queue()
     def test_master_advance_queues_merge_and_retest_turn(self):
         conn = make_db(phase="merging")
         row = row_for(conn)
@@ -1454,6 +1477,7 @@ class PublicationGateTests(TestCase):
         self.assertEqual(row_for(conn)["base_sha"], HEAD_TWO)
         conn.close()
 
+    @unchanged_queue()
     def test_github_merge_refusal_after_master_advance_queues_update_and_retest(self):
         conn = make_db(phase="merging")
         view = {"state": "OPEN", "isDraft": False, "baseRefName": "master",
@@ -1513,10 +1537,11 @@ class PublicationGateTests(TestCase):
         ):
             automerge._merge_integration(conn, monitor.SlackTransport("webhook", webhook="x"), row)
         rebuild.assert_called_once()
-        gh.assert_not_called()
+        gh.assert_called_once_with(["pr", "ready", "7", "--undo", "--repo", automerge.REPO_NAME])
         self.assertEqual(post_status.call_args.args[2:4], (HEAD_ONE, "pending"))
         conn.close()
 
+    @unchanged_queue()
     def test_new_trusted_rejection_queues_rebuild_without_rejected_pr(self):
         conn = make_db(phase="merging", pulls=[pull(7), pull(8, HEAD_TWO)])
         view = {"state": "OPEN", "isDraft": False, "baseRefName": "master",
@@ -1587,6 +1612,7 @@ class PublicationGateTests(TestCase):
                              for call in gh.call_args_list))
         conn.close()
 
+    @unchanged_queue()
     def test_ejection_rebuild_prompt_cannot_revert_or_force_push_another_branch(self):
         conn = make_db(phase="fixing", pulls=[pull(7), pull(8, HEAD_TWO)])
         row = row_for(conn)
@@ -1818,6 +1844,7 @@ class PublicationGateTests(TestCase):
         self.assertEqual(row_for(conn)["ci_not_worse"], 0)
         conn.close()
 
+    @unchanged_queue()
     def test_restart_dispatches_each_persisted_phase(self):
         transport = monitor.SlackTransport("webhook", webhook="x")
         for phase, helper in (
@@ -2660,6 +2687,8 @@ class LaunchAndLifecycleTests(TestCase):
             self.assertIn("baseline_dispatch_intent_at", columns)
             self.assertIn("baseline_dispatch_grace_until", columns)
             self.assertIn("excluded_source_heads_json", columns)
+            self.assertEqual(defaults["expansion_count"], "0")
+            self.assertEqual(defaults["retry_rescan_pending"], "0")
             self.assertIn("ci_result_failure_details_json", columns)
             self.assertIn("verdict_status_sha", columns)
             self.assertIn("verdict_status_state", columns)
@@ -2672,6 +2701,7 @@ class LaunchAndLifecycleTests(TestCase):
             self.assertIn("suspend_verify_failures", columns)
             conn.close()
 
+    @unchanged_queue()
     def test_new_batch_persists_ci_mode_and_ignores_later_setting_change(self):
         self.assertEqual(automerge.CI_MODE, "async")
         conn = make_db()
@@ -2732,6 +2762,7 @@ class LaunchAndLifecycleTests(TestCase):
         self.assertEqual(adopted, "adopted-session")
         conn.close()
 
+    @unchanged_queue()
     def test_nonzero_mj_new_is_held_until_grace_then_absence_releases_queue(self):
         conn = make_db(phase="building", session_id=None, status="launching")
         empty_listing = json.dumps({"sessions": []})
@@ -2760,6 +2791,7 @@ class LaunchAndLifecycleTests(TestCase):
         self.assertIsNone(automerge.active_batch(conn))
         conn.close()
 
+    @unchanged_queue()
     def test_failed_session_listing_keeps_launch_attempt_held(self):
         conn = make_db(phase="building", session_id=None, status="launching")
         with conn:

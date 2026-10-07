@@ -2186,7 +2186,7 @@ class KnownFailureLedgerTests(unittest.TestCase):
             make_run(), known_failures_context=context
         )
         self.assertIn("Known failures on master", monitor_prompt)
-        self.assertIn("Focus on new failures", monitor_prompt)
+        self.assertIn("A triage issue documents a failure available for you to repair", monitor_prompt)
 
     def test_known_failures_issue_updates_only_when_rendered_set_changes(self):
         now = monitor.utc_now()

@@ -2457,6 +2457,11 @@ def _wait_agent_turn(conn: sqlite3.Connection, transport: monitor.SlackTransport
     if turn.timed_out:
         return False
     if turn.outcome in {"interrupted", "cancelled", "canceled"}:
+        # The agent may have published a rejection before interruption prevented
+        # its final report. Honor that evidence before choosing retry membership.
+        _record_trusted_rejection_markers(conn, row)
+        row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                           (row["batch_id"],)).fetchone()
         _rebuild_or_finish(conn, transport, row, _active_sources(row),
                            "the agent turn was interrupted; continue in the same live session")
         return False
