@@ -45,6 +45,7 @@ STATE_DIR = monitor.configured_path(
 LOCK_PATH = STATE_DIR / "automerge.lock"
 REJECTED_LABEL = "automerge-rejected"
 INTEGRATION_LABEL = "mergemarshall-batch"
+IN_PROGRESS_LABEL = "mergemarshall:in-progress"
 PRIORITY_LABEL = "mergemarshall-priority"  # Legacy alias for high.
 HIGH_LABELS = frozenset({
     "mergemarshall:high", "mergemarshall-priority:high", PRIORITY_LABEL,
@@ -366,13 +367,13 @@ def enqueue_github_write(conn: sqlite3.Connection, batch_id: str, kind: str,
                          number: int, head_sha: str, payload: dict[str, Any]) -> str:
     """Record a GitHub intent in the caller's transaction, without doing I/O."""
     if kind not in {"reject_head", "draft_changed_head", "clear_rejection_label",
-                    "issue_comment", "integration_metadata", "promote_dependency"}:
+                    "issue_comment", "integration_metadata", "promote_dependency", "membership_label"}:
         raise ValueError("unknown GitHub write intent")
     if type(number) is not int or number <= 0 or not re.fullmatch(r"[0-9a-f]{40}|", head_sha):
         raise ValueError("invalid GitHub write target")
     ensure_github_outbox_schema(conn)
     identity = [batch_id, kind, number, head_sha]
-    if kind in {"issue_comment", "promote_dependency"}:
+    if kind in {"issue_comment", "promote_dependency", "membership_label"}:
         identity.append(payload)
     intent_id = hashlib.sha256(json.dumps(
         identity, sort_keys=True, separators=(",", ":")
@@ -395,6 +396,57 @@ def enqueue_github_write(conn: sqlite3.Connection, batch_id: str, kind: str,
             "WHERE intent_id=? AND delivered_at IS NOT NULL", (intent_id,),
         )
     return intent_id
+
+
+def enqueue_membership_labels(conn: sqlite3.Connection, batch_id: str) -> None:
+    """Checkpoint informational label reconciliation with a membership change."""
+    row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+    if row is None:
+        return
+    live = row["status"] in {"launching", "running", "finishing"} and row["phase"] != "terminal"
+    selected = {(pull.number, pull.head_sha) for pull in row_pulls(row)} if live else set()
+    for pull in _all_batch_pulls(row):
+        enqueue_github_write(conn, batch_id, "membership_label", pull.number, pull.head_sha,
+                             {"selected": (pull.number, pull.head_sha) in selected})
+
+
+def enqueue_active_membership_labels(conn: sqlite3.Connection) -> None:
+    # Adopt batches selected before this feature was deployed. Immutable intents
+    # make subsequent polls/restarts cheap and preserve pending retry backoff.
+    with conn:
+        for row in conn.execute("SELECT batch_id FROM automerge_batches "
+                                "WHERE status IN ('launching','running','finishing')").fetchall():
+            enqueue_membership_labels(conn, str(row["batch_id"]))
+
+
+def _deliver_membership_label(conn: sqlite3.Connection, number: int, detail: dict[str, Any],
+                              current_head: str) -> None:
+    # An old add/remove intent may arrive after removal, abort, or reselection.
+    # Only current durable membership decides the desired PR label.
+    selected = str(detail.get("state") or "").lower() == "open" and any(
+        pull.number == number and pull.head_sha == current_head
+        for batch in conn.execute("SELECT * FROM automerge_batches "
+                                  "WHERE status IN ('launching','running','finishing') "
+                                  "AND phase<>'terminal'")
+        for pull in row_pulls(batch)
+    )
+    present = IN_PROGRESS_LABEL in _labels(detail)
+    if selected and not present:
+        try:
+            label = gh_json(["api", f"repos/{REPO_NAME}/labels/{quote(IN_PROGRESS_LABEL, safe='')}"])
+        except monitor.CommandError as exc:
+            if "HTTP 404" not in str(exc):
+                raise
+            github_api_write("labels", "POST", {
+                "name": IN_PROGRESS_LABEL, "color": "1d76db",
+                "description": "Selected for a MergeMarshall batch",
+            })
+        else:
+            if not isinstance(label, dict) or label.get("name") != IN_PROGRESS_LABEL:
+                raise AutomergeError("GitHub returned invalid membership label", reason="github_invalid_response")
+        github_api_write(f"issues/{number}/labels", "POST", {"labels": [IN_PROGRESS_LABEL]})
+    elif not selected and present:
+        github_api_write(f"issues/{number}/labels/{quote(IN_PROGRESS_LABEL, safe='')}", "DELETE")
 
 
 def github_api_write(endpoint: str, method: str, payload: dict[str, Any] | None = None) -> Any:
@@ -423,7 +475,7 @@ def _trusted_comment(number: int, marker: str) -> bool:
     return False
 
 
-def deliver_github_write(row: sqlite3.Row | dict[str, Any]) -> None:
+def deliver_github_write(row: sqlite3.Row | dict[str, Any], *, conn: sqlite3.Connection | None = None) -> None:
     """Reconcile one App-owned write; safe to repeat after a lost response."""
     kind, number, head = str(row["kind"]), int(row["number"]), str(row["head_sha"])
     payload = json.loads(str(row["payload_json"]))
@@ -456,6 +508,11 @@ def deliver_github_write(row: sqlite3.Row | dict[str, Any]) -> None:
     current_head = str(head_data.get("sha") or "").lower() if isinstance(head_data, dict) else ""
     if not re.fullmatch(r"[0-9a-f]{40}", current_head):
         raise AutomergeError(f"GitHub returned invalid PR #{number} head", reason="github_invalid_response")
+    if kind == "membership_label":
+        if conn is None:
+            raise ValueError("membership labels require current batch state")
+        _deliver_membership_label(conn, number, detail, current_head)
+        return
     if kind == "draft_changed_head":
         if (str(detail.get("state") or "").lower() == "open"
                 and current_head != payload["selected_head"] and not detail.get("draft")):
@@ -509,11 +566,12 @@ def retry_github_outbox(conn: sqlite3.Connection, transport: monitor.SlackTransp
     rows = conn.execute(
         "SELECT * FROM automerge_github_outbox WHERE delivered_at IS NULL AND cancelled_at IS NULL "
         "AND (next_attempt_at IS NULL OR next_attempt_at<=?) "
-        "ORDER BY created_at,intent_id LIMIT ?", (utc_now(), limit),
+        "ORDER BY CASE WHEN kind='membership_label' THEN 1 ELSE 0 END,created_at,intent_id LIMIT ?",
+        (utc_now(), limit),
     ).fetchall()
     for row in rows:
         try:
-            deliver_github_write(row)
+            deliver_github_write(row, conn=conn)
         except (monitor.CommandError, AutomergeError, OSError, ValueError, KeyError) as exc:
             attempts = int(row["attempts"]) + 1
             delay = min(60 * 2 ** min(attempts - 1, 4), GITHUB_WRITE_RETRY_MAX_SECONDS)
@@ -525,7 +583,7 @@ def retry_github_outbox(conn: sqlite3.Connection, transport: monitor.SlackTransp
                     (attempts, retry_at, str(exc)[:1000], row["intent_id"]),
                 )
             log(f"GitHub {row['kind']} for #{row['number']} failed; retry at {retry_at}: {exc}")
-            if attempts >= 3 and not row["alerted_at"]:
+            if attempts >= 3 and not row["alerted_at"] and row["kind"] != "membership_label":
                 try:
                     ok, _ = monitor.slack_send(
                         transport, f":rotating_light: MergeMarshall GitHub write pending for "
@@ -1019,6 +1077,7 @@ def create_batch(
                 direct_head,
             ),
         )
+        enqueue_membership_labels(conn, identifier)
     return identifier
 
 
@@ -2136,6 +2195,7 @@ def _finish_failed_launch(conn: sqlite3.Connection, transport: monitor.SlackTran
     with conn:
         conn.execute("UPDATE automerge_batches SET status = 'failed', terminal_status = ?, "
                      "finished_at = ? WHERE batch_id = ?", (reason, utc_now(), batch_id))
+        enqueue_membership_labels(conn, batch_id)
     notify_blocked_once(conn, transport, batch_id, reason, details)
 
 
@@ -3258,6 +3318,7 @@ def _persist_excluded_source_heads_locked(
          json.dumps([pull.as_json() for pull in active]), json.dumps(ejected),
          int(set(by_key) != previous_keys), row["batch_id"]),
     )
+    enqueue_membership_labels(conn, str(row["batch_id"]))
     return set(by_key) != previous_keys
 
 
@@ -3403,6 +3464,7 @@ def _terminal(conn: sqlite3.Connection, transport: monitor.SlackTransport,
         conn.execute("UPDATE automerge_batches SET status='completed', terminal_status=?, "
                      "phase='terminal', finished_at=? WHERE batch_id=?",
                      (status, utc_now(), row["batch_id"]))
+        enqueue_membership_labels(conn, str(row["batch_id"]))
     latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                           (row["batch_id"],)).fetchone()
     finish_batch(conn, transport, latest)
@@ -3889,6 +3951,7 @@ Do not merge the integration PR. Reason for rebuild: {reason}.
                      "WHERE batch_id=?", (json.dumps([p.as_json() for p in pulls]),
                                            row["ci_head_sha"], json.dumps([p.as_json() for p in original + additions]),
                                            int(bool(additions)), json.dumps(impact), prompt, row["batch_id"]))
+        enqueue_membership_labels(conn, str(row["batch_id"]))
     if additions:
         log(f"batch {row['batch_id']} expansion {int(row['expansion_count']) + 1}/{MAX_BATCH_EXPANSIONS}: "
             + ", ".join(f"#{p.number}" for p in additions))
@@ -4261,6 +4324,7 @@ def _complete_landed_batch(conn: sqlite3.Connection, transport: monitor.SlackTra
                      "terminal_status='merged', integration_merge_commit_sha=COALESCE(?, integration_merge_commit_sha), "
                      "finished_at=? WHERE batch_id=?",
                      (merge_commit_sha, utc_now(), row["batch_id"]))
+        enqueue_membership_labels(conn, str(row["batch_id"]))
     latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                           (row["batch_id"],)).fetchone()
     finish_batch(conn, transport, latest)
@@ -4343,6 +4407,7 @@ def _direct_terminal(
             "terminal_status=?, finished_at=? WHERE batch_id=?",
             (status, utc_now(), row["batch_id"]),
         )
+        enqueue_membership_labels(conn, str(row["batch_id"]))
     latest = conn.execute(
         "SELECT * FROM automerge_batches WHERE batch_id=?", (row["batch_id"],)
     ).fetchone()
@@ -4621,6 +4686,7 @@ def _complete_abort(
             "terminal_status='aborted', finished_at=? WHERE batch_id=?",
             (utc_now(), batch_id),
         )
+        enqueue_membership_labels(conn, batch_id)
     latest = conn.execute(
         "SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,),
     ).fetchone()
@@ -5258,6 +5324,7 @@ def run_automerge() -> int:
                 return 3
             if not ensure_github_auth(conn, transport):
                 return 3
+            enqueue_active_membership_labels(conn)
             retry_github_outbox(conn, transport)
             monitor.update_known_failures(conn, transport)
             check_pending_suspensions(conn, transport)

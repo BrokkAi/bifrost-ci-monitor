@@ -213,6 +213,14 @@ class GithubOutboxTests(TestCase):
     def setUp(self):
         self.conn = make_db()
         self.addCleanup(self.conn.close)
+        # Selection labels have their own regressions; exercise each other
+        # intent with the fixture's informational writes already delivered.
+        with self.conn:
+            self.conn.execute("UPDATE automerge_github_outbox SET delivered_at=? "
+                              "WHERE kind='membership_label'", (automerge.utc_now(),))
+        patcher = mock.patch.object(automerge, "run_gh", side_effect=AssertionError("unexpected external command"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.transport = monitor.SlackTransport("webhook", webhook="x")
 
     def retry_now(self):
@@ -247,14 +255,15 @@ class GithubOutboxTests(TestCase):
                   "head": {"sha": HEAD_ONE}, "labels": labels,
               })):
             automerge.retry_github_outbox(self.conn, self.transport)
-            pending = self.conn.execute("SELECT attempts,delivered_at FROM automerge_github_outbox").fetchone()
+            pending = self.conn.execute("SELECT attempts,delivered_at FROM automerge_github_outbox "
+                                        "WHERE kind='reject_head'").fetchone()
             self.assertEqual(pending["attempts"], 1)
             self.assertIsNone(pending["delivered_at"])
             self.retry_now()
         self.assertEqual(len(comments), 1)
         self.assertEqual(label_calls, 2)
         self.assertIsNotNone(self.conn.execute(
-            "SELECT delivered_at FROM automerge_github_outbox").fetchone()[0])
+            "SELECT delivered_at FROM automerge_github_outbox WHERE kind<>'membership_label'").fetchone()[0])
 
     def test_rejection_does_not_draft_the_rejected_head(self):
         with self.conn:
@@ -271,7 +280,7 @@ class GithubOutboxTests(TestCase):
         gh.assert_not_called()
         self.assertFalse(detail["draft"])
         self.assertIsNotNone(self.conn.execute(
-            "SELECT delivered_at FROM automerge_github_outbox").fetchone()[0])
+            "SELECT delivered_at FROM automerge_github_outbox WHERE kind<>'membership_label'").fetchone()[0])
 
     def test_rejection_does_not_label_a_newer_head(self):
         with self.conn:
@@ -308,7 +317,7 @@ class GithubOutboxTests(TestCase):
         self.assertEqual(calls, 1)
         self.assertEqual(len(comments), 1)
         self.assertIsNotNone(self.conn.execute(
-            "SELECT delivered_at FROM automerge_github_outbox").fetchone()[0])
+            "SELECT delivered_at FROM automerge_github_outbox WHERE kind<>'membership_label'").fetchone()[0])
 
     def test_lost_draft_response_is_reconciled_from_current_pr_state(self):
         with self.conn:
@@ -329,7 +338,7 @@ class GithubOutboxTests(TestCase):
             self.retry_now()
         self.assertEqual(calls, 1)
         self.assertIsNotNone(self.conn.execute(
-            "SELECT delivered_at FROM automerge_github_outbox").fetchone()[0])
+            "SELECT delivered_at FROM automerge_github_outbox WHERE kind<>'membership_label'").fetchone()[0])
 
     def test_integration_metadata_retries_label_without_repeating_accepted_update(self):
         with self.conn:
@@ -341,7 +350,8 @@ class GithubOutboxTests(TestCase):
                 self.conn, "batch-test", "integration_metadata", 211, HEAD_ONE,
                 {"title": "Merge batch: #7 #8", "body": "latest body"},
             )
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM automerge_github_outbox").fetchone()[0], 1)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM automerge_github_outbox "
+                                           "WHERE kind='integration_metadata'").fetchone()[0], 1)
         detail = {"state": "open", "head": {"sha": HEAD_ONE}, "title": "old",
                   "body": "old", "labels": []}
         patches = []
@@ -365,7 +375,7 @@ class GithubOutboxTests(TestCase):
         self.assertEqual(patches, [{"title": "Merge batch: #7 #8", "body": "latest body"}])
         self.assertEqual(label_calls, 2)
         self.assertIsNotNone(self.conn.execute(
-            "SELECT delivered_at FROM automerge_github_outbox").fetchone()[0])
+            "SELECT delivered_at FROM automerge_github_outbox WHERE kind<>'membership_label'").fetchone()[0])
 
 
 class SelectionTests(TestCase):
@@ -1794,7 +1804,8 @@ class PublicationGateTests(TestCase):
             automerge._merge_integration(conn, monitor.SlackTransport("webhook", webhook="x"), row)
         rebuild.assert_called_once()
         self.assertFalse(any(call.args[0][:2] == ["pr", "ready"] for call in gh.call_args_list))
-        intent = conn.execute("SELECT kind,number,head_sha FROM automerge_github_outbox").fetchone()
+        intent = conn.execute("SELECT kind,number,head_sha FROM automerge_github_outbox "
+                              "WHERE kind='draft_changed_head'").fetchone()
         self.assertEqual(tuple(intent), ("draft_changed_head", 7, HEAD_TWO))
         self.assertEqual(post_status.call_args.args[2:4], (HEAD_ONE, "pending"))
         conn.close()
@@ -2533,7 +2544,8 @@ class DirectMergeTests(TestCase):
             automerge.process_batch(
                 conn, monitor.SlackTransport("webhook", webhook="x"), "batch-test",
             )
-        intent = conn.execute("SELECT kind,number,head_sha,payload_json FROM automerge_github_outbox").fetchone()
+        intent = conn.execute("SELECT kind,number,head_sha,payload_json FROM automerge_github_outbox "
+                              "WHERE kind='reject_head'").fetchone()
         self.assertEqual(tuple(intent[:3]), ("reject_head", 7, HEAD_ONE))
         self.assertIn("crate::new_failure", json.loads(intent["payload_json"])["evidence"])
         self.assertFalse(any(args[:2] in (["pr", "comment"], ["pr", "edit"]) for args in calls))
@@ -3187,7 +3199,7 @@ class AbortBatchTests(TestCase):
         with mock.patch.object(automerge, "finish_batch"):
             automerge._complete_abort(conn, monitor.SlackTransport("webhook", webhook="x"), row_for(conn))
         intents = conn.execute("SELECT kind,cancelled_at FROM automerge_github_outbox "
-                               "ORDER BY kind").fetchall()
+                               "WHERE kind<>'membership_label' ORDER BY kind").fetchall()
         self.assertEqual([row["kind"] for row in intents], ["clear_rejection_label", "reject_head"])
         self.assertIsNotNone(intents[1]["cancelled_at"])
         rejected_comment = {"id": 1, "user": {"login": automerge.TRUSTED_REJECTION_LOGIN},

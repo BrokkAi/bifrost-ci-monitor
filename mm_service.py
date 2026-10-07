@@ -68,6 +68,7 @@ def state(conn, batch_id):
         for row in conn.execute(
             "SELECT kind,number,head_sha FROM automerge_github_outbox "
             "WHERE batch_id=? AND delivered_at IS NULL AND cancelled_at IS NULL "
+            "AND kind<>'membership_label' "
             "ORDER BY created_at", (batch_id,)
         )
     ]

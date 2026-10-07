@@ -280,7 +280,8 @@ class StateTests(unittest.TestCase):
                          [{"kind": "reject_head", "number": 7, "head_sha": HEAD_ONE}])
         self.call("exclude", revision=updated["revision"], number=7, head=HEAD_ONE,
                   kind="rejected", reason="isolated failure", evidence="base passes; base plus PR fails")
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM automerge_github_outbox").fetchone()[0], 1)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM automerge_github_outbox "
+                                           "WHERE kind='reject_head'").fetchone()[0], 1)
 
     def test_comment_is_recorded_once_and_does_not_change_batch_revision(self):
         current = self.state()
@@ -290,7 +291,8 @@ class StateTests(unittest.TestCase):
         self.assertEqual(updated["pending_github_writes"][0]["kind"], "issue_comment")
         self.call("comment", revision=current["revision"], number=4519,
                   body="New diagnosis for this batch.")
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM automerge_github_outbox").fetchone()[0], 1)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM automerge_github_outbox "
+                                           "WHERE kind='issue_comment'").fetchone()[0], 1)
 
     def test_cancelled_write_is_not_reported_as_pending(self):
         self.call("comment", revision=self.state()["revision"], number=4519,

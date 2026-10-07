@@ -82,6 +82,15 @@ merge remain synchronous. Fixer tables are
 remain readable. An active legacy invocation blocks new issue repairs until
 it is retired. Never replace or discard the live database to fix scheduling.
 
+The tooling owns `mergemarshall:in-progress` on selected source PRs, including
+batch expansions and direct/operator records. Membership changes checkpoint
+label intents atomically; removal, completion, abort, and failed launches queue
+cleanup. Delivery reconciles against current live membership and the current
+open head, so delayed cleanup cannot untag a reselected PR. The worker creates
+the repository label if absent. This label is informational: failures retain
+backoff/retries without blocking selection, validation, landing, or changing
+agent revisions. These tooling intents are omitted from agent pending writes.
+
 Each entry point takes its own non-blocking file lock. Operator abort and
 fast-track commands wait up to 120 seconds for the merger's same lock.
 Triage publication also coordinates with the fixer lock before deciding
@@ -460,7 +469,7 @@ Slack/GitHub messages without user authorization.
 # Validation
 
 This is a Python repository. Pick the relevant existing modules:
-`test_automerge`, `test_merge_retries`, `test_mm_skills`, `test_issue_fixer`,
+`test_automerge`, `test_merge_retries`, `test_membership_labels`, `test_mm_skills`, `test_issue_fixer`,
 `test_repair_dossier`, `test_triage`, and `test_monitor`. Dependency changes also
 use `test_pr_dependencies`, with temporary Git histories and mocked external
 writes. Never validate scheduling against the live queue. For Python changes,
