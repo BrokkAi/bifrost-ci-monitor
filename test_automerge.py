@@ -3524,6 +3524,17 @@ class KnownFailureBaselineTests(TestCase):
         dispatch.assert_not_called()
         conn.close()
 
+    def test_classified_infrastructure_cannot_authorize_a_product_failure_baseline(self):
+        conn = make_db(phase="waiting_ci", ci_mode="sync")
+        self.add_known_failure(conn, sha=BASE_SHA, job="runner", kind="step", identity="unknown failure")
+        self.add_known_failure(conn, sha=BASE_SHA, job="unit", kind="test", identity="pytest:test_old")
+        conn.execute("UPDATE known_failures SET triage_outcome='infrastructure' WHERE job_name='runner'")
+        baseline = automerge._known_failure_baseline(conn, BASE_SHA)
+        self.assertEqual(baseline.failed_jobs, frozenset({'CI/unit'}))
+        conn.execute("UPDATE known_failures SET status='fixed' WHERE job_name='unit'")
+        self.assertIsNone(automerge._known_failure_baseline(conn, BASE_SHA))
+        conn.close()
+
     def test_sync_baseline_uses_ledger_before_dispatch_after_cancelled_ci(self):
         conn = make_db(phase="waiting_ci", ci_mode="sync")
         row = row_for(conn)
@@ -3544,6 +3555,33 @@ class KnownFailureBaselineTests(TestCase):
 
 
 class MissingFailedJobLogTests(TestCase):
+    def test_runner_loss_partial_output_timeout_and_missing_logs_are_incomplete(self):
+        jobs = {'workflowName': 'CI', 'jobs': [
+            {'name': 'not acquired', 'databaseId': 101, 'conclusion': 'failure', 'steps': []},
+            {'name': 'lost mid-test', 'databaseId': 102, 'conclusion': 'failure', 'steps': [
+                {'name': 'Checkout', 'conclusion': 'success'},
+                {'name': 'Run tests', 'conclusion': None, 'status': 'in_progress'},
+                {'name': 'Upload results', 'conclusion': None, 'status': 'queued'}]},
+            {'name': 'timeout', 'databaseId': 103, 'conclusion': 'timed_out', 'steps': [
+                {'name': 'Run tests', 'conclusion': 'timed_out'}]},
+            {'name': 'missing logs', 'databaseId': 104, 'conclusion': 'failure', 'steps': [
+                {'name': 'Run tests', 'conclusion': 'failure'}]},
+            {'name': 'completed', 'databaseId': 105, 'conclusion': 'failure', 'steps': [
+                {'name': 'Run tests', 'conclusion': 'failure'},
+                {'name': 'Upload results', 'conclusion': 'success'}]},
+        ]}
+        test_log = 'FAILED tests/test_api.py::test_bad - AssertionError'
+        with mock.patch.object(automerge, 'gh_json', return_value=jobs), mock.patch.object(
+            automerge, 'run_gh', side_effect=[monitor.CommandError('BlobNotFound'), test_log,
+                                            test_log, monitor.CommandError('log expired'), test_log]
+        ):
+            report = automerge.collect_failure_report_for_run(555)
+        self.assertEqual(report.incomplete_jobs, frozenset({
+            'CI/not acquired', 'CI/lost mid-test', 'CI/timeout', 'CI/missing logs'}))
+        self.assertEqual(report.successful_steps['CI/lost mid-test'], frozenset({'Checkout'}))
+        self.assertEqual(report.successful_steps['CI/completed'], frozenset({'Upload results'}))
+        self.assertEqual(report.details['CI/lost mid-test'].tests, frozenset({'pytest:tests/test_api.py::test_bad'}))
+
     def test_missing_log_uses_metadata_steps_and_continues_to_other_jobs(self):
         conn = make_db()
         jobs = {

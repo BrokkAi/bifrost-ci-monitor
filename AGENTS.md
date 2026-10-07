@@ -330,8 +330,13 @@ real matrix values; exclude aggregate `PR verification`. All three jobs use
 shared persisted five-minute upkeep. Process each completed master run once,
 ignore cancelled runs, fetch logs only for failed jobs, and use failed-step
 metadata if logs are unavailable. First backfill is at most five completed
-runs per workflow in the last 24 hours. A later passing job or disappearance
-of the identity closes the row. `known-failure:` text can diagnose only an
+runs per workflow in the last 24 hours. A later passing job closes its rows.
+Within a red job, retire an absent identity only when its recorded failed
+steps passed, or completed test results from those steps establish its absence.
+`FailureReport.successful_steps` carries per-step passes; `incomplete_jobs`
+marks runner loss/acquisition, unfinished/timed-out steps, or unavailable logs.
+Partial logs can add failures, but cannot prove prior failures disappeared.
+A failure in checkout/build does not resolve unexecuted tests. `known-failure:` text can diagnose only an
 existing observed identity; it never creates evidence.
 
 SQLite is authoritative. The pinned `Known CI failures on master` issue is a
@@ -357,6 +362,15 @@ notice; issue bodies and Slack text are prepared once and cached in
 handled observations in the existing `triage_observations` table. Handled
 infrastructure remains open in the CI ledger until normal completed-run upkeep
 observes recovery; it is never treated as resolved merely because it was reported.
+Persist the accepted classification in the additive `known_failures.triage_outcome`
+column. Keep it only for the same open commit/failed-step observation; reset
+on changed SHA, changed steps, or reopening. On upgrade, triage backfills matching
+open observations from explicit outcomes in completed cached reports, once,
+without investigation or publication. Do not infer infrastructure from old
+unclassified reports. Merger prompts label infrastructure as diagnostic only:
+never reproduce/repair it, reject a source PR for it, or treat it as a product-test
+baseline. Exclude classified infrastructure from the sync ledger-baseline fallback;
+the sync CI failure state machine itself still needs separate infrastructure handling.
 Publication outages leave the cached report available for later polls without
 occupying the investigation slot or allowing duplicate investigation of its
 captured fingerprints. Accepted findings are checkpointed independently so a

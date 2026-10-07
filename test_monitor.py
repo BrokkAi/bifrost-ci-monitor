@@ -2082,6 +2082,99 @@ class KnownFailureLedgerTests(unittest.TestCase):
         row = self.conn.execute("SELECT status,last_seen_sha FROM known_failures").fetchone()
         self.assertEqual(tuple(row), ("open", "a" * 40))
 
+    def test_interrupted_and_unrelated_failed_steps_do_not_clear_prior_tests(self):
+        import automerge
+
+        old = "pytest:tests/test_api.py::test_old"
+        initial = automerge.FailureReport(frozenset({"CI/unit"}), {
+            "CI/unit": automerge.FailedJobDetails(frozenset({"Run tests"}), frozenset({old}))
+        }, "failed tests")
+        with mock.patch.object(automerge, "collect_failure_report_for_run", return_value=initial):
+            monitor._process_known_failure_run(self.conn, "CI", self.run_item(101, "a" * 40))
+
+        reports = [
+            # Runner acquisition/loss: no test result.
+            automerge.FailureReport(frozenset({"CI/unit"}), {
+                "CI/unit": automerge.FailedJobDetails()
+            }, "", incomplete_jobs=frozenset({"CI/unit"})),
+            # Partial output contains a different failing test, then the runner dies.
+            automerge.FailureReport(frozenset({"CI/unit"}), {
+                "CI/unit": automerge.FailedJobDetails(frozenset({"Run tests"}),
+                    frozenset({"pytest:tests/test_api.py::test_new"}))
+            }, "partial tests", incomplete_jobs=frozenset({"CI/unit"})),
+            # The job fails in checkout before the test step executes.
+            automerge.FailureReport(frozenset({"CI/unit"}), {
+                "CI/unit": automerge.FailedJobDetails(frozenset({"Checkout"}))
+            }, "checkout error"),
+            # Concluded failure with unavailable logs cannot show an old test passed.
+            automerge.FailureReport(frozenset({"CI/unit"}), {
+                "CI/unit": automerge.FailedJobDetails(frozenset({"Run tests"}))
+            }, "", incomplete_jobs=frozenset({"CI/unit"})),
+        ]
+        for index, report in enumerate(reports, start=102):
+            with self.subTest(run=index), mock.patch.object(
+                automerge, "collect_failure_report_for_run", return_value=report
+            ):
+                monitor._process_known_failure_run(self.conn, "CI", self.run_item(index, "b" * 40))
+                row = self.conn.execute("SELECT status,last_seen_sha,last_seen_run_id,fixed_at "
+                                        "FROM known_failures WHERE identity=?", (old,)).fetchone()
+                self.assertEqual(tuple(row), ("open", "a" * 40, 101, None))
+
+    def test_completed_test_results_retire_absent_same_step_failures(self):
+        import automerge
+
+        old = "pytest:tests/test_api.py::test_old"
+        new = "pytest:tests/test_api.py::test_new"
+        for run_id, identity in [(101, old), (102, new)]:
+            report = automerge.FailureReport(frozenset({"CI/unit"}), {
+                "CI/unit": automerge.FailedJobDetails(frozenset({"Run tests"}), frozenset({identity}))
+            }, "completed test results")
+            with mock.patch.object(automerge, "collect_failure_report_for_run", return_value=report):
+                monitor._process_known_failure_run(self.conn, "CI", self.run_item(run_id, "a" * 40))
+        rows = {r['identity']: r['status'] for r in self.conn.execute('SELECT * FROM known_failures')}
+        self.assertEqual(rows, {old: 'fixed', new: 'open'})
+
+    def test_passing_step_is_recovery_evidence_even_when_later_step_is_interrupted(self):
+        import automerge
+
+        report = automerge.FailureReport(frozenset({"CI/unit"}), {
+            "CI/unit": automerge.FailedJobDetails(frozenset({"Run tests"}), frozenset({"pytest:test_old"}))
+        }, "tests failed")
+        with mock.patch.object(automerge, "collect_failure_report_for_run", return_value=report):
+            monitor._process_known_failure_run(self.conn, "CI", self.run_item(101, "a" * 40))
+        interrupted = automerge.FailureReport(frozenset({"CI/unit"}), {
+            "CI/unit": automerge.FailedJobDetails()
+        }, "", successful_steps={"CI/unit": frozenset({"Run tests"})},
+            incomplete_jobs=frozenset({"CI/unit"}))
+        with mock.patch.object(automerge, "collect_failure_report_for_run", return_value=interrupted):
+            monitor._process_known_failure_run(self.conn, "CI", self.run_item(102, "b" * 40))
+        row = self.conn.execute("SELECT status FROM known_failures WHERE identity='pytest:test_old'").fetchone()
+        self.assertEqual(row['status'], 'fixed')
+
+    def test_infrastructure_classification_is_scoped_to_the_observation(self):
+        import automerge
+
+        report = automerge.FailureReport(frozenset({"CI/unit"}), {
+            "CI/unit": automerge.FailedJobDetails(frozenset({"Run tests"}))
+        }, "")
+        with mock.patch.object(automerge, "collect_failure_report_for_run", return_value=report):
+            monitor._process_known_failure_run(self.conn, "CI", self.run_item(101, "a" * 40))
+            self.conn.execute("UPDATE known_failures SET triage_outcome='infrastructure',diagnosis='Spot interruption',"
+                              "diagnosis_source='triage'")
+            monitor._process_known_failure_run(self.conn, "CI", self.run_item(102, "a" * 40))
+            self.assertEqual(self.conn.execute('SELECT triage_outcome FROM known_failures').fetchone()[0], 'infrastructure')
+            monitor._process_known_failure_run(self.conn, "CI", self.run_item(103, "b" * 40))
+            self.assertIsNone(self.conn.execute('SELECT triage_outcome FROM known_failures').fetchone()[0])
+            self.assertEqual(tuple(self.conn.execute('SELECT diagnosis,diagnosis_source FROM known_failures').fetchone()),
+                             (None, None))
+            self.conn.execute("UPDATE known_failures SET triage_outcome='infrastructure',"
+                              "last_seen_failed_steps_json='[\"Run tests\",\"Upload results\"]'")
+            monitor._process_known_failure_run(self.conn, "CI", self.run_item(104, "b" * 40))
+            self.assertIsNone(self.conn.execute('SELECT triage_outcome FROM known_failures').fetchone()[0])
+            self.conn.execute("UPDATE known_failures SET triage_outcome='infrastructure',status='fixed'")
+            monitor._process_known_failure_run(self.conn, "CI", self.run_item(105, "b" * 40))
+            self.assertIsNone(self.conn.execute('SELECT triage_outcome FROM known_failures').fetchone()[0])
+
     def test_upkeep_five_minute_guard_is_shared_across_connections(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "activity.db"

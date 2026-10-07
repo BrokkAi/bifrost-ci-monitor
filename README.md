@@ -141,6 +141,9 @@ product tickets. Notices include the observed failure, uncertainty, and run
 links. Flaky product tests still create repair tickets. Failed Slack/GitHub
 publication retries the prepared result from SQLite on the next poll without
 another investigation; unrelated triage and repair work can continue.
+An interrupted job preserves earlier product failures until completed results
+show recovery. Merge agents see classified infrastructure as diagnostic context,
+so expected Spot preemption does not become a code repair task.
 
 For RunsOn incidents, inspect `/aws/ecs/runs-on/runs-on-worker` in the CI AWS
 account's `us-east-1` CloudWatch logs, filtering by job ID and failure time.
