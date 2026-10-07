@@ -267,8 +267,15 @@ useful local checks and expand testing when failures or specific unresolved
 concerns warrant it. A `full` result does not require the full CI suite locally.
 The agent uses Bifrost's AGENTS and workflow definitions for commands and
 environment conventions, without rerunning ci-impact. Run chosen checks, then
-rerun failures at the exact base to establish baseline evidence. Do not use
-temporary source edits, validation shims, or a different tree as proof. A
+rerun failures observed in the candidate at the exact base to establish baseline
+evidence. Do not reproduce passing tests or ledger failures absent from the
+candidate to prove historical breakage. Baseline summaries include only candidate
+failures reproduced at base; repaired tests belong in fix notes. Workflow
+definitions are command references, not a local checklist. Before an additional
+check, name the unresolved concern and how it will resolve it. Broad checks may
+cover broad concerns; when selected checks satisfy the gate, proceed to the
+mode's publication/reporting step without exhausting the workflow inventory.
+Do not use temporary source edits, validation shims, or a different tree as proof. A
 baseline build failure can block dependent checks; report those as blocked
 and run unaffected checks. No local test command registry is implemented.
 
