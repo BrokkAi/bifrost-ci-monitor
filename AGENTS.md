@@ -116,6 +116,15 @@ Manual abort and immediate-priority preemption deliberately interrupt work.
 After a verified terminal outcome, checkpoint/suspend through the existing
 cleanup path; supervision errors leave sessions available for later polls.
 
+Integration launch prompts establish sole ownership of the session checkout and
+branch. Agents keep a private progress note in the Git directory with pending
+work, decisions, test evidence, and the next action. After compaction, reconcile
+that note once with HEAD, working-tree status, batch revision, and running
+commands; continue when they match. Reopen decisions or repeat completed checks
+only for changed inputs, missing evidence, or contradictory evidence. The
+supervisor retains final master/source freshness checks and required update
+instructions; recovery does not weaken validation or publication gates.
+
 Persist the exact launch title/intent before a request may create a session.
 On an ambiguous result, list the CI workspace and adopt the matching title;
 never duplicate a session because creation timed out or a response was lost.

@@ -72,6 +72,13 @@ GITHUB_WRITE_RETRY_MAX_SECONDS = 10 * 60
 VERDICT_CONTEXT = "mergemarshall/verdict"
 VERDICT_APP_ID = 5203169
 TURN_TICK_SECONDS = 50
+SESSION_RECOVERY_GUIDANCE = """You are the sole writer to this session's checkout and integration branch. Other agents' commits elsewhere do not change your local files. Work against the captured base until the supervisor requests an update. The supervisor owns final master and source-head freshness checks; follow the batch skills, revision checks, and mode-specific validation/publication gates below.
+
+Maintain a short local progress note outside tracked files, at the path returned by `git rev-parse --git-path mergemarshall-progress.md`. Update it at meaningful milestones with current HEAD and pending edits, completed checks and log paths, settled decisions and supporting evidence, unresolved questions, any running command/session ID, and the next concrete action. Keep credentials and connection contents out of it.
+
+After compaction, read that note and perform one brief recovery check: current HEAD, working-tree status, batch revision, and any running command. If they match the recorded state, continue the next action. Uncommitted edits may be your own saved work; preserve them. Investigate a mismatch only far enough to determine what actually changed.
+
+Reopen a settled question or repeat a completed check only when relevant inputs changed, evidence is missing, or new evidence contradicts the conclusion. State that trigger before reinvestigating. Compaction alone calls for recovering recorded evidence, not repeating the investigation. Requirements to reproduce new failures at the exact base and validate changed candidates still apply."""
 SKILLS_GUIDANCE = (
     "Use the installed mm-merge, mm-db, mm-autopr, and mm-compare skills for "
     "batch mechanics. Use mm-db pr/issue for GitHub reads and mm-db exclude/comment "
@@ -1109,6 +1116,8 @@ def build_prompt(
     ledger_context = _format_known_failure_prompt(known_failures_context)
     return f"""You are preparing one integration pull request for {REPO_NAME}. This batch is {batch_id}; your integration branch is {branch}, based at the exact master commit {base_sha}. Do not create or switch branches. Do not push master or any branch other than {branch}.
 
+{SESSION_RECOVERY_GUIDANCE}
+
 {ledger_context}
 
 Process these PRs in the order listed:
@@ -1180,6 +1189,8 @@ def build_async_prompt(
     integration_title = "Merge batch: " + " ".join(f"#{pull.number}" for pull in pulls)
     ledger_context = _format_known_failure_prompt(known_failures_context)
     return f"""You are preparing one integration pull request for {REPO_NAME}. This batch is {batch_id}; your integration branch is {branch}, based at the exact master commit {base_sha}. Do not create or switch branches. Do not push master or any branch other than {branch}.
+
+{SESSION_RECOVERY_GUIDANCE}
 
 {ledger_context}
 
