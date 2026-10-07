@@ -610,6 +610,9 @@ def ensure_known_failure_schema(conn: sqlite3.Connection) -> None:
     )
     ensure_column(conn, "known_failures", "linked_pr_state", "TEXT NOT NULL DEFAULT 'OPEN'")
     ensure_column(conn, "known_failures", "linked_issue_state", "TEXT NOT NULL DEFAULT 'OPEN'")
+    # Triage supplies context, rather than claiming a repair for a human.
+    ensure_column(conn, "known_failures", "triage_issue_url", "TEXT")
+    ensure_column(conn, "known_failures", "triage_issue_state", "TEXT NOT NULL DEFAULT 'OPEN'")
     _migrate_known_failure_job_names(conn)
 
 
@@ -709,6 +712,8 @@ def render_known_failures_prompt(
             item += f"; PR: {row['linked_pr_url']}"
         if row["linked_issue_url"]:
             item += f"; issue: {row['linked_issue_url']}"
+        if row["triage_issue_url"]:
+            item += f"; triage issue (available for repair): {row['triage_issue_url']}"
         lines.append(item)
     if overflow:
         lines.append(f"- {overflow} additional open failures omitted")
@@ -742,6 +747,8 @@ def _known_failure_issue_body(conn: sqlite3.Connection) -> str:
             links.append(f"[PR {cell(row['linked_pr_state'])}]({cell(row['linked_pr_url'])})")
         if row["linked_issue_url"]:
             links.append(f"[issue {cell(row['linked_issue_state'])}]({cell(row['linked_issue_url'])})")
+        if row["triage_issue_url"] and row["triage_issue_url"] != row["linked_issue_url"]:
+            links.append(f"[triage {cell(row['triage_issue_state'])}]({cell(row['triage_issue_url'])})")
         lines.append(
             "| " + " | ".join(cell(value) for value in (
                 row["workflow"], row["job_name"], identity,
@@ -1083,23 +1090,28 @@ def refresh_known_failure_link_states(conn: sqlite3.Connection) -> None:
         "SELECT DISTINCT linked_pr_url AS url,'pr' AS kind FROM known_failures "
         "WHERE status='open' AND linked_pr_url IS NOT NULL UNION "
         "SELECT DISTINCT linked_issue_url AS url,'issue' AS kind FROM known_failures "
-        "WHERE status='open' AND linked_issue_url IS NOT NULL"
+        "WHERE status='open' AND linked_issue_url IS NOT NULL UNION "
+        "SELECT DISTINCT triage_issue_url AS url,'triage' AS kind FROM known_failures "
+        "WHERE status='open' AND triage_issue_url IS NOT NULL"
     ).fetchall()
     for item in rows:
         url = str(item["url"])
         kind = str(item["kind"])
         try:
             data = json.loads(run_gh([
-                kind, "view", url, "--repo", REPO_NAME, "--json", "state",
+                "pr" if kind == "pr" else "issue", "view", url, "--repo", REPO_NAME, "--json", "state",
             ]))
             state = str(data.get("state") or "").upper() if isinstance(data, dict) else ""
-            if state not in {"OPEN", "CLOSED"}:
+            if state not in ({"OPEN", "CLOSED", "MERGED"} if kind == "pr" else {"OPEN", "CLOSED"}):
                 raise CommandError(f"GitHub returned invalid state for linked {kind} {url}")
         except (CommandError, ValueError, TypeError) as exc:
             log(f"could not refresh linked known-failure {kind} state for {url}: {exc}")
             continue
-        column = "linked_pr_state" if kind == "pr" else "linked_issue_state"
-        url_column = "linked_pr_url" if kind == "pr" else "linked_issue_url"
+        column, url_column = {
+            "pr": ("linked_pr_state", "linked_pr_url"),
+            "issue": ("linked_issue_state", "linked_issue_url"),
+            "triage": ("triage_issue_state", "triage_issue_url"),
+        }[kind]
         with conn:
             conn.execute(
                 f"UPDATE known_failures SET {column}=?,updated_at=? WHERE {url_column}=?",
@@ -2188,7 +2200,7 @@ Queued PR metadata (JSON):
     if known_failures_context:
         known_failure_context = f"""
 {known_failures_context}
-These entries are known baseline failures. Focus on new failures. Rows with a linked open PR or issue were omitted because they are already covered; do not re-prove or duplicate that work.
+Use these diagnoses and run evidence to guide the repair. Rows owned by an open repair PR or human escalation were omitted. A triage issue documents a failure available for you to repair; it is not a human-ownership claim. Reuse that issue for findings, escalation, or revert discussion about the same cause.
 """
     return f"""You are triaging a red CI run for {REPO_NAME}. The monitor observed workflow run {run.url} for master commit {run.sha}.
 
@@ -2203,6 +2215,8 @@ Your job is to get master green quickly, not to repair every breaking change her
 - Only when nothing falls under FIX or REVERT, follow BLOCKED REVERT or ESCALATE, covering all remaining failures in one issue.
 
 In your final message, include one line per parser-observed failure you diagnosed using exactly `known-failure: <workflow> | <job> | <test or step> | <one-line diagnosis>`. Do not invent identities; the supervisor stores diagnoses only for parser-observed open ledger rows.
+
+Before any instruction below to file an issue, check the linked triage issues and search existing issues for the same cause. Reuse the matching issue, reopening it if needed and adding your evidence in a comment. Create a new issue only for a distinct cause with no existing ticket. A triage ticket alone does not stop you from fixing or reverting its failure.
 
 Publication steps for FIX and REVERT commits: leave upstream integration to automerge. Push this branch with `git push origin HEAD:refs/heads/{branch}`. Then open one PR with `gh pr create --base master --head {branch} --label ci-fix --title "<short summary>" --body "<details>"`. Use a concise title. The body must include the failing run link ({run.url}), the failing tests, the introducing commit, the classification (FIX or REVERT, or both), and the evidence for the diagnosis and action. Never push to master or force-push. Do not merge the PR yourself.
 

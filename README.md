@@ -39,7 +39,7 @@ it to `False` allows ambient `gh` authentication and logs that fallback
 explicitly. The supervisor caches the token for at most 30 minutes and asks
 Mjolnir for a fresh one after a GitHub 401 response.
 
-Both cron jobs update the shared `known_failures` ledger at most once every
+The fixer, merger, and triage poller update the shared `known_failures` ledger at most once every
 five minutes. It records parser-derived identities from completed master runs
 for CI, Hourly CI, and Nightly CI, marks failures fixed when their job passes or
 their identity disappears, and links monitor repair PRs or escalation issues.
@@ -354,7 +354,7 @@ per-run labels while retaining real matrix values. The aggregate
 cancelled runs are ignored. A later passing job, or a failure
 whose parsed identity no longer appears, closes an open ledger row.
 
-Both cron entry points share a persisted five-minute upkeep guard. They fetch
+All three cron entry points share a persisted five-minute upkeep guard. They fetch
 recent completed runs for CI, Hourly CI, and Nightly CI, and fetch logs only for
 failed jobs. The first backfill is limited to the five newest completed runs
 per workflow from the last 24 hours; older runs are never traversed. If a
@@ -367,6 +367,42 @@ with a one-line diagnosis; a diagnosis is stored only when the corresponding
 identity already exists in the ledger. The bot maintains and pins one issue
 named `Known CI failures on master`; its rendered table is informational and
 is never read back as data.
+
+### Independent failure triage
+
+`triage.py` runs every minute alongside the merger. It reads the shared ledger
+and starts one `mj new` session in `CI`, on the `podman` target with the `bifrost`
+bundle, using `deepseek-flash`, no subagents, **2 CPUs and 4 GiB RAM**. The session
+reads logs, source, history, issues and repair PRs; it does not build or fix code.
+It has no runtime deadline and stays live throughout its investigation.
+
+Up to 40 new observations are grouped into one investigation. An observation is
+identified by workflow, job, failure identity, failed steps and failing commit;
+repeated runs of the same failure on the same commit do not launch more agents.
+Changed commits or failure identities become new work. Diagnoses must distinguish
+evidence from hypotheses. The agent drafts one issue per cause, searches existing
+open and closed issues, and identifies stale failures already fixed on master.
+
+The poller validates the final JSON report, creates or updates `buildfailure`
+issues, reopens matching closed issues, and records their links and diagnoses in
+the ledger. Persisted publication markers recover successful GitHub writes whose
+responses were lost. Failures fixed or superseded during the investigation are
+skipped. Only CI clears a ledger entry; an agent's claim of resolution is context.
+The aggregate known-failures issue remains the generated index.
+
+Triage issue links are separate from human escalation links: a triage ticket does
+not suppress the fixer. The fixer is instructed to reuse it. Publication waits
+for the fixer's lock and any active repair invocation before deciding whether a
+new ticket is needed. A completed triage session is checkpointed for the existing
+archive policy, after its findings have been published.
+
+State lives in the shared SQLite database, in `triage_jobs`,
+`triage_observations` and `triage_publications`. `python3 triage.py --check` shows
+sessions, pending observations and errors without contacting GitHub or mj. An
+ambiguous launch is recovered by its unique session title; it is never blindly
+launched twice. If no matching session was created, an operator can explicitly
+retry with `python3 triage.py --retry-launch <job-id>`. Other API failures retry
+on later polls. Logs use the `bifrost-ci-triage` journal tag on the runner.
 
 ### Async mode
 
