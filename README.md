@@ -1,496 +1,360 @@
-# Bifrost CI Auto-fixer
+# Operating the Bifrost CI monitor and MergeMarshall
 
-`monitor.py` polls the shared failure ledger and runs one issue-scoped repair at
-a time through `issue_fixer.py`. Triage diagnoses failed CI, Hourly CI, and Nightly
-CI runs and creates individual `buildfailure` issues. The fixer selects an open,
-unassigned issue without `agent-in-progress`; the aggregate known-failures issue
-is never a repair target. Issues assigned to another person are left to them.
+This repository runs the merge queue, failure triage, and issue fixer for
+[`BrokkAi/bifrost-dev`](https://github.com/BrokkAi/bifrost-dev). This README is
+the operator runbook. See [docs/ABOUT.md](docs/ABOUT.md) for the feature overview
+and [AGENTS.md](AGENTS.md) for agent-facing implementation contracts.
 
-Each session handles only its selected issue. It reads Bifrost's `AGENTS.md`,
-claims the issue with `agent-in-progress`, and posts a MergeMarshall claim comment
-containing its session and branch. The requested assignee is `brokk-service`.
-The agent checks its assignability and assigns it when repository access permits;
-otherwise the user-authorized label/comment claim suffices. GitHub rejects
-assigning `mergemarshall[bot]` itself, so it is not used as an assignee.
-It refreshes ownership before
-claiming and publishing. On standing down without a submitted repair, it removes
-only its own claim. A failed label/comment claim does not permit work to begin.
+If MergeMarshall is completely stuck, start with
+[emergency merge access](#emergency-merge-access). Recovery can be performed
+from GitHub without a working CI host or Mjolnir daemon.
 
-The agent chooses a straightforward production fix or mechanical test update,
-otherwise reverts the introducing change. If subsequent work makes the revert
-nontrivial, it records the evidence and escalates on the same issue. Unrelated CI
-failures are validation limitations, not extra repair tasks. The agent may also bail
-out on a particularly tricky issue or irreconcilable requirements: it documents
-the blocker, adds `Escalated`, assigns `DavidBakerEffendi`, and releases its own
-claim. Escalated issues are never selected automatically. Fixes go through a
-`ci-fix` PR, with `Fixes #N`, `CI-Repair-Issue: N` and relevant run trailers. The
-agent merges current master before opening/readying the PR, uses draft status
-while working, and never merges its own PR or pushes master.
+## Where it runs
 
-## Rejected repair PRs
+The CI host runs `~/Projects/bifrost-ci-monitor` as its normal login user.
+Cron executes the Python files directly from that checkout:
 
-Each idle poll reads current GitHub candidates and selects one with SQL ordering:
-rejected fixer PRs first, then oldest issue number. There is no stored pending queue.
-The scheduler requires a recorded fixer PR association and a trusted merger
-comment whose `automerge-rejected-head` exactly matches the current PR SHA. A
-stale label or another author's PR does not trigger a retry. Another person's
-assignment prevents a retry, too; the existing MergeMarshall claim is allowed
-only for its own recorded repair.
+| Entry point | Schedule | Purpose | Journal tag |
+| --- | --- | --- | --- |
+| `automerge.py` | Every minute | Supervise and land PR batches | `bifrost-ci-automerge` |
+| `triage.py` | Every minute | Diagnose new master CI failures | `bifrost-ci-triage` |
+| `monitor.py` | Every five minutes | Repair one unclaimed failure issue | `bifrost-ci-monitor` |
 
-The retry receives the same issue, PR, branch, rejected head and rejection
-comments. It checks out the existing branch, makes the PR draft before pushing,
-appends corrections, merges master, validates and readies the same PR. A changed
-head re-enters the merge queue. Each rejected head is handled once; a rejection
-of a later head can launch another repair. This priority does not interrupt an
-already running repair.
-
-## Dossier
-
-The prompt includes the target issue body, recent comments, only that issue's
-linked failure observations and diagnosis provenance, plus a compact inventory
-of open PRs targeting master. The agent judges PR relevance. A rejection retry
-also includes the merger's rejection evidence. There is no dump of every open
-issue or directive to fix every red test.
-
-Bodies are excerpts with explicit truncation flags. The prompt is capped at
-65,536 Unicode characters and its JSON-encoded request at 96 KiB, leaving room
-within mj's 128 KiB request limit. Both independent limits are checked. If
-necessary, general PR inventory entries are omitted first, followed by older
-comments; counts tell the agent what to retrieve with `gh`. Target issue and
-rejection evidence take precedence.
-
-## Lifecycle and inspection
-
-The `issue_repairs` table in `$HOME/Projects/bifrost-ci/activity.db` stores one
-job per issue evidence snapshot or exact rejected PR head, its prompt, branch, session, transcript
-cursor and outcome. Multiple issues from the same CI run can have independent
-sessions. Historical run-wide `invocations` remain readable; they are no longer
-scheduled. A still-active legacy invocation blocks new work until retired.
-
-Repairs use workspace CI, target podman, bundle bifrost, `deepseek-flash`, no
-subagents, 32 CPUs and 28 GiB RAM. New jobs branch from current master; rejection
-retries use the existing PR branch. The session stays live through the work and
-has no wall-clock deadline. Each cron tick observes it without suspending or
-restarting the agent. After the final outcome is captured and the submitted PR
-is verified, the session is checkpointed and suspended. Supervision failures
-are recorded for the next poll, leaving the session intact.
-
-`monitor.py` retains the shared GitHub App authentication, Slack transport,
-ledger and CI helpers used by all three components. Every host-side `gh` call
-uses the installation token from `mj github-token`; sessions use mj's injected
-token. Configuration and data stay on the host; do not commit secrets or DBs.
-The pinned `Known CI failures on master` issue is generated from the SQLite
-ledger. Completed CI or evidence-backed triage can retire the exact failure observation;
-a fixer PR merely links its target issue's observations to proposed work.
-
-With the Slack bot transport, each repair gets a thread and completed agent
-messages are relayed with persisted cursors and stable-ID deduplication. The
-webhook transport gets engagement and outcome messages. See MORNING-SETUP.md.
-
-Inspect current work:
+Each job has its own process lock. Ticks observe existing work rather than
+launching another copy. Agent sessions stay live across ticks and have no
+elapsed-time deadline. A long-running session is not, by itself, stuck.
+Run the host commands below as the cron user, from the checkout:
 
 ```sh
-sqlite3 ~/Projects/bifrost-ci/activity.db \
-  "SELECT issue_number,status,session_id,retry_pr_number,repair_pr_number,last_error
-   FROM issue_repairs ORDER BY created_at DESC LIMIT 10;"
+cd ~/Projects/bifrost-ci-monitor
 ```
 
-An ambiguous `mj new` result is reconciled by the job's exact persisted title;
-the poller adopts a matching session instead of starting a duplicate. If it
-remains `launching`, inspect workspace CI before resetting that job to `selected`.
-Never retry creation while the original request may still be provisioning.
-Explicit prompt-validation or request-size rejections return the job to
-`selected` for retry; they do not wait for session discovery. The original error
-is retained while an ambiguous launch is pending. Selected jobs saved by an older
-scheduler are compacted to the current prompt limits before launch.
+This repository's `master` accepts direct commits and pushes. The protected
+`master` discussed below belongs to **bifrost-dev**, where agent changes land
+through pull requests.
 
-## Agent selection
+## Initial setup
 
-The CI monitor sessions use `--model deepseek-flash --subagents none` and the
-label DeepSeek Flash (mj). Automerge uses `deepseek-flash` too, set separately, with
-`--subagents none` and the label DeepSeek Flash (mj). The executables have
-absolute defaults: `mj` at `$HOME/.cargo/bin/mj` and `gh` at `/usr/bin/gh`.
-Override them with `BIFROST_MJ_BIN` and `BIFROST_GH_BIN`. Both scripts check
-that the required executables exist and are executable at startup, then post a
-once-per-reason blocked notice if one is missing. `BIFROST_CI_MONITOR_STATE`,
-`BIFROST_CI_AUTOMERGE_STATE`, and `BIFROST_CI_CONFIG_DIR` override the state
-and secrets directories, which otherwise live under the current user's home.
+Install Python 3.11 or later, Git, GitHub CLI (`gh`), Mjolnir (`mj`), Podman,
+and SQLite's CLI for inspection/backups. The Python programs use the standard
+library. Configure Mjolnir's `CI` workspace, `podman` target, `bifrost` bundle,
+and `deepseek-flash` profile before enabling cron.
 
-The installed mj must support transcript --finished-only. A transcript error
-is recorded on the active repair for a later retry. Upgrade Mjolnir from
-~/Projects/mjolnir before enabling repair launches.
+Merger/fixer sessions each use 32 CPUs and 28 GiB RAM; triage uses 2 CPUs and
+4 GiB RAM. Provision capacity for overlapping work. The published Mjolnir
+agent-dev image contains the Rust/Node tooling, uv, and Python development
+dependencies. Refresh the host's image cache after an image update:
 
-Runtime state and secrets stay local. Do not commit the Slack webhook, bot
-token, SQLite database, cron output, or session data.
+```sh
+podman pull ghcr.io/brokkai/mjolnir/agent-dev:latest
+```
 
-## Slack setup with the Slack CLI
+Default executable paths are `~/.cargo/bin/mj` and `/usr/bin/gh`. Override
+them in cron and the skill service when installed elsewhere, for example:
 
-The Slack CLI is used to create and install the app. Incoming webhooks are
-channel-bound, so the final channel authorization is performed in Slack app
-settings. Slack CLI has no command that creates or returns a channel-bound
-webhook URL; Slack's supported flow is the Incoming Webhooks channel picker,
-or a custom OAuth flow whose response contains incoming_webhook.url.
+```sh
+export BIFROST_MJ_BIN="$HOME/.cargo/bin/mj"
+export BIFROST_GH_BIN="$HOME/.local/bin/gh"
+```
 
-1. Authenticate the CLI if needed:
+Jobs obtain the MergeMarshall installation token from
+`mj github-token --owner BrokkAi`. Configure that App access in Mjolnir;
+an operator's ambient `gh` login is not the production credential.
+Installed Mjolnir must support `transcript --finished-only`.
 
-       slack auth login --team brokkworkspace
+Create these repository labels: `ci-fix`, `buildfailure`, `agent-in-progress`,
+`Escalated`, `automerge-rejected`, `mergemarshall-batch`, `mergemarshall:high`,
+`mergemarshall:immediate`, and `known-ci-failures`. Jobs do not create labels.
 
-2. Request a Slack service token:
-
-       slack auth token --team brokkworkspace
-
-   Run the displayed /slackauthticket ... command in Slack, approve the
-   modal, and enter the resulting challenge code back into the CLI. Keep the
-   resulting service token private.
-
-3. Create the app from the checked-in manifest:
-
-       export SLACK_SERVICE_TOKEN='paste-the-service-token-locally'
-       manifest=$(python3 -c 'import json; print(json.dumps(open("slack/manifest.json").read()))')
-       slack api apps.manifest.create --token "$SLACK_SERVICE_TOKEN" --json "{\"team_id\":\"T08PB1S0VL2\",\"manifest\":$manifest}"
-
-   The created app is A0BPC1HK4M6. Never commit the service token.
-
-4. Install the app into brokkworkspace:
-
-       slack app install --team T08PB1S0VL2 --app A0BPC1HK4M6 --token "$SLACK_SERVICE_TOKEN"
-
-5. Open settings and add the webhook:
-
-       slack app settings --app A0BPC1HK4M6
-
-   In the app settings, choose Incoming Webhooks, add a webhook to
-   #github-brokk-desktop, and copy the generated URL. The URL is a secret
-   and Slack may revoke it if it is exposed.
-
-6. Store and test the webhook without putting it in Git:
-
-       ./monitor.py --configure-slack
-       ./monitor.py --test-slack
-
-The first command hides the URL while reading it and writes a mode-0600
-file under `$HOME/.config/bifrost-ci-monitor/` by default.
-
-## PR automerge
-
-Automerge agents have four scripted skills, maintained in this repository:
-`mm-merge` attempts an octopus merge of verified source heads, then supports
-manual sequential merges when it fails; `mm-db` reads shared batch state and
-records exact-head exclusions and explicit local test assessments; `mm-autopr`
-pushes the tested branch and reconciles one integration PR through REST;
-`mm-compare` runs a supplied Bash check at two commits in detached worktrees and
-returns raw output diffs and exit codes. Check selection and diagnosis remain
-the agent's responsibility. The CI command registry is deferred.
-
-Install them into enabled Mjolnir profile homes and start the batch state service:
+Install the batch skills and start their user service on the host's private IP:
 
 ```sh
 python3 scripts/install-mm-skills.py --service-listen <host-private-IP>
+systemctl --user status mm-skills.service
 ```
 
-Mjolnir stages those skills into container sessions. The user systemd service
-`mm-skills.service` listens on port 8769 at the specified private interface;
-rootless Podman agents reach it through `host.containers.internal`. The supervisor
-supplies a token scoped to that batch in initial and follow-up prompts. Its key
-is generated mode 0600 under the automerge state directory. Agent updates check
-a state revision; finished batches refuse mutations. The additive
-`automerge_skill_events` table stores assessments, exclusions, and publication
-evidence. Exclusions update the existing supervisor membership immediately;
-publication does not merge or bypass the common landing checks.
+The service listens on port 8769. Container agents reach it through
+`host.containers.internal`; verify that route and restrict access to the
+private host/container network. Pass `--github-cli <absolute-gh-path>` to the
+installer if the service needs a different GitHub CLI path.
 
-Agents, including the CI repair agent, open pull requests instead of pushing
-to master. `automerge.py` batches eligible PRs into one integration PR and
-merges after the selected CI mode's gate and common pre-merge checks pass. Run
-it from cron every minute. It has a separate non-blocking lock and persists its
-phase, mode, integration PR number, and Mjolnir session in its own tables in
-`$HOME/Projects/bifrost-ci/activity.db` by default (`BIFROST_CI_DB` overrides
-the database path). After a restart it reattaches during
-building, CI wait, repair, and merge phases.
+### Slack
 
-`CI_MODE` is a module setting with Bifrost's default set to `"async"`; set it
-to `"sync"` for CI-gated batches. Each batch stores its mode when created and
-keeps it across restarts and later setting changes. Existing batches migrated
-without a mode remain `sync`.
+Create and install the app described by [slack/manifest.json](slack/manifest.json),
+authorize its bot to post, and invite it to the chosen channel. Configure its
+bot token and Slack channel ID, not the channel's display name:
 
-The default queue includes every open, non-draft PR based on `master`, except
-one rejected at its current head. The optional `READY_POLICY="approved"`
-setting also requires an approved review. Integration PRs are excluded from
-the source queue. If any eligible PR has `mergemarshall:high` or
-`mergemarshall:immediate`, the next selection contains only eligible high and
-immediate PRs; all others wait. The `mergemarshall-priority:` prefix is also
-accepted for both tiers, and the legacy `mergemarshall-priority` label counts
-as high. `ci-fix` PRs have no automatic priority. A single up-to-date high or
-immediate PR uses the direct-landing path.
+```sh
+python3 monitor.py --configure-bot
+python3 monitor.py --test-slack
+```
 
-`high` waits for the current batch to finish. `immediate` aborts an active
-batch before publication, even if that batch is already high priority, then
-selects all currently eligible high and immediate PRs. The aborted batch's
-source PRs remain eligible. A batch that has entered the merge phase or posted
-success finishes first.
+Prompts hide the token and store it in mode-0600 files. The bot transport
+provides engagement threads and relays completed agent messages. A legacy
+incoming webhook can instead be configured with `monitor.py --configure-slack`;
+it provides engagement/outcome notices without the threaded transcript.
+After configuration, delivery failures are logged without stopping supervision.
+`--test-slack` sends a real test message.
 
-When an agent turn is interrupted, a source PR is removed, or a retry requires
-rebuilding/retesting, the supervisor rescans for newly ready PRs. Each batch can
-expand **three times**; scans with no additions do not consume an expansion.
-After that its membership can only shrink until it lands. Priority batches
-only admit new priority PRs, and previously removed PRs cannot reenter that
-same batch. The counter and updated membership are committed with the retry
-prompt, so restarting the poller does not reset the limit. `--check` shows the
-counter. A completed, passing tree is not rebuilt just to collect new arrivals.
+### State and scheduling
 
-If a selected source PR's head changes while the batch runs, the supervisor
-marks it **draft**. The author must mark it ready again when finished. The
-agent's current turn continues; removal and any expansion take effect at the
-next attempt. Changed heads are also drafted on the single-PR direct path.
-An interrupted agent turn continues in the same live session with the refreshed
-source list; it is not suspended and restored between attempts.
+| Item | Default path | Override |
+| --- | --- | --- |
+| Shared SQLite database | `~/Projects/bifrost-ci/activity.db` | `BIFROST_CI_DB` |
+| Fixer state and lock | `~/.local/state/bifrost-ci-monitor` | `BIFROST_CI_MONITOR_STATE` |
+| Merger state and lock | `~/.local/state/bifrost-ci-automerge` | `BIFROST_CI_AUTOMERGE_STATE` |
+| Slack configuration | `~/.config/bifrost-ci-monitor` | `BIFROST_CI_CONFIG_DIR` |
 
-When exactly one PR is eligible and GitHub compare reports
-`behind_by == 0` against current `master`, the supervisor records a `direct`
-attempt and lands that PR without an Mjolnir session or integration branch.
-If it is behind, or more than one PR is eligible, the normal batch path runs.
+Triage's lock lives in `bifrost-ci-triage` beside the fixer's state directory.
+Keep databases, tokens, logs, and session data out of Git.
 
-Direct attempts repeat the source state, head, and rejection-marker gates before
-merging. Async mode lands immediately after those checks.
-Sync mode waits for `PR verification` from the exact `.github/workflows/ci.yml`
-`pull_request` run at that head; green lands, and red lands only when the
-supervisor's same-job test and step comparison proves it is no worse than the
-captured master baseline. A worse red result is rejected by the supervisor at
-that exact head with `automerge-rejected-head: <full sha>`, evidence, and the
-`automerge-rejected` label. If master advances before the merge, the direct
-attempt ends without rejecting the PR;
-the next tick sends it through the normal batch path.
+Initialize and inspect the jobs, then install the schedules with `crontab -e`.
+Use absolute executable/checkout paths and the journal tags above. Preserve
+the required environment in each entry. An entry point without an inspection
+flag performs real work.
 
-An operator can fast-track one PR with
-`python automerge.py --land-now <PR-number>`. It waits up to two minutes for
-the cron lock, requires an open, non-draft PR based on master and up to date
-with master, and applies the rejection gate. A PR behind master is refused
-with a prompt to update its branch. The supervisor posts `mergemarshall/verdict`
-success on the exact head with description `fast-track by operator`, then
-merges with `--merge --match-head-commit`. It records a direct batch with
-source `operator` and does not abort or modify a batch already in progress; an
-active batch handles any resulting master movement through its normal update
-path. This operator path does not wait for CI. Slack marks operator
-fast-tracks separately.
+```sh
+python3 monitor.py --init-db
+python3 monitor.py --check
+python3 triage.py --check
+python3 automerge.py --check
+crontab -l
+```
 
-For regular batches, one DeepSeek Flash (`deepseek-flash`, no sub-agents)
-session starts from current master, merges source heads with merge commits,
-resolves conflicts, runs targeted checks using `ci-impact` and repository
-guidance, then opens or updates one integration PR. Its title lists its source
-PRs and it carries the
-`mergemarshall-batch` label.
+`automerge.py --check` (alias `--once`) reports the active batch or next
+selection without changing SQLite, GitHub, or sessions. `triage.py --check`
+shows local jobs without polling GitHub/Mjolnir; it can initialize/migrate
+local schema. `monitor.py --check` checks current CI and prerequisites without
+starting a repair, but can initialize state and send a blocked notice.
 
-Run `python automerge.py --check` (or `--once`) to inspect the next tick's
-selection and plan. It reads queue state and GitHub but does not create a batch,
-remove labels, start Mjolnir, post Slack, or write to GitHub.
+## Monitor and intervene
 
-### Sync mode
+Inspect the batch's Slack thread and integration PR for source PRs, the tested
+head, test evidence, and outcome. The pinned `Known CI failures on master`
+issue is the generated view of unresolved failures; individual `buildfailure`
+issues are repair targets.
 
-The agent session stays live and idle while the supervisor polls `PR verification`
-every minute. It accepts that check only from `.github/workflows/ci.yml` for
-the exact tested head and `pull_request` event, matching the latest attempt's
-check suite. On red, the supervisor sends failed-step logs for the integration
-head and the selected baseline run for the exact batch base back to the same
-session. If the base is a previous integration merge, its final PR CI is used
-only when its tested head and the base have identical Git trees. Otherwise the
-baseline is the newest `ci.yml` run on master for that exact SHA. Pending CI is
-waited on; when CI is missing or cancelled, the supervisor first checks for
-open ledger failures whose last-seen commit is equal to or an ancestor of the
-base. Those parser-derived identities count as baseline evidence. If none
-qualify, CI is dispatched on master only while master still points to the base.
-If master advances, the supervisor asks the agent to merge current master and
-retest before waiting for a baseline on the old base. After dispatch, the supervisor waits on a persisted
-10-minute grace period for the run to appear before retrying. If no baseline
-can be established, the batch stays waiting, sends a top-level Slack alert, and
-retries automatically. Unavailable integration CI run data receives the same
-alert and retry treatment. The
-supervisor compares failed tests and failed steps independently within each
-same failed job against that baseline. The
-agent can append fixes or eject a responsible PR by rebuilding the branch
-without it; ejection never uses a revert commit. Force-push is permitted only
-for rebuilding `mergemarshall/batch-<id>`, using that exact branch ref. Sync batches
-allow at most four CI rounds.
+```sh
+journalctl -t bifrost-ci-automerge -t bifrost-ci-monitor -t bifrost-ci-triage --since '1 hour ago'
+systemctl --user status mm-skills.service
+journalctl --user -u mm-skills.service --since '1 hour ago'
+sqlite3 -readonly "${BIFROST_CI_DB:-$HOME/Projects/bifrost-ci/activity.db}" \
+  'SELECT batch_id,status,phase,ci_mode,integration_pr_number,session_id,
+          github_write_retry_attempts,github_write_retry_after
+   FROM automerge_batches ORDER BY created_at DESC LIMIT 10;'
+sqlite3 -readonly "${BIFROST_CI_DB:-$HOME/Projects/bifrost-ci/activity.db}" \
+  'SELECT issue_number,status,session_id,retry_pr_number,repair_pr_number,last_error
+   FROM issue_repairs ORDER BY created_at DESC LIMIT 10;'
+```
 
-The supervisor decides whether red CI is not worse than the batch base by
-comparing failed jobs, test identities, and failed step names. The agent's
-`automerge-verdict` is advice only. Before merge, the supervisor checks that
-the integration PR is based on current master, every constituent PR is still
-open, non-draft, based on master, and at its tested head, and every recorded
-source head is present while no ejected head remains in the integration tree.
-An excluded head already on current master is accepted as part of that base.
-A confirmed ancestry mismatch rebuilds the integration branch from the selected
-source heads and retests it. If GitHub compare data is unavailable, the merge
-remains pending, a top-level Slack alert is sent, and verification retries on
-the next tick.
-Once all sync gates pass, it posts the required `mergemarshall/verdict` success
-status on the exact CI-tested integration head, then runs
-`gh pr merge <n> --merge --match-head-commit <tested-sha>`. A GitHub refusal
-caused by master advancing returns the status to pending, merges master into
-the batch branch, and requires fresh CI before another success status. The
-supervisor posts pending while CI runs and failure when a batch closes without
-landing. The bot never pushes master.
+The default mode is **async**: integration agents run targeted local tests;
+GitHub CI need not finish before landing. One eligible PR already current with
+master can land directly without an agent or a new local test run. **Sync**
+waits for verified PR CI and permits failures proven no worse than the captured
+master baseline. `CI_MODE` in `automerge.py` controls new batches; existing
+batches retain their recorded mode.
 
-If GitHub refuses the verdict status or merge while the candidate is still
-current, the supervisor leaves the PR open and retries after 1, 2, 4, 8, then
-10 minutes, continuing every 10 minutes until it lands or an operator aborts
-the batch. The first failure sends a top-level Slack alert. A successful merge
-command is confirmed against the PR state before the batch is marked landed.
+### Prioritize, fast-track, or abort
 
-After landing, constituent PR states appear in the single batch summary. The
-bot does not post per-PR warnings for provisional unmerged status: GitHub's
-indirect merge status can lag, and excluded PRs intentionally remain open.
+Apply `mergemarshall:high` to enter the next priority batch after current work
+finishes. `mergemarshall:immediate` aborts active work before landing, then
+selects all eligible high/immediate PRs. A batch already merging or carrying
+a success verdict finishes first. `mergemarshall-priority:high` and
+`mergemarshall-priority:immediate` are aliases; the old
+`mergemarshall-priority` label counts as high. `ci-fix` alone is not priority.
+Draft and rejected heads remain ineligible.
 
-Sync not-worse mode trusts test output produced by PR code, which could fake
-its reported failures. This is accepted while Bifrost PRs are authored by the
-team's agents and people. Strict green-only mode does not have this issue.
+An operator who has reviewed a source PR can fast-track it through the App:
 
-### Known CI failures ledger
+```sh
+python3 automerge.py --land-now <PR-number>
+```
 
-The additive `known_failures` table shares the monitor's SQLite database. Its
-key is workflow, job, and either a deterministic test identity parsed from a
-failed-job log or a failed step name when the log has no parseable test. The
-same parser powers sync not-worse comparisons. Job names omit RunsOn's
-per-run labels while retaining real matrix values. The aggregate
-`PR verification` job is excluded. Each completed master run is recorded once;
-cancelled runs are ignored. A later passing job, or a failure
-whose parsed identity no longer appears, closes an open ledger row.
+The PR must be open, non-draft, unrejected, based on master and current with
+master. This command does not wait for CI or run tests. It waits up to two
+minutes for the cron lock and does not abort an existing batch. It still needs
+the MergeMarshall credential and GitHub merge permission. Current master has
+no special workflow/action-change hold; `--allow-workflow-changes` was removed.
 
-All three cron entry points share a persisted five-minute upkeep guard. They fetch
-recent completed runs for CI, Hourly CI, and Nightly CI, and fetch logs only for
-failed jobs. The first backfill is limited to the five newest completed runs
-per workflow from the last 24 hours; older runs are never traversed. If a
-failed-job log is unavailable, failed-step names from the job metadata still
-enter the ledger and other jobs continue normally. The repair and automerge
-prompts include up to 40 open identities and a count of additional rows. The
-monitor omits rows already linked to an open repair PR or escalation issue.
-Agents may return `known-failure:` lines
-with a one-line diagnosis; a diagnosis is stored only when the corresponding
-identity already exists in the ledger. The bot maintains and pins one issue
-named `Known CI failures on master`; its rendered table is informational and
-is never read back as data.
+To stop a batch and release its source PRs back to the queue:
 
-### Independent failure triage
+```sh
+python3 automerge.py --abort-batch <batch-id> --reason 'Operator intervention: ...'
+```
 
-`triage.py` runs every minute alongside the merger. It reads the shared ledger
-and starts one `mj new` session in `CI`, on the `podman` target with the `bifrost`
-bundle, using `deepseek-flash`, no subagents, **2 CPUs and 4 GiB RAM**. The session
-reads logs, source, history, issues and repair PRs; it does not build or fix code.
-It has no runtime deadline and stays live throughout its investigation.
+Abort interrupts/suspends the agent, closes the integration PR, records a
+failure verdict, and leaves the branch for inspection. It rejects no source
+PRs. For a direct attempt, the source PR stays open.
 
-Up to 40 new observations are grouped into one investigation. An observation is
-identified by workflow, job, failure identity, failed steps and failing commit;
-repeated runs of the same failure on the same commit do not launch more agents.
-Changed commits or failure identities become new work. Diagnoses must distinguish
-evidence from hypotheses. The agent drafts one issue per cause, searches existing
-open and closed issues, and identifies stale failures already fixed on master.
+### Common stalls
 
-The poller validates the final JSON report, creates or updates `buildfailure`
-issues, reopens matching closed issues, and records their links and diagnoses in
-the ledger. Persisted publication markers recover successful GitHub writes whose
-responses were lost. Failures fixed or superseded during the investigation are
-skipped. A resolved finding (`issue: null`, with concrete evidence) retires only
-the captured observation when its commit, failed steps, and run still match.
-The row and diagnosis remain in SQLite as history; the aggregate issue and repair
-prompts show only open rows. A later failed run reopens the row and can trigger
-fresh triage even on the same commit. Completed historical reports are reconciled
-on polling; `python3 triage.py --reconcile-resolved` applies that cleanup and
-refreshes the issue immediately without launching a session.
+| Symptom | Operator action |
+| --- | --- |
+| Verdict or merge write refused | Read the top-level Slack alert and GitHub rules. Retries wait 1, 2, 4, 8, then 10 minutes, continuing every 10 minutes. Repair credentials/rules or use emergency access below. |
+| Missing executable or App token | Check the cron user's paths and Mjolnir App configuration. Keep production jobs on App authentication. |
+| Skill service unreachable | Check its journal, private IP and container route; after correcting the cause, run `systemctl --user restart mm-skills.service`. |
+| Source PR changed during a batch | The changed head is made draft. Finish its update and mark it ready again. |
+| Exact head rejected | Read the bot's evidence and fix the existing branch. A new head can re-enter; removing the label does not establish a fix. |
+| Fixer issue not selected | Check assignment, `agent-in-progress`, and `Escalated`. Respect other people's work; escalations go to `DavidBakerEffendi`. |
+| CI run, baseline, or ancestry lookup unavailable | Read the top-level Slack alert. The batch remains pending and retries automatically; inspect the exact SHA and GitHub availability. |
+| Master advanced or ancestry mismatch confirmed | The agent updates/rebuilds the integration branch and retests before landing. |
+| `launching` job without a session ID | Run `mj sessions --workspace CI --json` and match the persisted title before retrying. A lost response can still mean a session exists. |
 
-Triage issue links are separate from human escalation links: a triage ticket does
-not suppress the fixer. The fixer is instructed to reuse it. Publication waits
-for the fixer's lock and any active repair invocation before deciding whether a
-new ticket is needed. A completed triage session is checkpointed for the existing
-archive policy, after its findings have been published.
+After proving no matching session exists, triage offers
+`python3 triage.py --retry-launch <job-id>`. Fixer has no reset command; state
+repair requires investigating its persisted job and taking the fixer lock.
+Never blindly delete/reset a launching job: that can create duplicate agents.
+Explicit fixer prompt-size rejections already return to a retryable state.
 
-State lives in the shared SQLite database, in `triage_jobs`,
-`triage_observations` and `triage_publications`. `python3 triage.py --check` shows
-sessions, pending observations and errors without contacting GitHub or mj. An
-ambiguous launch is recovered by its unique session title; it is never blindly
-launched twice. If no matching session was created, an operator can explicitly
-retry with `python3 triage.py --retry-launch <job-id>`. Other API failures retry
-on later polls. Logs use the `bifrost-ci-triage` journal tag on the runner.
+## Emergency merge access
 
-### Async mode
+Use this if MergeMarshall or Mjolnir cannot recover and PRs must land. These
+steps change the gate on **BrokkAi/bifrost-dev**, not this repository.
 
-The session runs targeted tests locally, using `AGENTS.md`, `ci-impact`, and
-`.github/workflows` to choose the affected checks. It reruns any failing test at
-the exact batch base in a separate worktree. Failures reproduced at the base
-are baseline; new failures must be fixed or the responsible PR must be removed
-and rejected at its tested head. The final agent message includes
-`automerge-local: pass|fail`, `Tests run: ...`, and
-`Baseline failures: ...`. Only `pass` proceeds to publication.
+### Pause automation and inspect the gate
 
-The supervisor does not wait for or query CI, run baseline workflows, or apply
-the four-round sync limit. It performs the same master-freshness, source state
-and head, and ancestry checks as sync mode. After they pass, it
-posts `mergemarshall/verdict` success on the locally tested head with a description
-such as `async: local targeted tests passed; CI runs after merge`, then merges
-with `--match-head-commit`. The integration PR and master CI run normally after
-merge. If master is red, the agent reruns targeted failures at the batch base
-locally; it does not wait for master CI. Any breakage after merge is handled by
-the existing CI monitor, which opens `ci-fix` PRs for later queue batches. The
-Slack outcome links the integration PR so people can watch its CI.
+On the CI host, save `crontab -l > ~/bifrost-ci-crontab-before-recovery.txt`,
+then use `crontab -e` to comment out only the `automerge.py` entry. Let the
+active poll finish. With the default lock path, wait for it using:
 
-Async mode also trusts test output produced by PR code: a PR could fake its
-local results. This is accepted for Bifrost's current contributors, the team's
-agents and people.
+```sh
+flock -w 120 "${BIFROST_CI_AUTOMERGE_STATE:-$HOME/.local/state/bifrost-ci-automerge}/automerge.lock" true
+```
 
-The desired master ruleset requires a pull request with zero approvals, the
-`mergemarshall/verdict` status from mergemarshall (GitHub App ID 5203169), and an
-up-to-date branch; it blocks force-push and deletion and has no bypass actors.
-People cannot push directly to master or self-merge; changes land through the
-queue. See [the ruleset guide](docs/mergemarshall-ruleset.md). An administrator
-applies it manually with `bash scripts/apply-mergemarshall-ruleset.sh`; inspect the
-JSON without making changes using `bash scripts/apply-mergemarshall-ruleset.sh
---dry-run`. The script is never run by cron or by `automerge.py`.
+Pausing cron does not stop the live agent or remove GitHub's gate. Use
+`--abort-batch` if the supervisor is healthy and its agent should stop. A
+broken host does not prevent recovery on GitHub; review the PR head again
+immediately before merging.
 
-Each agent turn has a one-hour budget. On expiry the supervisor interrupts the
-turn and notifies Slack. Finished messages and the GitHub outcome are reported
-in the batch Slack thread. A failed or ambiguous `mj new` holds the queue until
-the session listing proves the exact-title session is absent.
+Use your own repository-administrator login in GitHub or `gh`. The supervisor
+App cannot administer this recovery. Clear token overrides in the operator
+shell with `unset GH_TOKEN GITHUB_TOKEN` before using your stored personal
+`gh` login. Inspect the rules:
 
-An operator can abort an active integration batch with
-`python automerge.py --abort-batch <batch-id> --reason "<reason>"`. The command
-waits up to two minutes for the same lock used by cron, interrupts and suspends
-its session, posts a failure status on the integration head, and closes the
-integration PR with the reason. It leaves the branch in place, removes any
-rejection labels applied by that batch, rejects no source PRs, and releases the
-queue. The aborted outcome is posted in Slack and retried on later ticks if
-Slack is unavailable.
-For a `direct` record there is no integration PR to close: abort marks the
-attempt, posts failure on its source head, and leaves the source PR open and
-eligible.
+```sh
+gh api repos/BrokkAi/bifrost-dev/rulesets --paginate \
+  --jq '.[] | {id,name,source,enforcement}'
+gh api repos/BrokkAi/bifrost-dev/rulesets/18574277
+```
 
-The supervisor uses the GitHub App token from `mj github-token --owner
-BrokkAi`; sessions receive their own Mjolnir GitHub token, which cannot post
-the required verdict status.
+At writing, **Protect `master`**, ID **18574277**, targets the default branch.
+It requires PRs with zero approvals and the up-to-date `mergemarshall/verdict`
+status from App **5203169**, blocks deletion/force-push, and has no bypass
+actors. Verify its ID and scope before changing it. Read-only credentials may
+omit `bypass_actors`; omission does not prove the list is empty. Organization
+rulesets or classic branch protection can add requirements.
 
-Create these labels in GitHub before enabling the job; the job does not create
-labels:
+### Disable the merge gate
 
-- `ci-fix` — labels CI repair pull requests.
-- `buildfailure` — labels issues filed for blocked or unrevertable failures.
-- `automerge-rejected` — marks a PR rejected at its current head, paired with a
-  trusted bot comment containing `automerge-rejected-head: <full sha>`.
-- `mergemarshall-batch` — marks the integration PR.
-- `mergemarshall:high` — next batch contains only high and immediate PRs.
-- `mergemarshall:immediate` — interrupts an active batch before publication and
-  selects all high and immediate PRs. `mergemarshall-priority:high` and
-  `mergemarshall-priority:immediate` are accepted aliases; the old
-  `mergemarshall-priority` label remains a high alias.
-- `known-ci-failures` — labels the generated master-failure ledger issue.
+An administrator can open
+[bifrost-dev's ruleset settings](https://github.com/BrokkAi/bifrost-dev/settings/rules),
+select **Protect `master`**, remove only `mergemarshall/verdict` from required
+status checks, and save. Keep its PR and deletion/force-push rules. Removing
+the last required check also removes that check rule's up-to-date requirement;
+update the reviewed branch against current master yourself.
 
-## Running and inspecting
+For a complete temporary disable, set that ruleset's enforcement to
+**Disabled** and save. This disables all its rules, including PR and
+deletion/force-push protections. Export or record the original configuration
+first. See GitHub's [ruleset management instructions](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/managing-rulesets-for-a-repository).
+Pausing cron or using `--land-now` alone does not disable GitHub's gate.
 
-    ./monitor.py --check
-    ./monitor.py --init-db
-    sqlite3 "${BIFROST_CI_DB:-$HOME/Projects/bifrost-ci/activity.db}" 'select workflow_run_id,sha,status,exit_code,started_at,finished_at from invocations order by started_at desc;'
-    crontab -l
+### Designate someone else to merge
 
-The installed cron entry uses absolute paths and a non-overlapping process lock.
-Slack delivery is fail-open after configuration: an outage is logged but does
-not stop session supervision.
+Keep the ruleset active and add a recovery actor to its **Bypass list**. To
+designate one person, grant them repository write access, place them in a
+non-secret team, and add that team. A suitable repository role or installed
+GitHub App can also be selected. Choose **For pull requests only** to keep the
+PR trail while permitting bypass of the missing verdict. An assignee/reviewer
+alone has no bypass. See GitHub's [bypass configuration instructions](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository#granting-bypass-permissions-for-your-branch-or-tag-ruleset).
+
+That actor can use the PR interface's bypass option or authenticate the CLI/API
+as themselves. `gh pr merge --admin` requests bypass; it grants no new rights.
+See the [GitHub CLI merge options](https://cli.github.com/manual/gh_pr_merge).
+
+### Create an emergency token or App key
+
+For a person, open GitHub **Settings → Developer settings → Personal access
+tokens → Fine-grained tokens**. Choose resource owner **BrokkAi**, only
+**bifrost-dev**, an expiry, and **Contents: Read and write** plus **Pull
+requests: Read and write** for `gh` PR commands. Obtain required organization
+approval. Add **Administration: Read and write** only if editing rulesets and
+the account has that authority. See GitHub's [merge-token permissions](https://docs.github.com/en/rest/pulls/pulls#fine-grained-access-tokens-for-merge-a-pull-request)
+and [ruleset-update permissions](https://docs.github.com/en/rest/repos/rules#fine-grained-access-tokens-for-update-a-repository-ruleset).
+
+**The token still obeys the ruleset.** Its user needs bypass, or an administrator
+must remove/disable the gate first. A personal status named
+`mergemarshall/verdict` cannot satisfy the App-specific requirement. A writable
+SSH/deploy key authenticates Git, not the PR merge API.
+
+Read the token without echoing it or saving it in shell history. Replace the
+placeholders with the PR number and the full SHA you have reviewed:
+
+```sh
+set +x
+read -r -s -p 'Emergency GitHub token: ' recovery_token
+printf '\n'
+export GH_TOKEN="$recovery_token"
+unset recovery_token
+pr_number='<PR-number>'
+gh pr view "$pr_number" --repo BrokkAi/bifrost-dev \
+  --json state,isDraft,baseRefName,headRefOid,url
+reviewed_head='<full-reviewed-head-SHA>'
+gh pr merge "$pr_number" --repo BrokkAi/bifrost-dev \
+  --merge --match-head-commit "$reviewed_head"
+unset GH_TOKEN
+```
+
+Add `--admin` when exercising configured bypass. For an integration PR, use a
+**merge commit** so source commits remain reachable and their PRs can be marked
+merged. Verify with `gh pr view <PR-number> --repo BrokkAi/bifrost-dev
+--json state,mergeCommit`.
+
+For a separate automation identity, create/install a recovery GitHub App on
+bifrost-dev with Contents and Pull requests write permissions, add it to the
+PR-only bypass list, and generate its private key. The key must mint an
+installation access token; it is not itself a `gh` token. Follow
+[GitHub's installation-token procedure](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app).
+The replacement App also needs bypass or a changed gate: its App ID differs
+from MergeMarshall's. Keep credentials local and revoke emergency access
+after recovery.
+
+### Restore normal operation
+
+Confirm the manual merge and master CI, then restore the original enforcement,
+App-specific required check, and bypass list. Remove temporary bypass entries
+and revoke the emergency token/key. The helper restores normal policy with
+**no bypass actors**:
+
+```sh
+bash scripts/apply-mergemarshall-ruleset.sh --dry-run
+bash scripts/apply-mergemarshall-ruleset.sh
+```
+
+Use administrator authentication. It prints a plan and asks before writing;
+cron never calls it. It replaces the selected ruleset's rules/bypass list, so
+inspect the plan if other policy has been added. Restore the merger cron entry
+with `crontab -e`, run `automerge.py --check`, and watch the next tick reconcile
+PRs that were merged manually.
+
+## Update or recover the host
+
+Use `git pull --ff-only` in the cron checkout. The next tick uses that code;
+there is no monitor daemon to restart. Restart `mm-skills.service` when its
+implementation changes. Preserve credentials, SQLite, and Mjolnir session data
+when replacing a host. Before upgrading or repairing state, take a consistent
+backup:
+
+```sh
+sqlite3 "${BIFROST_CI_DB:-$HOME/Projects/bifrost-ci/activity.db}" \
+  ".backup '$HOME/bifrost-ci-activity-backup.db'"
+```
+
+Restore only with all three cron entries paused and their active polls
+finished. Reconcile preserved sessions and GitHub PRs; deleting the database
+does not stop agents or undo GitHub writes.
 
 ## License
 
 Copyright 2026 Brokk AI. Licensed under the Apache License, Version 2.0.
-See LICENSE.
+See [LICENSE](LICENSE).
