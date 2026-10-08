@@ -6,6 +6,7 @@ from unittest import TestCase, mock
 import issue_fixer as fixer
 import automerge
 import monitor
+import local_findings
 
 
 def issue(number=12, *, assignees=(), progress=False):
@@ -55,6 +56,32 @@ class IssueFixerTests(TestCase):
                                                        issue(3, assignees=[fixer.ASSIGNEE])], []))
         selected = fixer.select_work(self.conn, [issue(2), issue(1)], [])
         self.assertEqual(selected[0]["number"], 1)
+
+    def test_local_finding_repair_link_closure_releases_selection(self):
+        target = issue()
+        with self.conn:
+            finding = local_findings.record(self.conn, 'batch', 'session', 'baseline', 'b' * 40,
+                                            'policy_cli', 'check policy_cli', 'expected 2, got 1', 'now')
+            local_findings.classify(self.conn, finding['id'], 'product', 'exit-code regression',
+                                    target['html_url'])
+            self.conn.execute('UPDATE local_findings SET linked_pr_url=?', (pr()['html_url'],))
+        self.assertIsNone(fixer.select_work(self.conn, [target], []))
+        with mock.patch.object(monitor, 'run_gh', return_value='{"state":"CLOSED"}'):
+            monitor.refresh_known_failure_link_states(self.conn)
+        self.assertIsNotNone(fixer.select_work(self.conn, [target], []))
+
+    def test_local_finding_evidence_is_bounded_in_repair_prompt(self):
+        with self.conn:
+            for number in range(20):
+                finding = local_findings.record(self.conn, 'batch', 'session', 'baseline', 'b' * 40,
+                                                f'test_{number}', 'check tests', 'x' * 12000, 'now')
+                local_findings.classify(self.conn, finding['id'], 'product', 'observed failure',
+                                        issue()['html_url'])
+        job = self.job()
+        self.assertTrue(fixer.prompt_fits(job['prompt']))
+        context = json.loads(job['prompt'].split('## Issue dossier\n', 1)[1])
+        self.assertEqual(len(context['observed_failures']), 20)
+        self.assertTrue(any(row['evidence']['truncated'] for row in context['observed_failures']))
 
     def test_default_open_link_states_without_urls_do_not_claim_the_issue(self):
         row = dict(workflow="CI", job_name="linux", identity_kind="step", identity="test",

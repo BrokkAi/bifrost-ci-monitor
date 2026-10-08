@@ -12,7 +12,7 @@ from unittest import mock
 
 import automerge
 import mm_service
-from test_automerge import make_db, pull, row_for, HEAD_ONE, HEAD_TWO
+from test_automerge import make_db, pull, row_for, BASE_SHA, HEAD_ONE, HEAD_TWO
 
 
 ROOT = Path(__file__).resolve().parent
@@ -227,6 +227,50 @@ class StateTests(unittest.TestCase):
         return self.call("tests", revision=self.state()["revision"], head=HEAD_ONE,
                          verdict="pass", tests="bash /tmp/check.sh", baseline="none")
 
+    def test_local_baseline_finding_preserves_assessment_and_is_idempotent(self):
+        before = self.assessment()
+        payload = dict(revision=before['revision'], kind='baseline', head=BASE_SHA,
+                       identity='policy_cli_test', command='eatmydata cargo nextest run -E test(policy_cli_test)',
+                       evidence='At the captured base: expected exit 2, got 1; log /tmp/base.log.')
+        first = self.call('finding', **payload)
+        second = self.call('finding', **payload)
+        self.assertEqual(first['recorded_finding'], second['recorded_finding'])
+        self.assertEqual(first['revision'], before['revision'])
+        self.assertEqual(first['tests'], before['tests'])
+        self.assertEqual(first['sources'], before['sources'])
+        self.assertEqual(first['pending_github_writes'], [])
+        self.assertEqual(len(self.call('findings')['findings']), 1)
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM known_failures').fetchone()[0], 0)
+        self.assertEqual(row_for(self.conn)['retry_rescan_pending'], 0)
+
+    def test_local_findings_validate_revision_base_and_evidence(self):
+        payload = dict(revision=self.state()['revision'], kind='baseline', head=BASE_SHA,
+                       identity='test_name', command='check test_name', evidence='actual failure')
+        for change, error in [({'revision': 'stale'}, 'stale revision'),
+                              ({'head': HEAD_ONE}, 'captured base'),
+                              ({'kind': 'infrastructure'}, 'baseline or flaky'),
+                              ({'command': ''}, 'command'),
+                              ({'evidence': ''}, 'evidence'),
+                              ({'evidence': 'x' * 12001}, '12000'),
+                              ({'evidence': '\u754c' * 12000}, 'encoded limit')]:
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, error):
+                self.call('finding', **dict(payload, **change))
+        self.assertEqual(self.call('findings')['findings'], [])
+
+    def test_flake_can_be_recorded_after_completion_without_reopening_batch(self):
+        before = self.assessment()
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal'")
+        before = self.state()
+        updated = self.call('finding', revision=before['revision'], kind='flaky', head=HEAD_ONE,
+                            identity='golden_flake', command='check golden_flake',
+                            evidence='Failed once: 836 != 837; passed all three subsequent reruns.')
+        self.assertEqual(updated['revision'], before['revision'])
+        self.assertEqual(updated['phase'], 'terminal')
+        self.assertEqual(updated['tests'], before['tests'])
+        self.assertEqual(updated['local_findings'][0]['kind'], 'flaky')
+        self.assertEqual(updated['local_findings'][0]['head_sha'], HEAD_ONE)
+
     def test_stale_revision_and_wrong_head_exclusions_are_rejected(self):
         revision = self.state()["revision"]
         updated = self.call("exclude", revision=revision, number=7, head=HEAD_ONE,
@@ -418,6 +462,11 @@ class HttpTests(unittest.TestCase):
                                       verdict="pass", tests="bash check.sh", baseline="none")
                 self.assertEqual(client.call("state")["tests"], updated["tests"])
                 self.assertEqual(automerge._async_local_result(db.render_report(updated)), "pass")
+                finding = client.call('finding', revision=updated['revision'], kind='baseline',
+                                      head=BASE_SHA, identity='local_cli_failure', command='check cli',
+                                      evidence='expected status 2, got 1 at captured base')
+                self.assertEqual(finding['revision'], updated['revision'])
+                self.assertEqual(client.call('findings')['findings'][0]['identity'], 'local_cli_failure')
             finally:
                 server.shutdown()
                 server.server_close()

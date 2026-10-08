@@ -10,6 +10,7 @@ import uuid
 
 import automerge
 import monitor
+import local_findings
 
 ASSIGNEE = "brokk-service"
 ESCALATION_ASSIGNEE = "DavidBakerEffendi"
@@ -19,6 +20,7 @@ MAX_PROMPT_BYTES = 96 * 1024  # Leave room in mj's 128 KiB JSON request envelope
 
 
 def ensure_schema(conn):
+    local_findings.ensure_schema(conn)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS issue_repairs (
             id TEXT PRIMARY KEY, work_key TEXT NOT NULL UNIQUE,
@@ -75,7 +77,7 @@ def observations(conn, issue_url):
         "last_seen_run_url,diagnosis,diagnosis_source,triage_issue_url,linked_pr_url,"
         "linked_pr_state,linked_issue_url,linked_issue_state FROM known_failures "
         "WHERE status='open' AND (triage_issue_url=? OR linked_issue_url=?) "
-        "ORDER BY workflow,job_name,identity", (issue_url, issue_url))]
+        "ORDER BY workflow,job_name,identity", (issue_url, issue_url))] + local_findings.observations(conn, issue_url)
 
 
 def initial_work_key(issue, rows):
@@ -144,6 +146,10 @@ def excerpt(text, limit):
 
 def dossier(conn, issue, prs, *, rejection=None):
     comments = api(f"issues/{issue['number']}/comments?per_page=100", pages=True)
+    observed = observations(conn, issue['html_url'])
+    for row in observed:
+        if row.get('local_finding_id'):
+            row['evidence'] = excerpt(row['evidence'], 4000)
     return {
         "generated_at": monitor.utc_now(), "repository": monitor.REPO_NAME,
         "target_issue": {"number": issue["number"], "url": issue["html_url"],
@@ -153,7 +159,7 @@ def dossier(conn, issue, prs, *, rejection=None):
         "recent_comments": [{"url": c.get("html_url"), "author": c["user"]["login"],
                              "body": excerpt(c.get("body"), 1500)} for c in comments[-8:]],
         "comments_omitted": max(0, len(comments) - 8),
-        "observed_failures": observations(conn, issue["html_url"]),
+        "observed_failures": observed,
         "merger_rejection": excerpt(rejection, 8000) if rejection else None,
         # An inventory, not a relevance classifier. The agent evaluates titles
         # and follows promising links before duplicating an existing repair.
@@ -208,7 +214,9 @@ claiming; if another person claimed concurrently, stand down. If claiming fails,
 report blocked and do not start repair work. Recheck ownership before publishing.
 
 Read the dossier below before investigating. It covers this ticket and its linked
-CI observations. Diagnoses are leads: verify their run, commit and current master.
+CI and local test observations. Local findings include their committed tested SHA,
+command and evidence, with no CI run ID. Diagnoses are leads: verify the supplied
+run or local evidence, commit and current master.
 PR inventory entries are not relevance judgments; inspect promising PRs' full
 bodies/diffs/comments. If an existing PR already addresses this issue, report
 deferred with its URL and stand down instead of duplicating it. Excerpts and
@@ -298,6 +306,14 @@ def render_prompt(prefix, context):
             body = context["target_issue"]["body"]
             body["text"] = body["text"][:len(body["text"]) // 2]
             body["truncated"] = True
+        elif any(row.get('local_finding_id') and isinstance(row.get('evidence'), dict)
+                 and len(row['evidence']['text']) > 500 for row in context.get('observed_failures', [])):
+            row = max((row for row in context['observed_failures']
+                       if row.get('local_finding_id') and isinstance(row.get('evidence'), dict)),
+                      key=lambda row: len(row['evidence']['text']))
+            evidence = row['evidence']
+            evidence['text'] = evidence['text'][:len(evidence['text']) // 2]
+            evidence['truncated'] = True
         else:
             raise ValueError("issue evidence alone exceeds mj prompt budget")
 
@@ -490,6 +506,9 @@ def finish(conn, job):
             conn.execute("UPDATE known_failures SET linked_pr_url=?,linked_pr_state=?,updated_at=? "
                          "WHERE status='open' AND triage_issue_url=?",
                          (pr["html_url"], pr_state, monitor.utc_now(), job["issue_url"]))
+            conn.execute("UPDATE local_findings SET linked_pr_url=?,linked_pr_state=? "
+                         "WHERE status='open' AND triage_issue_url=?",
+                         (pr["html_url"], pr_state, job["issue_url"]))
         conn.execute("UPDATE issue_repairs SET status='completed',finished_at=?,repair_pr_number=?,"
                      "repair_pr_url=?,last_error=NULL WHERE id=?",
                      (monitor.utc_now(), owned_pr["number"] if owned_pr else None,

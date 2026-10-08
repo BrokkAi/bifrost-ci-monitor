@@ -15,6 +15,7 @@ import tempfile
 import uuid
 
 import monitor
+import local_findings
 
 LOCK_PATH = monitor.STATE_DIR.parent / "bifrost-ci-triage" / "triage.lock"
 KEY = ("workflow", "job_name", "identity_kind", "identity")
@@ -42,6 +43,7 @@ def lock(path: Path):
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    local_findings.ensure_schema(conn)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS triage_jobs (
             id TEXT PRIMARY KEY, title TEXT NOT NULL, base_sha TEXT NOT NULL,
@@ -95,6 +97,8 @@ def backfill_outcomes(conn) -> None:
 
 
 def fingerprint(row) -> str:
+    if 'local_finding_id' in row.keys():
+        return 'local:' + row['local_finding_id']
     # Repeated hourly runs of the same tree are the same investigation.
     data = [row[k] for k in (*KEY, "last_seen_sha", "last_seen_failed_steps_json")]
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
@@ -107,7 +111,10 @@ def pending(conn) -> list[dict]:
         for o in json.loads(job['observations_json'])}
     rows = conn.execute("SELECT * FROM known_failures WHERE status='open' "
                         "ORDER BY last_seen_at DESC,workflow,job_name,identity").fetchall()
+    rows = sorted([*rows, *local_findings.observations(conn)],
+                  key=lambda row: row['last_seen_at'], reverse=True)
     result = []
+    size = 0
     for row in rows:
         digest = fingerprint(row)
         if digest in claimed:
@@ -115,13 +122,23 @@ def pending(conn) -> list[dict]:
         prior = conn.execute("SELECT resolved_run_id FROM triage_observations WHERE fingerprint=?", (digest,)).fetchone()
         if prior and (prior["resolved_run_id"] is None or prior["resolved_run_id"] == row["last_seen_run_id"]):
             continue
-        result.append(dict(row, failure_id=len(result) + 1, fingerprint=digest))
+        observation = dict(row, failure_id=len(result) + 1, fingerprint=digest)
+        # Local excerpts can be larger than parser-derived CI identities. Keep
+        # each triage prompt inside mj's character and encoded request limits.
+        added_size = len(json.dumps(observation).encode())
+        if result and size + added_size > 48 * 1024:
+            break
+        result.append(observation)
+        size += added_size
         if len(result) == 40:
             break
     return result
 
 
 def current_observation(conn, observation):
+    if observation.get('local_finding_id'):
+        return next((row for row in local_findings.observations(conn)
+                     if row['local_finding_id'] == observation['local_finding_id']), None)
     row = conn.execute(f"SELECT * FROM known_failures WHERE {WHERE_KEY}",
                        tuple(observation[k] for k in KEY)).fetchone()
     return row if row and row["status"] == "open" and fingerprint(row) == observation["fingerprint"] else None
@@ -142,7 +159,7 @@ def gh_api(endpoint: str, *, method: str = "GET", payload=None, pages=False):
 
 
 def build_prompt(job) -> str:
-    return f"""Diagnose master CI failures in {monitor.REPO_NAME}. This is triage job {job['id']}.
+    return f"""Diagnose master CI failures and local merge-test findings in {monitor.REPO_NAME}. This is triage job {job['id']}.
 Your checkout starts at master {job['base_sha']}. You have {CPUS} CPUs and {MEMORY_GIB} GiB RAM.
 Investigate logs, source, history, existing issues and repair PRs. Do not run builds or
 test suites, modify source, commit, push, or write to GitHub or Slack. The supervisor
@@ -155,6 +172,14 @@ it may describe an older failure in the same job. Use exact run URLs, SHAs, erro
 source locations. Distinguish confirmed facts from hypotheses. You can file a useful
 failure ticket without proving the root cause: say what remains unknown and the next
 useful diagnostic step. Avoid prescribing fixes unsupported by the evidence.
+
+Observations with local_finding_id come from a merge agent's committed-tree checks,
+not a CI run. Read their command, evidence, tested SHA, kind and originating batch/
+session. Baseline findings were reproduced at that batch's captured master base;
+flaky findings include intermittent failures and subsequent results. Check current
+master source/history and available results before deciding whether the defect is
+still applicable. A passing rerun alone does not resolve a flaky product test.
+Use the supplied logs/evidence; do not rebuild or rerun tests to investigate them.
 
 Classify each finding's outcome as product, infrastructure, or resolved. Product
 defects include code regressions and flaky product tests. Infrastructure means runner
@@ -316,10 +341,15 @@ def existing_number(url) -> int | None:
 
 
 def issue_body(job, index, finding, observations) -> str:
+    def source(row):
+        if 'local_finding_id' in row.keys():
+            return (f"- Local {row['kind']}: `{row['identity']}` at `{row['last_seen_sha']}`; "
+                    f"command: `{row['command']}`; batch `{row['batch_id']}`, "
+                    f"merge session `{row['session_id']}`.\n\n{row['evidence']}")
+        return (f"- {row['workflow']} / {row['job_name']} / `{row['identity']}`: "
+                f"{row['last_seen_run_url']} (`{row['last_seen_sha']}`)")
     return (finding['issue']['body'] + '\n\n### Triage evidence\n\n' + finding['diagnosis']
-            + '\n\n' + finding['evidence'] + '\n\n' + '\n'.join(
-                f"- {row['workflow']} / {row['job_name']} / `{row['identity']}`: "
-                f"{row['last_seen_run_url']} (`{row['last_seen_sha']}`)" for row in observations)
+            + '\n\n' + finding['evidence'] + '\n\n' + '\n'.join(source(row) for row in observations)
             + f"\n\nTriage session: `{job['session_id']}`.\n\n"
             + f"<!-- mergemarshall-triage:{job['id']}:{index} -->")
 
@@ -386,6 +416,10 @@ def retire_resolved_observation(conn, job, finding, observation) -> bool:
     current = current_observation(conn, observation)
     if current is None or current["last_seen_run_id"] != observation["last_seen_run_id"]:
         return False
+    if observation.get('local_finding_id'):
+        local_findings.classify(conn, observation['local_finding_id'], 'resolved',
+                               finding['diagnosis'] + ' Evidence: ' + finding['evidence'])
+        return True
     now = monitor.utc_now()
     conn.execute(f"UPDATE known_failures SET status='fixed',fixed_at=?,fixed_by_sha=NULL,"
                  f"diagnosis=?,diagnosis_source=?,updated_at=? WHERE {WHERE_KEY}",
@@ -401,7 +435,8 @@ def reconcile_resolved(conn) -> int:
         conn.execute("BEGIN IMMEDIATE")
         jobs = conn.execute("SELECT DISTINCT j.* FROM triage_jobs j JOIN triage_observations o ON o.job_id=j.id "
                             "WHERE j.status='completed' AND j.report_json IS NOT NULL "
-                            "AND o.issue_url IS NULL AND o.resolved_run_id IS NULL").fetchall()
+                            "AND o.issue_url IS NULL AND o.resolved_run_id IS NULL "
+                            "AND o.fingerprint NOT LIKE 'local:%'").fetchall()
         for job in jobs:
             observations = {o["failure_id"]: o for o in json.loads(job["observations_json"])}
             for finding in json.loads(job["report_json"])["findings"]:
@@ -528,6 +563,10 @@ def publish(conn, job) -> None:
                     if finding['outcome'] == 'resolved':
                         retire_resolved_observation(conn, job, finding, o)
                     elif current_observation(conn, o) is not None:
+                        if o.get('local_finding_id'):
+                            local_findings.classify(conn, o['local_finding_id'], finding['outcome'],
+                                                    finding['diagnosis'] + ' Evidence: ' + finding['evidence'], url)
+                            continue
                         # Recheck inside the write transaction: ledger polling can run during GitHub calls.
                         conn.execute(f"UPDATE known_failures SET diagnosis=?,diagnosis_source=?,triage_outcome=?,"
                                      f"triage_issue_url=COALESCE(?,triage_issue_url),triage_issue_state="

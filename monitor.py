@@ -27,6 +27,8 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any, Callable
 
+import local_findings
+
 
 REPO_NAME = "BrokkAi/bifrost-dev"
 TRACKED_WORKFLOWS: tuple[tuple[str, str | None], ...] = (
@@ -551,6 +553,7 @@ def _migrate_known_failure_job_names(conn: sqlite3.Connection) -> None:
 
 def ensure_known_failure_schema(conn: sqlite3.Connection) -> None:
     """Create the shared failure ledger additively for both cron jobs."""
+    local_findings.ensure_schema(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS known_failures (
@@ -1168,7 +1171,9 @@ def refresh_known_failure_link_states(conn: sqlite3.Connection) -> None:
         "SELECT DISTINCT linked_issue_url AS url,'issue' AS kind FROM known_failures "
         "WHERE status='open' AND linked_issue_url IS NOT NULL UNION "
         "SELECT DISTINCT triage_issue_url AS url,'triage' AS kind FROM known_failures "
-        "WHERE status='open' AND triage_issue_url IS NOT NULL"
+        "WHERE status='open' AND triage_issue_url IS NOT NULL UNION "
+        "SELECT DISTINCT linked_pr_url AS url,'pr' AS kind FROM local_findings "
+        "WHERE status='open' AND linked_pr_url IS NOT NULL"
     ).fetchall()
     for item in rows:
         url = str(item["url"])
@@ -1193,6 +1198,9 @@ def refresh_known_failure_link_states(conn: sqlite3.Connection) -> None:
                 f"UPDATE known_failures SET {column}=?,updated_at=? WHERE {url_column}=?",
                 (state, utc_now(), url),
             )
+            if kind == 'pr':
+                conn.execute('UPDATE local_findings SET linked_pr_state=? WHERE linked_pr_url=?',
+                             (state, url))
 
 
 def connect_db() -> sqlite3.Connection:

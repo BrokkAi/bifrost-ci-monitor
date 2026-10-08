@@ -79,6 +79,14 @@ def main():
     config.add_argument("--connection-file", required=True, type=Path)
     sub.add_parser("state")
     sub.add_parser("report")
+    sub.add_parser("findings")
+    finding = sub.add_parser("finding")
+    finding.add_argument("--revision", required=True)
+    finding.add_argument("--kind", required=True, choices=["baseline", "flaky"])
+    finding.add_argument("--head", required=True)
+    finding.add_argument("--identity", required=True)
+    finding.add_argument("--command", required=True)
+    finding.add_argument("--evidence-file", required=True, type=Path)
     inspect_pr = sub.add_parser("pr")
     inspect_pr.add_argument("--pr", required=True, type=int)
     inspect_issue = sub.add_parser("issue")
@@ -114,6 +122,8 @@ def main():
         path = args.pop("evidence_file")
         args["evidence"] = path.read_text() if path else ""
         args["number"] = args.pop("pr")
+    if operation == "finding":
+        args["evidence"] = args.pop("evidence_file").read_text()
     if operation == "comment":
         args["number"] = args.pop("issue")
         args["body"] = args.pop("body_file").read_text()

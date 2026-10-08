@@ -11,6 +11,7 @@ python3 <this skill>/scripts/mm_db.py configure --connection-file /tmp/mm-connec
 python3 <this skill>/scripts/mm_db.py state
 python3 <this skill>/scripts/mm_db.py pr --pr N
 python3 <this skill>/scripts/mm_db.py issue --issue N
+python3 <this skill>/scripts/mm_db.py findings
 ```
 
 The connection is stored privately inside the Git directory. Keep its token out
@@ -23,7 +24,29 @@ python3 <this skill>/scripts/mm_db.py exclude --revision REV --pr N --head SHA -
 python3 <this skill>/scripts/mm_db.py exclude --revision REV --pr N --head SHA --kind rejected --reason 'isolated regression' --evidence-file /tmp/evidence.md
 python3 <this skill>/scripts/mm_db.py tests --revision REV --head SHA --verdict pass --tests 'commands actually run' --baseline 'reproduced failures or none'
 python3 <this skill>/scripts/mm_db.py comment --revision REV --issue N --body-file /tmp/comment.md
+python3 <this skill>/scripts/mm_db.py finding --revision REV --kind baseline --head BASE_SHA --identity 'exact failing test' --command 'actual check command' --evidence-file /tmp/evidence.md
+python3 <this skill>/scripts/mm_db.py finding --revision REV --kind flaky --head TESTED_SHA --identity 'exact flaky test' --command 'actual check command' --evidence-file /tmp/evidence.md
 ```
+
+Record unresolved baseline failures and flaky product tests for later repair with
+`finding`. Include the failure output, settings/environment, exact committed
+tested SHA, reusable log paths, and any subsequent pass/fail outcomes. Finding
+evidence is limited to 12,000 characters (40 KiB after JSON encoding with the
+identity and command); reference full logs when longer. Baseline
+findings must name the batch's captured base SHA; candidate-only failures need
+normal fix/reject investigation first. A passing rerun does not erase a product
+flake. Use `findings` to reuse an existing observation. Do not record already
+fixed interactions, infrastructure incidents, or known container limitations as
+unresolved product failures. Reuse existing evidence; registration needs no new
+test run.
+
+Local findings are durable diagnostic records in the shared database. Triage
+checks their applicability to current master, deduplicates product issues, and
+routes them to the normal issue fixer. They retain local provenance and never
+stand in for master CI run evidence or authorize a sync baseline. Recording one
+does not change membership, invalidate test evidence, or change the batch
+revision. Diagnostic intake remains available after publication/completion;
+membership, test and publication mutations retain their lifecycle guards.
 
 Removal updates the supervisor immediately. Rejection records the exact-head
 marker and evidence for delivery by the supervisor's App identity; use it only after

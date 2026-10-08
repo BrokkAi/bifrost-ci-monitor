@@ -110,6 +110,15 @@ SKILLS_GUIDANCE = (
     "allowed. Record removals and test evidence through mm-db, publish through "
     "mm-autopr, and render the final evidence with mm-db report. mm-compare runs "
     "a supplied Bash check at two commits; choose the checks and assess failures yourself. "
+    "Record unresolved locally reproduced baseline failures and flaky product tests "
+    "for later triage with mm-db finding --revision REV --kind baseline|flaky "
+    "--head TESTED_SHA --identity TEST_NAME --command 'actual check command' "
+    "--evidence-file FILE. Baseline findings must name the captured base SHA. "
+    "Include the exact error, environment, log paths, and rerun outcomes in the evidence. "
+    "Read mm-db findings to reuse an existing record; a passing rerun does not erase "
+    "an observed product flake. Reuse collected evidence without running more checks "
+    "just to register it. Do not register already repaired interactions, infrastructure, "
+    "or known container limitations as unresolved product findings. "
     "Only mm-autopr publishes the integration PR; only the supervisor merges it."
 )
 FIX_VS_EJECT_GUIDANCE = (

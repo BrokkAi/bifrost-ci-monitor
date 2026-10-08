@@ -17,9 +17,11 @@ import uuid
 from urllib.parse import quote
 
 import automerge
+import local_findings
 
 
 def ensure_schema(conn):
+    local_findings.ensure_schema(conn)
     conn.execute("""CREATE TABLE IF NOT EXISTS automerge_skill_events (
         batch_id TEXT NOT NULL, event_id TEXT NOT NULL, kind TEXT NOT NULL,
         payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
@@ -63,6 +65,10 @@ def state(conn, batch_id):
     result["tests"] = tests if tests and tests["source_revision"] == result["source_revision"] else None
     result["publication"] = latest(conn, batch_id, "publication")
     result["revision"] = digest(result)
+    # Diagnostic intake does not invalidate the candidate's test assessment or
+    # publication revision, just like asynchronous outbox delivery.
+    result["local_findings"] = [dict(r) for r in conn.execute(
+        "SELECT * FROM local_findings WHERE batch_id=? ORDER BY created_at,id", (batch_id,))]
     result["pending_github_writes"] = [
         {"kind": row["kind"], "number": row["number"], "head_sha": row["head_sha"]}
         for row in conn.execute(
@@ -152,6 +158,9 @@ def reconcile_publication(current, head, notes):
 def dispatch(conn, batch_id, operation, payload):
     if operation == "state":
         return state(conn, batch_id)
+    if operation == "findings":
+        state(conn, batch_id)
+        return {"findings": local_findings.observations(conn)}
     if operation == "inspect":
         state(conn, batch_id)  # Authenticate against an existing batch.
         number = payload.get("number")
@@ -161,10 +170,35 @@ def dispatch(conn, batch_id, operation, payload):
         resource = "pulls" if kind == "pull" else "issues"
         return {"item": automerge.gh_json(["api", f"repos/{automerge.REPO_NAME}/{resource}/{number}"]),
                 "comments": automerge.list_pull_comments(number)}
-    if operation not in {"exclude", "tests", "publish", "comment"}:
+    if operation not in {"exclude", "tests", "publish", "comment", "finding"}:
         raise ValueError("unknown operation")
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if operation == "finding":
+            # Findings preserve evidence after a final report or landing too;
+            # they cannot change membership, tests, publication, or CI gates.
+            current = state(conn, batch_id)
+            if payload.get("revision") != current["revision"]:
+                raise ValueError("stale revision; read mm-db state again")
+            kind = payload.get("kind")
+            if kind not in {"baseline", "flaky"}:
+                raise ValueError("finding kind must be baseline or flaky")
+            head = sha(payload.get("head"))
+            if kind == "baseline" and head != current["base_sha"]:
+                raise ValueError("baseline findings must name the captured base SHA")
+            row = conn.execute("SELECT session_id FROM automerge_batches WHERE batch_id=?",
+                               (batch_id,)).fetchone()
+            identity = text(payload.get("identity"), "identity", 1000)
+            command = text(payload.get("command"), "command", 2000)
+            evidence = text(payload.get("evidence"), "evidence", 12000)
+            if len(json.dumps([identity, command, evidence]).encode()) > 40 * 1024:
+                raise ValueError("finding evidence exceeds the encoded limit; use an excerpt and full log paths")
+            finding = local_findings.record(
+                conn, batch_id, row["session_id"], kind, head, identity, command, evidence, automerge.utc_now(),
+            )
+            record(conn, batch_id, "finding", {"finding_id": finding["id"]})
+            conn.commit()
+            return dict(state(conn, batch_id), recorded_finding=finding)
         current = checked(conn, batch_id, payload.get("revision"))
         if operation == "comment":
             number = payload.get("number")

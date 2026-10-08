@@ -9,6 +9,8 @@ from unittest import TestCase, mock
 import monitor
 import triage
 import automerge
+import local_findings
+import issue_fixer
 
 
 class FakeGitHub:
@@ -87,6 +89,81 @@ class TriageTests(TestCase):
                 "last_seen_sha,last_seen_run_id,last_seen_run_url,last_seen_at,updated_at) "
                 "VALUES ('CI',?,'step',?,?,1,'https://github.test/run/1','2026-01-01',"
                 "?,1,'https://github.test/run/1','2026-01-01','2026-01-01')", (job_name, identity, sha, sha))
+
+    def add_local_finding(self, kind='baseline'):
+        with self.conn:
+            return local_findings.record(self.conn, 'batch', 'merge-session', kind, 'a' * 40,
+                                         'local_policy_test', 'eatmydata cargo nextest run local_policy_test',
+                                         'expected exit 2, got 1; settings and log /tmp/base.log', '2026-01-02')
+
+    def test_local_finding_reaches_deduplicated_issue_and_fixer_dossier(self):
+        finding = self.add_local_finding()
+        self.make_job()
+        captured = json.loads(self.job()['observations_json'])[0]
+        self.assertEqual(captured['local_finding_id'], finding['id'])
+        self.assertIsNone(captured['last_seen_run_id'])
+        self.assertIsNone(captured['last_seen_run_url'])
+        self.assertIn('A passing rerun alone does not resolve a flaky product test',
+                      triage.build_prompt(self.job()))
+        triage.publish(self.conn, self.job())
+        self.reopen()
+        triage.publish(self.conn, self.job())
+        self.assertEqual(len(self.github.issues), 1)
+        self.assertEqual(triage.pending(self.conn), [])
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM known_failures').fetchone()[0], 0)
+        row = self.conn.execute('SELECT * FROM local_findings').fetchone()
+        published = dict(next(iter(self.github.issues.values())),
+                         html_url=row['triage_issue_url'], assignees=[])
+        self.assertIn('Local baseline', published['body'])
+        self.assertIn(finding['command'], published['body'])
+        self.assertIn(finding['evidence'], published['body'])
+        issue_fixer.ensure_schema(self.conn)
+        selected = issue_fixer.select_work(self.conn, [published], [])
+        self.assertEqual(selected[0]['number'], published['number'])
+        with mock.patch.object(issue_fixer, 'api', return_value=[]):
+            dossier = issue_fixer.dossier(self.conn, published, [])
+        self.assertEqual(dossier['observed_failures'][0]['command'], finding['command'])
+        self.assertEqual(dossier['observed_failures'][0]['last_seen_sha'], finding['head_sha'])
+        with self.conn:
+            repeated = local_findings.record(self.conn, 'another-batch', 'another-session',
+                                            finding['kind'], finding['head_sha'], finding['identity'],
+                                            finding['command'], finding['evidence'], '2026-01-03')
+        self.assertEqual(repeated['id'], finding['id'])
+        self.assertEqual(triage.pending(self.conn), [])
+
+    def test_local_resolution_does_not_retire_master_ci_failure(self):
+        self.add_local_finding()
+        self.make_job(resolved=True)
+        self.add_failure()
+        triage.publish(self.conn, self.job())
+        self.assertEqual(self.conn.execute('SELECT status FROM local_findings').fetchone()[0], 'fixed')
+        self.assertEqual(self.conn.execute('SELECT status FROM known_failures').fetchone()[0], 'open')
+        self.assertEqual(len(triage.pending(self.conn)), 1)
+        self.assertEqual(triage.reconcile_resolved(self.conn), 0)
+
+    def test_large_local_findings_are_split_into_bounded_triage_prompts(self):
+        with self.conn:
+            for number in range(12):
+                local_findings.record(self.conn, 'batch', 'session', 'baseline', 'a' * 40,
+                                     f'test_{number}', 'check tests', '\u754c' * 6000, '2026-01-02')
+        observations = triage.pending(self.conn)
+        self.assertGreater(len(observations), 0)
+        self.assertLess(len(observations), 12)
+        prompt = triage.build_prompt(dict(id='job', base_sha='a' * 40,
+                                         observations_json=json.dumps(observations)))
+        self.assertLess(len(prompt), 65536)
+
+    def test_local_publication_retries_lost_create_without_another_investigation(self):
+        self.add_local_finding(kind='flaky')
+        self.make_job()
+        self.github.lose_response_to = ('POST', 'issues')
+        with self.assertRaisesRegex(RuntimeError, 'response lost'):
+            triage.publish(self.conn, self.job())
+        self.reopen()
+        self.assertEqual(triage.pending(self.conn), [])
+        triage.publish(self.conn, self.job())
+        self.assertEqual(len(self.github.issues), 1)
+        self.assertEqual(self.conn.execute('SELECT triage_outcome FROM local_findings').fetchone()[0], 'product')
 
     def job(self, job_id="job"):
         return self.conn.execute("SELECT * FROM triage_jobs WHERE id=?", (job_id,)).fetchone()

@@ -49,6 +49,8 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   live-session supervision, local/CI gates, exact-head status and merge writes.
 - `mm_service.py`: batch-scoped HTTP interface over shared state; it records
   test assessments/exclusions and reconciles integration-PR publication.
+- `local_findings.py`: durable local baseline/flaky observations consumed by
+  triage and included in the corresponding issue fixer's dossier.
 - `skills/mm-*`: agent tools for merge mechanics, state, publication, and
   two-commit checks. `scripts/install-mm-skills.py` installs symlinks and the
   user service. Tool invocation instructions remain in each `SKILL.md`.
@@ -59,6 +61,54 @@ Cron executes `monitor.py` straight from this working tree every five minutes
 This repository's direct-master workflow does not authorize the supervised
 agents to push `bifrost-dev/master`. Those agents publish PRs; only the
 supervisor lands their tested heads through GitHub.
+
+# CI host access and Mjolnir operation
+
+The CI daemon runs as `ubuntu` on the running EC2 instance named
+`bifrost-ci-agents` in `us-east-1`. Discover its current public address with
+the workstation's `bifrost-ci` AWS profile; require exactly one running match.
+Do not reuse an old IP or the retired `hel` hostname.
+
+```sh
+aws --profile bifrost-ci --region us-east-1 ec2 describe-instances \
+  --filters 'Name=tag:Name,Values=bifrost-ci-agents' 'Name=instance-state-name,Values=running' \
+  --query 'Reservations[].Instances[].{ID:InstanceId,IP:PublicIpAddress}' --output json
+ssh -o BatchMode=yes -o ConnectTimeout=10 ubuntu@CURRENT_PUBLIC_IP
+```
+
+Run mj on that host, using `/home/ubuntu/.cargo/bin/mj` and workspace `CI`.
+The workstation daemon and remote build targets have separate sessions.
+The monitor checkout is `/home/ubuntu/Projects/bifrost-ci-monitor`; set
+`BIFROST_GH_BIN=/home/ubuntu/.local/bin/gh` when invoking its Python helpers,
+matching cron. The older `/usr/bin/gh` lacks required PR fields.
+
+```sh
+/home/ubuntu/.cargo/bin/mj api-info
+/home/ubuntu/.cargo/bin/mj sessions --workspace CI --json
+/home/ubuntu/.cargo/bin/mj sessions --session SESSION_ID --json
+/home/ubuntu/.cargo/bin/mj transcript --session SESSION_ID --role agent --json
+/home/ubuntu/.cargo/bin/mj transcript --session SESSION_ID --role tool --after-seq CURSOR --json \
+  | jq '{next_after_seq, items: [.items[] | {seq, text, status: .body.call.status}]}'
+```
+
+A merge batch ID is not its mj session ID. Resolve it through
+`automerge_batches.session_id` in `monitor.DB_PATH` or match the batch's exact
+persisted title in `mj sessions`. Page transcripts with `next_after_seq`.
+Transcript cursors and `mj events` cursors are different sequence spaces.
+Read the agent's own output before reporting findings. For tool activity,
+project only safe summary text/status; raw bodies, inputs and presentation
+fields can contain connection tokens. `api-info` reports a credential file's
+path; never read or print that file's contents.
+
+For authorized steering, use `mj prompt --session SESSION_ID --command-id ID
+--prompt-file FILE`; reuse the command ID after an ambiguous response instead
+of sending the prompt again. Inspect command `--help` for installed flags.
+`mj interrupt-turn` cancels the current turn, `mj stop-task --session SESSION_ID
+TASK_ID` stops a listed background task, and `mj suspend --session SESSION_ID
+--acknowledge-unpublished-work --json` preserves recovery state while releasing
+the environment. Coordinate supervised lifecycle changes through the existing
+supervisor lock and cleanup path. Use suspension to preserve work; `mj destroy`
+permanently deletes the environment and recovery archive.
 
 # State, authentication, and process ownership
 
@@ -81,6 +131,22 @@ merge remain synchronous. Fixer tables are
 `triage_observations`, and `triage_publications`. Historical `invocations`
 remain readable. An active legacy invocation blocks new issue repairs until
 it is retired. Never replace or discard the live database to fix scheduling.
+
+`local_findings` retains merge-agent baseline and flaky product-test observations
+with their actual tested commit, command, evidence, and originating batch/session.
+Use `mm-db findings` to inspect them and `mm-db finding --revision REV --kind
+baseline|flaky --head SHA --identity TEST --command 'actual command'
+--evidence-file FILE` to record one. Baselines must name the captured base SHA.
+Reuse collected evidence; registration does not require another test run. Record
+unresolved product failures, including flakes that passed a rerun; omit repaired
+interactions, infrastructure and known container limitations. Exact-head source
+rejection still uses `mm-db exclude --kind rejected`. These are distinct records.
+Local findings do not change the batch revision or invalidate its assessment,
+and may be registered after publication/completion. Triage investigates them
+alongside CI observations and publishes through its existing ownership/dedup
+path; the fixer receives the local evidence in the linked issue's dossier.
+Keep local findings out of the master CI ledger and sync baseline authorization;
+do not invent run IDs, workflow/job mappings, or proof of recovery.
 
 The tooling owns `mergemarshall:in-progress` on selected source PRs, including
 batch expansions and direct/operator records. Membership changes checkpoint
