@@ -859,7 +859,31 @@ def report_dependency_blocks(conn, transport):
         reason_key = hashlib.sha256(item['reason'].encode()).hexdigest()[:12]
         notify_blocked_once(conn, transport, f"dependency-{item['number']}-{item['head_sha']}",
                             f'dependency_blocked-{reason_key}',
-                            f"PR #{item['number']} is waiting: {item['reason']}. Unrelated eligible work continues.")
+                            item['reason'])
+
+
+def dependency_block_message(number: int, reason: str) -> str:
+    pull = f"<https://github.com/{REPO_NAME}/pull/{number}|PR #{number}>"
+    changed = re.fullmatch(r'PR #(\d+) changed; its current head is absent from this PR', reason)
+    blocked = re.fullmatch(r'blocked by prerequisite PR #(\d+)', reason)
+    if changed:
+        parent = int(changed[1])
+        prerequisite = f"<https://github.com/{REPO_NAME}/pull/{parent}|PR #{parent}>"
+        summary = (f"{pull} needs a dependency update.\n"
+                   f"It depends on {prerequisite}, but does not include that PR's latest commit.")
+        action = (f"Action for the author: merge PR #{parent}'s latest branch into PR #{number}, "
+                  "push the update, and mark the PR ready for merging.")
+    elif blocked:
+        parent = int(blocked[1])
+        prerequisite = f"<https://github.com/{REPO_NAME}/pull/{parent}|PR #{parent}>"
+        summary = f"{pull} is waiting for prerequisite {prerequisite} to become eligible."
+        action = (f"Action: check PR #{parent} and resolve its draft, rejection, or dependency block. "
+                  "The queue will reconsider this PR automatically.")
+    else:
+        summary = f"{pull} has a dependency block: {html.escape(reason)}."
+        action = "Action: check the PR's prerequisite branches and resolve the dependency block."
+    return (f"Bifrost merge queue: {summary}\n{action}\n"
+            "This dependency block affects this PR and its dependents; other PRs remain eligible.")
 
 
 def current_master_sha() -> str:
@@ -1864,10 +1888,19 @@ def deliver_blocked_notice(
         "source_ancestry_unverified", "baseline_unavailable", "ci_run_unavailable",
     }
     prefix = ":rotating_light:" if loud else ":warning:"
+    dependency = re.fullmatch(r'dependency-(\d+)-[0-9a-f]{40}', batch_id)
+    if dependency and reason.startswith('dependency_blocked-'):
+        details = notice['details']
+        # Already-persisted notices retain their identity and retry state.
+        legacy = re.fullmatch(r'PR #\d+ is waiting: (.*)\. Unrelated eligible work continues\.',
+                              details, re.DOTALL)
+        text = f"{prefix} {dependency_block_message(int(dependency[1]), legacy[1] if legacy else details)}"
+    else:
+        text = f"{prefix} Bifrost {lane}automerge batch {batch_id} ({reason}): {notice['details']}"
     try:
         ok, _ = monitor.slack_send(
             transport,
-            f"{prefix} Bifrost {lane}automerge batch {batch_id} ({reason}): {notice['details']}",
+            text,
             thread_ts=None if loud else (batch["thread_ts"] if batch else None),
         )
     except Exception as exc:

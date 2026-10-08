@@ -343,6 +343,11 @@ A repair unblocks descendants after they contain the new eligible prerequisite
 head. Ambiguous branches/shared heads, cycles, and unresolved relationships are
 reported through dependency block notices and `--check`.
 
+Dependency notices link the affected PR and prerequisite, state the author's
+next action, and describe the scope of that block without claiming the queue
+is progressing. Keep exact-head and reason identities internal to notification
+deduplication; pending legacy notices use the same readable delivery format.
+
 Ejection removes dependent descendants with exclusion kind `blocked`; only the
 standalone-broken prerequisite receives a rejection. Recheck captured dependency
 heads before landing. Global recorded rejections also prevent a candidate from

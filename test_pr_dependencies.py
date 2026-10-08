@@ -118,6 +118,51 @@ class DependencyTests(TestCase):
         self.assertEqual({d.number for d in selected[2].dependencies}, {20, 30})
         self.assertEqual(self.writes, [])
 
+    def test_changed_dependency_notice_links_prs_and_names_author_action_without_internal_ids(self):
+        self.selected()  # Capture the dependency before its prerequisite changes.
+        self.git('checkout', '-q', 'x')
+        self.items[30]['head']['sha'] = self.commit('repair', 'new prerequisite commit')
+        self.selected()
+        item = next(item for item in automerge.DEPENDENCY_BLOCKS if item['number'] == 20)
+        transport = monitor.SlackTransport('webhook', webhook='unused')
+        with (mock.patch.object(automerge, 'DEPENDENCY_BLOCKS', [item]),
+              mock.patch.object(monitor, 'slack_send', return_value=(True, 'thread')) as send):
+            automerge.report_dependency_blocks(self.conn, transport)
+            automerge.report_dependency_blocks(self.conn, transport)
+        send.assert_called_once()
+        message = send.call_args.args[1]
+        self.assertIn('/pull/20|PR #20>', message)
+        self.assertIn('/pull/30|PR #30>', message)
+        self.assertIn('merge PR #30\'s latest branch into PR #20', message)
+        self.assertIn('push the update', message)
+        self.assertIn('other PRs remain eligible', message)
+        self.assertNotIn(item['head_sha'], message)
+        self.assertNotIn('dependency_blocked-', message)
+        self.assertNotIn('automerge batch', message)
+        self.assertNotIn('work continues', message)
+
+    def test_pending_legacy_dependency_notice_gets_the_clear_format_on_retry(self):
+        identifier = 'dependency-20-' + self.y
+        reason = 'dependency_blocked-legacy'
+        transport = monitor.SlackTransport('webhook', webhook='unused')
+        with mock.patch.object(monitor, 'slack_send', return_value=(False, None)):
+            automerge.notify_blocked_once(self.conn, transport, identifier, reason,
+                'PR #20 is waiting: PR #30 changed; its current head is absent from this PR. '
+                'Unrelated eligible work continues.')
+        with mock.patch.object(monitor, 'slack_send', return_value=(True, 'thread')) as send:
+            automerge.deliver_blocked_notice(self.conn, transport, identifier, reason)
+            automerge.deliver_blocked_notice(self.conn, transport, identifier, reason)
+        send.assert_called_once()
+        self.assertIn('Action for the author:', send.call_args.args[1])
+        self.assertNotIn(identifier, send.call_args.args[1])
+
+    def test_ineligible_prerequisite_notice_points_action_at_the_prerequisite(self):
+        message = automerge.dependency_block_message(20, 'blocked by prerequisite PR #30')
+        self.assertIn('/pull/30|PR #30>', message)
+        self.assertIn('Action: check PR #30', message)
+        self.assertIn('reconsider this PR automatically', message)
+        self.assertNotIn('merge PR #30', message)
+
     def test_lookahead_selects_disjoint_dependency_closure_without_promoting_unlanded_work(self):
         foreground = [p for p in self.selected() if p.number == 30]
         identifier = automerge.create_batch(self.conn, foreground, self.base, batch_id='parent', ci_mode='sync')
