@@ -344,7 +344,14 @@ batches admit only priority PRs and their prerequisites; removed heads never ree
 batch. Commit membership/counter with the follow-up prompt so restarts cannot
 reset the limit. A finished passing tree is not rebuilt just for new arrivals.
 A source head changed during processing is made draft. Remove changed/closed
-sources without rejection and let the author ready the new head.
+sources without rejection and let the author ready the new head. If removal or
+ejection leaves no sources, end the batch; never fill an empty batch with arrivals.
+During running turns, each supervisor tick checks source eligibility and starts
+cleanup immediately when every source is ineligible or already excluded. Fence
+agent writes, stop queued turns/background checks/subagents, and suspend through
+the durable cleanup path before releasing the batch. Normal selection creates a
+new batch/session on a later tick. If sources remain, retain useful agent work
+and apply external removals at the existing turn/rebuild boundary.
 
 ## Integration and test evidence
 

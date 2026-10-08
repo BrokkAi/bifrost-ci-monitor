@@ -271,6 +271,29 @@ class StateTests(unittest.TestCase):
         rejection = self.conn.execute("SELECT cancelled_at FROM automerge_github_outbox WHERE kind='reject_head'").fetchone()
         self.assertIsNone(rejection[0])
 
+    def test_empty_successor_ends_without_recovery_or_promotion(self):
+        current = service.state(self.conn, self.child)
+        service.dispatch(self.conn, self.child, 'exclude', {'revision': current['revision'], 'number': 8,
+                         'head': HEAD_TWO, 'kind': 'rejected', 'reason': 'standalone', 'evidence': 'inspection'})
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET phase='waiting_parent' WHERE batch_id=?", (self.child,))
+        with (mock.patch.object(a, 'send_start_notification'),
+              mock.patch.object(a, '_session_status', return_value={'state': 'running'}),
+              mock.patch.object(s, 'stop_work', return_value=True) as stop,
+              mock.patch.object(a, 'request_suspend', return_value=True) as suspend,
+              mock.patch.object(a, 'finish_batch'), mock.patch.object(s, 'launch_child'),
+              mock.patch.object(s, 'invalidate') as reset, mock.patch.object(s, 'promote') as promote):
+            s.tick(a, self.conn, self.transport, self.row(self.parent))
+        self.assertEqual(self.row()['terminal_status'], 'no_sources_remain')
+        self.assertEqual(self.row()['phase'], 'terminal')
+        self.assertEqual(self.row(self.parent)['status'], 'running')
+        reset.assert_not_called()
+        promote.assert_not_called()
+        stop.assert_called_once()
+        suspend.assert_called_once_with(self.conn, self.transport, self.child, 'child-session')
+        rejection = self.conn.execute("SELECT cancelled_at FROM automerge_github_outbox WHERE kind='reject_head'").fetchone()
+        self.assertIsNone(rejection[0])
+
     def test_promotion_waits_for_build_then_requires_tree_proof(self):
         self.assess()
         with self.conn:

@@ -71,7 +71,10 @@ PRs are removed without rejection. Diagnose the available failure groups before
 recording the combined rejection set. Record all established exact-head exclusions,
 refreshing the revision between mutations, then read state again for the remaining
 membership. Removing a prerequisite also removes its descendants; do not reject
-them unless they are independently broken. Rebuild the recorded remainder once,
+them unless they are independently broken. If no sources remain, finish the turn
+with the evidence already collected; do not rebuild, test or publish an empty
+batch. The supervisor ends it and selects new work in a fresh batch/session.
+Otherwise rebuild the recorded remainder once,
 preserving applicable fixes and conflict resolutions. Do not rebuild and retest
 between individual exclusions from the same diagnosis pass. Test evidence is your
 explicit assessment; this helper does not select tests or infer a verdict.

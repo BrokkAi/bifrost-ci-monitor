@@ -474,6 +474,9 @@ def tick(a, conn, transport, parent):
     row = child(conn, parent["batch_id"])
     if row is None:
         return
+    if not a._active_sources(row):
+        a.process_batch(conn, transport, row["batch_id"])
+        return
     parent = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (parent["batch_id"],)).fetchone()
     if parent["phase"] == "aborting" or (parent["terminal_status"] and parent["terminal_status"] != "merged"):
         a.abort_batch_locked(conn, transport, row, "predecessor batch aborted or failed")
@@ -516,7 +519,7 @@ def finished(a, conn, transport, row, final):
     a._record_agent_exclusions(conn, row, final)
     row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (row["batch_id"],)).fetchone()
     if not a._active_sources(row):
-        a._terminal(conn, transport, row, "no_sources_remain", "No speculative sources remain.")
+        a._end_empty_batch(conn, transport, row, "No speculative sources remain.")
         return
     keep, removed = a._recheck_sources(a._active_sources(row), conn=conn, batch_id=row['batch_id'])
     if removed:

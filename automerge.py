@@ -144,7 +144,10 @@ REJECTION_TOOL_GUIDANCE = (
     "between mutations. "
     "The supervisor posts the trusted comment and label asynchronously and retries failures. "
     "Do not post comments, edit labels, or change PR state with gh yourself. "
-    "For changed or closed PRs, record `mm-db exclude --kind removed` instead."
+    "For changed or closed PRs, record `mm-db exclude --kind removed` instead. "
+    "If no sources remain, finish with the collected evidence; do not rebuild, "
+    "run more checks or publish an empty batch. The supervisor ends it and "
+    "selects new work in a fresh batch/session."
 )
 
 
@@ -3611,6 +3614,9 @@ def _finish_async_agent_turn(
     exclusions_changed = _record_agent_exclusions(conn, row, final)
     row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                        (row["batch_id"],)).fetchone()
+    if not _active_sources(row):
+        _end_empty_batch(conn, transport, row, "No source PRs remain after the agent's report.")
+        return
     local_result = _async_local_result(final, allow_no_tests=_docs_validation(row))
     # A passing report covers the rebuilt remainder after any ejections.
     # New arrivals belong to the next batch once that candidate is finished.
@@ -3631,10 +3637,6 @@ def _finish_async_agent_turn(
         )
         return
 
-    if not _active_sources(row):
-        _terminal(conn, transport, row, "no_sources_remain",
-                  "The async local gate passed but no source PRs remain in the batch.")
-        return
     integration = find_integration_pr(row)
     if integration is None:
         _queue_async_gate_retry(
@@ -3692,6 +3694,9 @@ def _agent_turn_finished(conn: sqlite3.Connection, transport: monitor.SlackTrans
     reported_exclusions = _record_agent_exclusions(conn, row, final)
     row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                        (row["batch_id"],)).fetchone()
+    if not _active_sources(row):
+        _end_empty_batch(conn, transport, row, "No source PRs remain after the agent's report.")
+        return
     if row["retry_rescan_pending"] and _request_rebuild(
         conn, row, _active_sources(row), "a source PR was ejected; include newly ready PRs",
         only_if_expanded=True,
@@ -3930,12 +3935,30 @@ def _draft_changed_source(pull: PullRequest, state: dict[str, Any], *,
         log(f"PR #{pull.number} changed from its selected head; draft requested")
 
 
+def _end_empty_batch(conn, transport, row, reason) -> None:
+    # Fence agent writes before asking mj to stop. If cleanup is interrupted,
+    # the persisted abort phase resumes next tick instead of launching a rebuild.
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                              (row["batch_id"],)).fetchone()
+        if _active_sources(latest):
+            raise AutomergeError("cannot finish a batch with remaining sources",
+                                 reason="batch_state_changed")
+        conn.execute("UPDATE automerge_batches SET phase='aborting', status='running', "
+                     "terminal_status='no_sources_remain', abort_reason=COALESCE(abort_reason, ?), "
+                     "pending_prompt=NULL, prompt_delivered=0, retry_rescan_pending=0 "
+                     "WHERE batch_id=?", (reason, row["batch_id"]))
+    latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                          (row["batch_id"],)).fetchone()
+    _complete_abort(conn, transport, latest)
+
+
 def _rebuild_or_finish(conn, transport, row, pulls, reason) -> None:
     if not _request_rebuild(conn, row, pulls, reason):
         latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                               (row["batch_id"],)).fetchone()
-        _terminal(conn, transport, latest, "no_sources_remain",
-                  "No source PRs remain after rescan: " + reason)
+        _end_empty_batch(conn, transport, latest, "No source PRs remain: " + reason)
 
 
 def _append_removed(conn: sqlite3.Connection, batch_id: str, removed: list[str],
@@ -3972,6 +3995,10 @@ def _request_rebuild(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]
         _append_removed(conn, str(row["batch_id"]), removed)
         row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                            (row["batch_id"],)).fetchone()
+    # An empty batch has no work to preserve. New arrivals get their own batch
+    # and session through normal selection, regardless of the expansion budget.
+    if not pulls:
+        return False
     original = _all_batch_pulls(row)
     seen = {pull.number for pull in original}
     additions = []
@@ -4299,7 +4326,7 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
         _rebuild_or_finish(conn, transport, row, keep, "source state/head gate changed: " + "; ".join(removed))
         return
     if not pulls:
-        _terminal(conn, transport, row, "empty_batch", "No source PRs remain to land.")
+        _end_empty_batch(conn, transport, row, "No source PRs remain to land.")
         return
     try:
         row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
@@ -4699,6 +4726,7 @@ def _complete_abort(
     row: sqlite3.Row | dict[str, Any],
 ) -> None:
     batch_id = str(row["batch_id"])
+    terminal_status = "no_sources_remain" if row["terminal_status"] == "no_sources_remain" else "aborted"
     descendant = speculation.child(conn, batch_id)
     if descendant is not None:
         abort_batch_locked(conn, transport, descendant, "predecessor aborted: " + str(row['abort_reason'] or 'operator abort'))
@@ -4711,13 +4739,22 @@ def _complete_abort(
                     "UPDATE automerge_batches SET session_id=? WHERE batch_id=?",
                     (session_id, batch_id),
                 )
+            row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+        elif terminal_status == "no_sources_remain" and not _launch_grace_expired(row):
+            return
     if session_id:
         session = _session_status(session_id)
         if not monitor.session_is_stopped(session):
-            interrupt_and_wait(
-                conn, transport, batch_id, session_id,
-                grace_seconds=INTERRUPTION_GRACE_SECONDS,
-            )
+            if terminal_status == "no_sources_remain":
+                # Stop queued turns, background checks and subagents too. Poll
+                # completion on later ticks rather than waiting for a final report.
+                if not speculation.stop_work(sys.modules[__name__], row):
+                    return
+            else:
+                interrupt_and_wait(
+                    conn, transport, batch_id, session_id,
+                    grace_seconds=INTERRUPTION_GRACE_SECONDS,
+                )
         if not request_suspend(conn, transport, batch_id, session_id):
             raise AutomergeError(
                 f"could not suspend aborted batch session {session_id}",
@@ -4765,7 +4802,7 @@ def _complete_abort(
             ).fetchone()
             post_verdict_status(
                 conn, latest, head, "failure",
-                f"batch aborted: {row['abort_reason'] or 'operator requested abort'}",
+                f"batch ended: {row['abort_reason'] or 'operator requested abort'}",
             )
         if str(view.get("state") or "").lower() == "open":
             run_gh(["pr", "close", str(number), "--repo", REPO_NAME])
@@ -4778,8 +4815,8 @@ def _complete_abort(
     with conn:
         conn.execute(
             "UPDATE automerge_batches SET status='completed', phase='terminal', "
-            "terminal_status='aborted', finished_at=? WHERE batch_id=?",
-            (utc_now(), batch_id),
+            "terminal_status=?, finished_at=? WHERE batch_id=?",
+            (terminal_status, utc_now(), batch_id),
         )
         enqueue_membership_labels(conn, batch_id)
     latest = conn.execute(
@@ -4975,15 +5012,28 @@ def process_batch(conn: sqlite3.Connection, transport: monitor.SlackTransport,
     if phase == "aborting":
         _complete_abort(conn, transport, row)
         return
+    if not _active_sources(row):
+        _end_empty_batch(conn, transport, row, "No source PRs remain in the batch.")
+        return
     if phase in {"resetting", "restarting"}:
         speculation.recover(sys.modules[__name__], conn, row)
         return
     if phase == "waiting_parent":
         return
     if phase in {"building", "fixing", "waiting_ci"}:
-        # Draft changed heads promptly, without interrupting the agent. Membership
-        # changes are applied at its next completed/interrupted turn or merge gate.
-        _recheck_sources(_active_sources(row), conn=conn, batch_id=batch_id)
+        # A running turn can still produce useful work for a retained remainder.
+        # When every source is ineligible, stop immediately instead of waiting
+        # for the turn to end and replacing the whole batch with new arrivals.
+        keep, removed = _recheck_sources(_active_sources(row), conn=conn, batch_id=batch_id)
+        row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+        if removed and not keep:
+            _append_removed(conn, batch_id, removed)
+            row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+            _end_empty_batch(conn, transport, row, "; ".join(removed))
+            return
+        if not _active_sources(row):
+            _end_empty_batch(conn, transport, row, "No source PRs remain in the batch.")
+            return
     if phase == "waiting_ci":
         if _batch_ci_mode(row) == "async":
             if (_async_local_result(str(row["agent_final_message"] or ""),
