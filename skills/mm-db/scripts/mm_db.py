@@ -53,6 +53,31 @@ class Client:
             raise RuntimeError(message) from None
 
 
+def checkpoint(client, revision, *, rebuild=False, withdraw=False):
+    state = client.call("state")
+    if state["revision"] != revision:
+        raise ValueError("stale revision; read mm-db state again")
+    if withdraw:
+        return client.call("candidate", revision=revision, withdraw=True)
+    if git("branch", "--show-current").stdout.strip() != state["branch"]:
+        raise ValueError("not on the recorded integration branch")
+    if git("status", "--porcelain").stdout.strip():
+        raise ValueError("candidate working tree must be clean and committed")
+    head = git("rev-parse", "HEAD").stdout.strip()
+    for source in state["sources"]:
+        if git("merge-base", "--is-ancestor", source["head_sha"], head, check=False).returncode:
+            raise ValueError(f"included PR #{source['number']} is absent")
+    if git("merge-base", "--is-ancestor", state["base_sha"], head, check=False).returncode:
+        raise ValueError("candidate does not contain its recorded base")
+    ref = "refs/heads/" + state["branch"]
+    args = ["push"]
+    if rebuild:
+        observed = git("ls-remote", "--heads", "origin", ref).stdout.split()
+        args.append("--force-with-lease=" + ref + ":" + (observed[0] if observed else ""))
+    git(*args, "origin", "HEAD:" + ref)
+    return client.call("candidate", revision=revision, head=head)
+
+
 def render_report(state):
     evidence = state.get("tests")
     if not evidence:
@@ -87,6 +112,10 @@ def main():
     finding.add_argument("--identity", required=True)
     finding.add_argument("--command", required=True)
     finding.add_argument("--evidence-file", required=True, type=Path)
+    candidate = sub.add_parser("candidate")
+    candidate.add_argument("--revision", required=True)
+    candidate.add_argument("--rebuild", action="store_true")
+    candidate.add_argument("--withdraw", action="store_true")
     inspect_pr = sub.add_parser("pr")
     inspect_pr.add_argument("--pr", required=True, type=int)
     inspect_issue = sub.add_parser("issue")
@@ -115,6 +144,9 @@ def main():
         print("Configured MergeMarshall connection.")
         return
     client = Client()
+    if operation == "candidate":
+        print(json.dumps(checkpoint(client, **args), indent=2))
+        return
     if operation == "report":
         print(render_report(client.call("state")))
         return

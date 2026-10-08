@@ -47,6 +47,8 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   deduplicated failure issues and retirement of exact resolved observations.
 - `automerge.py`: queue selection, batch/direct/operator state machines,
   live-session supervision, local/CI gates, exact-head status and merge writes.
+- `speculation.py`: one-batch lookahead, candidate checkpoints, same-session
+  recovery and ordered promotion, shared by sync and async.
 - `mm_service.py`: batch-scoped HTTP interface over shared state; it records
   test assessments/exclusions and reconciles integration-PR publication.
 - `local_findings.py`: durable local baseline/flaky observations consumed by
@@ -346,6 +348,47 @@ sources without rejection and let the author ready the new head.
 
 ## Integration and test evidence
 
+### Candidate checkpoints and speculative successors
+
+After merging/fixing a clean committed candidate, checkpoint with `mm-db candidate`
+before expensive validation. This pushes only the recorded ref and atomically
+records head, tree, source revision and attempt generation; it creates no PR.
+Withdraw the checkpoint before further edits and register a replacement when
+ready. Repeated accepted registrations/withdrawals retain their identities.
+The supervisor permits one successor, selected with dependency closure against
+the pinned candidate, excluding every live batch's reservations. Dependency
+publication continues to use actual master. New batches persist current CI_MODE.
+
+A successor's membership contains only its new source PRs. It may resolve,
+validate and independently reject those exact heads. An interaction with the
+unlanded predecessor does not establish a standalone defect. It records local
+pass and waits without publishing; the service and landing gates forbid
+publication/landing before promotion. Source changes, priorities and aborts
+retain the normal policies. Never discard established rejection intents on
+reset, abort or failed launch.
+
+Invalidation fences old mutations immediately. Persist a new attempt generation,
+stop queued prompts/turns/background tasks and child sessions, then issue typed
+`/clear` with a stable command ID. Wait for its durable context divider before
+submitting a deterministic brief, also with a stable ID. Lost replies retry the
+same command; confirmed failed clears use a new ID. The session, container,
+checkout and caches survive. `mm-merge --restart` archives the old tip, pending
+source edits and progress note once, then assembles from the replacement base
+and original own heads. Preserve Git rerere with automatic staging disabled;
+review reused resolutions. Never transplant old merge commits or retain the
+invalidated predecessor's ancestry. No agent-written handoff or cache transfer
+is needed. Read final reports only after this attempt's context divider.
+
+Promotion proves the pinned head landed and its tree equals the actual GitHub
+merge commit. `mm-merge --promote` incorporates that landed commit. Evidence may
+be reused only with unchanged tree and applicable validation inputs/settings;
+always record a fresh assessment for the resulting committed HEAD/source set.
+A differing master tree starts a fresh attempt in the same environment. Normal
+sync/async freshness, CI and landing gates apply after promotion. Completed
+notification retries must not occupy the foreground selection slot.
+
+### Merge and validation policy
+
 One session creates `mergemarshall/batch-<id>` from the captured master base,
 retaining source heads through merge commits. Every agent-authored commit has
 `Automerge-Batch: <id>`. Resolve conflicts preserving both intents; a conflict
@@ -373,7 +416,8 @@ consolidate changes and validation through the primary. Subagents propose the
 smallest useful check and build only when assigned a check that resolves a
 specific decision. Concurrent builds are appropriate when independent useful
 checks justify their cost and use the existing mbx configuration. Throttling
-controls resource contention; avoid duplicate or speculative builds.
+controls resource contention; avoid duplicate or speculative diagnostic builds.
+The supervisor's next-batch lookahead is an independent useful build.
 
 Prefer blame, history, focused diffs, and tracing the failing assertion through
 data/control flow; inspection is almost always faster here than rebuilding Rust
@@ -522,8 +566,9 @@ candidate freshness at retries. Do not terminate/close a tested candidate
 merely because GitHub refused one write or confirmation was ambiguous.
 
 Abort is resumable: interrupt/suspend, failure verdict, close the integration
-PR, preserve branch, remove batch-applied rejection labels without rejecting
-sources, then release the queue. Direct abort leaves its source PR open.
+PR, preserve branch, then release nonrejected sources to the queue. Established
+exact-head rejections and their pending outbox writes survive every abort;
+never cancel them or remove their labels as abort cleanup. Direct abort leaves its source PR open.
 Retry the Slack outcome independently when delivery is unavailable.
 
 # Failure ledger, triage, and Slack

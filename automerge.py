@@ -11,8 +11,10 @@ import hashlib
 import hmac
 import html
 import json
+import os
 import re
 import sqlite3
+import sys
 import tempfile
 import time
 import uuid
@@ -24,6 +26,7 @@ from urllib.parse import quote
 
 import monitor
 import pr_dependencies
+import speculation
 
 
 REPO_NAME = monitor.REPO_NAME
@@ -61,6 +64,8 @@ TRUSTED_REJECTION_LOGIN = "mergemarshall[bot]"
 GH_OWNER = "BrokkAi"
 READY_POLICY = "non-draft"  # Change to "approved" to require an APPROVED review decision.
 CI_MODE = "async"  # Bifrost default; supported values are "async" and "sync".
+SPECULATIVE_LOOKAHEAD = os.environ.get("BIFROST_CI_SPECULATIVE_LOOKAHEAD", "1") == "1"
+OBSERVATION_DEADLINE: float | None = None
 REJECTION_MARKER = re.compile(
     r"(?m)^(?:mergemarshall:rejected-head|automerge-rejected-head):\s*([0-9a-f]{40})\s*$", re.IGNORECASE
 )
@@ -93,7 +98,8 @@ MERGE_DELEGATION_GUIDANCE = (
     "when assigned a check whose result will resolve a specific decision. "
     "Concurrent builds are appropriate when independent useful checks justify "
     "their compilation cost and use the existing mbx configuration. Throttling "
-    "controls resource contention; avoid duplicate or speculative builds."
+    "controls resource contention; avoid duplicate builds and speculative diagnostic builds. "
+    "The supervisor's next-batch lookahead is an intentional independent useful build."
 )
 SKILLS_GUIDANCE = (
     "Use the installed mm-merge, mm-db, mm-autopr, and mm-compare skills for "
@@ -704,7 +710,7 @@ def _dependency_node(item, *, conn=None, dry_run=False):
         _queue_ready(item, conn=conn, dry_run=dry_run), priority, immediate)
 
 
-def dependency_graph(conn=None, *, dry_run=False, master=None):
+def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True):
     """Refresh open heads and durable prerequisites, then verify their ancestry."""
     cached = pr_dependencies.inventory(conn)
     items = {int(p['number']): p for p in list_open_pull_requests() if not _is_integration_pull(p)}
@@ -770,7 +776,7 @@ def dependency_graph(conn=None, *, dry_run=False, master=None):
                         rejected['head_sha'], {'reason': 'MergeMarshall recorded a trusted rejection.',
                                                'evidence': REJECTION_MARKER.sub('', rejected['evidence']).strip()})
                 deps = graph.dependencies[number]
-                if (node.base != BASE_BRANCH and str(node.data.get('state')).lower() == 'open'
+                if (promote and node.base != BASE_BRANCH and str(node.data.get('state')).lower() == 'open'
                         and deps and number not in graph.problems
                         and all(graph.landed(dep.head_sha) for dep in deps)):
                     enqueue_github_write(conn, '__dependencies__', 'promote_dependency', number, node.head,
@@ -805,7 +811,7 @@ def dependency_order(pulls):
 
 
 def check_source_dependencies(pulls, conn=None, *, master=None):
-    graph = dependency_graph(conn, master=master)
+    graph = dependency_graph(conn, master=master, promote=master is None, dry_run=master is not None)
     blocked = graph.validate(pulls)
     return [dependency_pull(graph, p.number) for p in pulls if p.number not in blocked], blocked
 
@@ -969,6 +975,7 @@ def connect_db() -> sqlite3.Connection:
     )
     ensure_github_outbox_schema(conn)
     pr_dependencies.ensure_schema(conn)
+    speculation.ensure_schema(conn, ensure_column)
     ensure_column(conn, "automerge_batches", "launch_attempted_at", "TEXT")
     ensure_column(conn, "automerge_batches", "agent_final_message", "TEXT NOT NULL DEFAULT ''")
     prior_columns = {
@@ -1062,7 +1069,10 @@ def create_batch(
     ci_mode: str | None = None,
     kind: str = "batch",
     source: str = "queue",
+    predecessor_id: str | None = None,
+    predecessor_candidate: dict[str, Any] | None = None,
 ) -> str:
+    speculation.ensure_schema(conn, ensure_column)
     if not pulls:
         raise ValueError("cannot create an empty automerge batch")
     identifier = batch_id or _new_batch_id()
@@ -1087,8 +1097,8 @@ def create_batch(
                 (batch_id, kind, source, priority, status, base_sha,
                  pull_requests_json, title, branch, created_at,
                  active_pull_requests_json, phase, ci_mode, integration_pr_number,
-                 integration_pr_url, ci_head_sha)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 integration_pr_url, ci_head_sha, predecessor_id, predecessor_candidate_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 identifier,
@@ -1107,6 +1117,8 @@ def create_batch(
                 direct_pr_number,
                 direct_pr_url,
                 direct_head,
+                predecessor_id,
+                json.dumps(predecessor_candidate or {}),
             ),
         )
         enqueue_membership_labels(conn, identifier)
@@ -1615,7 +1627,7 @@ def launch_batch_session(
         known_failures_context=_known_failures_prompt(conn) if conn is not None else "",
         validation_impact=impact,
     )
-    prompt += skills_connection_prompt(row)
+    prompt += "\n\n" + speculation.GUIDANCE + skills_connection_prompt(row)
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", prefix="bifrost-automerge-",
         suffix=".prompt", delete=False,
@@ -3189,7 +3201,7 @@ def deliver_pending_prompt(conn: sqlite3.Connection, transport: monitor.SlackTra
                              (utc_now(), row["batch_id"]))
         else:
             monitor.send_session_prompt(
-                session_id, str(prompt) + "\n\n" + SKILLS_GUIDANCE + skills_connection_prompt(row)
+                session_id, str(prompt) + "\n\n" + SKILLS_GUIDANCE + speculation.GUIDANCE + skills_connection_prompt(row)
             )
             with conn:
                 conn.execute("UPDATE automerge_batches SET prompt_delivered=1, "
@@ -3202,7 +3214,8 @@ def _store_agent_result(conn: sqlite3.Connection, transport: monitor.SlackTransp
                         row: sqlite3.Row | dict[str, Any], session_id: str) -> str:
     drain_transcript(conn, transport, str(row["batch_id"]), session_id)
     transcript = monitor.read_complete_agent_transcript(session_id)
-    final = read_final_agent_message(session_id)
+    lower = int(speculation.get(row, "report_after_seq", 0))
+    final = read_final_agent_message(session_id, after_seq=lower) if lower else read_final_agent_message(session_id)
     with conn:
         conn.execute("UPDATE automerge_batches SET agent_transcript=?, agent_final_message=?, "
                      "turn_started_at=NULL WHERE batch_id=?",
@@ -3213,9 +3226,9 @@ def _store_agent_result(conn: sqlite3.Connection, transport: monitor.SlackTransp
     return final
 
 
-def read_final_agent_message(session_id: str) -> str:
+def read_final_agent_message(session_id: str, *, after_seq: int = 0) -> str:
     """Read the final agent item, retaining boundaries for machine markers."""
-    cursor = 0
+    cursor = after_seq
     messages: list[tuple[int, str]] = []
     for _ in range(10_000):
         result = monitor.mj_command(["transcript", "--session", session_id, "--role", "agent",
@@ -3251,8 +3264,13 @@ def _wait_agent_turn(conn: sqlite3.Connection, transport: monitor.SlackTransport
             conn.execute("UPDATE automerge_batches SET turn_started_at=? WHERE batch_id=?",
                          (utc_now(), row["batch_id"]))
     # Bound this cron poll, never the agent's turn. Later ticks reattach.
+    timeout = TURN_TICK_SECONDS
+    if OBSERVATION_DEADLINE is not None:
+        timeout = min(timeout, max(1, int(OBSERVATION_DEADLINE - time.monotonic())))
+        if speculation.candidate(sys.modules[__name__], row) or speculation.get(row, 'predecessor_id'):
+            timeout = min(timeout, max(1, TURN_TICK_SECONDS // 2))
     turn = supervise_turn(conn, transport, str(row["batch_id"]), session_id,
-                          TURN_TICK_SECONDS)
+                          timeout)
     if turn.timed_out:
         return False
     if turn.outcome in {"interrupted", "cancelled", "canceled"}:
@@ -3548,6 +3566,9 @@ def _queue_async_gate_retry(
     reason: str,
 ) -> None:
     local_result = _async_local_result(final, allow_no_tests=_docs_validation(row))
+    if local_result == 'fail':
+        with conn:
+            conn.execute("UPDATE automerge_batches SET candidate_json='{}' WHERE batch_id=?", (row['batch_id'],))
     if local_result != "pass" and _request_rebuild(
         conn, row, _active_sources(row), reason, only_if_expanded=True,
     ):
@@ -3649,6 +3670,12 @@ def _agent_turn_finished(conn: sqlite3.Connection, transport: monitor.SlackTrans
     final = _store_agent_result(conn, transport, row, session_id)
     row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                        (row["batch_id"],)).fetchone()
+    if speculation.get(row, "predecessor_id"):
+        if speculation.parent_current(sys.modules[__name__], conn, row):
+            speculation.finished(sys.modules[__name__], conn, transport, row, final)
+        else:
+            speculation.invalidate(sys.modules[__name__], conn, row)
+        return
     keep, removed = _recheck_sources(_active_sources(row), conn=conn, batch_id=str(row["batch_id"]))
     row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
     if removed:
@@ -3848,7 +3875,10 @@ def _recheck_sources(pulls: list[PullRequest], *, conn: sqlite3.Connection | Non
         else:
             keep.append(pull)
     if keep:
-        verified, blocked = check_source_dependencies(keep, conn)
+        owner = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch_id,)).fetchone() if conn is not None and batch_id else None
+        pinned_base = owner['base_sha'] if owner is not None and speculation.get(owner, 'predecessor_id') else None
+        verified, blocked = (check_source_dependencies(keep, conn, master=pinned_base) if pinned_base
+                             else check_source_dependencies(keep, conn))
         for pull in keep:
             if pull.number in blocked:
                 removed.append(f'PR #{pull.number} {pull.title}: {blocked[pull.number]}')
@@ -3959,7 +3989,8 @@ def _request_rebuild(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]
                         closure.add(dep.number)
                         pending.append(dep.number)
             selected = [p for p in selected if p.number in closure]
-        additions = [pull for pull in selected if pull.number not in seen] if lane_matches else []
+        occupied = speculation.reserved(sys.modules[__name__], conn, except_batch=row['batch_id'])
+        additions = [pull for pull in selected if pull.number not in seen and pull.number not in occupied] if lane_matches else []
         # A priority seed may require an ordinary prerequisite. Exclusions and
         # the expansion cap still govern the whole dependency closure.
         candidate = {p.number: p for p in pulls + additions}
@@ -4173,6 +4204,8 @@ def _sync_ci_gate_allows_merge(
 
 def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTransport,
                        row: sqlite3.Row | dict[str, Any]) -> None:
+    if speculation.get(row, "predecessor_id"):
+        raise AutomergeError("speculative batch cannot land before promotion", reason="predecessor_pending")
     if not _session_is_idle(row):
         return
     number = int(row["integration_pr_number"])
@@ -4666,6 +4699,9 @@ def _complete_abort(
     row: sqlite3.Row | dict[str, Any],
 ) -> None:
     batch_id = str(row["batch_id"])
+    descendant = speculation.child(conn, batch_id)
+    if descendant is not None:
+        abort_batch_locked(conn, transport, descendant, "predecessor aborted: " + str(row['abort_reason'] or 'operator abort'))
     session_id = str(row["session_id"] or "")
     if not session_id and row["launch_attempted"] and _batch_kind(row) == "batch":
         session_id = lookup_batch_session(row) or ""
@@ -4737,23 +4773,8 @@ def _complete_abort(
                 enqueue_github_write(conn, batch_id, "issue_comment", number, "",
                                      {"body": str(row["abort_reason"] or "Operator requested abort.")})
 
-    ensure_github_outbox_schema(conn)
-    cancelled = conn.execute(
-        "SELECT number,head_sha FROM automerge_github_outbox "
-        "WHERE batch_id=? AND kind='reject_head' AND cancelled_at IS NULL",
-        (batch_id,),
-    ).fetchall()
-    with conn:
-        conn.execute(
-            "UPDATE automerge_github_outbox SET cancelled_at=? "
-            "WHERE batch_id=? AND kind='reject_head' AND cancelled_at IS NULL",
-            (utc_now(), batch_id),
-        )
-        for rejected in cancelled:
-            enqueue_github_write(conn, batch_id, "clear_rejection_label",
-                                 int(rejected["number"]), str(rejected["head_sha"]),
-                                 {"cancelled_rejection": True})
-
+    # Exact-head rejection evidence outlives the batch that established it.
+    # Abort releases membership, never a rejected head or its pending writes.
     with conn:
         conn.execute(
             "UPDATE automerge_batches SET status='completed', phase='terminal', "
@@ -4954,6 +4975,11 @@ def process_batch(conn: sqlite3.Connection, transport: monitor.SlackTransport,
     if phase == "aborting":
         _complete_abort(conn, transport, row)
         return
+    if phase in {"resetting", "restarting"}:
+        speculation.recover(sys.modules[__name__], conn, row)
+        return
+    if phase == "waiting_parent":
+        return
     if phase in {"building", "fixing", "waiting_ci"}:
         # Draft changed heads promptly, without interrupting the agent. Membership
         # changes are applied at its next completed/interrupted turn or merge gate.
@@ -5058,6 +5084,15 @@ def acquire_lock_wait(
 
 
 def active_batch(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    columns = {c[1] for c in conn.execute("PRAGMA table_info(automerge_batches)")}
+    if "predecessor_id" in columns:
+        return conn.execute(
+            "SELECT * FROM automerge_batches b WHERE predecessor_id IS NULL AND ("
+            "status IN ('launching','running','finishing') OR EXISTS ("
+            "SELECT 1 FROM automerge_batches c WHERE c.predecessor_id=b.batch_id "
+            "AND c.status IN ('launching','running','finishing'))) "
+            "ORDER BY created_at,batch_id LIMIT 1"
+        ).fetchone()
     return conn.execute(
         "SELECT * FROM automerge_batches WHERE status IN ('launching', 'running', 'finishing') "
         "OR (status = 'completed' AND outcome_posted = 0 "
@@ -5158,9 +5193,22 @@ def read_active_batch_for_check() -> dict[str, Any] | None:
             "session_id": row["session_id"],
             "expansions": int(row["expansion_count"]) if "expansion_count" in row.keys() else 0,
             "expansion_limit": MAX_BATCH_EXPANSIONS,
+            "candidate": speculation.candidate(sys.modules[__name__], row, landed=row['terminal_status'] == 'merged'),
+            "speculative_batch": _speculative_check(conn, str(row['batch_id'])),
         }
     finally:
         conn.close()
+
+
+def _speculative_check(conn, parent_id):
+    row = speculation.child(conn, parent_id)
+    if row is None:
+        return None
+    return {'batch_id': row['batch_id'], 'phase': row['phase'], 'mode': row['ci_mode'],
+            'session_id': row['session_id'], 'base_sha': row['base_sha'],
+            'attempt_generation': row['attempt_generation'],
+            'predecessor_candidate': json.loads(row['predecessor_candidate_json']),
+            'candidate': speculation.candidate(sys.modules[__name__], row)}
 
 
 def check_only() -> int:
@@ -5380,6 +5428,7 @@ def run_land_now(number: int) -> int:
 
 
 def run_automerge() -> int:
+    global OBSERVATION_DEADLINE
     lock_handle = acquire_lock()
     if lock_handle is None:
         return 0
@@ -5402,6 +5451,10 @@ def run_automerge() -> int:
             retry_github_outbox(conn, transport)
             monitor.update_known_failures(conn, transport)
             check_pending_suspensions(conn, transport)
+            # Completed outcome delivery is independent of foreground selection.
+            for completed in conn.execute("SELECT * FROM automerge_batches WHERE status='completed' "
+                                          "AND outcome_posted=0 AND COALESCE(terminal_status,'')<>'aborted'").fetchall():
+                finish_batch(conn, transport, completed)
             row = active_batch(conn)
             try:
                 pulls: list[PullRequest] | None = None
@@ -5436,7 +5489,10 @@ def run_automerge() -> int:
                 log(f"queue selection blocked ({reason}): {exc}")
                 return 4
             try:
+                OBSERVATION_DEADLINE = time.monotonic() + TURN_TICK_SECONDS
                 process_batch(conn, transport, batch_id)
+                latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+                speculation.tick(sys.modules[__name__], conn, transport, latest)
             except (AutomergeError, monitor.MjError, monitor.CommandError,
                     OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
                 reason = (
@@ -5451,6 +5507,7 @@ def run_automerge() -> int:
         finally:
             conn.close()
     finally:
+        OBSERVATION_DEADLINE = None
         lock_handle.close()
 
 

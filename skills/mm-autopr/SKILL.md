@@ -6,6 +6,9 @@ description: Publish a locally tested MergeMarshall branch and reconcile its int
 First record your local assessment with mm-db for the exact committed HEAD,
 including checks run there, separately identified reused results with their
 original tested SHAs and applicability reasons, and reproduced baseline failures.
+When mm-db state has a predecessor, publication is blocked: record local pass
+and finish the turn. After the supervisor requests promotion, incorporate the
+actual landed base with mm-merge, record a fresh assessment, then publish.
 Then:
 
 ```sh

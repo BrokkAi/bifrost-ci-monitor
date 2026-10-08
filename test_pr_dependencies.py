@@ -11,6 +11,7 @@ import automerge
 import mm_service
 import monitor
 import pr_dependencies
+import speculation
 
 
 class DependencyTests(TestCase):
@@ -116,6 +117,30 @@ class DependencyTests(TestCase):
         self.assertEqual([p.number for p in selected], [30, 20, 10, 40])
         self.assertEqual({d.number for d in selected[2].dependencies}, {20, 30})
         self.assertEqual(self.writes, [])
+
+    def test_lookahead_selects_disjoint_dependency_closure_without_promoting_unlanded_work(self):
+        foreground = [p for p in self.selected() if p.number == 30]
+        identifier = automerge.create_batch(self.conn, foreground, self.base, batch_id='parent', ci_mode='sync')
+        row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (identifier,)).fetchone()
+        checkpoint = dict(id='candidate-1', head=self.x, tree=self.git('rev-parse', self.x + '^{tree}'),
+                          source_revision=speculation.source_revision(automerge, row))
+        with self.conn:
+            self.conn.execute('UPDATE automerge_batches SET candidate_json=? WHERE batch_id=?', (json.dumps(checkpoint), identifier))
+        row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (identifier,)).fetchone()
+        before = self.git('rev-parse', 'master')
+        with (mock.patch.object(automerge, 'SPECULATIVE_LOOKAHEAD', True),
+              mock.patch.object(automerge, 'CI_MODE', 'async'),
+              mock.patch.object(speculation, 'require_recovery_controls')):
+            speculation.launch_child(automerge, self.conn, row)
+            speculation.launch_child(automerge, self.conn, row)
+        child = speculation.child(self.conn, identifier)
+        self.assertEqual([p.number for p in automerge.row_pulls(child)], [20, 10, 40])
+        self.assertEqual(child['base_sha'], self.x)
+        self.assertEqual(child['ci_mode'], 'async')
+        self.assertEqual(self.git('rev-parse', 'master'), before)
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM automerge_batches').fetchone()[0], 2)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM automerge_github_outbox WHERE kind='promote_dependency'").fetchone()[0], 0)
 
     def test_master_targeting_descendant_cannot_import_rejected_head_before_selection(self):
         self.items[20]['base']['ref'] = 'master'

@@ -207,6 +207,24 @@ waits for verified PR CI and permits failures proven no worse than the captured
 master baseline. `CI_MODE` in `automerge.py` controls new batches; existing
 batches retain their recorded mode.
 
+The scheduler permits one speculative successor while the foreground batch
+validates. It starts from the foreground's pushed candidate and owns only newly
+selected PRs. `python3 automerge.py --check` shows the candidate, successor and
+recovery generation. A successor publishes and lands only after promotion,
+incorporating the actual landed base and recording a fresh assessment. Both CI
+modes use this lifecycle.
+
+If the predecessor changes, the supervisor stops the successor's work, clears
+its native conversation, and sends a generated restart brief in the same
+session/container. Its helper saves pending source work and the old tip in the
+Git directory; caches, logs and reviewed rerere resolutions remain available.
+No agent-written handoff is required. Set `BIFROST_CI_SPECULATIVE_LOOKAHEAD=0`
+in the cron environment to disable new successors; existing ones still finish
+or recover. Lookahead requires mj's prompt command IDs and `clear-queue` API;
+missing controls leave selection pending rather than starting an unrecoverable
+successor. Existing sessions acquire lookahead only when they checkpoint a
+candidate.
+
 ### Prioritize, fast-track, or abort
 
 Apply `mergemarshall:high` to enter the next priority batch after current work
@@ -237,8 +255,9 @@ python3 automerge.py --abort-batch <batch-id> --reason 'Operator intervention: .
 
 Abort interrupts/suspends the agent, closes the integration PR, records a
 failure verdict, and leaves the branch for inspection. It rejects no source
-PRs. It cancels this batch's queued rejections and retries label cleanup; the
-source heads become eligible again. For a direct attempt, the source PR stays open.
+PRs. Established exact-head rejections remain recorded and their delivery is
+retried; other source heads become eligible again. Aborting a predecessor also
+aborts its speculative successor. For a direct attempt, the source PR stays open.
 
 ### Common stalls
 

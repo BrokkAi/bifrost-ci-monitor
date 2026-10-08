@@ -18,6 +18,7 @@ from urllib.parse import quote
 
 import automerge
 import local_findings
+import speculation
 
 
 def ensure_schema(conn):
@@ -60,7 +61,15 @@ def state(conn, batch_id):
               "ci_mode": row["ci_mode"], "status": row["status"], "phase": row["phase"],
               "sources": [p.as_json() for p in automerge.row_pulls(row)],
               "excluded": automerge._excluded_source_heads(row)}
-    result["source_revision"] = digest([result["base_sha"], result["sources"], result["excluded"]])
+    result["source_revision"] = speculation.source_revision(automerge, row)
+    result["attempt_generation"] = speculation.get(row, "attempt_generation", 0)
+    result["candidate"] = speculation.candidate(automerge, row)
+    result["predecessor"] = ({"batch_id": row["predecessor_id"],
+                              "candidate": json.loads(row["predecessor_candidate_json"]),
+                              "current": speculation.parent_current(automerge, conn, row)}
+                             if speculation.get(row, "predecessor_id") else None)
+    result["recovery"] = json.loads(speculation.get(row, "recovery_json", "{}"))
+    result["promotion"] = json.loads(speculation.get(row, "promotion_json", "{}"))
     tests = latest(conn, batch_id, "tests")
     result["tests"] = tests if tests and tests["source_revision"] == result["source_revision"] else None
     result["publication"] = latest(conn, batch_id, "publication")
@@ -83,10 +92,13 @@ def state(conn, batch_id):
 
 def checked(conn, batch_id, revision):
     current = state(conn, batch_id)
-    if current["status"] not in {"running", "launching"} or current["phase"] not in {"building", "fixing"}:
+    restarting = current['phase'] == 'restarting' and current['recovery'].get('stage') == 'restart'
+    if current["status"] not in {"running", "launching"} or (current["phase"] not in {"building", "fixing"} and not restarting):
         raise ValueError("batch is no longer accepting agent updates")
     if revision != current["revision"]:
         raise ValueError("stale revision; read mm-db state again")
+    if current["predecessor"] and not current["predecessor"]["current"]:
+        raise ValueError("predecessor candidate invalidated; wait for the supervisor to restart this attempt")
     return current
 
 
@@ -170,7 +182,7 @@ def dispatch(conn, batch_id, operation, payload):
         resource = "pulls" if kind == "pull" else "issues"
         return {"item": automerge.gh_json(["api", f"repos/{automerge.REPO_NAME}/{resource}/{number}"]),
                 "comments": automerge.list_pull_comments(number)}
-    if operation not in {"exclude", "tests", "publish", "comment", "finding"}:
+    if operation not in {"exclude", "tests", "publish", "comment", "finding", "candidate"}:
         raise ValueError("unknown operation")
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -199,8 +211,47 @@ def dispatch(conn, batch_id, operation, payload):
             record(conn, batch_id, "finding", {"finding_id": finding["id"]})
             conn.commit()
             return dict(state(conn, batch_id), recorded_finding=finding)
+        if operation == 'candidate':
+            current = state(conn, batch_id)
+            checkpoint = current['candidate']
+            withdrawal = latest(conn, batch_id, 'candidate_withdrawal')
+            registered = (not payload.get('withdraw') and checkpoint
+                          and checkpoint.get('registered_revision') == payload.get('revision')
+                          and checkpoint['head'] == payload.get('head'))
+            withdrawn = (payload.get('withdraw') is True and not checkpoint and withdrawal
+                         and withdrawal.get('revision') == payload.get('revision')
+                         and withdrawal.get('source_revision') == current['source_revision'])
+            if (registered or withdrawn) and (not current['predecessor'] or current['predecessor']['current']):
+                conn.commit()
+                return current  # The original accepted write survived a lost reply.
         current = checked(conn, batch_id, payload.get("revision"))
-        if operation == "comment":
+        if operation == "candidate":
+            if payload.get("withdraw") is True:
+                conn.execute("UPDATE automerge_batches SET candidate_json='{}' WHERE batch_id=?", (batch_id,))
+                record(conn, batch_id, "candidate_withdrawal", {"id": uuid.uuid4().hex,
+                                                               "revision": current['revision'],
+                                                               "source_revision": current['source_revision'],
+                                                               "candidate": current["candidate"]})
+                conn.commit()
+                return state(conn, batch_id)
+            head = sha(payload.get("head"))
+            if not current["sources"]:
+                raise ValueError("cannot checkpoint an empty batch")
+            conn.commit()
+            tree = speculation.verify_candidate(automerge, current, head, conn)
+            conn.execute("BEGIN IMMEDIATE")
+            checked(conn, batch_id, current["revision"])
+            previous = current["candidate"]
+            checkpoint = {"id": previous["id"] if previous and previous["head"] == head else uuid.uuid4().hex,
+                          "head": head, "tree": tree, "branch": current["branch"],
+                          "source_revision": current["source_revision"],
+                          "registered_revision": current['revision'],
+                          "attempt_generation": current["attempt_generation"]}
+            conn.execute("UPDATE automerge_batches SET candidate_json=? WHERE batch_id=?",
+                         (json.dumps(checkpoint), batch_id))
+            record(conn, batch_id, "candidate", checkpoint)
+            conn.commit()
+        elif operation == "comment":
             number = payload.get("number")
             if type(number) is not int or number <= 0:
                 raise ValueError("issue number must be positive")
@@ -238,12 +289,20 @@ def dispatch(conn, batch_id, operation, payload):
                 raise ValueError("verdict must be pass or fail")
             tests = text(payload.get("tests"), "tests")
             baseline = text(payload.get("baseline"), "baseline")
-            if "\n" in tests or "\n" in baseline or tests.casefold() in {"none", "n/a", "not run"}:
+            row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+            no_tests = tests.casefold() in {"none", "n/a", "not run"}
+            if "\n" in tests or "\n" in baseline or (no_tests and not automerge._docs_validation(row)):
                 raise ValueError("tests and baseline must be one-line evidence summaries")
+            if current["predecessor"] and (not current["candidate"] or current["candidate"]["head"] != head):
+                raise ValueError("speculative assessment requires this attempt's checkpointed head")
             record(conn, batch_id, "tests", {"head": head, "verdict": verdict, "tests": tests,
                                             "baseline": baseline, "source_revision": current["source_revision"]})
+            if verdict == "fail":
+                conn.execute("UPDATE automerge_batches SET candidate_json='{}' WHERE batch_id=?", (batch_id,))
             conn.commit()
         else:
+            if current["predecessor"]:
+                raise ValueError("publication is blocked until the predecessor lands and the batch is promoted")
             head = sha(payload.get("head"))
             if not current["sources"] or not current["tests"] or current["tests"]["head"] != head or current["tests"]["verdict"] != "pass":
                 raise ValueError("publication requires a passing assessment for this exact head and source set")
