@@ -649,9 +649,9 @@ def retry_github_outbox(conn: sqlite3.Connection, transport: monitor.SlackTransp
                                      (row["batch_id"],)).fetchone()
                 lane = "speculative " if batch is not None and speculation.is_speculative(batch) else ""
                 try:
-                    ok, _ = monitor.slack_send(
-                        transport, f":rotating_light: MergeMarshall GitHub write pending for "
-                        f"#{row['number']} ({row['kind']}, {lane}batch {row['batch_id']}): {exc}. "
+                    ok, _ = send_batch_slack(
+                        transport, batch, f":rotating_light: MergeMarshall GitHub write pending for "
+                        f"#{row['number']} ({row['kind']}, {lane}batch): {exc}. "
                         "Automatic retries continue; no agent action is needed.", thread_ts=None,
                     )
                 except Exception as slack_exc:
@@ -1765,6 +1765,28 @@ def _slack_pr_title(title: str) -> str:
     )
 
 
+def batch_slack_details(row: sqlite3.Row | dict[str, Any]) -> str:
+    details = f"Batch ID: `{row['batch_id']}`"
+    if speculation.is_speculative(row):
+        details += f"\nPredecessor batch ID: `{row['predecessor_id']}`"
+    return details
+
+
+def send_batch_slack(transport, row, text, *, thread_ts=None):
+    """Keep identifiers in a reply when a batch notice starts a new thread."""
+    ok, timestamp = monitor.slack_send(transport, text, thread_ts=thread_ts)
+    if ok and row is not None and not thread_ts and timestamp and transport.kind == "chat":
+        # The notice was accepted. A failed diagnostic reply must not cause the
+        # caller to resend the channel-level alert or block queue progress.
+        try:
+            replied, _ = monitor.slack_send(transport, batch_slack_details(row), thread_ts=timestamp)
+            if not replied:
+                log(f"Slack batch details reply failed for {row['batch_id']}")
+        except Exception as exc:
+            log(f"Slack batch details reply failed for {row['batch_id']}: {exc}")
+    return ok, timestamp
+
+
 def send_start_notification(
     conn: sqlite3.Connection,
     transport: monitor.SlackTransport,
@@ -1774,7 +1796,7 @@ def send_start_notification(
         return
     pulls = row_pulls(row)
     only_pull = pulls[0] if len(pulls) == 1 else None
-    list_in_thread = only_pull is None and transport.kind == "chat"
+    list_in_thread = transport.kind == "chat"
     inline = (f"<{only_pull.url}|#{only_pull.number}> "
               f"{_slack_pr_title(only_pull.title)}"
               if only_pull else f"{len(pulls)} PRs")
@@ -1786,16 +1808,15 @@ def send_start_notification(
         lane += "SPECULATIVE "
     if _batch_kind(row) == "direct":
         message = (
-            f":arrows_counterclockwise: Bifrost {lane}direct merge {row['batch_id']}: "
+            f":arrows_counterclockwise: Bifrost {lane}direct merge: "
             f"{inline}"
         )
     else:
         message = (
-            f":arrows_counterclockwise: Bifrost {lane}{AUTOMERGE_AGENT_LABEL} batch "
-            f"{row['batch_id']}: {inline}"
+            f":arrows_counterclockwise: Bifrost {lane}{AUTOMERGE_AGENT_LABEL} batch: {inline}"
         )
     if predecessor:
-        message += (f"\nPreparing ahead of batch {predecessor}; "
+        message += ("\nPreparing ahead of the current batch; "
                     "publication and merge wait for that batch to land.")
     thread_ts = row["thread_ts"]
     if not row["start_notification_sent"]:
@@ -1809,15 +1830,18 @@ def send_start_notification(
                 "WHERE batch_id = ?",
                 (int(not list_in_thread), thread_ts, row["batch_id"]),
             )
-    if not list_in_thread or row["start_pr_list_sent"]:
+    if not list_in_thread or row["start_pr_list_sent"] or not thread_ts:
         return
     items = "\n".join(
         f"• <{pull.url}|#{pull.number}> "
         f"{_slack_pr_title(pull.title)}"
         for pull in pulls
     )
+    details = batch_slack_details(row)
+    if only_pull is None:
+        details += f"\n\nPRs in this {'speculative ' if predecessor else ''}batch:\n{items}"
     ok, _ = monitor.slack_send(
-        transport, f"PRs in this {'speculative ' if predecessor else ''}batch:\n{items}",
+        transport, details,
         thread_ts=thread_ts,
     )
     if ok:
@@ -1896,10 +1920,11 @@ def deliver_blocked_notice(
                               details, re.DOTALL)
         text = f"{prefix} {dependency_block_message(int(dependency[1]), legacy[1] if legacy else details)}"
     else:
-        text = f"{prefix} Bifrost {lane}automerge batch {batch_id} ({reason}): {notice['details']}"
+        subject = f"{lane}automerge batch" if batch is not None else "merge queue"
+        text = f"{prefix} Bifrost {subject} ({reason}): {notice['details']}"
     try:
-        ok, _ = monitor.slack_send(
-            transport,
+        ok, _ = send_batch_slack(
+            transport, batch,
             text,
             thread_ts=None if loud else (batch["thread_ts"] if batch else None),
         )
@@ -2001,7 +2026,7 @@ def drain_transcript(
             continue
         item_text = text.strip()
         predecessor = speculation.get(row, "predecessor_id") if speculation.is_speculative(row) else None
-        relay_text = (f"*SPECULATIVE batch {batch_id} (waiting for {predecessor})*\n{item_text}"
+        relay_text = (f"*SPECULATIVE batch (waiting for the preceding batch to land)*\n{item_text}"
                       if predecessor else item_text)
         if not monitor.relay_text(transport, row["thread_ts"], relay_text):
             all_processed = False
@@ -2219,7 +2244,7 @@ def format_batch_outcome(batch_id: str, terminal_status: str, outcome: BatchOutc
     if predecessor_id:
         lane += "speculative "
     subject = f"{lane}direct merge" if kind == "direct" else f"{lane}integration batch"
-    lines = [f"Bifrost {subject} {batch_id} finished ({terminal_status})."]
+    lines = [f"Bifrost {subject} finished ({terminal_status})."]
     lines.append("Landed (GitHub confirms merged):")
     lines.extend(f"• PR #{item.pull.number} {item.pull.title}" for item in outcome.merged)
     if not outcome.merged:
@@ -2287,7 +2312,7 @@ def finish_batch(conn: sqlite3.Connection, transport: monitor.SlackTransport,
                      f"<{row['integration_pr_url']}|#{number}>")
         summary = (summary[:max(0, SLACK_MESSAGE_LIMIT - len(link_line) - 1)]
                    + "\n" + link_line)
-    ok, _ = monitor.slack_send(transport, summary, thread_ts=row["thread_ts"])
+    ok, _ = send_batch_slack(transport, row, summary, thread_ts=row["thread_ts"])
     if not ok:
         notify_blocked_once(conn, transport, batch_id, "slack_outcome_failed",
                             "The final outcome summary could not be delivered; it will retry.")

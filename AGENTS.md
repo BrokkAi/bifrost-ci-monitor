@@ -419,8 +419,12 @@ until ancestry incorporation: the agent continues its existing validation and
 uses `mm-db ready` as before. Passing evidence gates publication, not role
 promotion. A changed actual master tree uses the existing same-session recovery.
 
-Slack start headings mark successors as `SPECULATIVE` and name the predecessor
-whose landing gates publication/merge. PR-list replies, relayed progress, blocked
+Slack start headings mark successors as `SPECULATIVE` and explain that the
+preceding batch gates publication/merge. Batch and predecessor IDs belong in
+the first thread reply, alongside the PR list for multi-PR batches, rather than
+channel-level messages. Start replies use the existing durable reply retry;
+standalone alerts and outcomes attach diagnostic replies on a best-effort basis
+without duplicating an accepted root message. PR-list replies, relayed progress, blocked
 alerts and terminal summaries retain that distinction until role promotion.
 After role promotion, new messages use normal batch wording. Message decoration
 must not change stored agent evidence, relay identities/cursors or delivery retries.

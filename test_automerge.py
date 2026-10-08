@@ -1300,8 +1300,8 @@ class CiSupervisionTests(TestCase):
                 row_for(conn),
             )
         self.assertEqual(row_for(conn)["phase"], "waiting_ci")
-        self.assertIsNone(slack.call_args.kwargs["thread_ts"])
-        self.assertIn("Retrying baseline resolution automatically", slack.call_args.args[1])
+        self.assertIsNone(slack.call_args_list[0].kwargs["thread_ts"])
+        self.assertIn("Retrying baseline resolution automatically", slack.call_args_list[0].args[1])
         conn.close()
 
     def test_unavailable_ci_run_alerts_channel_and_retries(self):
@@ -1322,8 +1322,8 @@ class CiSupervisionTests(TestCase):
                 row_for(conn),
             )
         self.assertEqual(row_for(conn)["phase"], "waiting_ci")
-        self.assertIsNone(slack.call_args.kwargs["thread_ts"])
-        self.assertIn("Retrying the CI run lookup automatically", slack.call_args.args[1])
+        self.assertIsNone(slack.call_args_list[0].kwargs["thread_ts"])
+        self.assertIn("Retrying the CI run lookup automatically", slack.call_args_list[0].args[1])
         conn.close()
 
     @unchanged_queue()
@@ -2069,8 +2069,8 @@ class PublicationGateTests(TestCase):
                 row_for(conn),
             )
         self.assertEqual(row_for(conn)["phase"], "merging")
-        self.assertIsNone(slack.call_args.kwargs["thread_ts"])
-        self.assertIn("Retrying ancestry verification automatically", slack.call_args.args[1])
+        self.assertIsNone(slack.call_args_list[0].kwargs["thread_ts"])
+        self.assertIn("Retrying ancestry verification automatically", slack.call_args_list[0].args[1])
         conn.close()
 
     def test_integration_merge_does_not_request_a_workflow_file_list(self):
@@ -2137,8 +2137,8 @@ class PublicationGateTests(TestCase):
             self.assertTrue(automerge._github_write_retry_pending(row_for(conn)))
             automerge._merge_integration(conn, transport, row_for(conn))
         self.assertEqual(pr_view.call_count, 3)
-        self.assertEqual(slack.call_args.kwargs["thread_ts"], None)
-        self.assertIn(":rotating_light:", slack.call_args.args[1])
+        self.assertEqual(slack.call_args_list[0].kwargs["thread_ts"], None)
+        self.assertIn(":rotating_light:", slack.call_args_list[0].args[1])
         terminal.assert_not_called()
         close.assert_not_called()
         complete.assert_called_once()
@@ -2160,7 +2160,10 @@ class PublicationGateTests(TestCase):
                 self.assertEqual(row["github_write_retry_attempts"], attempts)
                 self.assertEqual(row["github_write_retry_after"],
                                  automerge._timestamp_after(start, delay))
-        slack.assert_called_once()
+        self.assertEqual(slack.call_count, 2)
+        self.assertNotIn("batch-test", slack.call_args_list[0].args[1])
+        self.assertEqual(slack.call_args_list[1].args[1], "Batch ID: `batch-test`")
+        self.assertEqual(slack.call_args_list[1].kwargs["thread_ts"], "alert")
         conn.close()
 
     def test_success_verdict_failure_schedules_retry_and_alerts_channel(self):
@@ -2176,7 +2179,7 @@ class PublicationGateTests(TestCase):
             )
         self.assertFalse(ok)
         self.assertEqual(row_for(conn)["github_write_retry_attempts"], 1)
-        self.assertIsNone(slack.call_args.kwargs["thread_ts"])
+        self.assertIsNone(slack.call_args_list[0].kwargs["thread_ts"])
         conn.close()
 
     @unchanged_queue()
@@ -2829,7 +2832,7 @@ class DirectMergeTests(TestCase):
         gate.assert_called_once()
         self.assertEqual(pr_view.call_count, 2)
         gh.assert_called_once()
-        self.assertIsNone(slack.call_args.kwargs["thread_ts"])
+        self.assertIsNone(slack.call_args_list[0].kwargs["thread_ts"])
         terminal.assert_not_called()
         conn.close()
 
@@ -3057,11 +3060,12 @@ class PriorityLaneTests(TestCase):
         self.assertIn("2 PRs", root.args[1])
         self.assertNotIn("#7", root.args[1])
         self.assertNotIn("#8", root.args[1])
+        self.assertNotIn("batch-test", root.args[1])
         self.assertNotIn("thread_ts", root.kwargs)
         reply = send.call_args_list[1]
         self.assertEqual(reply.kwargs["thread_ts"], "root-ts")
         self.assertEqual(reply.args[1], (
-            "PRs in this batch:\n"
+            "Batch ID: `batch-test`\n\nPRs in this batch:\n"
             "• <https://github.com/BrokkAi/bifrost-dev/pull/7|#7> Fix "
             "<https://github.com/BrokkAi/bifrost-dev/issues/4519|#4519> &amp; "
             "<https://github.com/BrokkAi/bifrost-dev/issues/4520|#4520>\n"
@@ -3071,7 +3075,7 @@ class PriorityLaneTests(TestCase):
         self.assertEqual(row_for(conn)["start_pr_list_sent"], 1)
         conn.close()
 
-    def test_single_pr_start_inlines_pr_without_a_second_message(self):
+    def test_single_pr_start_inlines_pr_with_batch_id_in_reply(self):
         conn = make_db(pulls=[pull(title="Fix #4519")])
         with conn:
             conn.execute(
@@ -3083,16 +3087,20 @@ class PriorityLaneTests(TestCase):
                 conn, monitor.SlackTransport("chat", token="token", channel="channel"),
                 row_for(conn),
             )
-        send.assert_called_once()
+        self.assertEqual(send.call_count, 2)
+        root, reply = send.call_args_list
         self.assertIn(
             "<https://github.com/BrokkAi/bifrost-dev/pull/7|#7>",
-            send.call_args.args[1],
+            root.args[1],
         )
         self.assertIn(
             "Fix <https://github.com/BrokkAi/bifrost-dev/issues/4519|#4519>",
-            send.call_args.args[1],
+            root.args[1],
         )
-        self.assertNotIn("1 PRs", send.call_args.args[1])
+        self.assertNotIn("1 PRs", root.args[1])
+        self.assertNotIn("batch-test", root.args[1])
+        self.assertEqual(reply.args[1], "Batch ID: `batch-test`")
+        self.assertEqual(reply.kwargs['thread_ts'], 'root-ts')
         self.assertEqual(row_for(conn)["start_pr_list_sent"], 1)
         conn.close()
 
