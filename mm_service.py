@@ -70,9 +70,11 @@ def state(conn, batch_id):
                              if speculation.get(row, "predecessor_id") else None)
     result["recovery"] = json.loads(speculation.get(row, "recovery_json", "{}"))
     result["promotion"] = json.loads(speculation.get(row, "promotion_json", "{}"))
+    result["prompt_command_id"] = speculation.get(row, "prompt_command_id")
     tests = latest(conn, batch_id, "tests")
     result["tests"] = tests if tests and tests["source_revision"] == result["source_revision"] else None
     result["publication"] = latest(conn, batch_id, "publication")
+    result["ready"] = automerge.ready_candidate(row)
     result["revision"] = digest(result)
     # Diagnostic intake does not invalidate the candidate's test assessment or
     # publication revision, just like asynchronous outbox delivery.
@@ -97,6 +99,8 @@ def checked(conn, batch_id, revision):
         raise ValueError("batch is no longer accepting agent updates")
     if revision != current["revision"]:
         raise ValueError("stale revision; read mm-db state again")
+    if current["ready"]:
+        raise ValueError("candidate handed to supervisor; wait for its next instruction")
     if current["predecessor"] and not current["predecessor"]["current"]:
         raise ValueError("predecessor candidate invalidated; wait for the supervisor to restart this attempt")
     return current
@@ -167,6 +171,15 @@ def reconcile_publication(current, head, notes):
     return {"number": pr["number"], "url": pr["html_url"], "head": head}
 
 
+def handoff(conn, current, kind, *, publication=None, notes=""):
+    row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (current["batch_id"],)).fetchone()
+    receipt = automerge.make_ready_receipt(row, current["tests"], kind, publication=publication,
+                                         revision=current["revision"], notes=notes)
+    record(conn, current["batch_id"], "ready", receipt)
+    conn.execute("UPDATE automerge_batches SET ready_json=? WHERE batch_id=?",
+                 (json.dumps(receipt), current["batch_id"]))
+
+
 def dispatch(conn, batch_id, operation, payload):
     if operation == "state":
         return state(conn, batch_id)
@@ -182,10 +195,20 @@ def dispatch(conn, batch_id, operation, payload):
         resource = "pulls" if kind == "pull" else "issues"
         return {"item": automerge.gh_json(["api", f"repos/{automerge.REPO_NAME}/{resource}/{number}"]),
                 "comments": automerge.list_pull_comments(number)}
-    if operation not in {"exclude", "tests", "publish", "comment", "finding", "candidate"}:
+    if operation not in {"exclude", "tests", "publish", "ready", "comment", "finding", "candidate"}:
         raise ValueError("unknown operation")
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if operation in {"publish", "ready"}:
+            current = state(conn, batch_id)
+            receipt = current["ready"]
+            if (receipt and isinstance(payload.get("revision"), str)
+                    and receipt["kind"] == operation and receipt["head"] == payload.get("head")
+                    and payload.get("revision") in {receipt["registered_revision"], current["revision"]}
+                    and receipt["notes"] == payload.get("notes", "")
+                    and (not current["predecessor"] or current["predecessor"]["current"])):
+                conn.commit()
+                return current  # A handoff accepted before a lost reply remains accepted.
         if operation == "finding":
             # Findings preserve evidence after a final report or landing too;
             # they cannot change membership, tests, publication, or CI gates.
@@ -300,12 +323,34 @@ def dispatch(conn, batch_id, operation, payload):
             if verdict == "fail":
                 conn.execute("UPDATE automerge_batches SET candidate_json='{}' WHERE batch_id=?", (batch_id,))
             conn.commit()
+        elif operation == "ready":
+            if not current["predecessor"]:
+                raise ValueError("foreground candidates hand off through mm-autopr")
+            head = sha(payload.get("head"))
+            checkpoint = current["candidate"]
+            if (not current["sources"] or not checkpoint or checkpoint["head"] != head
+                    or not current["tests"] or current["tests"]["head"] != head
+                    or current["tests"]["verdict"] != "pass"):
+                raise ValueError("readiness requires the checkpointed passing head and current source set")
+            conn.commit()
+            remote = gh_api("git/ref/heads/" + quote(current["branch"], safe="/"))
+            if remote.get("object", {}).get("sha") != head:
+                raise ValueError("remote batch head does not match checkpointed tested head")
+            conn.execute("BEGIN IMMEDIATE")
+            checked(conn, batch_id, current["revision"])
+            notes = payload.get("notes", "")
+            if not isinstance(notes, str) or len(notes) > 30000:
+                raise ValueError("notes must be text of at most 30000 characters")
+            handoff(conn, current, "ready", notes=notes)
+            conn.commit()
         else:
             if current["predecessor"]:
                 raise ValueError("publication is blocked until the predecessor lands and the batch is promoted")
             head = sha(payload.get("head"))
             if not current["sources"] or not current["tests"] or current["tests"]["head"] != head or current["tests"]["verdict"] != "pass":
                 raise ValueError("publication requires a passing assessment for this exact head and source set")
+            if current["candidate"] and current["candidate"]["head"] != head:
+                raise ValueError("withdraw the old candidate and checkpoint the tested head before publication")
             notes = payload.get("notes", "")
             if not isinstance(notes, str) or len(notes) > 30000:
                 raise ValueError("notes must be text of at most 30000 characters")
@@ -320,6 +365,7 @@ def dispatch(conn, batch_id, operation, payload):
             )
             conn.execute("UPDATE automerge_batches SET integration_pr_number=?,integration_pr_url=? WHERE batch_id=?",
                          (publication["number"], publication["url"], batch_id))
+            handoff(conn, current, "publish", publication=publication, notes=notes)
             conn.commit()
         return state(conn, batch_id)
     except Exception:

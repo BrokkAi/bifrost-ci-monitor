@@ -210,6 +210,20 @@ Manual abort and immediate-priority preemption deliberately interrupt work.
 After a verified terminal outcome, checkpoint/suspend through the existing
 cleanup path; supervision errors leave sessions available for later polls.
 
+Integration completion uses a durable `ready_json` handoff in the shared DB.
+Successful `mm-autopr` records it atomically with publication; speculative
+successors call `mm-db ready` for their checkpointed passing head. Receipts bind
+the tested full head, local assessment, source revision and attempt generation.
+The supervisor consumes them in both CI modes without requiring `mj wait`,
+session idleness or a final assistant message. It preserves all normal freshness,
+ancestry, exact-head and CI gates and suspends after confirmed landing. Agent
+mutations are fenced after handoff; accepted retries are idempotent. Changed
+inputs, recovery, promotion and new instructions invalidate readiness. Follow-up
+prompts use persisted command IDs so an old active-turn flag cannot swallow new
+work and ambiguous replies cannot duplicate it. Read-only state and diagnostic
+findings remain available after handoff. On upgrade, matching durable publications
+and already parked successors acquire receipts once; incomplete assessments do not.
+
 Integration sessions use Opus 5.5 (`opus`) on `bedrock-podman` with Mjolnir Luna 6
 (`global.openai.gpt-6-luna`, high effort) subagents. The CI Mjolnir configuration
 allows up to 16 concurrent subagents per session. The primary coordinates the
@@ -516,10 +530,12 @@ Persist `CI_MODE` at batch creation; the Bifrost default is async. Migrated
 old batches without a mode remain sync. A later setting edit never changes
 an active batch's mode.
 
-Async requires one standalone `mergemarshall:local: pass|fail` line, `Tests run:`
-and `Baseline failures:` in the final agent report, with the tested full HEAD.
-Only pass proceeds. `Tests run: none` is accepted only for a supervisor-confirmed
-docs candidate; baseline/test summaries remain required. Any new failure must be fixed or the exact responsible
+Async requires a recorded passing local assessment and accepted publication
+handoff for the tested full HEAD and current source revision. The human report
+renders `mergemarshall:local: pass|fail`, `Tests run:` and `Baseline failures:`;
+its arrival is not a scheduling gate. `Tests run: none` is accepted only for a
+supervisor-confirmed docs candidate; baseline/test summaries remain required.
+Any new failure must be fixed or the exact responsible
 head removed/rejected; a baseline requires a local rerun at the captured base.
 The supervisor does not wait for/query CI or dispatch baseline runs. There is
 no sync-style CI-round limit. Master CI after landing is handled by triage

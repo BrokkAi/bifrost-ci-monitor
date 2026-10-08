@@ -107,7 +107,7 @@ def verify_candidate(a, current, head, conn):
 
 GUIDANCE = """Candidate checkpoints and lookahead: after completing your merges and fixes, before starting expensive validation, run mm-db candidate --revision <current revision> (add --rebuild for a rebuilt branch). This pushes only your recorded batch branch and records the committed candidate; it opens no PR. Before making further edits, withdraw it with mm-db candidate --revision <current revision> --withdraw. Register the replacement when ready. The supervisor may run the next batch's useful checks concurrently through existing mbx.
 
-Read mm-db state: if predecessor is present, your base is its pinned unlanded candidate, and your membership contains only your own newly selected PRs. Never redo or eject the predecessor's membership. Investigate, merge, fix, validate, and record independent standalone rejections of your own exact heads normally. An interaction with the unlanded predecessor is not proof that your PR is independently broken. After local pass, record mm-db tests and finish this turn without publishing; the supervisor will request promotion when the predecessor lands. Publication is blocked until promotion. A changed predecessor restarts this attempt with /clear in the same environment and a generated brief; caches, logs and rerere remain available.
+Read mm-db state: if predecessor is present, your base is its pinned unlanded candidate, and your membership contains only your own newly selected PRs. Never redo or eject the predecessor's membership. Investigate, merge, fix, validate, and record independent standalone rejections of your own exact heads normally. An interaction with the unlanded predecessor is not proof that your PR is independently broken. After local pass, record mm-db tests, refresh state, and call mm-db ready --revision <current revision> to hand off the checkpointed candidate, then finish this turn without publishing; the supervisor will request promotion when the predecessor lands. Publication is blocked until promotion. A changed predecessor restarts this attempt with /clear in the same environment and a generated brief; caches, logs and rerere remain available.
 """
 
 
@@ -157,7 +157,7 @@ def invalidate(a, conn, row):
     with conn:
         conn.execute("UPDATE automerge_batches SET attempt_generation=attempt_generation+1,phase='resetting',"
                      "candidate_json='{}',recovery_json=?,pending_prompt=NULL,prompt_delivered=0,"
-                     "agent_final_message='',turn_started_at=NULL WHERE batch_id=?",
+                     "ready_json='{}',prompt_command_id=NULL,agent_final_message='',turn_started_at=NULL WHERE batch_id=?",
                      (json.dumps(old), row["batch_id"]))
 
 
@@ -421,7 +421,7 @@ def recover(a, conn, row):
 
 
 def promote(a, conn, transport, row, parent):
-    if row['phase'] != 'waiting_parent' or not a._session_is_idle(row):
+    if row['phase'] != 'waiting_parent' or not a.ready_candidate(row):
         return
     pinned = json.loads(row["predecessor_candidate_json"])
     landed = parent["integration_merge_commit_sha"]
@@ -461,8 +461,9 @@ def promote(a, conn, transport, row, parent):
     with conn:
         conn.execute("UPDATE automerge_batches SET predecessor_id=NULL,base_sha=?,candidate_json='{}',"
                      "promotion_json=?,phase='fixing',pending_prompt=?,prompt_delivered=0,"
-                     "turn_started_at=NULL,validation_impact_json=? WHERE batch_id=?",
-                     (landed, json.dumps(promotion), prompt, json.dumps(impact), row["batch_id"]))
+                     "ready_json='{}',prompt_command_id=?,turn_started_at=NULL,validation_impact_json=? WHERE batch_id=?",
+                     (landed, json.dumps(promotion), prompt, 'mm-promote-' + a.uuid.uuid4().hex,
+                      json.dumps(impact), row["batch_id"]))
 
 
 def _mode(a, row):
@@ -516,6 +517,7 @@ def tick(a, conn, transport, parent):
 
 
 def finished(a, conn, transport, row, final):
+    """Legacy report recovery; live successors hand off through mm-db ready."""
     a._record_agent_exclusions(conn, row, final)
     row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (row["batch_id"],)).fetchone()
     if not a._active_sources(row):

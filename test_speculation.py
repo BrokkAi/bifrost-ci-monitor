@@ -169,10 +169,21 @@ class StateTests(unittest.TestCase):
         self.assertEqual([p.number for p in a.row_pulls(self.row(self.parent))], [7])
 
     def test_local_pass_parks_instead_of_publishing(self):
-        self.assess()
+        current = self.assess()
+        self.assertIsNone(a.ready_candidate(self.row()))
+        with mock.patch.object(service, 'gh_api', return_value={'object': {'sha': HEAD_TWO}}):
+            ready = service.dispatch(self.conn, self.child, 'ready',
+                                     {'revision': current['revision'], 'head': HEAD_TWO})
+        again = service.dispatch(self.conn, self.child, 'ready',
+                                 {'revision': current['revision'], 'head': HEAD_TWO})
+        self.assertEqual(ready['ready'], again['ready'])
+        with self.assertRaisesRegex(ValueError, 'handed to supervisor'):
+            service.dispatch(self.conn, self.child, 'tests',
+                             {'revision': ready['revision'], 'head': HEAD_TWO, 'verdict': 'pass',
+                              'tests': 'another check', 'baseline': 'none'})
         with (mock.patch.object(a, '_record_agent_exclusions'),
               mock.patch.object(a, '_recheck_sources', side_effect=lambda pulls, **kw: (pulls, []))):
-            s.finished(a, self.conn, self.transport, self.row(), 'automerge-local: pass')
+            a._consume_ready_candidate(self.conn, self.transport, self.row())
         self.assertEqual(self.row()['phase'], 'waiting_parent')
         self.assertIsNone(self.row()['integration_pr_number'])
 
@@ -295,7 +306,7 @@ class StateTests(unittest.TestCase):
         self.assertIsNone(rejection[0])
 
     def test_promotion_waits_for_build_then_requires_tree_proof(self):
-        self.assess()
+        current = self.assess()
         with self.conn:
             self.conn.execute("UPDATE automerge_batches SET phase='waiting_parent' WHERE batch_id=?", (self.child,))
             self.conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal',terminal_status='merged',"
@@ -305,7 +316,14 @@ class StateTests(unittest.TestCase):
               mock.patch.object(s, 'commit_tree') as tree):
             s.promote(a, self.conn, self.transport, self.row(), self.row(self.parent))
             tree.assert_not_called()
-        with (mock.patch.object(a, '_session_is_idle', return_value=True),
+        with mock.patch.object(service, 'gh_api', return_value={'object': {'sha': HEAD_TWO}}):
+            # Accept handoff while still building, then park via the shared supervisor path.
+            with self.conn:
+                self.conn.execute("UPDATE automerge_batches SET phase='building' WHERE batch_id=?", (self.child,))
+            current = service.state(self.conn, self.child)
+            service.dispatch(self.conn, self.child, 'ready', {'revision': current['revision'], 'head': HEAD_TWO})
+            a._consume_ready_candidate(self.conn, self.transport, self.row())
+        with (mock.patch.object(a, '_session_is_idle', side_effect=AssertionError('ACP is not a gate')),
               mock.patch.object(a, 'compare_commit_ancestry', return_value=True),
               mock.patch.object(s, 'commit_tree', return_value=TREE),
               mock.patch.object(a, 'current_master_sha', return_value=BASE_SHA),
@@ -318,7 +336,9 @@ class StateTests(unittest.TestCase):
         self.assertEqual(json.loads(row['promotion_json'])['previous_tests']['head'], HEAD_TWO)
 
     def test_actual_master_advance_uses_fresh_attempt(self):
-        self.assess()
+        current = self.assess()
+        with mock.patch.object(service, 'gh_api', return_value={'object': {'sha': HEAD_TWO}}):
+            service.dispatch(self.conn, self.child, 'ready', {'revision': current['revision'], 'head': HEAD_TWO})
         with self.conn:
             self.conn.execute("UPDATE automerge_batches SET phase='waiting_parent' WHERE batch_id=?", (self.child,))
             self.conn.execute("UPDATE automerge_batches SET ci_head_sha=?,integration_merge_commit_sha=? WHERE batch_id=?",

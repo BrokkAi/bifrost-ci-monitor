@@ -313,6 +313,24 @@ class StateTests(unittest.TestCase):
         self.assertEqual(row_for(self.conn)["integration_pr_number"], 211)
         self.assertEqual(automerge._async_local_result(db.render_report(updated)), "pass")
         self.assertIn('mergemarshall:local: pass', db.render_report(updated))
+        self.assertEqual(updated['ready']['head'], HEAD_ONE)
+        self.assertEqual(updated['ready']['assessment'], current['tests'])
+        with mock.patch.object(mm_service, 'reconcile_publication', side_effect=AssertionError('duplicate publication')):
+            again = self.call('publish', revision=current['revision'], head=HEAD_ONE, notes='resolved conflict')
+        self.assertEqual(again['ready'], updated['ready'])
+        with self.assertRaisesRegex(ValueError, 'handed to supervisor'):
+            self.call('comment', revision=updated['revision'], number=7, body='late mutation')
+        # A durable handoff advances even while ACP reports an active turn.
+        with (mock.patch.object(automerge, '_wait_agent_turn', side_effect=AssertionError('unexpected wait')),
+              mock.patch.object(automerge, '_session_is_idle', side_effect=AssertionError('unexpected idle gate')),
+              mock.patch.object(automerge, 'send_start_notification'),
+              mock.patch.object(automerge, '_merge_integration') as land):
+            automerge.process_batch(self.conn, mock.Mock(), 'batch-test')
+        self.assertEqual(land.call_args.args[2]['ci_head_sha'], HEAD_ONE)
+        self.assertEqual(row_for(self.conn)['phase'], 'merging')
+        with mock.patch.object(mm_service, 'reconcile_publication', side_effect=AssertionError('duplicate publication')):
+            self.assertEqual(self.call('publish', revision=current['revision'], head=HEAD_ONE,
+                                       notes='resolved conflict')['ready'], updated['ready'])
 
     def test_rejected_source_is_recorded_without_waiting_for_github(self):
         current = self.state()
