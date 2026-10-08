@@ -355,6 +355,19 @@ def require_mj_success(args: list[str], *, timeout: int = 60) -> str:
     return (result.stdout or "").strip()
 
 
+def interrupt_turn(session_id: str) -> None:
+    """Cancellation is idempotent when the worker has already ended its turn."""
+    result = mj_command(["interrupt-turn", "--session", session_id, "--json"], timeout=60)
+    if result.returncode == 0:
+        return
+    detail = mj_output(result)
+    if any(marker in detail.lower() for marker in (
+            "no active turn", "nothing is running", "turn is not running", "no turn to cancel")):
+        return
+    reason = "daemon_unreachable" if looks_like_daemon_failure(detail) else "mj_supervision_failed"
+    raise MjError(f"mj interrupt-turn failed: {detail}", reason=reason)
+
+
 def migrate_invocations(conn: sqlite3.Connection) -> None:
     """Drop the legacy sha-keyed invocations table so it can be recreated run-keyed.
 
@@ -2719,23 +2732,7 @@ def interrupt_and_wait(
     *,
     grace_seconds: int,
 ) -> TurnResult:
-    interrupted = mj_command(
-        ["interrupt-turn", "--session", session_id, "--json"], timeout=60
-    )
-    if interrupted.returncode != 0:
-        detail = mj_output(interrupted)
-        lower = detail.lower()
-        already_ended = any(
-            marker in lower
-            for marker in ("no active turn", "nothing is running", "turn is not running")
-        )
-        if not already_ended:
-            reason = (
-                "daemon_unreachable"
-                if looks_like_daemon_failure(detail)
-                else "mj_supervision_failed"
-            )
-            raise MjError(f"mj interrupt-turn failed: {detail}", reason=reason)
+    interrupt_turn(session_id)
     deadline = time.monotonic() + grace_seconds
     while True:
         turn = wait_once(session_id, MJ_WAIT_POLL_SECONDS)

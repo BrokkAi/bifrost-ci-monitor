@@ -15,6 +15,7 @@ from unittest import TestCase, mock
 
 import automerge
 import monitor
+import speculation
 
 
 BASE_SHA = "a" * 40
@@ -3311,7 +3312,7 @@ class AbortBatchTests(TestCase):
         session_status = mock.patch.object(
             automerge, "_session_status", return_value={"state": "running"},
         )
-        interrupt = mock.patch.object(automerge, "interrupt_and_wait")
+        interrupt = mock.patch.object(speculation, "stop_work", return_value=True)
         suspend = mock.patch.object(automerge, "request_suspend", return_value=True)
         with (
             session_status as session,
@@ -3326,6 +3327,7 @@ class AbortBatchTests(TestCase):
             mock.patch.object(automerge, "post_verdict_status") as post,
             mock.patch.object(automerge, "run_gh") as gh,
             mock.patch.object(automerge, "finish_batch", side_effect=mark_outcome_posted) as finish,
+            mock.patch.object(monitor, "wait_once", side_effect=AssertionError("no idle wait")),
         ):
             automerge._complete_abort(conn, transport, row_for(conn))
         updated = row_for(conn)
@@ -3365,6 +3367,19 @@ class AbortBatchTests(TestCase):
 
     def test_abort_without_session_closes_pr_and_releases_queue(self):
         self._run_abort("building", None)
+
+    def test_abort_keeps_ownership_until_child_and_task_cleanup_finishes(self):
+        conn = make_db(phase='aborting')
+        self.addCleanup(conn.close)
+        with (mock.patch.object(automerge, '_session_status', return_value={'state': 'running'}),
+              mock.patch.object(speculation, 'stop_work', return_value=False),
+              mock.patch.object(automerge, 'request_suspend') as suspend,
+              mock.patch.object(automerge, 'finish_batch') as finish):
+            automerge._complete_abort(conn, monitor.SlackTransport('webhook', webhook='unused'), row_for(conn))
+        self.assertEqual(row_for(conn)['phase'], 'aborting')
+        self.assertIsNotNone(automerge.active_batch(conn))
+        suspend.assert_not_called()
+        finish.assert_not_called()
 
     def test_abort_preserves_pending_rejection_and_queue_exclusion(self):
         conn = make_db(phase="aborting", session_id=None, integration_pr_number=None)

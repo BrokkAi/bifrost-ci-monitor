@@ -18,6 +18,36 @@ from test_mm_skills import GitFixture, merge, db
 TREE = '4' * 40
 
 
+class StopWorkTests(unittest.TestCase):
+    def test_children_are_cleaned_up_even_when_their_turns_already_ended(self):
+        busy = {'state': 'running', 'chat_phase': 'idle', 'is_idle': False}
+        child = dict(busy, id='child')
+        with (mock.patch.object(s, 'mj', return_value={}) as command,
+              mock.patch.object(s, 'mj_api', return_value={'subagents': [{'session': child}]}),
+              mock.patch.object(a, '_session_status', side_effect=lambda identifier:
+                  {'state': 'stopped'} if identifier == 'child' else busy),
+              mock.patch.object(monitor, 'mj_command', return_value=subprocess.CompletedProcess(
+                  [], 1, '', 'this session has no turn to cancel')) as interrupt):
+            self.assertTrue(s.stop_work(a, {'session_id': 'parent'}))
+        self.assertEqual([call.args[0][2] for call in interrupt.call_args_list], ['parent', 'child'])
+        commands = [call.args[1] for call in command.call_args_list]
+        self.assertIn(['stop-task', '--session', 'child', '--all', '--json'], commands)
+        self.assertIn(['suspend', '--session', 'child', '--acknowledge-unpublished-work', '--json'], commands)
+        self.assertIn(['stop-task', '--session', 'parent', '--all', '--json'], commands)
+
+    def test_remaining_tasks_and_child_suspension_still_block_reset(self):
+        for state, children in [({'background_tasks': [{'id': 'task'}]}, []),
+                                ({'background_work': {'tasks': [{'id': 'task'}]}}, []),
+                                ({}, [{'session': {'id': 'child', 'state': 'stopping'}}])]:
+            with (self.subTest(state=state, children=children),
+                  mock.patch.object(s, 'mj', return_value={}),
+                  mock.patch.object(s, 'mj_api', return_value={'subagents': children}),
+                  mock.patch.object(monitor, 'interrupt_turn'),
+                  mock.patch.object(a, '_session_status', side_effect=lambda identifier:
+                      {'state': 'stopping'} if identifier == 'child' else state)):
+                self.assertFalse(s.stop_work(a, {'session_id': 'parent'}))
+
+
 class StateTests(unittest.TestCase):
     def setUp(self):
         self.conn = make_db(ci_mode='async', integration_pr_number=None)
@@ -158,6 +188,36 @@ class StateTests(unittest.TestCase):
             self.assertEqual(send.call_args.args[-1], 'mm-restart-child-test-1')
         self.assertEqual(self.row()['phase'], 'building')
         self.assertEqual(self.row()['session_id'], 'child-session')
+
+    def test_already_ended_non_idle_session_advances_to_existing_clear_boundary(self):
+        s.invalidate(a, self.conn, self.row())
+        state = {'state': 'running', 'chat_phase': 'idle', 'is_idle': False,
+                 'activity_state': {'state': 'expecting'}, 'background_work': {'known': None, 'tasks': []}}
+        with (mock.patch.object(s, 'mj', return_value={'latest_seq': 99}),
+              mock.patch.object(s, 'mj_api', return_value={'subagents': []}),
+              mock.patch.object(a, '_session_status', return_value=state),
+              mock.patch.object(monitor, 'mj_command', return_value=subprocess.CompletedProcess(
+                  [], 1, '', '409 Conflict: this session has no turn to cancel')),
+              mock.patch.object(monitor, 'active_mj_turn', side_effect=AssertionError('no idle heuristic'))):
+            s.recover_step(a, self.conn, self.row())
+        self.assertEqual(json.loads(self.row()['recovery_json'])['stage'], 'clear')
+        self.assertEqual(self.row()['session_id'], 'child-session')
+
+    def test_clear_busy_reply_retries_same_identity_after_cancellation_finishes(self):
+        s.invalidate(a, self.conn, self.row())
+        with (mock.patch.object(s, 'stop_work', return_value=True),
+              mock.patch.object(s, 'mj', return_value={'latest_seq': 99})):
+            s.recover_step(a, self.conn, self.row())
+        expected = s.clear_id(self.row(), json.loads(self.row()['recovery_json']))
+        with mock.patch.object(s, 'send_once', side_effect=monitor.MjError('turn still running')) as send:
+            with self.assertRaises(monitor.MjError):
+                s.recover_step(a, self.conn, self.row())
+            self.assertEqual(send.call_args.args[-1], expected)
+        self.assertEqual(json.loads(self.row()['recovery_json'])['stage'], 'clear')
+        with mock.patch.object(s, 'send_once', return_value={'turn_id': 100}) as send:
+            s.recover_step(a, self.conn, self.row())
+            self.assertEqual(send.call_args.args[-1], expected)
+        self.assertEqual(json.loads(self.row()['recovery_json'])['stage'], 'cleared')
 
     def test_boundary_scan_advances_instead_of_rereading_old_history(self):
         s.invalidate(a, self.conn, self.row())

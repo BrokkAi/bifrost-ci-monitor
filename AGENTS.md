@@ -426,7 +426,10 @@ After role promotion, new messages use normal batch wording. Message decoration
 must not change stored agent evidence, relay identities/cursors or delivery retries.
 
 Invalidation fences old mutations immediately. Persist a new attempt generation,
-stop queued prompts/turns/background tasks and child sessions, then issue typed
+stop queued prompts/turns/background tasks and child sessions. Cancellation
+accepts an already-ended turn; cleanup never infers turn
+activity or waits for session idleness. Existing task/child cleanup and the
+clear boundary (or suspension for aborts) own termination. Then issue typed
 `/clear` with a stable command ID. Wait for its durable context divider before
 submitting a deterministic brief, also with a stable ID. Lost replies retry the
 same command; confirmed failed clears use a new ID. The session, container,

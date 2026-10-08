@@ -2057,18 +2057,7 @@ def interrupt_and_wait(
     *,
     grace_seconds: int,
 ) -> monitor.TurnResult:
-    result = monitor.mj_command(
-        ["interrupt-turn", "--session", session_id, "--json"], timeout=60
-    )
-    if result.returncode != 0:
-        detail = monitor.mj_output(result)
-        already_ended = any(
-            marker in detail.lower()
-            for marker in ("no active turn", "nothing is running", "turn is not running")
-        )
-        if not already_ended:
-            reason = "daemon_unreachable" if monitor.looks_like_daemon_failure(detail) else "mj_supervision_failed"
-            raise monitor.MjError(f"mj interrupt-turn failed: {detail}", reason=reason)
+    monitor.interrupt_turn(session_id)
     deadline = time.monotonic() + grace_seconds
     while True:
         turn = monitor.wait_once(session_id, MJ_WAIT_POLL_SECONDS)
@@ -5021,16 +5010,10 @@ def _complete_abort(
     if session_id:
         session = _session_status(session_id)
         if not monitor.session_is_stopped(session):
-            if terminal_status == "no_sources_remain":
-                # Stop queued turns, background checks and subagents too. Poll
-                # completion on later ticks rather than waiting for a final report.
-                if not speculation.stop_work(sys.modules[__name__], row):
-                    return
-            else:
-                interrupt_and_wait(
-                    conn, transport, batch_id, session_id,
-                    grace_seconds=INTERRUPTION_GRACE_SECONDS,
-                )
+            # Stop queued prompts, tasks and children for every abort reason.
+            # Suspension then closes the worker without waiting for global idle.
+            if not speculation.stop_work(sys.modules[__name__], row):
+                return
         if not request_suspend(conn, transport, batch_id, session_id):
             raise AutomergeError(
                 f"could not suspend aborted batch session {session_id}",

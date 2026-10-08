@@ -21,6 +21,26 @@ import monitor
 ISSUE_URL = "https://github.com/BrokkAi/bifrost-dev/issues/2304"
 
 
+class InterruptTurnTests(unittest.TestCase):
+    def test_already_ended_replies_are_idempotent(self):
+        for detail in ['no active turn', 'nothing is running', 'turn is not running',
+                       '409 Conflict: this session has no turn to cancel']:
+            with self.subTest(detail=detail), mock.patch.object(monitor, 'mj_command',
+                    return_value=subprocess.CompletedProcess([], 1, '', detail)) as command:
+                monitor.interrupt_turn('session')
+                command.assert_called_once_with(
+                    ['interrupt-turn', '--session', 'session', '--json'], timeout=60)
+
+    def test_other_conflicts_and_daemon_failures_still_raise(self):
+        for detail, reason in [('409 Conflict: session operation in progress', 'mj_supervision_failed'),
+                               ('connection refused', 'daemon_unreachable')]:
+            with self.subTest(detail=detail), mock.patch.object(monitor, 'mj_command',
+                    return_value=subprocess.CompletedProcess([], 1, '', detail)):
+                with self.assertRaises(monitor.MjError) as error:
+                    monitor.interrupt_turn('session')
+                self.assertEqual(error.exception.reason, reason)
+
+
 def make_run(run_id: int = 42) -> monitor.CiRun:
     return monitor.CiRun(
         workflow="CI",

@@ -270,9 +270,7 @@ def failed_clear(a, conn, row, recovery, result):
 def stop_work(a, row):
     session = row["session_id"]
     mj(a, ["clear-queue", "--session", session, "--json"])
-    state = a._session_status(session)
-    if a.monitor.active_mj_turn(state):
-        mj(a, ["interrupt-turn", "--session", session, "--json"])
+    a.monitor.interrupt_turn(session)
     # mj child sessions share this checkout; close their turns before resetting it.
     children = mj_api(a, f"/sessions/{session}/subagents")
     children_stopped = True
@@ -281,16 +279,16 @@ def stop_work(a, row):
         identifier = state['id']
         if not a.monitor.session_is_stopped(state) and state.get('state') != 'stopping':
             mj(a, ["clear-queue", "--session", identifier, "--json"])
-            if a.monitor.active_mj_turn(state):
-                mj(a, ["interrupt-turn", "--session", identifier, "--json"])
+            a.monitor.interrupt_turn(identifier)
             mj(a, ["stop-task", "--session", identifier, "--all", "--json"])
             mj(a, ["suspend", "--session", identifier, "--acknowledge-unpublished-work", "--json"])
         children_stopped &= a.monitor.session_is_stopped(a._session_status(identifier))
     mj(a, ["stop-task", "--session", session, "--all", "--json"])
     state = a._session_status(session)
     background = state.get('background_work') or {}
-    return (children_stopped and state.get("is_idle") is True and not a.monitor.active_mj_turn(state)
-            and background.get('known') is not False and not background.get('tasks') and not state.get('background_tasks'))
+    # /clear owns the context-reset boundary; suspension owns abort teardown.
+    # Neither needs a heuristic that guesses whether a local worker is idle.
+    return children_stopped and not background.get('tasks') and not state.get('background_tasks')
 
 
 def reset_brief(a, conn, row, recovery):
