@@ -390,7 +390,7 @@ class IssueFixerTests(TestCase):
     def test_running_session_is_left_live(self):
         job = dict(self.job(), session_id="session")
         with mock.patch.object(monitor, "wait_once", return_value=monitor.TurnResult("running", "timeout", True)), \
-             mock.patch.object(fixer, "relay"), mock.patch.object(monitor, "send_session_prompt") as prompt:
+             mock.patch.object(fixer, "relay"), mock.patch.object(monitor, "send_session_message") as prompt:
             fixer.collect(self.conn, self.transport, job)
         prompt.assert_not_called()
 
@@ -430,12 +430,18 @@ class IssueFixerTests(TestCase):
 
     def test_correction_is_sent_once_and_never_suspends(self):
         job = dict(self.job(), session_id="session")
-        with mock.patch.object(monitor, "send_session_prompt") as prompt:
+        with mock.patch.object(monitor, "send_session_message",
+                               side_effect=[monitor.MjError('lost reply'), None]) as prompt:
+            with self.assertRaises(monitor.MjError):
+                fixer.request_correction(self.conn, job, 'claim handoff', 'report')
+            pending = self.conn.execute("SELECT * FROM issue_repairs WHERE id=?", (job["id"],)).fetchone()
+            self.assertIsNone(pending['feedback_digest'])
             fixer.request_correction(self.conn, job, "claim handoff", "report")
             latest = self.conn.execute("SELECT * FROM issue_repairs WHERE id=?", (job["id"],)).fetchone()
             with self.assertRaisesRegex(RuntimeError, "already requested"):
                 fixer.request_correction(self.conn, latest, "claim handoff", "report")
-        self.assertEqual(prompt.call_count, 1)
+        self.assertEqual(prompt.call_count, 2)
+        self.assertEqual(prompt.call_args_list[0].kwargs['request_id'], prompt.call_args_list[1].kwargs['request_id'])
         self.assertEqual(latest["status"], "running")
 
     def test_poll_with_live_session_does_not_select_more_work(self):
@@ -454,7 +460,7 @@ class IssueFixerTests(TestCase):
             self.conn.execute("UPDATE issue_repairs SET status='finishing',session_id='live',start_notified=1,report_json=? WHERE id=?",
                               (json.dumps({"issue":12,"outcome":"escalated","pr":None,"summary":"tricky"}), job["id"]))
         with mock.patch.object(fixer, "api", return_value=issue()), mock.patch.object(fixer, "cleanup"), \
-             mock.patch.object(monitor, "send_session_prompt") as prompt:
+             mock.patch.object(monitor, "send_session_message") as prompt:
             with self.assertRaisesRegex(ValueError, "handoff is incomplete"):
                 fixer.tick(self.conn, self.transport)
         self.assertEqual(prompt.call_args.args[0], "live")

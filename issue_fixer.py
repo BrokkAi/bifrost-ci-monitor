@@ -445,12 +445,13 @@ def request_correction(conn, job, problem, report_text):
     digest = hashlib.sha256((problem + report_text).encode()).hexdigest()
     if digest == job["feedback_digest"]:
         raise RuntimeError("waiting for correction already requested")
-    with conn:
-        conn.execute("UPDATE issue_repairs SET status='running',feedback_digest=? WHERE id=?", (digest, job["id"]))
-    monitor.send_session_prompt(job["session_id"],
+    monitor.send_session_message(job["session_id"],
         f"Your issue #{job['issue_number']} completion needs correction: {problem}. "
         "Finish only the missing report/publication/claim handoff, respecting current ownership, "
-        "then return the original fixer-result JSON. Reuse your findings; do not repeat the investigation.")
+        "then return the original fixer-result JSON. Reuse your findings; do not repeat the investigation.",
+        request_id="fixer-feedback-" + hashlib.sha256((job['id'] + digest).encode()).hexdigest())
+    with conn:
+        conn.execute("UPDATE issue_repairs SET status='running',feedback_digest=? WHERE id=?", (digest, job["id"]))
 
 
 def collect(conn, transport, job):
