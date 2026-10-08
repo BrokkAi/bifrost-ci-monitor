@@ -4711,23 +4711,8 @@ def _complete_abort(
                 enqueue_github_write(conn, batch_id, "issue_comment", number, "",
                                      {"body": str(row["abort_reason"] or "Operator requested abort.")})
 
-    ensure_github_outbox_schema(conn)
-    cancelled = conn.execute(
-        "SELECT number,head_sha FROM automerge_github_outbox "
-        "WHERE batch_id=? AND kind='reject_head' AND cancelled_at IS NULL",
-        (batch_id,),
-    ).fetchall()
-    with conn:
-        conn.execute(
-            "UPDATE automerge_github_outbox SET cancelled_at=? "
-            "WHERE batch_id=? AND kind='reject_head' AND cancelled_at IS NULL",
-            (utc_now(), batch_id),
-        )
-        for rejected in cancelled:
-            enqueue_github_write(conn, batch_id, "clear_rejection_label",
-                                 int(rejected["number"]), str(rejected["head_sha"]),
-                                 {"cancelled_rejection": True})
-
+    # Exact-head rejection evidence outlives the batch that established it.
+    # Abort releases membership, never a rejected head or its pending writes.
     with conn:
         conn.execute(
             "UPDATE automerge_batches SET status='completed', phase='terminal', "

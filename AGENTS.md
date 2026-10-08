@@ -443,8 +443,9 @@ candidate freshness at retries. Do not terminate/close a tested candidate
 merely because GitHub refused one write or confirmation was ambiguous.
 
 Abort is resumable: interrupt/suspend, failure verdict, close the integration
-PR, preserve branch, remove batch-applied rejection labels without rejecting
-sources, then release the queue. Direct abort leaves its source PR open.
+PR, preserve branch, then release nonrejected sources to the queue. Established
+exact-head rejections and their pending outbox writes survive every abort;
+never cancel them or remove their labels as abort cleanup. Direct abort leaves its source PR open.
 Retry the Slack outcome independently when delivery is unavailable.
 
 # Failure ledger, triage, and Slack

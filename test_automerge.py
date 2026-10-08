@@ -3200,7 +3200,7 @@ class AbortBatchTests(TestCase):
     def test_abort_without_session_closes_pr_and_releases_queue(self):
         self._run_abort("building", None)
 
-    def test_abort_cancels_pending_rejection_and_queues_label_cleanup(self):
+    def test_abort_preserves_pending_rejection_and_queue_exclusion(self):
         conn = make_db(phase="aborting", session_id=None, integration_pr_number=None)
         with conn:
             automerge.enqueue_github_write(conn, "batch-test", "reject_head", 7, HEAD_ONE,
@@ -3209,14 +3209,23 @@ class AbortBatchTests(TestCase):
             automerge._complete_abort(conn, monitor.SlackTransport("webhook", webhook="x"), row_for(conn))
         intents = conn.execute("SELECT kind,cancelled_at FROM automerge_github_outbox "
                                "WHERE kind<>'membership_label' ORDER BY kind").fetchall()
-        self.assertEqual([row["kind"] for row in intents], ["clear_rejection_label", "reject_head"])
-        self.assertIsNotNone(intents[1]["cancelled_at"])
+        self.assertEqual([row["kind"] for row in intents], ["reject_head"])
+        self.assertIsNone(intents[0]["cancelled_at"])
         rejected_comment = {"id": 1, "user": {"login": automerge.TRUSTED_REJECTION_LOGIN},
                             "body": f"automerge-rejected-head: {HEAD_ONE}"}
         with (mock.patch.object(automerge, "list_open_pull_requests", return_value=[
                   api_pull(7, labels=[automerge.REJECTED_LABEL])]),
               mock.patch.object(automerge, "list_pull_comments", return_value=[rejected_comment])):
-            self.assertEqual([p.number for p in automerge.select_eligible_pull_requests(conn=conn)], [7])
+            self.assertEqual(automerge.select_eligible_pull_requests(conn=conn), [])
+        # Delivery and repeated terminal cleanup cannot release the head either.
+        with conn:
+            conn.execute("UPDATE automerge_github_outbox SET delivered_at='now' WHERE kind='reject_head'")
+        with mock.patch.object(automerge, "finish_batch"):
+            automerge._complete_abort(conn, monitor.SlackTransport("webhook", webhook="x"), row_for(conn))
+        self.assertIsNone(conn.execute("SELECT cancelled_at FROM automerge_github_outbox "
+                                     "WHERE kind='reject_head'").fetchone()[0])
+        self.assertFalse(conn.execute("SELECT 1 FROM automerge_github_outbox "
+                                      "WHERE kind='clear_rejection_label'").fetchone())
         conn.close()
 
     def test_abort_lock_wait_retries_the_cron_lock(self):
