@@ -3582,7 +3582,9 @@ def _finish_async_agent_turn(
     row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                        (row["batch_id"],)).fetchone()
     local_result = _async_local_result(final, allow_no_tests=_docs_validation(row))
-    if row["retry_rescan_pending"] and _request_rebuild(
+    # A passing report covers the rebuilt remainder after any ejections.
+    # New arrivals belong to the next batch once that candidate is finished.
+    if local_result != "pass" and row["retry_rescan_pending"] and _request_rebuild(
         conn, row, _active_sources(row), "a source PR was ejected; include newly ready PRs",
         only_if_expanded=True,
     ):
@@ -3626,7 +3628,8 @@ def _finish_async_agent_turn(
         conn.execute(
             "UPDATE automerge_batches SET integration_pr_number=?, integration_pr_url=?, "
             "ci_head_sha=?, ci_round=0, phase='merging', status='running', "
-            "pending_prompt=NULL, prompt_delivered=0, validation_impact_json=? WHERE batch_id=?",
+            "retry_rescan_pending=0, pending_prompt=NULL, prompt_delivered=0, "
+            "validation_impact_json=? WHERE batch_id=?",
             (int(integration["number"]), str(view.get("url") or integration.get("url") or ""),
              head, json.dumps(impact), row["batch_id"]),
         )

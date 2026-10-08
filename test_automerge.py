@@ -1714,6 +1714,60 @@ class PublicationGateTests(TestCase):
         complete.assert_called_once()
         conn.close()
 
+    def test_async_pass_after_ejection_lands_without_absorbing_new_arrivals(self):
+        for already_recorded in (False, True):
+            with self.subTest(already_recorded=already_recorded):
+                conn = make_db(phase="building", ci_mode="async",
+                               pulls=[pull(7), pull(8, HEAD_TWO)])
+                self.addCleanup(conn.close)
+                final = (async_local_report() +
+                         f"\nmergemarshall:ejected-pr: 7 {HEAD_ONE}\n"
+                         f"Tested HEAD: {HEAD_THREE}")
+                with conn:
+                    conn.execute("UPDATE automerge_batches SET agent_final_message=?",
+                                 (final,))
+                if already_recorded:
+                    automerge._persist_excluded_source_heads(conn, row_for(conn), [{
+                        "number": 7, "head_sha": HEAD_ONE, "kind": "ejected",
+                    }])
+                    self.assertEqual(row_for(conn)["retry_rescan_pending"], 1)
+                view = {"state": "OPEN", "isDraft": False, "baseRefName": "master",
+                        "headRefOid": HEAD_THREE, "baseRefOid": BASE_SHA,
+                        "url": "https://github.test/pr/211"}
+                merged = {"state": "MERGED", "mergedAt": "now",
+                          "mergeCommit": {"oid": "4" * 40}}
+                with (
+                    mock.patch.object(automerge, "select_eligible_pull_requests",
+                                      return_value=[pull(9, "9" * 40)]) as select,
+                    mock.patch.object(automerge, "_source_pr_state",
+                                      side_effect=lambda p: direct_view(head_sha=p.head_sha)),
+                    mock.patch.object(automerge, "find_integration_pr", return_value={
+                        "number": 211, "url": view["url"], "headRefOid": HEAD_THREE,
+                    }),
+                    mock.patch.object(automerge, "integration_pr_view",
+                                      side_effect=[view, view, merged]),
+                    mock.patch.object(automerge, "_session_is_idle", return_value=True),
+                    mock.patch.object(automerge, "current_master_sha", return_value=BASE_SHA),
+                    mock.patch.object(automerge, "list_pull_comments", return_value=[]),
+                    mock.patch.object(automerge, "verify_source_ancestry", return_value=(True, "ok")),
+                    mock.patch.object(automerge, "_try_post_verdict_status", return_value=True),
+                    mock.patch.object(automerge, "run_gh") as gh,
+                    mock.patch.object(automerge, "_complete_landed_batch") as complete,
+                ):
+                    transport = monitor.SlackTransport("webhook", webhook="x")
+                    automerge._finish_async_agent_turn(conn, transport, row_for(conn), final)
+                    self.assertEqual(row_for(conn)["phase"], "merging")
+                    self.assertEqual(row_for(conn)["retry_rescan_pending"], 0)
+                    self.assertEqual(row_for(conn)["ci_head_sha"], HEAD_THREE)
+                    automerge._merge_integration(conn, transport, row_for(conn))
+                select.assert_not_called()
+                self.assertEqual([p.number for p in automerge.row_pulls(row_for(conn))], [8])
+                self.assertEqual(row_for(conn)["expansion_count"], 0)
+                self.assertIsNone(row_for(conn)["pending_prompt"])
+                self.assertTrue(any(call.args[0][:2] == ["pr", "merge"]
+                                    for call in gh.call_args_list))
+                complete.assert_called_once()
+
     @unchanged_queue()
     def test_async_local_fail_with_ejection_rebuilds_and_does_not_merge(self):
         conn = make_db(phase="building", ci_mode="async", pulls=[pull(7), pull(8, HEAD_TWO)])
