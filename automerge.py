@@ -635,7 +635,7 @@ def retry_github_outbox(conn: sqlite3.Connection, transport: monitor.SlackTransp
             if attempts >= 3 and not row["alerted_at"] and row["kind"] != "membership_label":
                 batch = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                                      (row["batch_id"],)).fetchone()
-                lane = "speculative " if batch is not None and speculation.get(batch, "predecessor_id") else ""
+                lane = "speculative " if batch is not None and speculation.is_speculative(batch) else ""
                 try:
                     ok, _ = monitor.slack_send(
                         transport, f":rotating_light: MergeMarshall GitHub write pending for "
@@ -1744,7 +1744,7 @@ def send_start_notification(
     lane = "PRIORITY " if _batch_priority(row) else ""
     if _batch_source(row) == "operator":
         lane = "OPERATOR FAST-TRACK "
-    predecessor = speculation.get(row, "predecessor_id")
+    predecessor = speculation.get(row, "predecessor_id") if speculation.is_speculative(row) else None
     if predecessor:
         lane += "SPECULATIVE "
     if _batch_kind(row) == "direct":
@@ -1845,7 +1845,7 @@ def deliver_blocked_notice(
     batch = conn.execute(
         "SELECT * FROM automerge_batches WHERE batch_id = ?", (batch_id,)
     ).fetchone()
-    lane = "speculative " if batch is not None and speculation.get(batch, "predecessor_id") else ""
+    lane = "speculative " if batch is not None and speculation.is_speculative(batch) else ""
     loud = reason in {
         "github_write_retry", "verdict_status_failed",
         "source_ancestry_unverified", "baseline_unavailable", "ci_run_unavailable",
@@ -1954,7 +1954,7 @@ def drain_transcript(
             processed_cursor = max(processed_cursor, seq)
             continue
         item_text = text.strip()
-        predecessor = speculation.get(row, "predecessor_id")
+        predecessor = speculation.get(row, "predecessor_id") if speculation.is_speculative(row) else None
         relay_text = (f"*SPECULATIVE batch {batch_id} (waiting for {predecessor})*\n{item_text}"
                       if predecessor else item_text)
         if not monitor.relay_text(transport, row["thread_ts"], relay_text):
@@ -2227,7 +2227,8 @@ def finish_batch(conn: sqlite3.Connection, transport: monitor.SlackTransport,
     summary = format_batch_outcome(
         batch_id, str(row["terminal_status"] or "completed"), outcome,
         ejected=ejected, kind=_batch_kind(row), priority=_batch_priority(row),
-        source=_batch_source(row), predecessor_id=speculation.get(row, "predecessor_id"),
+        source=_batch_source(row),
+        predecessor_id=speculation.get(row, "predecessor_id") if speculation.is_speculative(row) else None,
     )
     if row["terminal_status"] == "aborted":
         reason = str(row["abort_reason"] or "Operator requested abort.")
@@ -5252,6 +5253,12 @@ def process_batch(conn: sqlite3.Connection, transport: monitor.SlackTransport,
         if phase == "terminal":
             return
     if phase == "waiting_parent":
+        if speculation.get(row, "role_promoted", 0):
+            parent = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                                  (row["predecessor_id"],)).fetchone()
+            if parent is None or parent["terminal_status"] != "merged":
+                raise AutomergeError("primary predecessor has no confirmed landing", reason="predecessor_pending")
+            speculation.promote(sys.modules[__name__], conn, transport, row, parent)
         return
     if phase in {"building", "fixing", "waiting_ci"}:
         # A running turn can still produce useful work for a retained remainder.
@@ -5372,10 +5379,13 @@ def acquire_lock_wait(
 def active_batch(conn: sqlite3.Connection) -> sqlite3.Row | None:
     columns = {c[1] for c in conn.execute("PRAGMA table_info(automerge_batches)")}
     if "predecessor_id" in columns:
+        primary = "(predecessor_id IS NULL OR role_promoted=1)" if "role_promoted" in columns else "predecessor_id IS NULL"
+        child_role = "AND c.role_promoted=0 " if "role_promoted" in columns else ""
         return conn.execute(
-            "SELECT * FROM automerge_batches b WHERE predecessor_id IS NULL AND ("
+            f"SELECT * FROM automerge_batches b WHERE {primary} AND ("
             "status IN ('launching','running','finishing') OR EXISTS ("
             "SELECT 1 FROM automerge_batches c WHERE c.predecessor_id=b.batch_id "
+            + child_role +
             "AND c.status IN ('launching','running','finishing'))) "
             "ORDER BY created_at,batch_id LIMIT 1"
         ).fetchone()
@@ -5478,6 +5488,7 @@ def read_active_batch_for_check() -> dict[str, Any] | None:
             "integration_pr_number": row["integration_pr_number"],
             "session_id": row["session_id"],
             "expansions": int(row["expansion_count"]) if "expansion_count" in row.keys() else 0,
+            "role": "speculative" if speculation.is_speculative(row) else "primary",
             "expansion_limit": MAX_BATCH_EXPANSIONS,
             "candidate": speculation.candidate(sys.modules[__name__], row, landed=row['terminal_status'] == 'merged'),
             "speculative_batch": _speculative_check(conn, str(row['batch_id'])),

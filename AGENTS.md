@@ -397,14 +397,25 @@ A successor's membership contains only its new source PRs. It may resolve,
 validate and independently reject those exact heads. An interaction with the
 unlanded predecessor does not establish a standalone defect. It records local
 pass and waits without publishing; the service and landing gates forbid
-publication/landing before promotion. Source changes, priorities and aborts
+publication/landing before landed ancestry incorporation. Source changes, priorities and aborts
 retain the normal policies. Never discard established rejection intents on
 reset, abort or failed launch.
 
+When the predecessor lands, the successor takes the primary scheduling role
+immediately (`role_promoted`), even with validation still running. Prove the
+pinned predecessor tree landed; retain the same session, checkout, captured
+base, source revision, checkpoint, evidence and running work. Its checkpoint
+can now start the next speculative successor. Permit one primary and one
+speculative successor; an unpromoted successor cannot start another batch.
+`mm-db state` exposes `role`. A primary can still have `predecessor` metadata
+until ancestry incorporation: the agent continues its existing validation and
+uses `mm-db ready` as before. Passing evidence gates publication, not role
+promotion. A changed actual master tree uses the existing same-session recovery.
+
 Slack start headings mark successors as `SPECULATIVE` and name the predecessor
 whose landing gates publication/merge. PR-list replies, relayed progress, blocked
-alerts and terminal summaries retain that distinction while `predecessor_id` is
-set. After promotion, new messages use normal batch wording. Message decoration
+alerts and terminal summaries retain that distinction until role promotion.
+After role promotion, new messages use normal batch wording. Message decoration
 must not change stored agent evidence, relay identities/cursors or delivery retries.
 
 Invalidation fences old mutations immediately. Persist a new attempt generation,
@@ -419,8 +430,16 @@ review reused resolutions. Never transplant old merge commits or retain the
 invalidated predecessor's ancestry. No agent-written handoff or cache transfer
 is needed. Read final reports only after this attempt's context divider.
 
-Promotion proves the pinned head landed and its tree equals the actual GitHub
-merge commit. `mm-merge --promote` incorporates that landed commit. Evidence may
+After the passing handoff, recheck master and queue `mm-merge --promote` to
+incorporate the actual landed commit. Keep the checkpoint available while this
+approved ancestry incorporation is pending, provided its original source inputs
+and attempt generation still match. If the committed tree is unchanged, register
+the new head without withdrawing: the service verifies ancestry and preserves
+the logical checkpoint ID with its verified equivalent heads. A pinned successor
+can keep its work through this step. Different trees, source changes, exclusions,
+withdrawals and recovery invalidate it normally. Once landed, the parent's
+exact tested head must equal its current checkpoint head; a verified older
+equivalent head may remain the successor's pin. Evidence may
 be reused only with unchanged tree and applicable validation inputs/settings;
 always record a fresh assessment for the resulting committed HEAD/source set.
 A differing master tree starts a fresh attempt in the same environment. Normal

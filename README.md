@@ -225,6 +225,12 @@ recovery generation. A successor publishes and lands only after promotion,
 incorporating the actual landed base and recording a fresh assessment. Both CI
 modes use this lifecycle.
 
+When the foreground lands, its successor becomes primary immediately and keeps
+any running checks. Its checkpoint can start a new speculative successor before
+validation finishes. After a passing handoff it incorporates the landed merge
+commit and records a fresh assessment; unchanged trees can reuse applicable
+evidence and preserve the next successor's work.
+
 If the predecessor changes, the supervisor stops the successor's work, clears
 its native conversation, and sends a generated restart brief in the same
 session/container. Its helper saves pending source work and the old tip in the

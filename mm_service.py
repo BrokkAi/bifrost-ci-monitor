@@ -63,6 +63,7 @@ def state(conn, batch_id):
               "excluded": automerge._excluded_source_heads(row)}
     result["source_revision"] = speculation.source_revision(automerge, row)
     result["attempt_generation"] = speculation.get(row, "attempt_generation", 0)
+    result["role"] = "speculative" if speculation.is_speculative(row) else "primary"
     result["candidate"] = speculation.candidate(automerge, row)
     result["predecessor"] = ({"batch_id": row["predecessor_id"],
                               "candidate": json.loads(row["predecessor_candidate_json"]),
@@ -265,16 +266,27 @@ def dispatch(conn, batch_id, operation, payload):
                 raise ValueError("cannot checkpoint an empty batch")
             conn.commit()
             tree = speculation.verify_candidate(automerge, current, head, conn)
+            previous = current["candidate"]
+            row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+            equivalent = bool(previous and speculation.incorporating_candidate(automerge, row, previous)
+                              and previous["tree"] == tree
+                              and automerge.compare_commit_ancestry(previous["head"], head))
             conn.execute("BEGIN IMMEDIATE")
             checked(conn, batch_id, current["revision"])
-            previous = current["candidate"]
-            checkpoint = {"id": previous["id"] if previous and previous["head"] == head else uuid.uuid4().hex,
+            retain = bool(previous and (previous["head"] == head or equivalent))
+            checkpoint = {"id": previous["id"] if retain else uuid.uuid4().hex,
                           "head": head, "tree": tree, "branch": current["branch"],
                           "source_revision": current["source_revision"],
                           "registered_revision": current['revision'],
                           "attempt_generation": current["attempt_generation"]}
+            if retain:
+                checkpoint["equivalent_heads"] = sorted({previous["head"], *previous.get("equivalent_heads", [])})
             conn.execute("UPDATE automerge_batches SET candidate_json=? WHERE batch_id=?",
                          (json.dumps(checkpoint), batch_id))
+            if current["promotion"].get("stage") == "incorporating":
+                promotion = dict(current["promotion"], stage="incorporated")
+                conn.execute("UPDATE automerge_batches SET promotion_json=? WHERE batch_id=?",
+                             (json.dumps(promotion), batch_id))
             record(conn, batch_id, "candidate", checkpoint)
             conn.commit()
         elif operation == "comment":
@@ -349,6 +361,8 @@ def dispatch(conn, batch_id, operation, payload):
         else:
             if current["predecessor"]:
                 raise ValueError("publication is blocked until the predecessor lands and the batch is promoted")
+            if current["promotion"].get("stage") == "incorporating":
+                raise ValueError("checkpoint the incorporated landed base before publication")
             head = sha(payload.get("head"))
             if not current["sources"] or not current["tests"] or current["tests"]["head"] != head or current["tests"]["verdict"] != "pass":
                 raise ValueError("publication requires a passing assessment for this exact head and source set")

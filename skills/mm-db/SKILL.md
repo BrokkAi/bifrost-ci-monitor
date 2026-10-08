@@ -43,6 +43,14 @@ predecessor blocks mutations until the supervisor clears/restarts this attempt
 in the same environment. Independently
 established rejections survive that restart and every abort.
 
+`role` becomes `primary` as soon as the predecessor lands. Keep running your
+existing checks and use `ready` while `predecessor` remains present. The
+supervisor can start your successor from your checkpoint during validation.
+After its explicit `mm-merge --promote` instruction, register the new head
+without withdrawing only if incorporation leaves the tree unchanged. The
+service verifies ancestry and retains your successor's pinned checkpoint.
+For source edits or a changed tree, withdraw and replace it normally.
+
 ```sh
 python3 <this skill>/scripts/mm_db.py exclude --revision REV --pr N --head SHA --kind removed --reason 'source head changed'
 python3 <this skill>/scripts/mm_db.py exclude --revision REV --pr N --head SHA --kind rejected --reason 'isolated regression' --evidence-file /tmp/evidence.md

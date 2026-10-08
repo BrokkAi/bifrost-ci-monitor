@@ -28,6 +28,7 @@ def ensure_schema(conn, ensure_column):
     for name, declaration in (
         ("candidate_json", "TEXT NOT NULL DEFAULT '{}'"),
         ("predecessor_id", "TEXT"),
+        ("role_promoted", "INTEGER NOT NULL DEFAULT 0"),
         ("predecessor_candidate_json", "TEXT NOT NULL DEFAULT '{}'"),
         ("attempt_generation", "INTEGER NOT NULL DEFAULT 0"),
         ("recovery_json", "TEXT NOT NULL DEFAULT '{}'"),
@@ -37,17 +38,32 @@ def ensure_schema(conn, ensure_column):
         ensure_column(conn, "automerge_batches", name, declaration)
 
 
-def source_revision(a, row):
-    inputs = [row["base_sha"], [p.as_json() for p in a.row_pulls(row)], a._excluded_source_heads(row)]
+def source_revision(a, row, *, base=None):
+    inputs = [row["base_sha"] if base is None else base,
+              [p.as_json() for p in a.row_pulls(row)], a._excluded_source_heads(row)]
     generation = get(row, "attempt_generation", 0)
     if generation:
         inputs.append(generation)  # Generation zero retains legacy evidence digests.
     return digest(inputs)
 
 
+def is_speculative(row):
+    return bool(get(row, "predecessor_id") and not get(row, "role_promoted", 0))
+
+
+def incorporating_candidate(a, row, value):
+    """Retain a pinned tree only through the approved ancestry incorporation."""
+    promotion = json.loads(get(row, "promotion_json", "{}"))
+    return bool(value and promotion.get("stage") == "incorporating"
+                and promotion["base"] == row["base_sha"]
+                and promotion["old_candidate"] == value
+                and value["source_revision"] == source_revision(a, row, base=promotion["old_base"]))
+
+
 def candidate(a, row, *, landed=False):
     value = json.loads(get(row, "candidate_json", "{}"))
-    if (not value or value["source_revision"] != source_revision(a, row)
+    if (not value or (value["source_revision"] != source_revision(a, row)
+                     and not incorporating_candidate(a, row, value))
             or row["phase"] == "aborting"
             or (row["status"] not in {"running", "launching", "finishing"} and not landed)):
         return None
@@ -64,7 +80,9 @@ def parent_current(a, conn, row):
         return False
     current = candidate(a, parent, landed=parent["terminal_status"] == "merged")
     return bool(current and current["id"] == pinned.get("id")
-                and (parent["terminal_status"] != "merged" or parent["ci_head_sha"] == pinned["head"]))
+                and current["tree"] == pinned.get("tree")
+                and pinned.get("head") in {current["head"], *current.get("equivalent_heads", [])}
+                and (parent["terminal_status"] != "merged" or parent["ci_head_sha"] == current["head"]))
 
 
 def reserved(a, conn, *, except_batch=None):
@@ -74,9 +92,12 @@ def reserved(a, conn, *, except_batch=None):
 
 
 def child(conn, parent_id):
-    if "predecessor_id" not in {c[1] for c in conn.execute("PRAGMA table_info(automerge_batches)")}:
+    columns = {c[1] for c in conn.execute("PRAGMA table_info(automerge_batches)")}
+    if "predecessor_id" not in columns:
         return None
+    role_filter = "AND role_promoted=0 " if "role_promoted" in columns else ""
     return conn.execute("SELECT * FROM automerge_batches WHERE predecessor_id=? "
+                        + role_filter +
                         "AND status IN ('launching','running','finishing') ORDER BY created_at LIMIT 1",
                         (parent_id,)).fetchone()
 
@@ -107,7 +128,7 @@ def verify_candidate(a, current, head, conn):
 
 GUIDANCE = """Candidate checkpoints and lookahead: after completing your merges and fixes, before starting expensive validation, run mm-db candidate --revision <current revision> (add --rebuild for a rebuilt branch). This pushes only your recorded batch branch and records the committed candidate; it opens no PR. Before making further edits, withdraw it with mm-db candidate --revision <current revision> --withdraw. Register the replacement when ready. The supervisor may run the next batch's useful checks concurrently through existing mbx.
 
-Read mm-db state: if predecessor is present, your base is its pinned unlanded candidate, and your membership contains only your own newly selected PRs. Never redo or eject the predecessor's membership. Investigate, merge, fix, validate, and record independent standalone rejections of your own exact heads normally. An interaction with the unlanded predecessor is not proof that your PR is independently broken. After local pass, record mm-db tests, refresh state, and call mm-db ready --revision <current revision> to hand off the checkpointed candidate, then finish this turn without publishing; the supervisor will request promotion when the predecessor lands. Publication is blocked until promotion. A changed predecessor restarts this attempt with /clear in the same environment and a generated brief; caches, logs and rerere remain available.
+Read mm-db state: if predecessor is present, your captured base is its pinned candidate, and your membership contains only your own newly selected PRs. Never redo or eject the predecessor's membership. Investigate, merge, fix, validate, and record independent standalone rejections of your own exact heads normally. An interaction with the unlanded predecessor is not proof that your PR is independently broken. After local pass, record mm-db tests, refresh state, and call mm-db ready --revision <current revision> to hand off the checkpointed candidate, then finish this turn without publishing. When the predecessor lands, your role becomes primary while you keep running checks; your checkpoint can start the next speculative batch. Continue the ready protocol while predecessor metadata remains. The supervisor requests mm-merge --promote after your passing handoff; for this approved ancestry-only step, an unchanged tree can be checkpointed without withdrawal. Publication is blocked until landed ancestry is incorporated. A changed predecessor restarts this attempt with /clear in the same environment and a generated brief; caches, logs and rerere remain available.
 """
 
 
@@ -124,7 +145,8 @@ def selection(a, conn, parent):
 
 
 def launch_child(a, conn, parent):
-    if not a.SPECULATIVE_LOOKAHEAD or not candidate(a, parent) or child(conn, parent["batch_id"]):
+    if (not a.SPECULATIVE_LOOKAHEAD or is_speculative(parent)
+            or not candidate(a, parent) or child(conn, parent["batch_id"])):
         return
     pulls = selection(a, conn, parent)
     if not pulls:
@@ -135,7 +157,8 @@ def launch_child(a, conn, parent):
         conn.execute('BEGIN IMMEDIATE')
         fresh = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (parent['batch_id'],)).fetchone()
         current = candidate(a, fresh)
-        if not current or current['id'] != checkpoint['id'] or child(conn, parent['batch_id']):
+        if (is_speculative(fresh) or not current or current['id'] != checkpoint['id']
+                or child(conn, parent['batch_id'])):
             return
         a.create_batch(conn, pulls, checkpoint["head"], ci_mode=a.CI_MODE,
                        predecessor_id=parent['batch_id'], predecessor_candidate=checkpoint)
@@ -156,7 +179,7 @@ def invalidate(a, conn, row):
            "old_generation": row["attempt_generation"]}
     with conn:
         conn.execute("UPDATE automerge_batches SET attempt_generation=attempt_generation+1,phase='resetting',"
-                     "candidate_json='{}',recovery_json=?,pending_prompt=NULL,prompt_delivered=0,"
+                     "candidate_json='{}',promotion_json='{}',recovery_json=?,pending_prompt=NULL,prompt_delivered=0,"
                      "ready_json='{}',prompt_command_id=NULL,agent_final_message='',turn_started_at=NULL WHERE batch_id=?",
                      (json.dumps(old), row["batch_id"]))
 
@@ -322,7 +345,8 @@ def recover_step(a, conn, row):
         if checkpoint:
             with conn:
                 conn.execute("UPDATE automerge_batches SET base_sha=?,predecessor_candidate_json=?,phase='building',"
-                             "recovery_json='{}' WHERE batch_id=?", (checkpoint["head"], json.dumps(checkpoint), row["batch_id"]))
+                             "recovery_json='{}',predecessor_id=CASE WHEN ? THEN NULL ELSE predecessor_id END WHERE batch_id=?",
+                             (checkpoint["head"], json.dumps(checkpoint), bool(recovery.get('replacement')), row["batch_id"]))
         return
     if recovery["stage"] == "stop":
         if not stop_work(a, row):
@@ -420,9 +444,10 @@ def recover(a, conn, row):
         row = latest
 
 
-def promote(a, conn, transport, row, parent):
-    if row['phase'] != 'waiting_parent' or not a.ready_candidate(row):
-        return
+def landed_base(a, conn, row, parent):
+    """Prove the pinned predecessor tree is now the actual master tree."""
+    if parent is None or parent['terminal_status'] != 'merged':
+        raise a.AutomergeError('predecessor has no confirmed landing', reason='predecessor_pending')
     pinned = json.loads(row["predecessor_candidate_json"])
     landed = parent["integration_merge_commit_sha"]
     if not landed:
@@ -435,7 +460,7 @@ def promote(a, conn, transport, row, parent):
             conn.execute('UPDATE automerge_batches SET integration_merge_commit_sha=? WHERE batch_id=?',
                          (landed, parent['batch_id']))
     master = a.current_master_sha()
-    equivalent = (parent['ci_head_sha'] == pinned['head']
+    equivalent = (parent_current(a, conn, row)
                   and a.compare_commit_ancestry(pinned['head'], landed)
                   and commit_tree(a, landed) == pinned['tree'])
     if not equivalent or master != landed:
@@ -448,18 +473,35 @@ def promote(a, conn, transport, row, parent):
                                                 (row['batch_id'],)).fetchone()[0])
                 saved['replacement'] = replacement
                 conn.execute("UPDATE automerge_batches SET recovery_json=? WHERE batch_id=?", (json.dumps(saved), row['batch_id']))
-            return
+            return None
         landed = master
+    return landed
+
+
+def promote_role(a, conn, row, parent):
+    """Release the primary slot without changing the agent's validation inputs."""
+    landed_base(a, conn, row, parent)  # A differing master starts same-session recovery.
+    with conn:
+        conn.execute("UPDATE automerge_batches SET role_promoted=1 WHERE batch_id=?", (row['batch_id'],))
+
+
+def promote(a, conn, transport, row, parent):
+    """Incorporate landed ancestry only after the agent's passing handoff."""
+    if row['phase'] != 'waiting_parent' or not a.ready_candidate(row):
+        return
+    landed = landed_base(a, conn, row, parent)
+    if not landed:
+        return
     evidence = latest_tests(conn, row["batch_id"])
-    promotion = {"base": landed, "old_base": row["base_sha"], "previous_tests": evidence,
+    promotion = {"stage": "incorporating", "base": landed, "old_base": row["base_sha"], "previous_tests": evidence,
                  "old_candidate": json.loads(row["candidate_json"])}
     impact = a.run_ci_impact(landed, [p.head_sha for p in a.row_pulls(row)])
-    prompt = f"""Your predecessor batch landed. Read mm-db state and run mm-merge --promote to incorporate the exact landed base {landed}. Record a fresh local assessment for the resulting committed HEAD, explicitly citing reused evidence at its old SHA only if the helper proves the tree unchanged and validation inputs/settings still match. Otherwise reassess affected checks. Then checkpoint and publish through mm-autopr (use --rebuild if its push needs a lease). Finish with mm-db report. Normal {_mode(a, row)} publication/landing gates apply.
+    prompt = f"""Your batch is now primary and your predecessor landed. Read mm-db state and run mm-merge --promote to incorporate the exact landed base {landed}. If the helper proves the tree unchanged, register the resulting head with mm-db candidate without withdrawing the old checkpoint: the service verifies this ancestry-only replacement so your successor can keep its work. If the tree differs or you need source edits, withdraw the checkpoint before further edits and reassess affected checks. Record a fresh local assessment for the resulting committed HEAD, explicitly citing reused evidence at its old SHA only if the tree and validation inputs/settings still match. Then publish through mm-autopr (use --rebuild if its push needs a lease). Finish with mm-db report. Normal {_mode(a, row)} publication/landing gates apply.
 {a._validation_guidance(landed, impact)}
 {GUIDANCE}
 """
     with conn:
-        conn.execute("UPDATE automerge_batches SET predecessor_id=NULL,base_sha=?,candidate_json='{}',"
+        conn.execute("UPDATE automerge_batches SET predecessor_id=NULL,role_promoted=1,base_sha=?,"
                      "promotion_json=?,phase='fixing',pending_prompt=?,prompt_delivered=0,"
                      "ready_json='{}',prompt_command_id=?,turn_started_at=NULL,validation_impact_json=? WHERE batch_id=?",
                      (landed, json.dumps(promotion), prompt, 'mm-promote-' + a.uuid.uuid4().hex,
@@ -491,21 +533,24 @@ def tick(a, conn, transport, parent):
             recovery = json.loads(row['recovery_json'])
             recovery['replacement'] = replacement
             with conn:
-                conn.execute('UPDATE automerge_batches SET recovery_json=? WHERE batch_id=?',
+                conn.execute('UPDATE automerge_batches SET recovery_json=?,role_promoted=1 WHERE batch_id=?',
                              (json.dumps(recovery), row['batch_id']))
             row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
-    if row["phase"] in {'resetting', 'restarting'}:
-        recover(a, conn, row)
-    elif parent["terminal_status"] == "merged":
+    if parent["terminal_status"] == "merged":
         if not a._batch_priority(row) and any(p.priority for p in a.select_eligible_pull_requests(conn=conn)):
             a.abort_batch_locked(conn, transport, row, 'ready priority work takes precedence over ordinary lookahead')
             return
-        if row['phase'] in {'building', 'fixing'}:
-            a.process_batch(conn, transport, row['batch_id'])
-            row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
-        if row['status'] not in {'running', 'launching'} or row['phase'] != 'waiting_parent':
-            return
-        promote(a, conn, transport, row, parent)
+        if not get(row, 'role_promoted', 0):
+            promote_role(a, conn, row, parent)
+        # Refill lookahead before observing B: a running check need not finish
+        # for its already checkpointed tree to become C's base.
+        row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
+        launch_child(a, conn, row)
+        a.process_batch(conn, transport, row['batch_id'])
+        row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
+        tick(a, conn, transport, row)
+    elif row["phase"] in {'resetting', 'restarting'}:
+        recover(a, conn, row)
     elif row["phase"] != "waiting_parent":
         a.process_batch(conn, transport, row["batch_id"])
     else:

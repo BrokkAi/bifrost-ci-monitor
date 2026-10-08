@@ -58,6 +58,9 @@ review hold for changes to CI workflow/action files.
 
 The scheduler can prepare one successor batch while the current batch validates.
 It starts from the current candidate, preserving that work, and lands in order.
+Once the current batch lands, its successor becomes primary while keeping its
+running checks. That batch's checkpoint can start the next successor immediately;
+passing validation still gates publication and landing.
 A changed predecessor restarts the successor in its existing environment so
 build caches and reusable conflict resolutions survive. Independent exact-head
 rejections remain recorded across recovery and aborts.

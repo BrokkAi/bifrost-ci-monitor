@@ -55,12 +55,31 @@ class StateTests(unittest.TestCase):
                                 {'revision': current['revision'], 'head': head, 'verdict': 'pass',
                                  'tests': 'focused check passed', 'baseline': 'none'})
 
+    def land_parent(self):
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal',terminal_status='merged',"
+                              "ci_head_sha=?,integration_merge_commit_sha=? WHERE batch_id=?",
+                              (HEAD_THREE, BASE_SHA, self.parent))
+
+    def successor(self):
+        return a.create_batch(self.conn, [pull(9, HEAD_ONE)], HEAD_TWO, batch_id='successor-test',
+                              ci_mode='async', predecessor_id=self.child,
+                              predecessor_candidate=s.candidate(a, self.row()))
+
+    def handoff(self):
+        current = service.state(self.conn, self.child)
+        with mock.patch.object(service, 'gh_api', return_value={'object': {'sha': HEAD_TWO}}):
+            service.dispatch(self.conn, self.child, 'ready', {'revision': current['revision'], 'head': HEAD_TWO})
+        a._consume_ready_candidate(self.conn, self.transport, self.row())
+
     def test_legacy_source_revision_survives_migration(self):
         current = service.state(self.conn, self.parent)
         self.assertEqual(current['source_revision'], service.digest([
             current['base_sha'], current['sources'], current['excluded']]))
         s.ensure_schema(self.conn, a.ensure_column)
         self.assertEqual(current['source_revision'], service.state(self.conn, self.parent)['source_revision'])
+        self.assertEqual(self.row()['role_promoted'], 0)
+        self.assertEqual(self.row(self.parent)['role_promoted'], 0)
 
     def test_registration_verifies_remote_before_recording_and_opens_no_pr(self):
         current = service.state(self.conn, self.child)
@@ -158,8 +177,10 @@ class StateTests(unittest.TestCase):
                               "WHERE batch_id=?", (self.parent,))
         self.assertEqual(a.active_batch(self.conn)['batch_id'], self.parent)
         with self.conn:
-            self.conn.execute('UPDATE automerge_batches SET predecessor_id=NULL WHERE batch_id=?', (self.child,))
+            self.conn.execute('UPDATE automerge_batches SET role_promoted=1 WHERE batch_id=?', (self.child,))
         self.assertEqual(a.active_batch(self.conn)['batch_id'], self.child)
+        self.assertIsNone(s.child(self.conn, self.parent))
+        self.assertIsNotNone(self.row()['predecessor_id'])  # Incorporation still pending.
 
     def test_foreground_rebuild_does_not_steal_reserved_sources(self):
         with (mock.patch.object(a, '_recheck_sources', side_effect=lambda pulls, **kw: (pulls, [])),
@@ -341,8 +362,7 @@ class StateTests(unittest.TestCase):
             service.dispatch(self.conn, self.child, 'ready', {'revision': current['revision'], 'head': HEAD_TWO})
         with self.conn:
             self.conn.execute("UPDATE automerge_batches SET phase='waiting_parent' WHERE batch_id=?", (self.child,))
-            self.conn.execute("UPDATE automerge_batches SET ci_head_sha=?,integration_merge_commit_sha=? WHERE batch_id=?",
-                              (HEAD_THREE, BASE_SHA, self.parent))
+        self.land_parent()
         with (mock.patch.object(a, '_session_is_idle', return_value=True),
               mock.patch.object(a, 'compare_commit_ancestry', return_value=True),
               mock.patch.object(a, 'current_master_sha', return_value=HEAD_ONE),
@@ -351,16 +371,186 @@ class StateTests(unittest.TestCase):
         self.assertEqual(self.row()['phase'], 'resetting')
         self.assertEqual(json.loads(self.row()['recovery_json'])['replacement']['head'], HEAD_ONE)
 
-    def test_landed_parent_does_not_promote_an_idle_unfinished_successor(self):
-        with self.conn:
-            self.conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal',terminal_status='merged',"
-                              "ci_head_sha=? WHERE batch_id=?", (HEAD_THREE, self.parent))
-        with (mock.patch.object(s, 'launch_child'), mock.patch.object(a, 'select_eligible_pull_requests', return_value=[]),
-              mock.patch.object(a, '_session_is_idle', return_value=True),
+    def test_landed_parent_promotes_running_successor_and_refills_lookahead(self):
+        before = self.assess()  # Passing evidence alone is not a handoff.
+        self.land_parent()
+        original = self.row()
+        with (mock.patch.object(a, 'select_eligible_pull_requests', return_value=[]),
+              mock.patch.object(s, 'selection', return_value=[pull(9, HEAD_ONE)]),
+              mock.patch.object(s, 'require_recovery_controls'),
+              mock.patch.object(a, 'compare_commit_ancestry', return_value=True),
+              mock.patch.object(s, 'commit_tree', return_value=TREE),
+              mock.patch.object(a, 'current_master_sha', return_value=BASE_SHA),
+              mock.patch.object(a, '_session_is_idle', side_effect=AssertionError('do not wait for checks')),
+              mock.patch.object(s, 'stop_work', side_effect=AssertionError('keep running work')),
               mock.patch.object(a, 'process_batch') as process, mock.patch.object(s, 'promote') as promote):
             s.tick(a, self.conn, self.transport, self.row(self.parent))
-        process.assert_called_once_with(self.conn, self.transport, self.child)
+        row = self.row()
+        self.assertEqual(a.active_batch(self.conn)['batch_id'], self.child)
+        self.assertEqual(row['role_promoted'], 1)
+        self.assertFalse(s.is_speculative(row))
+        self.assertEqual(service.state(self.conn, self.child)['role'], 'primary')
+        for name in ['session_id', 'base_sha', 'phase', 'candidate_json', 'ready_json', 'attempt_generation', 'pending_prompt']:
+            self.assertEqual(row[name], original[name], name)
+        self.assertEqual(s.source_revision(a, row), before['source_revision'])
+        self.assertEqual(service.state(self.conn, self.child)['tests'], before['tests'])
+        next_row = s.child(self.conn, self.child)
+        self.assertEqual(next_row['base_sha'], HEAD_TWO)
+        self.assertTrue(s.is_speculative(next_row))
+        self.assertEqual([c.args[-1] for c in process.call_args_list], [self.child, next_row['batch_id']])
         promote.assert_not_called()
+
+    def test_unpromoted_successor_cannot_start_a_third_batch(self):
+        self.register(self.child, HEAD_TWO)
+        with mock.patch.object(s, 'selection') as select:
+            s.launch_child(a, self.conn, self.row())
+        select.assert_not_called()
+        self.assertIsNone(s.child(self.conn, self.child))
+
+    def test_primary_without_checkpoint_waits_to_refill_lookahead(self):
+        self.land_parent()
+        with (mock.patch.object(a, 'select_eligible_pull_requests', return_value=[]),
+              mock.patch.object(a, 'compare_commit_ancestry', return_value=True),
+              mock.patch.object(s, 'commit_tree', return_value=TREE),
+              mock.patch.object(a, 'current_master_sha', return_value=BASE_SHA),
+              mock.patch.object(s, 'selection') as select,
+              mock.patch.object(a, 'process_batch')):
+            s.tick(a, self.conn, self.transport, self.row(self.parent))
+        self.assertEqual(a.active_batch(self.conn)['batch_id'], self.child)
+        self.assertIsNone(s.child(self.conn, self.child))
+        select.assert_not_called()
+
+    def test_ready_priority_work_still_supersedes_ordinary_lookahead(self):
+        self.land_parent()
+        with (mock.patch.object(a, 'select_eligible_pull_requests', return_value=[pull(10, HEAD_ONE, priority=True)]),
+              mock.patch.object(a, 'abort_batch_locked') as abort,
+              mock.patch.object(s, 'promote_role') as promote):
+            s.tick(a, self.conn, self.transport, self.row(self.parent))
+        abort.assert_called_once()
+        promote.assert_not_called()
+        self.assertEqual(self.row()['role_promoted'], 0)
+
+    def test_primary_progress_uses_normal_wording_before_ancestry_incorporation(self):
+        with self.conn:
+            self.conn.execute('UPDATE automerge_batches SET role_promoted=1 WHERE batch_id=?', (self.child,))
+        with mock.patch.object(monitor, 'slack_send', return_value=(True, 'thread')) as send:
+            a.send_start_notification(self.conn, self.transport, self.row())
+        self.assertNotIn('SPECULATIVE', send.call_args.args[1])
+        self.assertNotIn('Preparing ahead', send.call_args.args[1])
+
+    def begin_incorporation(self):
+        self.assess()
+        successor = self.successor()
+        self.land_parent()
+        with (mock.patch.object(a, 'compare_commit_ancestry', return_value=True),
+              mock.patch.object(s, 'commit_tree', return_value=TREE),
+              mock.patch.object(a, 'current_master_sha', return_value=BASE_SHA),
+              mock.patch.object(a, 'run_ci_impact', return_value={'mode': 'impact'})):
+            s.promote_role(a, self.conn, self.row(), self.row(self.parent))
+            self.handoff()
+            with mock.patch.object(a, 'send_start_notification'):
+                a.process_batch(self.conn, self.transport, self.child)
+        return successor
+
+    def test_primary_incorporation_preserves_pinned_tree_and_requires_fresh_assessment(self):
+        successor = self.begin_incorporation()
+        self.assertIsNone(self.row()['predecessor_id'])
+        self.assertTrue(s.parent_current(a, self.conn, self.row(successor)))
+        current = service.state(self.conn, self.child)
+        self.assertIsNone(current['tests'])
+        self.assertIsNone(current['ready'])
+        with self.assertRaisesRegex(ValueError, 'incorporated landed base'):
+            service.dispatch(self.conn, self.child, 'publish', {'revision': current['revision'], 'head': HEAD_TWO})
+        new_head = '5' * 40
+        with (mock.patch.object(s, 'verify_candidate', return_value=TREE),
+              mock.patch.object(a, 'compare_commit_ancestry', return_value=True)):
+            updated = service.dispatch(self.conn, self.child, 'candidate',
+                                       {'revision': current['revision'], 'head': new_head})
+        self.assertEqual(updated['candidate']['id'], current['candidate']['id'])
+        self.assertIn(HEAD_TWO, updated['candidate']['equivalent_heads'])
+        self.assertTrue(s.parent_current(a, self.conn, self.row(successor)))
+        with self.assertRaisesRegex(ValueError, 'passing assessment'):
+            service.dispatch(self.conn, self.child, 'publish', {'revision': updated['revision'], 'head': new_head})
+        updated = service.dispatch(self.conn, self.child, 'tests',
+                                  {'revision': updated['revision'], 'head': new_head, 'verdict': 'pass',
+                                   'tests': 'reused focused check at ' + HEAD_TWO + '; same tree and settings', 'baseline': 'none'})
+        self.assertEqual(updated['tests']['head'], new_head)
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET terminal_status='merged',status='completed',phase='terminal',"
+                              "ci_head_sha=? WHERE batch_id=?", (new_head, self.child))
+        self.assertTrue(s.parent_current(a, self.conn, self.row(successor)))
+        with self.conn:
+            self.conn.execute('UPDATE automerge_batches SET ci_head_sha=? WHERE batch_id=?', (HEAD_TWO, self.child))
+        self.assertFalse(s.parent_current(a, self.conn, self.row(successor)))
+
+    def test_changed_tree_or_non_descendant_checkpoint_invalidates_successor(self):
+        successor = self.begin_incorporation()
+        original = self.row()['candidate_json']
+        for tree, ancestry in [(HEAD_ONE, True), (TREE, False)]:
+            with self.subTest(tree=tree, ancestry=ancestry):
+                with self.conn:
+                    promotion = json.loads(self.row()['promotion_json'])
+                    promotion['stage'] = 'incorporating'
+                    self.conn.execute('UPDATE automerge_batches SET candidate_json=?,promotion_json=? WHERE batch_id=?',
+                                      (original, json.dumps(promotion), self.child))
+                current = service.state(self.conn, self.child)
+                with (mock.patch.object(s, 'verify_candidate', return_value=tree),
+                      mock.patch.object(a, 'compare_commit_ancestry', return_value=ancestry)):
+                    service.dispatch(self.conn, self.child, 'candidate',
+                                     {'revision': current['revision'], 'head': '5' * 40})
+                self.assertFalse(s.parent_current(a, self.conn, self.row(successor)))
+
+    def test_incorporation_alias_cannot_survive_membership_change_withdrawal_or_reset(self):
+        successor = self.begin_incorporation()
+        current = service.state(self.conn, self.child)
+        service.dispatch(self.conn, self.child, 'candidate', {'revision': current['revision'], 'withdraw': True})
+        self.assertFalse(s.parent_current(a, self.conn, self.row(successor)))
+        with self.conn:
+            old = json.loads(self.row()['promotion_json'])['old_candidate']
+            self.conn.execute('UPDATE automerge_batches SET candidate_json=? WHERE batch_id=?', (json.dumps(old), self.child))
+        current = service.state(self.conn, self.child)
+        service.dispatch(self.conn, self.child, 'exclude', {'revision': current['revision'], 'number': 8,
+                         'head': HEAD_TWO, 'kind': 'rejected', 'reason': 'standalone defect', 'evidence': 'inspection'})
+        self.assertFalse(s.parent_current(a, self.conn, self.row(successor)))
+        self.assertIsNone(s.candidate(a, self.row()))
+        s.invalidate(a, self.conn, self.row())
+        self.assertEqual(json.loads(self.row()['promotion_json']), {})
+        self.assertEqual(self.row()['role_promoted'], 1)
+
+    def test_master_drift_during_running_validation_recovers_in_same_primary_session(self):
+        before = self.assess()
+        self.land_parent()
+        with (mock.patch.object(a, 'select_eligible_pull_requests', return_value=[]),
+              mock.patch.object(a, 'compare_commit_ancestry', return_value=True),
+              mock.patch.object(s, 'commit_tree', side_effect=lambda _, head: TREE if head == BASE_SHA else HEAD_ONE),
+              mock.patch.object(a, 'current_master_sha', return_value=HEAD_TWO),
+              mock.patch.object(a, 'process_batch'), mock.patch.object(s, 'selection') as select):
+            s.tick(a, self.conn, self.transport, self.row(self.parent))
+        row = self.row()
+        self.assertEqual(a.active_batch(self.conn)['batch_id'], self.child)
+        self.assertEqual(row['phase'], 'resetting')
+        self.assertEqual(row['session_id'], 'child-session')
+        self.assertEqual(row['attempt_generation'], 1)
+        recovery = json.loads(row['recovery_json'])
+        self.assertEqual(recovery['old_tests'], before['tests'])
+        self.assertEqual(recovery['replacement']['head'], HEAD_TWO)
+        self.assertIsNone(s.candidate(a, row))
+        select.assert_not_called()
+
+    def test_primary_abort_stops_its_own_lookahead_after_role_promotion(self):
+        self.register(self.child, HEAD_TWO)
+        successor = self.successor()
+        with self.conn:
+            self.conn.execute('UPDATE automerge_batches SET role_promoted=1 WHERE batch_id=?', (self.child,))
+        with (mock.patch.object(a, '_session_status', return_value={'state': 'suspended'}),
+              mock.patch.object(a, 'request_suspend', return_value=True),
+              mock.patch.object(monitor, 'slack_send', return_value=(True, 'thread')),
+              mock.patch.object(monitor, 'runtime_binary_issues', return_value=[]),
+              mock.patch.object(a, 'finish_batch'), mock.patch.object(a, 'lookup_batch_session', return_value=None)):
+            a.abort_batch_locked(self.conn, self.transport, self.row(), 'operator abort')
+        self.assertEqual(self.row(successor)['terminal_status'], 'aborted')
+        self.assertEqual(self.row()['terminal_status'], 'aborted')
+        self.assertIsNone(self.row(self.parent)['terminal_status'])
 
     def test_detached_recovery_dispatches_through_normal_batch_processor(self):
         s.invalidate(a, self.conn, self.row())
@@ -369,6 +559,18 @@ class StateTests(unittest.TestCase):
         with (mock.patch.object(a, 'send_start_notification'), mock.patch.object(s, 'recover') as recover):
             a.process_batch(self.conn, self.transport, self.child)
         recover.assert_called_once()
+
+    def test_primary_recovery_before_initial_launch_detaches_landed_predecessor(self):
+        s.invalidate(a, self.conn, self.row())
+        recovery = json.loads(self.row()['recovery_json'])
+        recovery['replacement'] = {'id': 'master-' + BASE_SHA, 'head': BASE_SHA, 'tree': TREE}
+        with self.conn:
+            self.conn.execute('UPDATE automerge_batches SET session_id=NULL,role_promoted=1,recovery_json=? WHERE batch_id=?',
+                              (json.dumps(recovery), self.child))
+        s.recover_step(a, self.conn, self.row())
+        self.assertIsNone(self.row()['predecessor_id'])
+        self.assertEqual(self.row()['base_sha'], BASE_SHA)
+        self.assertEqual(self.row()['phase'], 'building')
 
     def test_old_reports_are_bounded_by_the_new_attempt_context_divider(self):
         reply = subprocess.CompletedProcess([], 0, json.dumps({'items': []}), '')
@@ -443,6 +645,56 @@ class RecoveryGitTests(GitFixture):
         self.assertIn(candidate, history)
         self.assertIn(landed, history)
         self.assertIn(parent, history)
+
+        # C pinned B before incorporation. Exercise the actual state service
+        # using these real commit trees, not a permissive ancestry mock.
+        conn = make_db(pulls=[pull(8, before)], ci_mode='async', integration_pr_number=None)
+        self.addCleanup(conn.close)
+        service.ensure_schema(conn)
+        with conn:
+            conn.execute('UPDATE automerge_batches SET base_sha=? WHERE batch_id=?', (candidate, 'batch-test'))
+        row = row_for(conn)
+        checkpoint = {'id': 'pinned-b', 'head': before, 'tree': tree, 'branch': row['branch'],
+                      'source_revision': s.source_revision(a, row), 'attempt_generation': 0}
+        with conn:
+            conn.execute('UPDATE automerge_batches SET candidate_json=? WHERE batch_id=?',
+                         (json.dumps(checkpoint), 'batch-test'))
+        successor = a.create_batch(conn, [pull(9, HEAD_ONE)], before, batch_id='successor-test',
+                                   predecessor_id='batch-test', predecessor_candidate=checkpoint)
+        promotion = {'stage': 'incorporating', 'base': landed, 'old_base': candidate, 'old_candidate': checkpoint}
+        with conn:
+            conn.execute('UPDATE automerge_batches SET base_sha=?,promotion_json=?,phase=\'fixing\' WHERE batch_id=?',
+                         (landed, json.dumps(promotion), 'batch-test'))
+        child = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (successor,)).fetchone()
+        self.assertTrue(s.parent_current(a, conn, child))
+        current = service.state(conn, 'batch-test')
+
+        def ancestor(base, head):
+            return subprocess.run(['git', '-C', str(self.repo), 'merge-base', '--is-ancestor', base, head],
+                                  capture_output=True).returncode == 0
+
+        def api(args):
+            if '/git/ref/heads/' in args[1]:
+                return {'object': {'sha': result['head']}}
+            if '/git/commits/' in args[1]:
+                return {'tree': {'sha': self.run_git('rev-parse', args[1].rsplit('/', 1)[1] + '^{tree}')}}
+            self.fail('unexpected GitHub request: ' + str(args))
+
+        with (mock.patch.object(a, 'compare_commit_ancestry', side_effect=ancestor),
+              mock.patch.object(a, 'gh_json', side_effect=api)):
+            updated = service.dispatch(conn, 'batch-test', 'candidate',
+                                       {'revision': current['revision'], 'head': result['head']})
+            self.assertEqual(updated['candidate']['id'], checkpoint['id'])
+            self.assertIn(before, updated['candidate']['equivalent_heads'])
+            self.assertTrue(s.parent_current(a, conn, child))
+            landed_b = self.run_git('commit-tree', tree, '-p', landed, '-p', result['head'], '-m', 'Land B')
+            with conn:
+                conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal',terminal_status='merged',"
+                             "ci_head_sha=?,integration_merge_commit_sha=? WHERE batch_id=?",
+                             (result['head'], landed_b, 'batch-test'))
+            with mock.patch.object(a, 'current_master_sha', return_value=landed_b):
+                self.assertEqual(s.landed_base(a, conn, child, row_for(conn)), landed_b)
+            self.assertEqual(json.loads(child['predecessor_candidate_json'])['head'], before)
 
     def test_rerere_is_enabled_without_automatic_staging(self):
         self.source(1, 'one', 'one\n')
