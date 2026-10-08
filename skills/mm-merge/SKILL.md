@@ -29,3 +29,21 @@ from the captured base. It resets this batch branch after requiring a clean tree
 Preserve any needed resolutions/fixes; an octopus retry does not reconstruct
 agent-authored fixes. Source history remains reachable in either merge topology.
 Publication is a separate mm-autopr operation after the local test gate passes.
+
+The helper enables Git rerere with `rerere.autoupdate=false`. Review reused
+resolutions before staging them.
+
+After the supervisor creates a new attempt, run `--restart` (combine with
+`--manual` when useful). It saves the old tip, pending source files/patches and
+progress note under the Git directory's `mm-recovery/attempt-N`, then resets to
+the recorded replacement base and assembles your original own heads. Repeating
+it in the same attempt preserves current work. Caches and logs remain available.
+Use the archived work as evidence; never transplant old merge commits or retain
+the invalidated predecessor's ancestry. Read the generated brief and current
+state; the archived progress note's next action is obsolete.
+
+After promotion, run `--promote`. This merges the exact landed base and reports
+whether the resulting tree matches earlier passing evidence. Reuse requires
+applicable test inputs/settings as well as an unchanged tree. Record a fresh
+assessment at the resulting committed HEAD before publication. If the helper
+encounters conflicts, resolve/commit them and reassess affected checks.

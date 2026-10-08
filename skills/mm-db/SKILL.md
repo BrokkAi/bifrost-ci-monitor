@@ -18,6 +18,22 @@ of reports and PR bodies. `state` returns the current source list and revision.
 Pass that revision to each mutation; on a stale-revision error, read state again
 and reconsider the requested update.
 
+Checkpoint a clean committed candidate before expensive validation. The helper
+pushes only the recorded branch and records its head/tree without opening a PR:
+
+```sh
+python3 <this skill>/scripts/mm_db.py candidate --revision REV
+python3 <this skill>/scripts/mm_db.py candidate --revision REV --withdraw
+```
+
+Withdraw before edits. After rebuilding, checkpoint with `--rebuild` for an
+explicit observed lease. Re-read state between mutations. `attempt_generation`
+fences old attempts. If `predecessor` is present, merge only your own `sources`
+on its pinned base; never redo its membership. After local pass, run `report`
+and finish without publishing. A stale predecessor blocks mutations until the
+supervisor clears/restarts this attempt in the same environment. Independently
+established rejections survive that restart and every abort.
+
 ```sh
 python3 <this skill>/scripts/mm_db.py exclude --revision REV --pr N --head SHA --kind removed --reason 'source head changed'
 python3 <this skill>/scripts/mm_db.py exclude --revision REV --pr N --head SHA --kind rejected --reason 'isolated regression' --evidence-file /tmp/evidence.md
