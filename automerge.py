@@ -625,10 +625,13 @@ def retry_github_outbox(conn: sqlite3.Connection, transport: monitor.SlackTransp
                 )
             log(f"GitHub {row['kind']} for #{row['number']} failed; retry at {retry_at}: {exc}")
             if attempts >= 3 and not row["alerted_at"] and row["kind"] != "membership_label":
+                batch = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                                     (row["batch_id"],)).fetchone()
+                lane = "speculative " if batch is not None and speculation.get(batch, "predecessor_id") else ""
                 try:
                     ok, _ = monitor.slack_send(
                         transport, f":rotating_light: MergeMarshall GitHub write pending for "
-                        f"#{row['number']} ({row['kind']}, batch {row['batch_id']}): {exc}. "
+                        f"#{row['number']} ({row['kind']}, {lane}batch {row['batch_id']}): {exc}. "
                         "Automatic retries continue; no agent action is needed.", thread_ts=None,
                     )
                 except Exception as slack_exc:
@@ -1730,6 +1733,9 @@ def send_start_notification(
     lane = "PRIORITY " if _batch_priority(row) else ""
     if _batch_source(row) == "operator":
         lane = "OPERATOR FAST-TRACK "
+    predecessor = speculation.get(row, "predecessor_id")
+    if predecessor:
+        lane += "SPECULATIVE "
     if _batch_kind(row) == "direct":
         message = (
             f":arrows_counterclockwise: Bifrost {lane}direct merge {row['batch_id']}: "
@@ -1740,6 +1746,9 @@ def send_start_notification(
             f":arrows_counterclockwise: Bifrost {lane}{AUTOMERGE_AGENT_LABEL} batch "
             f"{row['batch_id']}: {inline}"
         )
+    if predecessor:
+        message += (f"\nPreparing ahead of batch {predecessor}; "
+                    "publication and merge wait for that batch to land.")
     thread_ts = row["thread_ts"]
     if not row["start_notification_sent"]:
         ok, thread_ts = monitor.slack_send(transport, message)
@@ -1760,7 +1769,8 @@ def send_start_notification(
         for pull in pulls
     )
     ok, _ = monitor.slack_send(
-        transport, f"PRs in this batch:\n{items}", thread_ts=thread_ts,
+        transport, f"PRs in this {'speculative ' if predecessor else ''}batch:\n{items}",
+        thread_ts=thread_ts,
     )
     if ok:
         with conn:
@@ -1822,8 +1832,9 @@ def deliver_blocked_notice(
     if notice is None or notice["slack_notification_attempted"]:
         return True
     batch = conn.execute(
-        "SELECT thread_ts FROM automerge_batches WHERE batch_id = ?", (batch_id,)
+        "SELECT * FROM automerge_batches WHERE batch_id = ?", (batch_id,)
     ).fetchone()
+    lane = "speculative " if batch is not None and speculation.get(batch, "predecessor_id") else ""
     loud = reason in {
         "github_write_retry", "verdict_status_failed",
         "source_ancestry_unverified", "baseline_unavailable", "ci_run_unavailable",
@@ -1832,7 +1843,7 @@ def deliver_blocked_notice(
     try:
         ok, _ = monitor.slack_send(
             transport,
-            f"{prefix} Bifrost automerge batch {batch_id} ({reason}): {notice['details']}",
+            f"{prefix} Bifrost {lane}automerge batch {batch_id} ({reason}): {notice['details']}",
             thread_ts=None if loud else (batch["thread_ts"] if batch else None),
         )
     except Exception as exc:
@@ -1902,7 +1913,7 @@ def drain_transcript(
     session_id: str,
 ) -> list[str]:
     row = conn.execute(
-        "SELECT transcript_after_seq, thread_ts FROM automerge_batches WHERE batch_id = ?",
+        "SELECT * FROM automerge_batches WHERE batch_id = ?",
         (batch_id,),
     ).fetchone()
     if row is None:
@@ -1932,7 +1943,10 @@ def drain_transcript(
             processed_cursor = max(processed_cursor, seq)
             continue
         item_text = text.strip()
-        if not monitor.relay_text(transport, row["thread_ts"], item_text):
+        predecessor = speculation.get(row, "predecessor_id")
+        relay_text = (f"*SPECULATIVE batch {batch_id} (waiting for {predecessor})*\n{item_text}"
+                      if predecessor else item_text)
+        if not monitor.relay_text(transport, row["thread_ts"], relay_text):
             all_processed = False
             processed_cursor = min(processed_cursor, seq - 1)
             break
@@ -2152,10 +2166,12 @@ def detect_batch_outcomes(pulls: list[PullRequest], *,
 def format_batch_outcome(batch_id: str, terminal_status: str, outcome: BatchOutcome,
                          *, ejected: list[str] | None = None,
                          kind: str = "batch", priority: bool = False,
-                         source: str = "queue") -> str:
+                         source: str = "queue", predecessor_id: str | None = None) -> str:
     lane = "operator fast-track " if source == "operator" else (
         "priority " if priority else ""
     )
+    if predecessor_id:
+        lane += "speculative "
     subject = f"{lane}direct merge" if kind == "direct" else f"{lane}integration batch"
     lines = [f"Bifrost {subject} {batch_id} finished ({terminal_status})."]
     lines.append("Landed (GitHub confirms merged):")
@@ -2200,7 +2216,7 @@ def finish_batch(conn: sqlite3.Connection, transport: monitor.SlackTransport,
     summary = format_batch_outcome(
         batch_id, str(row["terminal_status"] or "completed"), outcome,
         ejected=ejected, kind=_batch_kind(row), priority=_batch_priority(row),
-        source=_batch_source(row),
+        source=_batch_source(row), predecessor_id=speculation.get(row, "predecessor_id"),
     )
     if row["terminal_status"] == "aborted":
         reason = str(row["abort_reason"] or "Operator requested abort.")

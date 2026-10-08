@@ -120,6 +120,7 @@ the gate independently of Mjolnir; see [emergency merge access](../README.md#eme
 
 Slack bot transport supplies engagement threads, completed agent messages, and
 outcomes; legacy webhooks supply engagement/outcome notices. Delivery problems
-are recorded independently of supervision, and repeated blocked notices are
-deduplicated. The operator README lists schedules, resource requirements,
-commands, data paths, and restoration steps.
+are recorded independently of supervision. Speculative batches are labeled in
+Slack and name the batch they must wait for before publishing or merging. Repeated
+blocked notices are deduplicated. The operator README lists schedules, resource
+requirements, commands, data paths, and restoration steps.

@@ -374,6 +374,12 @@ publication/landing before promotion. Source changes, priorities and aborts
 retain the normal policies. Never discard established rejection intents on
 reset, abort or failed launch.
 
+Slack start headings mark successors as `SPECULATIVE` and name the predecessor
+whose landing gates publication/merge. PR-list replies, relayed progress, blocked
+alerts and terminal summaries retain that distinction while `predecessor_id` is
+set. After promotion, new messages use normal batch wording. Message decoration
+must not change stored agent evidence, relay identities/cursors or delivery retries.
+
 Invalidation fences old mutations immediately. Persist a new attempt generation,
 stop queued prompts/turns/background tasks and child sessions, then issue typed
 `/clear` with a stable command ID. Wait for its durable context divider before
