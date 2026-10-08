@@ -207,6 +207,13 @@ waits for verified PR CI and permits failures proven no worse than the captured
 master baseline. `CI_MODE` in `automerge.py` controls new batches; existing
 batches retain their recorded mode.
 
+Integration agents hand off through the shared database: successful `mm-autopr`
+publication records readiness atomically, and speculative successors use
+`mm-db ready`. The supervisor advances from that receipt even if `mj wait` times
+out or the session still appears active. It applies the normal source, master,
+tested-head and CI gates, then suspends the session after confirmed landing.
+An assessment alone or an externally tagged PR is not a completion signal.
+
 The scheduler permits one speculative successor while the foreground batch
 validates. It starts from the foreground's pushed candidate and owns only newly
 selected PRs. `python3 automerge.py --check` shows the candidate, successor and

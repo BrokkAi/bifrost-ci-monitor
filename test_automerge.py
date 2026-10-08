@@ -137,6 +137,7 @@ def make_db(
             excluded_source_heads_json TEXT NOT NULL DEFAULT '[]',
             expansion_count INTEGER NOT NULL DEFAULT 0,
             retry_rescan_pending INTEGER NOT NULL DEFAULT 0,
+            ready_json TEXT NOT NULL DEFAULT '{}', prompt_command_id TEXT,
             ci_round INTEGER NOT NULL DEFAULT 0,
             ci_head_sha TEXT, ci_failed_jobs_json TEXT NOT NULL DEFAULT '[]',
             ci_failure_details_json TEXT NOT NULL DEFAULT '{}',
@@ -3474,6 +3475,8 @@ class LaunchAndLifecycleTests(TestCase):
             self.assertIn("suspend_pending", columns)
             self.assertIn("suspend_verify_failures", columns)
             self.assertIn("start_pr_list_sent", columns)
+            self.assertEqual(defaults['ready_json'], "'{}'")
+            self.assertIn('prompt_command_id', columns)
             conn.close()
 
     def test_existing_start_notice_is_not_reposted_after_list_migration(self):

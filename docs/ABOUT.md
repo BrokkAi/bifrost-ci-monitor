@@ -66,6 +66,10 @@ GitHub verdict/merge write failures retain the open candidate and retry with
 persisted backoff instead of losing completed work. Operators can abort a
 batch explicitly. Agent sessions remain live across turns, supervisor polls,
 and CI waits, with no elapsed-time work cutoff.
+Integration publication hands the tested candidate to the supervisor through a
+durable database receipt; speculative successors record readiness without a PR.
+Scheduling does not depend on Mjolnir reporting a completed turn. Normal landing
+checks still apply, and confirmed completion suspends the session.
 
 ## Failure ledger and triage
 

@@ -30,15 +30,18 @@ python3 <this skill>/scripts/mm_db.py candidate --revision REV --withdraw
 Withdraw before edits. After rebuilding, checkpoint with `--rebuild` for an
 explicit observed lease. Re-read state between mutations. `attempt_generation`
 fences old attempts. If `predecessor` is present, merge only your own `sources`
-on its pinned base; never redo its membership. After local pass, run `report`
-and finish without publishing. A stale predecessor blocks mutations until the
-supervisor clears/restarts this attempt in the same environment. Independently
+on its pinned base; never redo its membership. After local pass, refresh state
+and run `ready --revision REV`, then `report` and finish without publishing.
+`ready` hands the exact checkpointed passing head to the supervisor. A stale
+predecessor blocks mutations until the supervisor clears/restarts this attempt
+in the same environment. Independently
 established rejections survive that restart and every abort.
 
 ```sh
 python3 <this skill>/scripts/mm_db.py exclude --revision REV --pr N --head SHA --kind removed --reason 'source head changed'
 python3 <this skill>/scripts/mm_db.py exclude --revision REV --pr N --head SHA --kind rejected --reason 'isolated regression' --evidence-file /tmp/evidence.md
 python3 <this skill>/scripts/mm_db.py tests --revision REV --head SHA --verdict pass --tests 'commands actually run' --baseline 'reproduced failures or none'
+python3 <this skill>/scripts/mm_db.py ready --revision REV
 python3 <this skill>/scripts/mm_db.py comment --revision REV --issue N --body-file /tmp/comment.md
 python3 <this skill>/scripts/mm_db.py finding --revision REV --kind baseline --head BASE_SHA --identity 'exact failing test' --command 'actual check command' --evidence-file /tmp/evidence.md
 python3 <this skill>/scripts/mm_db.py finding --revision REV --kind flaky --head TESTED_SHA --identity 'exact flaky test' --command 'actual check command' --evidence-file /tmp/evidence.md
@@ -95,7 +98,18 @@ the PR's draft state. Use `pr` and `issue` to read GitHub
 metadata and comments through the service. Do not run `gh` to post comments,
 change labels, mark PRs draft, or otherwise mutate GitHub directly.
 
-After publication, `report` renders the recorded local verdict, test summaries,
+Successful `mm-autopr` publication is the foreground handoff; `ready` is only for
+a speculative successor. Both record a durable receipt returned as `state.ready`.
+After acceptance, stop edits, builds, and pushes until the supervisor requests
+new work. Membership, assessment, candidate and publication mutations are fenced;
+read-only operations and diagnostic findings remain available. Repeating the
+accepted handoff after a lost reply returns the same receipt. Changed inputs or
+new supervisor instructions invalidate it and require another explicit handoff.
+
+After handoff, `report` renders the recorded local verdict, test summaries,
 tested SHA, publication, and ejection markers for your final message. Add any
-required `known-failure:` diagnoses yourself. An unavailable service is an error;
-do not substitute a local database for the shared state.
+required `known-failure:` diagnoses yourself and include them in the handoff
+notes (`ready --notes-file FILE` or mm-autopr's `--notes-file`). The report is
+informational; supervisor processing does not depend on a final message or
+`mj wait` completion. An unavailable service is an error; do not substitute a
+local database for the shared state.

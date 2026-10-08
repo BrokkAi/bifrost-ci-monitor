@@ -23,6 +23,13 @@ def publish(client, *, rebuild=False, notes=""):
     evidence = state.get("tests")
     if not evidence or evidence["verdict"] != "pass" or evidence["head"] != head:
         raise ValueError("record a passing local assessment for this exact HEAD with mm-db")
+    receipt = state.get("ready")
+    if receipt:
+        if receipt["kind"] != "publish" or receipt["head"] != head:
+            raise ValueError("candidate already handed to supervisor; wait for its next instruction")
+        if receipt["registered_revision"] is not None and receipt["notes"] != notes:
+            raise ValueError("candidate handed to supervisor; publication notes cannot be changed")
+        return state  # Lost replies must not cause another push after handoff.
     if not state["sources"]:
         raise ValueError("cannot publish an empty batch")
     for p in state["sources"]:

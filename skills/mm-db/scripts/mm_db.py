@@ -97,6 +97,32 @@ def render_report(state):
     return "\n".join(lines)
 
 
+def ready(client, revision, *, notes_file=None):
+    state = client.call("state")
+    notes = notes_file.read_text() if notes_file else ""
+    if git("branch", "--show-current").stdout.strip() != state["branch"]:
+        raise ValueError("not on the recorded integration branch")
+    if git("status", "--porcelain").stdout.strip():
+        raise ValueError("working tree must be clean and committed")
+    head = git("rev-parse", "HEAD").stdout.strip()
+    receipt = state.get("ready")
+    if (receipt and receipt["kind"] == "ready" and receipt["head"] == head
+            and revision in {receipt["registered_revision"], state["revision"]}):
+        if receipt["registered_revision"] is not None and receipt["notes"] != notes:
+            raise ValueError("candidate handed to supervisor; readiness notes cannot be changed")
+        return state
+    if revision != state["revision"]:
+        raise ValueError("stale revision; read mm-db state again")
+    if not state.get("predecessor"):
+        raise ValueError("foreground candidates hand off through mm-autopr")
+    evidence = state.get("tests")
+    checkpoint = state.get("candidate")
+    if (not evidence or evidence["verdict"] != "pass" or evidence["head"] != head
+            or not checkpoint or checkpoint["head"] != head):
+        raise ValueError("record a passing assessment for this exact checkpointed HEAD")
+    return client.call("ready", revision=revision, head=head, notes=notes)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="operation", required=True)
@@ -116,6 +142,9 @@ def main():
     candidate.add_argument("--revision", required=True)
     candidate.add_argument("--rebuild", action="store_true")
     candidate.add_argument("--withdraw", action="store_true")
+    readiness = sub.add_parser("ready")
+    readiness.add_argument("--revision", required=True)
+    readiness.add_argument("--notes-file", type=Path)
     inspect_pr = sub.add_parser("pr")
     inspect_pr.add_argument("--pr", required=True, type=int)
     inspect_issue = sub.add_parser("issue")
@@ -146,6 +175,9 @@ def main():
     client = Client()
     if operation == "candidate":
         print(json.dumps(checkpoint(client, **args), indent=2))
+        return
+    if operation == "ready":
+        print(json.dumps(ready(client, **args), indent=2))
         return
     if operation == "report":
         print(render_report(client.call("state")))

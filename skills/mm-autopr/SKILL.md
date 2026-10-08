@@ -6,8 +6,9 @@ description: Publish a locally tested MergeMarshall branch and reconcile its int
 First record your local assessment with mm-db for the exact committed HEAD,
 including checks run there, separately identified reused results with their
 original tested SHAs and applicability reasons, and reproduced baseline failures.
-When mm-db state has a predecessor, publication is blocked: record local pass
-and finish the turn. After the supervisor requests promotion, incorporate the
+When mm-db state has a predecessor, publication is blocked: record local pass,
+refresh state and call `mm-db ready --revision REV`, then finish the turn.
+After the supervisor requests promotion, incorporate the
 actual landed base with mm-merge, record a fresh assessment, then publish.
 Then:
 
@@ -18,10 +19,17 @@ python3 <this skill>/scripts/mm_autopr.py --notes-file /tmp/merge-notes.md
 The script checks a clean tree, matching recorded test head and pass verdict,
 included/excluded ancestry, and the recorded branch. It pushes only that branch.
 The supervisor service creates or finds exactly one integration PR using REST,
-verifies the published head, and records publication. It queues title/body and
+verifies the published head, and atomically records publication and a durable
+readiness receipt containing the tested head, source revision and attempt
+generation. This hands the candidate to the supervisor in either CI mode.
+It queues title/body and
 existing-label updates for automatic delivery and retries; those may still be
-pending when this tool returns. Repeated calls reuse the PR. Notes should explain
-conflict resolutions and fixes.
+pending when this tool returns. Repeated accepted calls return the receipt
+without pushing again. After acceptance, stop edits, builds and pushes until
+the supervisor gives new work; final messages and session idleness do not gate
+supervision. Notes should explain
+conflict resolutions and fixes, and include any `known-failure:` diagnosis lines
+that should be recorded before the supervisor advances.
 
 After an authorized rebuild, add `--rebuild` for a force push with an explicit
 lease against the observed remote head. Otherwise publication uses a normal push.
