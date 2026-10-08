@@ -69,14 +69,18 @@ an operator's ambient `gh` login is not the production credential.
 Installed Mjolnir must support `transcript --finished-only`.
 
 Create these repository labels: `ci-fix`, `buildfailure`, `agent-in-progress`,
-`Escalated`, `automerge-rejected`, `mergemarshall-batch`, `mergemarshall:high`,
+`Escalated`, `mergemarshall:high`,
 `mergemarshall:immediate`, and `known-ci-failures`.
 
 MergeMarshall creates and manages `mergemarshall:in-progress` automatically.
 It marks source PRs selected for a batch (including expansions and direct
 landing), then removes the label when they leave the batch or the batch ends.
 Updates are asynchronous and retry after GitHub outages; the label is
-informational and never gates a merge. Other labels require initial setup.
+informational and never gates a merge. The labels listed above require initial setup.
+
+The previous names `automerge-rejected` and `mergemarshall-batch` remain readable
+for existing PRs; new writes use `mergemarshall:rejected` and `mergemarshall:batch`.
+MergeMarshall creates these repository labels when needed.
 
 Install the batch skills and start their user service on the host's private IP:
 

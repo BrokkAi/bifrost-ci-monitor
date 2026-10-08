@@ -4,6 +4,7 @@ import tempfile
 from unittest import TestCase, mock
 
 import issue_fixer as fixer
+import automerge
 import monitor
 
 
@@ -18,7 +19,7 @@ def pr(number=30, *, rejected=False, sha="a" * 40):
     return dict(number=number, html_url=f"https://github.com/{monitor.REPO_NAME}/pull/{number}",
                 title="Repair", body="Fixes #12", state="open", draft=False,
                 head={"sha": sha, "ref": "ci-repair/issue-12-first", "repo": {"full_name": monitor.REPO_NAME}},
-                labels=[{"name": "ci-fix"}] + ([{"name": "automerge-rejected"}] if rejected else []))
+                labels=[{"name": "ci-fix"}] + ([{"name": automerge.REJECTED_LABEL}] if rejected else []))
 
 
 def rejection(sha="a" * 40, login="mergemarshall[bot]"):
@@ -92,6 +93,16 @@ class IssueFixerTests(TestCase):
         api.assert_not_called()
         self.assertEqual(selected[0]["number"], 13)
 
+    def test_legacy_rejection_label_and_new_marker_still_select_owned_repair(self):
+        self.owned_pr()
+        target = pr(rejected=True)
+        target['labels'] = [{'name': 'automerge-rejected'}]
+        comment = rejection()
+        comment['body'] = comment['body'].replace('automerge-rejected-head:', 'mergemarshall:rejected-head:')
+        with mock.patch.object(fixer, 'api', return_value=[comment]):
+            selected = fixer.select_work(self.conn, [issue()], [target])
+        self.assertEqual(selected[1]['number'], target['number'])
+
     def test_stale_untrusted_and_unowned_rejections_do_not_trigger_repair(self):
         for comments in [[rejection("c" * 40)], [rejection(login="someone")]]:
             self.owned_pr() if not self.conn.execute("SELECT 1 FROM issue_repairs").fetchone() else None
@@ -144,7 +155,7 @@ class IssueFixerTests(TestCase):
         job = self.job(retry=pr(rejected=True))
         self.assertEqual(job["branch"], pr()["head"]["ref"])
         for text in ["top-priority repair", "SAME issue, branch and PR", "gh pr ready 30 --undo",
-                     "Do not remove automerge-rejected", "reproduce the reported regression"]:
+                     "Do not remove mergemarshall:rejected", "reproduce the reported regression"]:
             self.assertIn(text, job["prompt"])
 
     def test_prompt_permits_tricky_or_conflicting_requirements_to_escalate(self):

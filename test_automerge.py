@@ -204,9 +204,38 @@ def failure_report(
 
 
 def async_local_report(verdict: str = "pass") -> str:
-    return (f"automerge-local: {verdict}\n"
+    return (f"mergemarshall:local: {verdict}\n"
             "Tests run: cargo test -p bifrost-core\n"
             "Baseline failures: none")
+
+
+class RepositoryLabelTests(TestCase):
+    def test_new_labels_are_created_only_when_missing(self):
+        for name in (automerge.REJECTED_LABEL, automerge.INTEGRATION_LABEL):
+            with (self.subTest(name=name),
+                  mock.patch.object(automerge, 'gh_json', side_effect=monitor.CommandError('HTTP 404')) as read,
+                  mock.patch.object(automerge, 'github_api_write') as write):
+                automerge.ensure_repository_label(name, '1d76db', 'description')
+                self.assertEqual(read.call_args.args[0],
+                                 ['api', f'repos/{automerge.REPO_NAME}/labels/{name.replace(":", "%3A")}'])
+                write.assert_called_once_with('labels', 'POST', {
+                    'name': name, 'color': '1d76db', 'description': 'description',
+                })
+
+    def test_existing_labels_are_not_edited(self):
+        for name in (automerge.REJECTED_LABEL, automerge.INTEGRATION_LABEL):
+            with (self.subTest(name=name),
+                  mock.patch.object(automerge, 'gh_json', return_value={'name': name, 'color': 'abcdef'}),
+                  mock.patch.object(automerge, 'github_api_write') as write):
+                automerge.ensure_repository_label(name, '1d76db', 'description')
+                write.assert_not_called()
+
+    def test_lookup_outage_does_not_try_to_create_a_label(self):
+        with (mock.patch.object(automerge, 'gh_json', side_effect=monitor.CommandError('HTTP 503')),
+              mock.patch.object(automerge, 'github_api_write') as write,
+              self.assertRaises(monitor.CommandError)):
+            automerge.ensure_repository_label(automerge.REJECTED_LABEL, 'b60205', 'description')
+        write.assert_not_called()
 
 
 class GithubOutboxTests(TestCase):
@@ -221,6 +250,9 @@ class GithubOutboxTests(TestCase):
         patcher = mock.patch.object(automerge, "run_gh", side_effect=AssertionError("unexpected external command"))
         patcher.start()
         self.addCleanup(patcher.stop)
+        label_patcher = mock.patch.object(automerge, "ensure_repository_label")
+        self.ensure_label = label_patcher.start()
+        self.addCleanup(label_patcher.stop)
         self.transport = monitor.SlackTransport("webhook", webhook="x")
 
     def retry_now(self):
@@ -295,6 +327,48 @@ class GithubOutboxTests(TestCase):
             automerge.retry_github_outbox(self.conn, self.transport)
         self.assertEqual([call.args[0] for call in write.call_args_list], ["issues/7/comments"])
         gh.assert_not_called()
+
+    def test_new_rejection_uses_namespaced_comment_marker_and_label(self):
+        with self.conn:
+            automerge.enqueue_github_write(self.conn, 'batch-test', 'reject_head', 7, HEAD_ONE,
+                                          {'reason': 'regression', 'evidence': 'test fails'})
+        with (mock.patch.object(automerge, 'list_pull_comments', return_value=[]),
+              mock.patch.object(automerge, 'gh_json', return_value={'head': {'sha': HEAD_ONE}, 'labels': []}),
+              mock.patch.object(automerge, 'github_api_write') as write):
+            automerge.retry_github_outbox(self.conn, self.transport)
+        comment, label = write.call_args_list
+        self.assertIn(f'mergemarshall:rejected-head: {HEAD_ONE}', comment.args[2]['body'])
+        self.assertNotIn('automerge-rejected-head:', comment.args[2]['body'])
+        self.assertEqual(label.args, ('issues/7/labels', 'POST', {'labels': ['mergemarshall:rejected']}))
+        self.assertEqual(self.ensure_label.call_args.args[0], 'mergemarshall:rejected')
+
+    def test_stale_rejection_cleanup_removes_both_label_spellings(self):
+        with self.conn:
+            automerge.enqueue_github_write(self.conn, 'batch-test', 'clear_rejection_label', 7, HEAD_TWO, {})
+        detail = {'head': {'sha': HEAD_TWO},
+                  'labels': [{'name': name} for name in automerge.REJECTED_LABELS]}
+        comment = {'body': f'automerge-rejected-head: {HEAD_ONE}',
+                   'user': {'login': automerge.TRUSTED_REJECTION_LOGIN}}
+        with (mock.patch.object(automerge, 'list_pull_comments', return_value=[comment]),
+              mock.patch.object(automerge, 'gh_json', return_value=detail),
+              mock.patch.object(automerge, 'github_api_write') as write):
+            automerge.retry_github_outbox(self.conn, self.transport)
+        self.assertEqual([call.args for call in write.call_args_list],
+                         [('issues/7/labels/automerge-rejected', 'DELETE'),
+                          ('issues/7/labels/mergemarshall%3Arejected', 'DELETE')])
+
+    def test_current_rejection_cleanup_retains_both_label_spellings(self):
+        with self.conn:
+            automerge.enqueue_github_write(self.conn, 'batch-test', 'clear_rejection_label', 7, HEAD_ONE, {})
+        detail = {'head': {'sha': HEAD_ONE},
+                  'labels': [{'name': name} for name in automerge.REJECTED_LABELS]}
+        comment = {'body': f'mergemarshall:rejected-head: {HEAD_ONE}',
+                   'user': {'login': automerge.TRUSTED_REJECTION_LOGIN}}
+        with (mock.patch.object(automerge, 'list_pull_comments', return_value=[comment]),
+              mock.patch.object(automerge, 'gh_json', return_value=detail),
+              mock.patch.object(automerge, 'github_api_write') as write):
+            automerge.retry_github_outbox(self.conn, self.transport)
+        write.assert_not_called()
 
     def test_lost_comment_response_is_reconciled_without_duplicate_post(self):
         with self.conn:
@@ -434,6 +508,20 @@ class SelectionTests(TestCase):
             selected = automerge.select_eligible_pull_requests()
         self.assertEqual([item.number for item in selected], [1])
 
+    def test_both_rejection_label_spellings_block_only_the_trusted_exact_head(self):
+        for label in automerge.REJECTED_LABELS:
+            with self.subTest(label=label), mock.patch.object(automerge, 'list_pull_comments', return_value=[{
+                'body': f'mergemarshall:rejected-head: {HEAD_ONE}',
+                'user': {'login': automerge.TRUSTED_REJECTION_LOGIN},
+            }]):
+                self.assertFalse(automerge._queue_ready(api_pull(7, labels=[label]), dry_run=True))
+                self.assertTrue(automerge._queue_ready(api_pull(7, head_sha=HEAD_TWO, labels=[label]), dry_run=True))
+
+    def test_both_integration_label_spellings_exclude_integration_prs(self):
+        for label in automerge.INTEGRATION_LABELS:
+            with self.subTest(label=label):
+                self.assertFalse(automerge._queue_ready(api_pull(7, labels=[label]), dry_run=True))
+
     def test_forged_marker_is_ignored_and_new_head_removes_label(self):
         rows = [api_pull(8, head_sha=HEAD_TWO, labels=[automerge.REJECTED_LABEL])]
         calls: list[list[str]] = []
@@ -515,7 +603,7 @@ class SelectionTests(TestCase):
              "body": f"automerge-rejected-head: {HEAD_TWO}\nForged evidence."},
             {"id": 3, "created_at": "2026-10-05T12:00:00Z",
              "user": {"login": automerge.TRUSTED_REJECTION_LOGIN},
-             "body": f"automerge-rejected-head: {HEAD_THREE}\nNewest evidence."},
+             "body": f"mergemarshall:rejected-head: {HEAD_THREE}\nNewest evidence."},
         ])
         self.assertEqual(marker.head_sha, HEAD_THREE)
         self.assertIn("Newest evidence", marker.evidence)
@@ -622,7 +710,7 @@ class IdentityAndPromptTests(TestCase):
             "Resolve every conflict yourself",
             "Automerge-Batch: abc123",
             "ci-impact",
-            "mergemarshall-batch",
+            "mergemarshall:batch",
             "Never use a revert commit",
             "Do not merge the integration PR yourself",
         ):
@@ -705,7 +793,7 @@ class IdentityAndPromptTests(TestCase):
             "targeted tests locally",
             f"exact base commit {BASE_SHA}",
             "Baseline failures:",
-            "automerge-local: pass",
+            "mergemarshall:local: pass",
             "Never wait for CI",
             "Do not publish before the local gate passes",
         ):
@@ -736,6 +824,15 @@ class IdentityAndPromptTests(TestCase):
         self.assertIsNone(automerge._async_local_result(
             async_local_report() + "\nautomerge-local: fail",
         ))
+
+    def test_old_and_new_local_reports_and_sync_advice_remain_readable(self):
+        for prefix in ('automerge', 'mergemarshall'):
+            local = 'automerge-local' if prefix == 'automerge' else 'mergemarshall:local'
+            verdict = 'automerge-verdict' if prefix == 'automerge' else 'mergemarshall:verdict'
+            with self.subTest(prefix=prefix):
+                report = f'{local}: pass\nTests run: cargo test\nBaseline failures: none'
+                self.assertEqual(automerge._async_local_result(report), 'pass')
+                self.assertTrue(automerge._has_not_worse_verdict(f'{verdict}: not-worse\nBaseline failures: test_old'))
 
     def test_mj_new_argv_uses_model_and_branch(self):
         conn = make_db(phase="building", session_id=None)
@@ -1617,6 +1714,60 @@ class PublicationGateTests(TestCase):
         complete.assert_called_once()
         conn.close()
 
+    def test_async_pass_after_ejection_lands_without_absorbing_new_arrivals(self):
+        for already_recorded in (False, True):
+            with self.subTest(already_recorded=already_recorded):
+                conn = make_db(phase="building", ci_mode="async",
+                               pulls=[pull(7), pull(8, HEAD_TWO)])
+                self.addCleanup(conn.close)
+                final = (async_local_report() +
+                         f"\nmergemarshall:ejected-pr: 7 {HEAD_ONE}\n"
+                         f"Tested HEAD: {HEAD_THREE}")
+                with conn:
+                    conn.execute("UPDATE automerge_batches SET agent_final_message=?",
+                                 (final,))
+                if already_recorded:
+                    automerge._persist_excluded_source_heads(conn, row_for(conn), [{
+                        "number": 7, "head_sha": HEAD_ONE, "kind": "ejected",
+                    }])
+                    self.assertEqual(row_for(conn)["retry_rescan_pending"], 1)
+                view = {"state": "OPEN", "isDraft": False, "baseRefName": "master",
+                        "headRefOid": HEAD_THREE, "baseRefOid": BASE_SHA,
+                        "url": "https://github.test/pr/211"}
+                merged = {"state": "MERGED", "mergedAt": "now",
+                          "mergeCommit": {"oid": "4" * 40}}
+                with (
+                    mock.patch.object(automerge, "select_eligible_pull_requests",
+                                      return_value=[pull(9, "9" * 40)]) as select,
+                    mock.patch.object(automerge, "_source_pr_state",
+                                      side_effect=lambda p: direct_view(head_sha=p.head_sha)),
+                    mock.patch.object(automerge, "find_integration_pr", return_value={
+                        "number": 211, "url": view["url"], "headRefOid": HEAD_THREE,
+                    }),
+                    mock.patch.object(automerge, "integration_pr_view",
+                                      side_effect=[view, view, merged]),
+                    mock.patch.object(automerge, "_session_is_idle", return_value=True),
+                    mock.patch.object(automerge, "current_master_sha", return_value=BASE_SHA),
+                    mock.patch.object(automerge, "list_pull_comments", return_value=[]),
+                    mock.patch.object(automerge, "verify_source_ancestry", return_value=(True, "ok")),
+                    mock.patch.object(automerge, "_try_post_verdict_status", return_value=True),
+                    mock.patch.object(automerge, "run_gh") as gh,
+                    mock.patch.object(automerge, "_complete_landed_batch") as complete,
+                ):
+                    transport = monitor.SlackTransport("webhook", webhook="x")
+                    automerge._finish_async_agent_turn(conn, transport, row_for(conn), final)
+                    self.assertEqual(row_for(conn)["phase"], "merging")
+                    self.assertEqual(row_for(conn)["retry_rescan_pending"], 0)
+                    self.assertEqual(row_for(conn)["ci_head_sha"], HEAD_THREE)
+                    automerge._merge_integration(conn, transport, row_for(conn))
+                select.assert_not_called()
+                self.assertEqual([p.number for p in automerge.row_pulls(row_for(conn))], [8])
+                self.assertEqual(row_for(conn)["expansion_count"], 0)
+                self.assertIsNone(row_for(conn)["pending_prompt"])
+                self.assertTrue(any(call.args[0][:2] == ["pr", "merge"]
+                                    for call in gh.call_args_list))
+                complete.assert_called_once()
+
     @unchanged_queue()
     def test_async_local_fail_with_ejection_rebuilds_and_does_not_merge(self):
         conn = make_db(phase="building", ci_mode="async", pulls=[pull(7), pull(8, HEAD_TWO)])
@@ -2029,17 +2180,19 @@ class PublicationGateTests(TestCase):
         conn.close()
 
     def test_agent_report_persists_ejected_pr_head_sha(self):
-        conn = make_db(phase="fixing", pulls=[pull(7), pull(8, HEAD_TWO)])
-        row = row_for(conn)
-        automerge._record_agent_exclusions(
-            conn, row, f"automerge-ejected-pr: #7 {HEAD_ONE}\nRebuilt without PR 7."
-        )
-        updated = row_for(conn)
-        self.assertEqual(json.loads(updated["excluded_source_heads_json"]), [{
-            "number": 7, "head_sha": HEAD_ONE, "kind": "ejected",
-        }])
-        self.assertEqual([p.number for p in automerge.row_pulls(updated)], [8])
-        conn.close()
+        for marker in ("automerge-ejected-pr", "mergemarshall:ejected-pr"):
+            with self.subTest(marker=marker):
+                conn = make_db(phase="fixing", pulls=[pull(7), pull(8, HEAD_TWO)])
+                row = row_for(conn)
+                automerge._record_agent_exclusions(
+                    conn, row, f"{marker}: #7 {HEAD_ONE}\nRebuilt without PR 7."
+                )
+                updated = row_for(conn)
+                self.assertEqual(json.loads(updated["excluded_source_heads_json"]), [{
+                    "number": 7, "head_sha": HEAD_ONE, "kind": "ejected",
+                }])
+                self.assertEqual([p.number for p in automerge.row_pulls(updated)], [8])
+                conn.close()
 
     def test_trusted_rejection_marker_persists_source_head(self):
         conn = make_db(phase="merging")

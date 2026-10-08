@@ -196,7 +196,7 @@ class MergeRetryTests(TestCase):
         suspend.assert_not_called()
 
     def test_ejection_rescan_survives_github_failure_and_restart(self):
-        final = async_local_report() + f"\nautomerge-ejected-pr: 7 {HEAD_ONE}\n"
+        final = async_local_report("fail") + f"\nautomerge-ejected-pr: 7 {HEAD_ONE}\n"
         self.select.side_effect = monitor.CommandError("GitHub offline")
         with self.assertRaises(monitor.CommandError):
             automerge._finish_async_agent_turn(self.conn, self.transport, self.row(), final)

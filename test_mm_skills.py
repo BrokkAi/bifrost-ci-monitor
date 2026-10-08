@@ -268,6 +268,7 @@ class StateTests(unittest.TestCase):
                          [{"kind": "integration_metadata", "number": 211, "head_sha": HEAD_ONE}])
         self.assertEqual(row_for(self.conn)["integration_pr_number"], 211)
         self.assertEqual(automerge._async_local_result(db.render_report(updated)), "pass")
+        self.assertIn('mergemarshall:local: pass', db.render_report(updated))
 
     def test_rejected_source_is_recorded_without_waiting_for_github(self):
         current = self.state()
@@ -282,6 +283,15 @@ class StateTests(unittest.TestCase):
                   kind="rejected", reason="isolated failure", evidence="base passes; base plus PR fails")
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM automerge_github_outbox "
                                            "WHERE kind='reject_head'").fetchone()[0], 1)
+
+    def test_rejection_evidence_cannot_supply_old_or_new_head_markers(self):
+        for marker in ('automerge-rejected-head', 'mergemarshall:rejected-head'):
+            with self.subTest(marker=marker), self.assertRaisesRegex(ValueError, 'without rejection-marker'):
+                self.call("exclude", revision=self.state()["revision"], number=7, head=HEAD_ONE,
+                          kind="rejected", reason="isolated failure",
+                          evidence=f"base passes\n{marker}: {HEAD_TWO}")
+        self.assertEqual([p["number"] for p in self.state()["sources"]], [7, 8])
+        self.assertEqual(self.state()["pending_github_writes"], [])
 
     def test_comment_is_recorded_once_and_does_not_change_batch_revision(self):
         current = self.state()

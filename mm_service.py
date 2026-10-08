@@ -186,7 +186,7 @@ def dispatch(conn, batch_id, operation, payload):
                 raise ValueError("kind must be removed or rejected")
             reason = text(payload.get("reason"), "reason", 1000)
             evidence = text(payload.get("evidence"), "evidence") if kind == "rejected" else ""
-            if re.search(r"(?m)^automerge-rejected-head:", evidence):
+            if re.search(r"(?mi)^(?:mergemarshall:rejected-head|automerge-rejected-head):", evidence):
                 raise ValueError("provide evidence without rejection-marker lines")
             automerge._persist_excluded_source_heads(conn, row, [{"number": number, "head_sha": head, "kind": kind}])
             record(conn, batch_id, "exclusion", {"number": number, "head": head, "kind": kind,

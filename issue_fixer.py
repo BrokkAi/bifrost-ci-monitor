@@ -93,7 +93,7 @@ def select_work(conn, issues, prs):
     candidates = []
     # The recorded PR association is ownership evidence; ci-fix alone is not.
     for pr in sorted(prs, key=lambda p: p["number"]):
-        if automerge.REJECTED_LABEL not in labels(pr):
+        if not automerge.REJECTED_LABELS & labels(pr):
             continue
         owner = conn.execute(
             "SELECT * FROM issue_repairs WHERE repair_pr_number=? "
@@ -187,7 +187,7 @@ Read all rejection comments and reproduce the reported regression. Before pushin
 make the PR draft with `gh pr ready {job['retry_pr_number']} --undo`.
 Append corrective commits; do not force-push or replace it with another PR.
 Merge current origin/master, validate, push, update the PR body, and mark it ready.
-Do not remove automerge-rejected yourself: the queue re-admits a new head SHA.
+Do not remove {automerge.REJECTED_LABEL} yourself: the queue re-admits a new head SHA.
 """
     prompt = f"""Repair ONLY issue #{number}: {job['issue_url']} in {monitor.REPO_NAME}.
 One session owns one issue. Resolve the cause(s) described in this ticket; do not
