@@ -1173,10 +1173,6 @@ class MjRunnerTests(unittest.TestCase):
                 return completed(json.dumps({"outcome": "cancelled"}))
             if args[0] == "transcript":
                 return completed(json.dumps({"items": [], "next_after_seq": 0}))
-            if args[0] == "prompt":
-                prompt_path = Path(args[args.index("--prompt-file") + 1])
-                prompts.append(prompt_path.read_text())
-                return completed(json.dumps({"session_id": "session-timeout", "turn_id": 2}))
             if args[0] == "suspend":
                 suspend_argv.append(args)
                 if "--acknowledge-unpublished-work" not in args:
@@ -1190,9 +1186,15 @@ class MjRunnerTests(unittest.TestCase):
 
         timeout = monitor.TurnResult("running", "timeout", timed_out=True)
         finished = monitor.TurnResult("completed", "finished")
+        def message(session_id, text, **kwargs):
+            commands.append('message')
+            prompts.append(text)
+            self.assertTrue(kwargs['request_id'].startswith('ci-timeout-'))
+            return {'session_id': session_id, 'via': 'mailbox'}
         with mock.patch.object(
             monitor, "supervise_turn", side_effect=[timeout, finished]
-        ), mock.patch.object(monitor, "mj_command", side_effect=fake_mj):
+        ), mock.patch.object(monitor, "mj_command", side_effect=fake_mj), \
+             mock.patch.object(monitor, 'send_session_message', side_effect=message):
             result = monitor.run_session_lifecycle(
                 self.conn,
                 self.transport,
@@ -1207,7 +1209,7 @@ class MjRunnerTests(unittest.TestCase):
         self.assertIn("ci-repair/42-1", prompts[0])
         self.assertIn("List any unpushed commits", prompts[0])
         self.assertIn("Do not push any commit", prompts[0])
-        self.assertLess(commands.index("interrupt-turn"), commands.index("prompt"))
+        self.assertLess(commands.index("interrupt-turn"), commands.index("message"))
         self.assertEqual(commands.count("suspend"), 1)
         self.assertIn("--acknowledge-unpublished-work", suspend_argv[0])
 
@@ -1262,7 +1264,7 @@ class MjRunnerTests(unittest.TestCase):
                 monitor.TurnResult("completed", "finished"),
             ]) as wait,
             mock.patch.object(monitor, "interrupt_and_wait") as interrupt,
-            mock.patch.object(monitor, "send_session_prompt") as prompt,
+            mock.patch.object(monitor, "send_session_message") as prompt,
             mock.patch.object(monitor, "drain_transcript"),
             mock.patch.object(monitor, "read_complete_agent_transcript", return_value="Fixed"),
             mock.patch.object(monitor, "suspend_session") as suspend,

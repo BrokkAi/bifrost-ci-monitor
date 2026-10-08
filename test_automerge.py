@@ -1331,20 +1331,32 @@ class CiSupervisionTests(TestCase):
         with conn:
             conn.execute("UPDATE automerge_batches SET pending_prompt=?, prompt_delivered=0 "
                          "WHERE batch_id='batch-test'", ("Investigate the red checks",))
-        events: list[str] = []
         with (
-            mock.patch.object(automerge, "_session_status", return_value={"state": "running", "is_idle": True}),
+            mock.patch.object(automerge, "_session_status", side_effect=AssertionError('active flags do not prove delivery')),
             mock.patch.object(monitor, "mj_command") as mj,
-            mock.patch.object(monitor, "send_session_prompt",
-                              side_effect=lambda sid, prompt: events.append(f"prompt:{prompt}")),
+            mock.patch.object(monitor, "send_session_message",
+                              side_effect=[monitor.MjError('lost reply'), {'via': 'mailbox'}]) as send,
             mock.patch.object(automerge, "_wait_agent_turn", return_value=False),
         ):
+            with self.assertRaises(monitor.MjError):
+                automerge.process_batch(conn, monitor.SlackTransport("webhook", webhook="x"), "batch-test")
+            self.assertEqual(row_for(conn)['prompt_delivered'], 0)
             automerge.process_batch(conn, monitor.SlackTransport("webhook", webhook="x"), "batch-test")
-        self.assertEqual(len(events), 1)
-        self.assertTrue(events[0].startswith("prompt:Investigate the red checks"))
-        self.assertIn("Do not run gh commands", events[0])
+            automerge.process_batch(conn, monitor.SlackTransport("webhook", webhook="x"), "batch-test")
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(send.call_args_list[0].kwargs['request_id'], send.call_args_list[1].kwargs['request_id'])
+        self.assertIn("Investigate the red checks", send.call_args.args[1])
+        self.assertIn('Before acting, read mm-db state', send.call_args.args[1])
+        self.assertIn("Do not run gh commands", send.call_args.args[1])
         mj.assert_not_called()
         self.assertEqual(row_for(conn)["prompt_delivered"], 1)
+        large_feedback = "Untrusted CI evidence: " + "é" * 40000
+        automerge.queue_agent_prompt(conn, row_for(conn), large_feedback)
+        with mock.patch.object(monitor, "send_session_message") as notify:
+            automerge.deliver_pending_prompt(conn, mock.Mock(), row_for(conn))
+        self.assertLessEqual(len(notify.call_args.args[1].encode()), 64 * 1024)
+        self.assertIn('supervisor_instruction.text', notify.call_args.args[1])
+        self.assertEqual(row_for(conn)['pending_prompt'], large_feedback)
         conn.close()
 
     @unchanged_queue()

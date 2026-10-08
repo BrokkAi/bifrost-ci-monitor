@@ -213,6 +213,10 @@ publication records readiness atomically, and speculative successors use
 out or the session still appears active. It applies the normal source, master,
 tested-head and CI gates, then suspends the session after confirmed landing.
 An assessment alone or an externally tagged PR is not a completion signal.
+Supervisor follow-ups use Mjolnir's message delivery: busy agents receive them at
+tool boundaries and idle agents wake to handle them. Delivery retries reuse the
+same request ID. Typed context clears and their ordered restart prompts keep the
+recovery protocol.
 
 Local checks run through `mm-db run` retain their command, tested commit/tree,
 settings/environment, timing, exit status, and output paths in

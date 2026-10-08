@@ -306,16 +306,17 @@ def request_report_correction(conn, job, final, problem) -> None:
     digest = hashlib.sha256((str(problem) + final).encode()).hexdigest()
     if digest == job['feedback_digest']:
         raise RuntimeError('waiting for corrected report; correction already submitted')
-    with conn:
-        conn.execute("UPDATE triage_jobs SET status='running',feedback_digest=? WHERE id=?",
-                     (digest, job['id']))
-    monitor.send_session_prompt(job['session_id'],
+    monitor.send_session_message(job['session_id'],
         f"Your report needs correction: {problem}. Return the complete triage-result JSON "
         "with all original failure_ids. Each finding needs outcome product, infrastructure, "
         "or resolved. Product requires an issue object; the other outcomes require issue:null. "
         "Use the evidence already collected to classify your findings; do not repeat the "
         "investigation or write to GitHub/Slack. Infrastructure findings are channel notices, "
-        "never product tickets, including when a later job has recovered.")
+        "never product tickets, including when a later job has recovered.",
+        request_id="triage-feedback-" + hashlib.sha256((job['id'] + digest).encode()).hexdigest())
+    with conn:
+        conn.execute("UPDATE triage_jobs SET status='running',feedback_digest=? WHERE id=?",
+                     (digest, job['id']))
 
 
 def collect_report(conn, job) -> None:

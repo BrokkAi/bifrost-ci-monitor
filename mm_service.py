@@ -74,6 +74,9 @@ def state(conn, batch_id):
     result["recovery"] = json.loads(speculation.get(row, "recovery_json", "{}"))
     result["promotion"] = json.loads(speculation.get(row, "promotion_json", "{}"))
     result["prompt_command_id"] = speculation.get(row, "prompt_command_id")
+    result["supervisor_instruction"] = (
+        {"id": result["prompt_command_id"], "text": row["pending_prompt"]}
+        if row["phase"] == "fixing" and result["prompt_command_id"] and row["pending_prompt"] else None)
     tests = latest(conn, batch_id, "tests")
     result["tests"] = tests if tests and tests["source_revision"] == result["source_revision"] else None
     result["publication"] = latest(conn, batch_id, "publication")

@@ -420,7 +420,7 @@ class TriageTests(TestCase):
         del report['findings'][0]['outcome']
         with self.conn:
             self.conn.execute('UPDATE triage_jobs SET report_json=?', (json.dumps(report),))
-        prompt = self.patch(monitor, 'send_session_prompt')
+        prompt = self.patch(monitor, 'send_session_message')
         triage.publish(self.conn, self.job())
         prompt.assert_called_once()
         self.assertIn('do not repeat the', prompt.call_args.args[1])
@@ -765,12 +765,17 @@ class TriageTests(TestCase):
         self.make_job(status="running")
         self.patch(monitor, "wait_once", return_value=monitor.TurnResult("completed", "finished"))
         self.patch(monitor, "read_final_agent_message", return_value="Here are some thoughts without a report.")
-        prompt = self.patch(monitor, "send_session_prompt")
+        prompt = self.patch(monitor, "send_session_message",
+                            side_effect=[monitor.MjError('lost reply'), None])
+        with self.assertRaises(monitor.MjError):
+            triage.collect_report(self.conn, self.job())
+        self.assertIsNone(self.job()['feedback_digest'])
         triage.collect_report(self.conn, self.job())
         self.reopen()
         with self.assertRaisesRegex(RuntimeError, "correction already submitted"):
             triage.collect_report(self.conn, self.job())
-        prompt.assert_called_once()
+        self.assertEqual(prompt.call_count, 2)
+        self.assertEqual(prompt.call_args_list[0].kwargs['request_id'], prompt.call_args_list[1].kwargs['request_id'])
 
     def test_poll_cycle_restarts_without_duplicate_session_or_ticket(self):
         self.add_failure()

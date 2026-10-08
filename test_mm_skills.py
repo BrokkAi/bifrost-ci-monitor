@@ -637,6 +637,15 @@ class HttpTests(unittest.TestCase):
                                       evidence='expected status 2, got 1 at captured base')
                 self.assertEqual(finding['revision'], updated['revision'])
                 self.assertEqual(client.call('findings')['findings'][0]['identity'], 'local_cli_failure')
+                with connect() as connection:
+                    row = connection.execute("SELECT * FROM automerge_batches WHERE batch_id='http-test'").fetchone()
+                    feedback = "CI evidence: " + "é" * 40000
+                    automerge.queue_agent_prompt(connection, row, feedback)
+                    command_id = connection.execute("SELECT prompt_command_id FROM automerge_batches "
+                                                    "WHERE batch_id='http-test'").fetchone()[0]
+                instructed = client.call('state')
+                self.assertEqual(instructed['supervisor_instruction'], {'id': command_id, 'text': feedback})
+                self.assertEqual(instructed['source_revision'], updated['source_revision'])
             finally:
                 server.shutdown()
                 server.server_close()

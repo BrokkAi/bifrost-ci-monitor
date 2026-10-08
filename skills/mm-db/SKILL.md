@@ -20,6 +20,12 @@ of reports and PR bodies. `state` returns the current source list and revision.
 Pass that revision to each mutation; on a stale-revision error, read state again
 and reconsider the requested update.
 
+Supervisor messages name their `prompt_command_id`, `attempt_generation` and
+`source_revision`. Check these against `state` before acting and discard stale
+instructions. Large feedback is retained in `supervisor_instruction.text` in
+state; read it when the message directs you there, checking its `id` matches.
+Message acceptance means queued for delivery, not that you have processed it.
+
 Checkpoint a clean committed candidate before expensive validation. The helper
 pushes only the recorded branch and records its head/tree without opening a PR:
 

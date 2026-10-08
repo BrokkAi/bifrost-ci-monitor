@@ -104,9 +104,13 @@ project only safe summary text/status; raw bodies, inputs and presentation
 fields can contain connection tokens. `api-info` reports a credential file's
 path; never read or print that file's contents.
 
-For authorized steering, use `mj prompt --session SESSION_ID --command-id ID
---prompt-file FILE`; reuse the command ID after an ambiguous response instead
-of sending the prompt again. Inspect command `--help` for installed flags.
+For authorized steering, `mj message --session SESSION_ID 'guidance'` uses the
+same route as `send_message`. Automation uses `monitor.send_session_message`
+with a persisted request ID through `/sessions/SESSION_ID/message`; the CLI
+generates a fresh ID per invocation, so it is unsuitable for ambiguous retries.
+Reuse the original request ID after a lost reply. Inspect command `--help` for
+installed flags. Typed `/clear` and the ordered restart brief continue to use
+`mj prompt --command-id ID --prompt-file FILE` and their durable recovery boundary.
 `mj interrupt-turn` cancels the current turn, `mj stop-task --session SESSION_ID
 TASK_ID` stops a listed background task, and `mj suspend --session SESSION_ID
 --acknowledge-unpublished-work --json` preserves recovery state while releasing
@@ -221,9 +225,18 @@ session idleness or a final assistant message. It preserves all normal freshness
 ancestry, exact-head and CI gates and suspends after confirmed landing. Agent
 mutations are fenced after handoff; accepted retries are idempotent. Changed
 inputs, recovery, promotion and new instructions invalidate readiness. Follow-up
-prompts use persisted command IDs so an old active-turn flag cannot swallow new
-work and ambiguous replies cannot duplicate it. Read-only state and diagnostic
-findings remain available after handoff. On upgrade, matching durable publications
+guidance uses Mjolnir's `send_message` API with persisted request IDs, reaching
+busy workers at tool boundaries and waking idle workers. Mjolnir handles older
+workers with its queued-turn fallback. A receipt means accepted into its outbox,
+not read by the agent; never resend an accepted message awaiting delivery. The
+legacy `prompt_delivered` flag records acceptance only after the API returns.
+Every merger message names its `prompt_command_id`, attempt and source revision;
+agents check those against mm-db state and discard stale messages after recovery
+or newer instructions. An old active-turn flag cannot establish acceptance.
+Feedback exceeding mj's 64 KiB message limit stays intact in
+`supervisor_instruction.text` in mm-db state; the message directs the agent to
+fetch that matching instruction. Read-only state and diagnostic findings remain
+available after handoff. On upgrade, matching durable publications
 and already parked successors acquire receipts once; incomplete assessments do not.
 
 Integration sessions use Opus 5.5 (`opus`) on `bedrock-podman` with Mjolnir Luna 6

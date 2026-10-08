@@ -2749,27 +2749,33 @@ def interrupt_and_wait(
             )
 
 
-def send_session_prompt(session_id: str, prompt: str) -> None:
-    with tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", prefix="bifrost-ci-",
-        suffix=".prompt", delete=False,
-    ) as handle:
-        handle.write(prompt)
-        prompt_path = handle.name
+def send_session_message(session_id: str, text: str, *, request_id: str) -> dict[str, Any]:
+    """Use mj's send_message route with a producer-owned identity across retries."""
+    if not text.strip() or len(text.encode()) > 64 * 1024:
+        raise MjError("mj message must contain 1 to 65536 UTF-8 bytes", reason="mj_message_invalid")
     try:
-        result = mj_command(
-            [
-                "prompt", "--session", session_id,
-                "--prompt-file", prompt_path, "--json",
-            ],
-            timeout=60,
+        info = json.loads(require_mj_success(["api-info", "--json"]))
+        token = Path(info["token_path"]).read_text().strip()
+        request = urllib.request.Request(
+            info["base_url"].rstrip("/") + "/sessions/" + urllib.parse.quote(session_id, safe="") + "/message",
+            data=json.dumps({"request_id": request_id, "text": text}).encode(),
+            headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+            method="POST",
         )
-    finally:
-        Path(prompt_path).unlink(missing_ok=True)
-    if result.returncode != 0:
-        detail = mj_output(result)
-        reason = "daemon_unreachable" if looks_like_daemon_failure(detail) else "mj_supervision_failed"
-        raise MjError(f"mj prompt failed: {detail}", reason=reason)
+        with urllib.request.urlopen(request, timeout=30) as response:
+            receipt = json.load(response)
+        if (not isinstance(receipt, dict) or receipt.get("session_id") != session_id
+                or receipt.get("via") not in {"mailbox", "turn"}):
+            raise ValueError("invalid message receipt")
+        return receipt  # Accepted into mj's outbox; not proof the agent read it.
+    except urllib.error.HTTPError as exc:
+        # Message bodies can contain the private batch connection. Never echo
+        # an HTTP body or request/header dump while reporting delivery errors.
+        raise MjError(f"mj message request refused (HTTP {exc.code})", reason="mj_supervision_failed") from None
+    except (OSError, urllib.error.URLError):
+        raise MjError("mj message API is unavailable", reason="daemon_unreachable") from None
+    except (ValueError, KeyError, TypeError):
+        raise MjError("mj message API returned an invalid receipt", reason="mj_supervision_failed") from None
 
 
 def suspend_response_warning(result: subprocess.CompletedProcess[str]) -> str | None:
@@ -3029,8 +3035,9 @@ def run_session_lifecycle(
                         (run.run_id,),
                     )
                 try:
-                    send_session_prompt(
-                        session_id, build_timeout_handoff_prompt(run, session_id, branch)
+                    send_session_message(
+                        session_id, build_timeout_handoff_prompt(run, session_id, branch),
+                        request_id="ci-timeout-" + hashlib.sha256(session_id.encode()).hexdigest(),
                     )
                     with conn:
                         conn.execute(
