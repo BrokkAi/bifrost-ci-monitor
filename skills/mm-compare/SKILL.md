@@ -25,3 +25,12 @@ The result reports each resolved commit, exit code, and whether the check change
 tracked source. Gate evidence must describe committed trees. Raw diffs may include
 temporary paths, timestamps, and ordering differences; inspect actual failures
 before classifying them. Do not infer baseline equivalence from equal exit codes.
+
+Each side also retains an execution receipt with its command, commit/tree,
+settings/environment, timing, exit status, and output paths. In a configured batch
+checkout, both receipts are automatically uploaded to the shared execution
+history without changing the batch revision. Use their printed execution IDs
+in `mm-db tests --execution ID` or `--reuse-execution ID REASON`. Failed uploads
+retain the receipt files for `mm-db execution --receipt FILE`; retry delivery
+without repeating the comparison. Outside a configured batch, receipts remain
+local alongside `result.json`.

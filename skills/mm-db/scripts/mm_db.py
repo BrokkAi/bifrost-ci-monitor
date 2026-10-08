@@ -9,6 +9,9 @@ import sys
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mm_execution
+
 
 def git(*args, cwd=None, check=True):
     return subprocess.run(["git", *args], cwd=cwd, text=True, capture_output=True, check=check)
@@ -34,7 +37,7 @@ class Client:
     def __init__(self, connection=None):
         self.connection = connection or json.loads(context_path().read_text())
 
-    def call(self, operation, **payload):
+    def call(self, operation, *, request_timeout=120, **payload):
         c = self.connection
         request = urllib.request.Request(
             c["url"].rstrip("/") + "/batch/" + c["batch_id"] + "/" + operation,
@@ -43,7 +46,7 @@ class Client:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
+            with urllib.request.urlopen(request, timeout=request_timeout) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
             try:
@@ -86,6 +89,12 @@ def render_report(state):
              "Tests run: " + evidence["tests"],
              "Baseline failures: " + evidence["baseline"],
              "Tested head: " + evidence["head"]]
+    for run in evidence.get("executions", []):
+        lines.append(f"Execution {run['id']}: {run['command']} at {run['head']}; "
+                     f"exit {run['exit_code']}, {run['duration_seconds']:.3f}s; "
+                     f"stdout {run['stdout']['path']}; stderr {run['stderr']['path']}")
+        if run.get("reuse_reason"):
+            lines.append("Reuse: " + run["reuse_reason"])
     publication = state.get("publication")
     if publication:
         if publication["head"] != evidence["head"]:
@@ -131,6 +140,13 @@ def main():
     sub.add_parser("state")
     sub.add_parser("report")
     sub.add_parser("findings")
+    sub.add_parser("executions")
+    execution = sub.add_parser("execution", help="upload a saved execution receipt without rerunning it")
+    execution.add_argument("--receipt", required=True, type=Path)
+    run = sub.add_parser("run", help="record an explicitly chosen local check")
+    run.add_argument("--output", type=Path)
+    run.add_argument("--script", type=Path)
+    run.add_argument("command", nargs=argparse.REMAINDER)
     finding = sub.add_parser("finding")
     finding.add_argument("--revision", required=True)
     finding.add_argument("--kind", required=True, choices=["baseline", "flaky"])
@@ -166,6 +182,8 @@ def main():
     tests.add_argument("--verdict", required=True, choices=["pass", "fail"])
     tests.add_argument("--tests", required=True)
     tests.add_argument("--baseline", required=True)
+    tests.add_argument("--execution", action="append", default=[])
+    tests.add_argument("--reuse-execution", action="append", nargs=2, metavar=("ID", "REASON"), default=[])
     args = vars(parser.parse_args())
     operation = args.pop("operation")
     if operation == "configure":
@@ -173,6 +191,19 @@ def main():
         print("Configured MergeMarshall connection.")
         return
     client = Client()
+    if operation == "run":
+        command = args["command"]
+        if command and command[0] == "--":
+            command = command[1:]
+        if args["script"] and command:
+            raise ValueError("supply either --script or a command after --")
+        receipt = mm_execution.run(client, command=command, script=args["script"], output=args["output"])
+        print(json.dumps(receipt, indent=2))
+        code = receipt["exit_code"]
+        return code if code >= 0 else 128 - code
+    if operation == "execution":
+        print(json.dumps(mm_execution.upload(client, args["receipt"]), indent=2))
+        return
     if operation == "candidate":
         print(json.dumps(checkpoint(client, **args), indent=2))
         return
@@ -191,6 +222,11 @@ def main():
     if operation == "comment":
         args["number"] = args.pop("issue")
         args["body"] = args.pop("body_file").read_text()
+    if operation == "tests":
+        runs, reused = args.pop("execution"), args.pop("reuse_execution")
+        if runs or reused:
+            args["executions"] = ([{"id": identifier, "reuse_reason": ""} for identifier in runs]
+                                  + [{"id": identifier, "reuse_reason": reason} for identifier, reason in reused])
     if operation in {"pr", "issue"}:
         args["number"] = args.pop(operation)
         args["kind"] = "pull" if operation == "pr" else "issue"
@@ -200,7 +236,7 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main() or 0)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)

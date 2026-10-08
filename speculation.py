@@ -301,6 +301,10 @@ def reset_brief(a, conn, row, recovery):
     assessment = recovery['old_tests']
     if assessment:
         assessment = dict(assessment)
+        # Full receipts remain in durable state; recovery needs stable pointers.
+        if assessment.get('executions'):
+            assessment['executions'] = {'ids': [r['id'] for r in assessment['executions']],
+                                        'details': 'Read mm-db executions for original tested inputs and logs.'}
         for name in ('tests', 'baseline'):
             value = assessment.get(name, '')
             if len(value) > 2000:

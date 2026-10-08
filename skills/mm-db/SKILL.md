@@ -12,6 +12,7 @@ python3 <this skill>/scripts/mm_db.py state
 python3 <this skill>/scripts/mm_db.py pr --pr N
 python3 <this skill>/scripts/mm_db.py issue --issue N
 python3 <this skill>/scripts/mm_db.py findings
+python3 <this skill>/scripts/mm_db.py executions
 ```
 
 The connection is stored privately inside the Git directory. Keep its token out
@@ -45,10 +46,34 @@ without withdrawing only if incorporation leaves the tree unchanged. The
 service verifies ancestry and retains your successor's pinned checkpoint.
 For source edits or a changed tree, withdraw and replace it normally.
 
+Run your chosen local builds/tests through the execution wrapper:
+
+```sh
+python3 <this skill>/scripts/mm_db.py run -- eatmydata cargo nextest run -E 'test(changed_behavior)'
+python3 <this skill>/scripts/mm_db.py run --script /tmp/check.sh
+python3 <this skill>/scripts/mm_db.py execution --receipt /path/to/receipt.json
+```
+
+`run` records the actual command/arguments, committed head/tree, selected build
+settings and host metadata, start/end times, duration, exit status, tracked-source
+changes, and stdout/stderr paths. It returns the check's exit status. Output and
+`receipt.json` default to a unique directory under the common Git directory's
+`mm-executions`; `--output DIR` chooses another new directory. `--script` retains
+a copy of the Bash script. Keep credentials out of commands and scripts; the
+helper never copies the complete process environment.
+
+Receipts are uploaded at start and completion. An unavailable service retains
+the local receipt and command result; retry with `execution --receipt FILE`
+without rerunning the check. `executions` reads this batch's durable history,
+including old attempts, failed and interrupted checks. Evidence intake changes
+no batch revision, assessment, readiness, or landing policy, and remains
+available after handoff/completion. New checks still respect the handoff fence.
+
 ```sh
 python3 <this skill>/scripts/mm_db.py exclude --revision REV --pr N --head SHA --kind removed --reason 'source head changed'
 python3 <this skill>/scripts/mm_db.py exclude --revision REV --pr N --head SHA --kind rejected --reason 'isolated regression' --evidence-file /tmp/evidence.md
 python3 <this skill>/scripts/mm_db.py tests --revision REV --head SHA --verdict pass --tests 'commands actually run' --baseline 'reproduced failures or none'
+python3 <this skill>/scripts/mm_db.py tests --revision REV --head SHA --verdict pass --tests 'selected and reused checks' --baseline none --execution ID --reuse-execution OLD_ID 'covered code, inputs and settings unchanged'
 python3 <this skill>/scripts/mm_db.py ready --revision REV
 python3 <this skill>/scripts/mm_db.py comment --revision REV --issue N --body-file /tmp/comment.md
 python3 <this skill>/scripts/mm_db.py finding --revision REV --kind baseline --head BASE_SHA --identity 'exact failing test' --command 'actual check command' --evidence-file /tmp/evidence.md
@@ -98,6 +123,15 @@ automatically. In the one-line `--tests` summary, distinguish commands run at th
 HEAD from reused results, identifying their original tested SHAs and why they
 remain applicable. Keep detailed commands, logs, and reuse reasons in the private
 progress note.
+
+By default, the assessment snapshots completed executions at its exact head and
+captured base for the current source revision/attempt. Repeated `--execution ID`
+selects specific records; `--reuse-execution ID REASON` links older results with
+an explicit applicability reason. Dirty-tree and unfinished records cannot be
+linked as committed-tree evidence. Exit codes are observations: you still assess
+baseline failures and flakes and decide the verdict. Receipts appear in the
+integration PR, final report, and readiness handoff. Existing evidence without
+execution receipts remains valid; do not rerun checks solely to create receipts.
 
 The state response lists pending GitHub writes. A recorded rejection or comment
 is accepted even if GitHub delivery is pending; continue the batch. The supervisor

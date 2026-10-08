@@ -214,6 +214,15 @@ out or the session still appears active. It applies the normal source, master,
 tested-head and CI gates, then suspends the session after confirmed landing.
 An assessment alone or an externally tagged PR is not a completion signal.
 
+Local checks run through `mm-db run` retain their command, tested commit/tree,
+settings/environment, timing, exit status, and output paths in
+`automerge_executions`. `mm-compare` records both sides in configured checkouts.
+Read a batch's history with `mm-db executions`; linked records also appear in
+the integration PR and final report. Output files and retryable receipts remain
+in the agent environment. If delivery fails, use `mm-db execution --receipt FILE`
+to upload the saved result without rerunning the check. Recording does not change
+test selection or merge policy, and older assessments remain accepted.
+
 The scheduler permits one speculative successor while the foreground batch
 validates. It starts from the foreground's pushed candidate and owns only newly
 selected PRs. `python3 automerge.py --check` shows the candidate, successor and

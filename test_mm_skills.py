@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -200,6 +201,11 @@ class CompareTests(GitFixture):
             self.assertEqual(result["results"]["b"]["exit_code"], 1)
             self.assertIn("+candidate", Path(result["stdout_diff"]).read_text())
             self.assertFalse(result["results"]["b"]["tracked_source_changed"])
+            receipt = json.loads(Path(result["results"]["b"]["receipt"]).read_text())
+            self.assertEqual(receipt["head"], b)
+            self.assertEqual(receipt["exit_code"], 1)
+            self.assertGreaterEqual(receipt["duration_seconds"], 0)
+            self.assertEqual(receipt["stdout"]["path"], result["results"]["b"]["stdout"])
             self.assertEqual(self.run_git("rev-parse", "HEAD"), self.base)
             self.assertEqual(len(self.run_git("worktree", "list", "--porcelain").split("worktree ")) - 1, 1)
 
@@ -209,6 +215,69 @@ class CompareTests(GitFixture):
         result = compare.compare(self.repo, self.base, self.base, script, self.root / "edited")
         self.assertTrue(result["results"]["a"]["tracked_source_changed"])
         self.assertEqual((self.repo / "marker").read_text(), "base\n")
+
+
+class ExecutionTests(GitFixture):
+    def context(self):
+        return dict(self.state, source_revision="a" * 64, attempt_generation=0,
+                    status="running", phase="building", ready=None, predecessor=None)
+
+    def client(self):
+        client = mock.Mock(connection={"batch_id": "batch-test"})
+        client.call.return_value = self.context()
+        return client
+
+    def test_runner_records_actual_arguments_output_failure_and_git_identity(self):
+        client = self.client()
+        command = ["bash", "-c", 'printf "%s" "$1"; echo diagnostic >&2; exit 7', "--", "a space; $(literal)"]
+        output = self.root / "execution"
+        receipt = db.mm_execution.execute(command, self.repo, output, client=client, state=self.context())
+        self.assertEqual(receipt["exit_code"], 7)
+        self.assertEqual(receipt["argv"], command)
+        self.assertEqual(receipt["head"], self.base)
+        self.assertEqual(receipt["tree"], self.run_git("rev-parse", "HEAD^{tree}"))
+        self.assertFalse(receipt["tracked_source_changed"])
+        self.assertEqual(Path(receipt["stdout"]["path"]).read_text(), "a space; $(literal)")
+        self.assertEqual(Path(receipt["stderr"]["path"]).read_text(), "diagnostic\n")
+        self.assertEqual(json.loads((output / "receipt.json").read_text()), receipt)
+        uploads = [call.kwargs["receipt"] for call in client.call.call_args_list]
+        self.assertEqual([r["status"] for r in uploads], ["running", "completed"])
+        self.assertNotIn("sha256", json.dumps(receipt))
+
+    def test_failed_delivery_keeps_result_and_replay_never_reruns_command(self):
+        client = self.client()
+        client.call.side_effect = RuntimeError("service unavailable")
+        output = self.root / "pending"
+        with mock.patch.dict(db.mm_execution.os.environ, {"GH_TOKEN": "private-token"}):
+            receipt = db.mm_execution.execute(["bash", "-c", "echo once"], self.repo, output,
+                                              client=client, state=self.context())
+        self.assertEqual(receipt["exit_code"], 0)
+        self.assertNotIn("private-token", json.dumps(receipt))
+        client.call.side_effect = None
+        with mock.patch.object(db.mm_execution.subprocess, "run", side_effect=AssertionError("reran check")):
+            db.mm_execution.upload(client, output / "receipt.json")
+        self.assertEqual(client.call.call_args.kwargs["receipt"], receipt)
+        other = mock.Mock(connection={"batch_id": "other"})
+        with self.assertRaisesRegex(ValueError, "different batch"):
+            db.mm_execution.upload(other, output / "receipt.json")
+
+    def test_script_edits_and_signalled_commands_are_recorded(self):
+        script = self.root / "check.sh"
+        script.write_text("echo edited > marker\n")
+        result = db.mm_execution.execute([], self.repo, self.root / "edit", script=script)
+        self.assertTrue(result["tracked_source_changed"])
+        self.assertEqual((self.root / "edit/check.sh").read_text(), script.read_text())
+        self.run_git("reset", "--hard", self.base)
+        result = db.mm_execution.execute(["bash", "-c", "kill -TERM $$"], self.repo, self.root / "signal")
+        self.assertEqual(result["status"], "interrupted")
+        self.assertEqual(result["exit_code"], -15)
+
+    def test_wrapper_refuses_new_checks_after_handoff(self):
+        client = self.client()
+        client.call.return_value = dict(self.context(), ready={"head": self.base})
+        with mock.patch.object(db.mm_execution, "execute", side_effect=AssertionError("started after handoff")):
+            with self.assertRaisesRegex(ValueError, "not accepting new checks"):
+                db.mm_execution.run(client, command=["true"])
 
 
 class StateTests(unittest.TestCase):
@@ -226,6 +295,89 @@ class StateTests(unittest.TestCase):
     def assessment(self):
         return self.call("tests", revision=self.state()["revision"], head=HEAD_ONE,
                          verdict="pass", tests="bash /tmp/check.sh", baseline="none")
+
+    def execution(self, *, identifier="1" * 32, head=HEAD_ONE, **changes):
+        current = self.state()
+        result = {"id": identifier, "batch_id": "batch-test", "head": head, "tree": "c" * 40,
+                  "source_revision": current["source_revision"], "attempt_generation": current["attempt_generation"],
+                  "argv": ["bash", "check.sh"], "command": "bash check.sh", "cwd": "/repo",
+                  "environment": {"system": "Linux"}, "status": "completed", "exit_code": 0,
+                  "started_at": "2026-10-08T12:00:00+00:00", "finished_at": "2026-10-08T12:00:01+00:00",
+                  "duration_seconds": 1.0, "head_after": head, "tree_after": "c" * 40,
+                  "tracked_source_changed": False, "stdout": {"path": "/logs/out"}, "stderr": {"path": "/logs/err"}}
+        return dict(result, **changes)
+
+    def test_execution_intake_is_idempotent_and_preserves_revision_and_assessment(self):
+        before = self.assessment()
+        receipt = self.execution()
+        first = self.call("execution", receipt=receipt)
+        second = self.call("execution", receipt=receipt)
+        self.assertEqual(first, second)
+        self.assertEqual(self.state()["revision"], before["revision"])
+        self.assertEqual(self.state()["tests"], before["tests"])
+        self.assertEqual(self.call("executions")["executions"], [receipt])
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal'")
+        terminal = self.state()
+        self.call("execution", receipt=self.execution(identifier="2" * 32))
+        self.assertEqual(self.state()["revision"], terminal["revision"])
+
+    def test_execution_start_finish_and_late_start_preserve_completed_evidence(self):
+        complete = self.execution()
+        start = dict(complete, status="running", finished_at=None, duration_seconds=None, exit_code=None)
+        self.call("execution", receipt=start)
+        self.call("execution", receipt=complete)
+        self.assertEqual(self.call("execution", receipt=start)["execution"], complete)
+        with self.assertRaisesRegex(ValueError, "immutable"):
+            self.call("execution", receipt=dict(complete, exit_code=1))
+        with self.assertRaisesRegex(ValueError, "different check"):
+            self.call("execution", receipt=dict(complete, command="another check"))
+        with self.assertRaisesRegex(ValueError, "different batch"):
+            self.call("execution", receipt=dict(complete, batch_id="other"))
+
+    def test_assessment_snapshots_executions_and_readiness_publication_retains_them(self):
+        self.call("execution", receipt=self.execution())
+        self.call("execution", receipt=self.execution(identifier="2" * 32, head=BASE_SHA, exit_code=1))
+        current = self.assessment()
+        self.assertEqual(len(current["tests"]["executions"]), 2)
+        self.assertIn("exit 1", db.render_report(current))
+        self.assertIn("/logs/out", mm_service.integration_metadata(current, HEAD_ONE, "")["body"])
+        publication = {"number": 211, "url": "https://example.invalid/211", "head": HEAD_ONE}
+        with mock.patch.object(mm_service, "reconcile_publication", return_value=publication):
+            final = self.call("publish", revision=current["revision"], head=HEAD_ONE, notes="")
+        self.assertEqual(final["ready"]["assessment"]["executions"], current["tests"]["executions"])
+        self.assertIn("Execution evidence:", automerge.ready_report(final["ready"]))
+        self.assertEqual(automerge._async_local_result(db.render_report(final)), "pass")
+
+    def test_reused_checks_require_reason_and_dirty_or_incomplete_checks_cannot_be_linked(self):
+        old = self.execution(head=HEAD_TWO)
+        self.call("execution", receipt=old)
+        args = dict(revision=self.state()["revision"], head=HEAD_ONE, verdict="pass", tests="reused check", baseline="none")
+        with self.assertRaisesRegex(ValueError, "applicability reason"):
+            self.call("tests", **args, executions=[{"id": old["id"]}])
+        updated = self.call("tests", **args, executions=[{"id": old["id"], "reuse_reason": "covered code and settings unchanged"}])
+        self.assertIn("covered code and settings unchanged", db.render_report(updated))
+        args["revision"] = updated["revision"]
+        for changes in ({"tracked_source_changed": True},
+                        {"status": "running", "finished_at": None, "exit_code": None, "duration_seconds": None}):
+            bad = self.execution(identifier="3" * 32 if changes.get("tracked_source_changed") else "4" * 32, **changes)
+            self.call("execution", receipt=bad)
+            with self.assertRaisesRegex(ValueError, "completed check"):
+                self.call("tests", **args, executions=[{"id": bad["id"]}])
+        with self.assertRaisesRegex(ValueError, "unknown execution"):
+            self.call("tests", **args, executions=[{"id": "5" * 32}])
+
+    def test_changed_attempt_retains_execution_history_without_automatic_reuse(self):
+        old = self.execution()
+        self.call("execution", receipt=old)
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET attempt_generation=1")
+        fresh = self.assessment()
+        self.assertNotIn("executions", fresh["tests"])
+        self.assertEqual(self.call("executions")["executions"], [old])
+        with self.assertRaisesRegex(ValueError, "applicability reason"):
+            self.call("tests", revision=fresh["revision"], head=HEAD_ONE, verdict="pass", tests="check", baseline="none",
+                      executions=[{"id": old["id"]}])
 
     def test_local_baseline_finding_preserves_assessment_and_is_idempotent(self):
         before = self.assessment()
@@ -501,6 +653,53 @@ class HttpTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "invalid batch token"):
                 client.call("state")
             server.connect.assert_not_called()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+
+class ExecutionHttpTests(GitFixture):
+    def test_cli_preserves_exit_status_and_links_actual_execution_through_http(self):
+        path = self.root / "state.db"
+        with mock.patch.object(automerge, "DB_PATH", path):
+            conn = automerge.connect_db()
+            automerge.create_batch(conn, [pull(7, self.base)], self.base, batch_id="execution-http", ci_mode="async")
+            conn.close()
+
+        def connect():
+            import sqlite3
+            connection = sqlite3.connect(path)
+            connection.row_factory = sqlite3.Row
+            return connection
+
+        key = b"k" * 32
+        server = mm_service.Server(("127.0.0.1", 0), key, connect)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            connection = {"url": f"http://127.0.0.1:{server.server_port}", "batch_id": "execution-http",
+                          "token": mm_service.batch_token(key, "execution-http")}
+            client = db.Client(connection)
+            context = self.root / "connection.json"
+            context.write_text(json.dumps(connection))
+            script = str(ROOT / "skills/mm-db/scripts/mm_db.py")
+            subprocess.run([sys.executable, script, "configure", "--connection-file", str(context)],
+                           cwd=self.repo, check=True, capture_output=True)
+            before = client.call("state")
+            command = subprocess.run([sys.executable, script, "run", "--", "bash", "-c", "echo checked; exit 7"],
+                                     cwd=self.repo, text=True, capture_output=True)
+            self.assertEqual(command.returncode, 7, command.stderr)
+            receipt = json.loads(command.stdout)
+            self.assertEqual(client.call("executions")["executions"], [receipt])
+            self.assertEqual(client.call("state")["revision"], before["revision"])
+            self.assertEqual(Path(receipt["stdout"]["path"]).read_text(), "checked\n")
+            assessment = subprocess.run([sys.executable, script, "tests", "--revision", before["revision"],
+                                         "--head", self.base, "--verdict", "fail", "--tests", "check exited 7",
+                                         "--baseline", "none", "--execution", receipt["id"]],
+                                        cwd=self.repo, text=True, capture_output=True)
+            self.assertEqual(assessment.returncode, 0, assessment.stderr)
+            self.assertEqual(json.loads(assessment.stdout)["tests"]["executions"][0]["id"], receipt["id"])
         finally:
             server.shutdown()
             server.server_close()

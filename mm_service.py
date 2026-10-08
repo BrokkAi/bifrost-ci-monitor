@@ -17,11 +17,13 @@ import uuid
 from urllib.parse import quote
 
 import automerge
+import execution_evidence
 import local_findings
 import speculation
 
 
 def ensure_schema(conn):
+    execution_evidence.ensure_schema(conn)
     local_findings.ensure_schema(conn)
     conn.execute("""CREATE TABLE IF NOT EXISTS automerge_skill_events (
         batch_id TEXT NOT NULL, event_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -137,6 +139,9 @@ def integration_metadata(current, head, notes):
         f"- #{p['number']} `{p['head_sha']}` ({p['kind']})" for p in current["excluded"]) or "None.")
     evidence = current["tests"]
     body += f"\n\nTested head: `{head}`\nTests run: {evidence['tests']}\nBaseline failures: {evidence['baseline']}\n"
+    executions = execution_evidence.render(evidence)
+    if executions:
+        body += "\n" + executions + "\n"
     if notes:
         body += "\nConflict resolutions and fixes:\n" + notes
     return {"title": title, "body": body}
@@ -187,6 +192,21 @@ def dispatch(conn, batch_id, operation, payload):
     if operation == "findings":
         state(conn, batch_id)
         return {"findings": local_findings.observations(conn)}
+    if operation == "executions":
+        state(conn, batch_id)
+        return {"executions": execution_evidence.observations(conn, batch_id)}
+    if operation == "execution":
+        # Observations retain the original attempt and may arrive after a
+        # restart/handoff. Intake never changes a revision or merge assessment.
+        state(conn, batch_id)
+        receipt = payload.get("receipt")
+        if not isinstance(receipt, dict) or receipt.get("batch_id") != batch_id:
+            raise ValueError("execution receipt belongs to a different batch")
+        row = conn.execute("SELECT session_id FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            recorded = execution_evidence.record(conn, batch_id, row["session_id"], receipt)
+        return {"execution": recorded}
     if operation == "inspect":
         state(conn, batch_id)  # Authenticate against an existing batch.
         number = payload.get("number")
@@ -330,8 +350,12 @@ def dispatch(conn, batch_id, operation, payload):
                 raise ValueError("tests and baseline must be one-line evidence summaries")
             if current["predecessor"] and (not current["candidate"] or current["candidate"]["head"] != head):
                 raise ValueError("speculative assessment requires this attempt's checkpointed head")
-            record(conn, batch_id, "tests", {"head": head, "verdict": verdict, "tests": tests,
-                                            "baseline": baseline, "source_revision": current["source_revision"]})
+            evidence = {"head": head, "verdict": verdict, "tests": tests,
+                        "baseline": baseline, "source_revision": current["source_revision"]}
+            executions = execution_evidence.assessment(conn, current, head, payload.get("executions"))
+            if executions:
+                evidence["executions"] = executions
+            record(conn, batch_id, "tests", evidence)
             if verdict == "fail":
                 conn.execute("UPDATE automerge_batches SET candidate_json='{}' WHERE batch_id=?", (batch_id,))
             conn.commit()

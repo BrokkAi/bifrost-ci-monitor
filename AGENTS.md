@@ -53,6 +53,8 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   test assessments/exclusions and reconciles integration-PR publication.
 - `local_findings.py`: durable local baseline/flaky observations consumed by
   triage and included in the corresponding issue fixer's dossier.
+- `execution_evidence.py`: durable local command receipts and explicit reuse
+  links in assessments; evidence intake never changes scheduling or verdicts.
 - `skills/mm-*`: agent tools for merge mechanics, state, publication, and
   two-commit checks. `scripts/install-mm-skills.py` installs symlinks and the
   user service. Tool invocation instructions remain in each `SKILL.md`.
@@ -520,6 +522,24 @@ repaired tests belong in fix notes. The final assessment describes the resulting
 committed candidate. When selected checks pass or only reproduced baseline
 failures remain, proceed to the mode's publication/reporting step. No local test
 command registry is implemented.
+
+Run selected local builds/tests through `mm-db run -- COMMAND...` or
+`mm-db run --script FILE`; configured `mm-compare` records both sides automatically.
+`automerge_executions` retains command/arguments, committed head/tree, safe build
+settings and host metadata, start/end times, duration, exit status, source changes,
+output paths, source revision and attempt generation. The helper retains output,
+script snapshots and retryable `receipt.json` under the common Git directory by
+default. Upload start/completion with stable execution IDs; late starts cannot
+overwrite finished results. Completed evidence is immutable. Retry delivery with
+`mm-db execution --receipt FILE` without rerunning checks. `mm-db executions`
+reads the batch's entire history. Intake remains diagnostic after handoff and
+completion and never changes a batch revision, assessment, readiness or CI gate.
+Assessments snapshot completed clean-tree checks at the assessed head and captured
+base in the current source revision/attempt by default. Explicit `--execution ID`
+selects checks; `--reuse-execution ID REASON` retains original tested inputs with
+an applicability reason across changed heads/source sets or attempts. Preserve
+these snapshots through publication and readiness. Existing summaries/evidence
+remain accepted without receipts; never rerun merely to backfill observations.
 
 Persist classification in `validation_impact_json` with the exact base and
 heads. Reclassify when the source set, base, or candidate changes; reuse the

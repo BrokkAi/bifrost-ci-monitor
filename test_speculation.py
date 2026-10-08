@@ -584,13 +584,17 @@ class StateTests(unittest.TestCase):
         row = self.row()
         recovery = json.loads(row['recovery_json'])
         recovery['old_tests'] = {'head': HEAD_TWO, 'verdict': 'pass',
-                                 'tests': '界' * 30000, 'baseline': '界' * 30000}
+                                 'tests': '界' * 30000, 'baseline': '界' * 30000,
+                                 'executions': [{'id': 'f' * 32, 'command': '界' * 30000}]}
         with mock.patch.object(a, 'skills_connection_prompt', return_value=''):
             brief = s.reset_brief(a, self.conn, row, recovery)
         self.assertLess(len(json.dumps({'text': brief}).encode()), 96 * 1024)
         self.assertIn(HEAD_TWO, brief)
         self.assertIn('"omitted_characters": 28000', brief)
         self.assertEqual(len(recovery['old_tests']['tests']), 30000)
+        self.assertIn('f' * 32, brief)
+        self.assertIn('mm-db executions', brief)
+        self.assertEqual(len(recovery['old_tests']['executions'][0]['command']), 30000)
 
 
 class RecoveryGitTests(GitFixture):

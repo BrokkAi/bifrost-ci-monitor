@@ -27,6 +27,7 @@ from urllib.parse import quote
 import monitor
 import pr_dependencies
 import speculation
+import execution_evidence
 
 
 REPO_NAME = monitor.REPO_NAME
@@ -134,6 +135,17 @@ SKILLS_GUIDANCE = (
     "just to register it. Do not register already repaired interactions, infrastructure, "
     "or known container limitations as unresolved product findings. "
     "Only mm-autopr publishes the integration PR; only the supervisor merges it."
+    " Run the local builds/tests you choose through `mm-db run -- <command and args>` "
+    "or `mm-db run --script FILE` so execution receipts retain the tested commit/tree, "
+    "command, environment, timestamps, duration, exit status and output paths. "
+    "mm-compare automatically records both executions when this checkout is configured. "
+    "Use `mm-db executions` to inspect recorded checks. The tests assessment automatically "
+    "links completed clean-tree executions for its head and captured base in this source "
+    "revision/attempt; select a subset with repeated `--execution ID` and cite older "
+    "applicable checks with `--reuse-execution ID 'applicability reason'`. "
+    "A failed upload retains receipt.json; retry with `mm-db execution --receipt FILE` "
+    "without rerunning the command. Recording evidence never selects tests or decides "
+    "whether a failure is baseline, flaky, or a regression."
 )
 FIX_VS_EJECT_GUIDANCE = (
     "Fix versus eject: fix in the batch with an appended commit when the failure "
@@ -988,6 +1000,7 @@ def connect_db() -> sqlite3.Connection:
         """
     )
     ensure_github_outbox_schema(conn)
+    execution_evidence.ensure_schema(conn)
     pr_dependencies.ensure_schema(conn)
     speculation.ensure_schema(conn, ensure_column)
     ensure_column(conn, "automerge_batches", "launch_attempted_at", "TEXT")
@@ -3438,6 +3451,7 @@ def ready_report(receipt):
         "Tests run: " + evidence["tests"],
         "Baseline failures: " + evidence["baseline"],
         "Tested head: " + receipt["head"],
+        execution_evidence.render(evidence),
         receipt.get("notes", ""),
     ]).strip()
 
