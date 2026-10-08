@@ -56,6 +56,12 @@ and any ordinary prerequisites needed by those PRs.
 CI repair PRs have no automatic priority. Current master has no special human
 review hold for changes to CI workflow/action files.
 
+The scheduler can prepare one successor batch while the current batch validates.
+It starts from the current candidate, preserving that work, and lands in order.
+A changed predecessor restarts the successor in its existing environment so
+build caches and reusable conflict resolutions survive. Independent exact-head
+rejections remain recorded across recovery and aborts.
+
 GitHub verdict/merge write failures retain the open candidate and retry with
 persisted backoff instead of losing completed work. Operators can abort a
 batch explicitly. Agent sessions remain live across turns, supervisor polls,

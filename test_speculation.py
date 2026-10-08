@@ -274,6 +274,7 @@ class StateTests(unittest.TestCase):
     def test_promotion_waits_for_build_then_requires_tree_proof(self):
         self.assess()
         with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET phase='waiting_parent' WHERE batch_id=?", (self.child,))
             self.conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal',terminal_status='merged',"
                               "ci_head_sha=?,integration_merge_commit_sha=? WHERE batch_id=?",
                               (HEAD_THREE, BASE_SHA, self.parent))
@@ -294,7 +295,9 @@ class StateTests(unittest.TestCase):
         self.assertEqual(json.loads(row['promotion_json'])['previous_tests']['head'], HEAD_TWO)
 
     def test_actual_master_advance_uses_fresh_attempt(self):
+        self.assess()
         with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET phase='waiting_parent' WHERE batch_id=?", (self.child,))
             self.conn.execute("UPDATE automerge_batches SET ci_head_sha=?,integration_merge_commit_sha=? WHERE batch_id=?",
                               (HEAD_THREE, BASE_SHA, self.parent))
         with (mock.patch.object(a, '_session_is_idle', return_value=True),
@@ -304,6 +307,17 @@ class StateTests(unittest.TestCase):
             s.promote(a, self.conn, self.transport, self.row(), self.row(self.parent))
         self.assertEqual(self.row()['phase'], 'resetting')
         self.assertEqual(json.loads(self.row()['recovery_json'])['replacement']['head'], HEAD_ONE)
+
+    def test_landed_parent_does_not_promote_an_idle_unfinished_successor(self):
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal',terminal_status='merged',"
+                              "ci_head_sha=? WHERE batch_id=?", (HEAD_THREE, self.parent))
+        with (mock.patch.object(s, 'launch_child'), mock.patch.object(a, 'select_eligible_pull_requests', return_value=[]),
+              mock.patch.object(a, '_session_is_idle', return_value=True),
+              mock.patch.object(a, 'process_batch') as process, mock.patch.object(s, 'promote') as promote):
+            s.tick(a, self.conn, self.transport, self.row(self.parent))
+        process.assert_called_once_with(self.conn, self.transport, self.child)
+        promote.assert_not_called()
 
     def test_detached_recovery_dispatches_through_normal_batch_processor(self):
         s.invalidate(a, self.conn, self.row())
@@ -319,6 +333,19 @@ class StateTests(unittest.TestCase):
             # Exercise the public transcript reader, never session data.
             self.assertEqual(a.read_final_agent_message('child-session', after_seq=101), '')
         self.assertIn('101', read.call_args.args[0])
+
+    def test_generated_brief_bounds_large_evidence_without_losing_exact_heads(self):
+        s.invalidate(a, self.conn, self.row())
+        row = self.row()
+        recovery = json.loads(row['recovery_json'])
+        recovery['old_tests'] = {'head': HEAD_TWO, 'verdict': 'pass',
+                                 'tests': '界' * 30000, 'baseline': '界' * 30000}
+        with mock.patch.object(a, 'skills_connection_prompt', return_value=''):
+            brief = s.reset_brief(a, self.conn, row, recovery)
+        self.assertLess(len(json.dumps({'text': brief}).encode()), 96 * 1024)
+        self.assertIn(HEAD_TWO, brief)
+        self.assertIn('"omitted_characters": 28000', brief)
+        self.assertEqual(len(recovery['old_tests']['tests']), 30000)
 
 
 class RecoveryGitTests(GitFixture):

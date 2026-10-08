@@ -271,10 +271,19 @@ def stop_work(a, row):
 
 
 def reset_brief(a, conn, row, recovery):
-    sources = json.dumps([p.as_json() for p in a.row_pulls(row)], indent=2)
+    sources = json.dumps([{'number': p.number, 'head_sha': p.head_sha,
+                           'dependencies': [d.as_json() for d in p.dependencies]}
+                          for p in a.row_pulls(row)], indent=2)
     exclusions = json.dumps(a._excluded_source_heads(row))
+    assessment = recovery['old_tests']
+    if assessment:
+        assessment = dict(assessment)
+        for name in ('tests', 'baseline'):
+            value = assessment.get(name, '')
+            if len(value) > 2000:
+                assessment[name] = {'excerpt': value[:2000], 'omitted_characters': len(value) - 2000}
     evidence = json.dumps({"old_base": recovery["old_base"], "candidate": recovery["old_candidate"],
-                           "assessment": recovery["old_tests"], "generation": recovery["old_generation"]})
+                           "assessment": assessment, "generation": recovery["old_generation"]})
     return f"""Start fresh attempt {row['attempt_generation']} of batch {row['batch_id']} in this same checkout.
 The old predecessor candidate was invalidated. Read mm-db state, then run mm-merge --restart (with --manual when needed). The helper preserves the old committed tip and pending source edits before resetting to the new base {row['base_sha']}. It archives the old progress note; do not resume its old next action. Review rerere resolutions before staging. Consult saved work only as evidence; do not transplant old merge commits or retain old predecessor ancestry.
 Exact current sources:
@@ -412,7 +421,7 @@ def recover(a, conn, row):
 
 
 def promote(a, conn, transport, row, parent):
-    if not a._session_is_idle(row):
+    if row['phase'] != 'waiting_parent' or not a._session_is_idle(row):
         return
     pinned = json.loads(row["predecessor_candidate_json"])
     landed = parent["integration_merge_commit_sha"]
@@ -487,10 +496,10 @@ def tick(a, conn, transport, parent):
         if not a._batch_priority(row) and any(p.priority for p in a.select_eligible_pull_requests(conn=conn)):
             a.abort_batch_locked(conn, transport, row, 'ready priority work takes precedence over ordinary lookahead')
             return
-        if row['phase'] in {'building', 'fixing'} and not a._session_is_idle(row):
+        if row['phase'] in {'building', 'fixing'}:
             a.process_batch(conn, transport, row['batch_id'])
             row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
-        if row['status'] not in {'running', 'launching'} or row['phase'] not in {'building', 'fixing', 'waiting_parent'}:
+        if row['status'] not in {'running', 'launching'} or row['phase'] != 'waiting_parent':
             return
         promote(a, conn, transport, row, parent)
     elif row["phase"] != "waiting_parent":

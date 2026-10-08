@@ -64,7 +64,7 @@ TRUSTED_REJECTION_LOGIN = "mergemarshall[bot]"
 GH_OWNER = "BrokkAi"
 READY_POLICY = "non-draft"  # Change to "approved" to require an APPROVED review decision.
 CI_MODE = "async"  # Bifrost default; supported values are "async" and "sync".
-SPECULATIVE_LOOKAHEAD = os.environ.get("BIFROST_CI_SPECULATIVE_LOOKAHEAD", "0") == "1"
+SPECULATIVE_LOOKAHEAD = os.environ.get("BIFROST_CI_SPECULATIVE_LOOKAHEAD", "1") == "1"
 OBSERVATION_DEADLINE: float | None = None
 REJECTION_MARKER = re.compile(
     r"(?m)^(?:mergemarshall:rejected-head|automerge-rejected-head):\s*([0-9a-f]{40})\s*$", re.IGNORECASE
