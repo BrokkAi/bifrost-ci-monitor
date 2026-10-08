@@ -42,8 +42,14 @@ Use the archived work as evidence; never transplant old merge commits or retain
 the invalidated predecessor's ancestry. Read the generated brief and current
 state; the archived progress note's next action is obsolete.
 
-After promotion, run `--promote`. This merges the exact landed base and reports
+Taking the primary scheduling role does not require changing your checkout or
+stopping checks. Continue validation and hand off with `mm-db ready` while
+`predecessor` remains present. After the supervisor explicitly requests ancestry
+incorporation, run `--promote`. This merges the exact landed base and reports
 whether the resulting tree matches earlier passing evidence. Reuse requires
 applicable test inputs/settings as well as an unchanged tree. Record a fresh
 assessment at the resulting committed HEAD before publication. If the helper
 encounters conflicts, resolve/commit them and reassess affected checks.
+If the tree is unchanged, register the resulting head without withdrawing the
+old checkpoint so the next speculative batch can retain its work. Otherwise
+withdraw the checkpoint before further edits and register a replacement.
