@@ -948,6 +948,8 @@ def connect_db() -> sqlite3.Connection:
             launch_attempted_at TEXT,
             session_id TEXT,
             thread_ts TEXT,
+            speculative_thread_ts TEXT,
+            start_notification_role TEXT,
             start_notification_sent INTEGER NOT NULL DEFAULT 0,
             start_pr_list_sent INTEGER NOT NULL DEFAULT 0,
             transcript_after_seq INTEGER NOT NULL DEFAULT 0,
@@ -1083,7 +1085,10 @@ def connect_db() -> sqlite3.Connection:
         ("pending_prompt", "TEXT"),
         ("prompt_delivered", "INTEGER NOT NULL DEFAULT 0"),
         ("turn_started_at", "TEXT"),
+        ("start_notification_sent", "INTEGER NOT NULL DEFAULT 0"),
         ("start_pr_list_sent", "INTEGER NOT NULL DEFAULT 0"),
+        ("speculative_thread_ts", "TEXT"),
+        ("start_notification_role", "TEXT"),
     ):
         ensure_column(conn, "automerge_batches", column, declaration)
     if not had_start_pr_list and "start_notification_sent" in prior_columns:
@@ -1094,9 +1099,19 @@ def connect_db() -> sqlite3.Connection:
                 "UPDATE automerge_batches SET start_pr_list_sent=1 "
                 "WHERE start_notification_sent=1"
             )
-    # Old supervisors requested suspension between turns. Those requests must
-    # never be retried against a batch that is still doing work.
     with conn:
+        # Existing live successors still use their original speculative root,
+        # including ones already promoted before this upgrade. Completed batch
+        # history must not acquire a new channel announcement.
+        conn.execute(
+            "UPDATE automerge_batches SET start_notification_role=CASE "
+            "WHEN predecessor_id IS NOT NULL AND role_promoted=0 THEN 'speculative' "
+            "WHEN status IN ('launching','running','finishing') AND phase<>'terminal' "
+            "AND predecessor_candidate_json<>'{}' THEN 'speculative' ELSE 'primary' END "
+            "WHERE start_notification_role IS NULL AND start_notification_sent=1"
+        )
+        # Old supervisors requested suspension between turns. Those requests
+        # must never be retried against a batch that is still doing work.
         conn.execute(
             "UPDATE automerge_batches SET suspend_pending=0, suspend_verify_failures=0 "
             "WHERE phase NOT IN ('terminal', 'aborting') AND suspend_pending=1"
@@ -1792,6 +1807,16 @@ def send_start_notification(
     transport: monitor.SlackTransport,
     row: sqlite3.Row | dict[str, Any],
 ) -> None:
+    # Callers may retain a snapshot from before promotion or an accepted post.
+    row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (row["batch_id"],)).fetchone()
+    if (row["start_notification_role"] == "speculative" and not speculation.is_speculative(row)
+            and row["phase"] != "terminal"):
+        with conn:
+            conn.execute(
+                "UPDATE automerge_batches SET speculative_thread_ts=thread_ts, thread_ts=NULL, "
+                "start_notification_role='primary',start_notification_sent=0,start_pr_list_sent=0 "
+                "WHERE batch_id=?", (row["batch_id"],))
+        row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (row["batch_id"],)).fetchone()
     if row["start_notification_sent"] and row["start_pr_list_sent"]:
         return
     pulls = row_pulls(row)
@@ -1818,6 +1843,8 @@ def send_start_notification(
     if predecessor:
         message += ("\nPreparing ahead of the current batch; "
                     "publication and merge wait for that batch to land.")
+    elif speculation.get(row, "role_promoted", 0):
+        message += "\nNow the primary batch; existing work and checks continue."
     thread_ts = row["thread_ts"]
     if not row["start_notification_sent"]:
         ok, thread_ts = monitor.slack_send(transport, message)
@@ -1826,9 +1853,9 @@ def send_start_notification(
         with conn:
             conn.execute(
                 "UPDATE automerge_batches SET start_notification_sent = 1, "
-                "start_pr_list_sent = ?, thread_ts = ? "
+                "start_pr_list_sent = ?, thread_ts = ?, start_notification_role = ? "
                 "WHERE batch_id = ?",
-                (int(not list_in_thread), thread_ts, row["batch_id"]),
+                (int(not list_in_thread), thread_ts, "speculative" if predecessor else "primary", row["batch_id"]),
             )
     if not list_in_thread or row["start_pr_list_sent"] or not thread_ts:
         return
@@ -1946,16 +1973,9 @@ def retry_pending_notifications(
 ) -> None:
     """Retry unsent batch notices after Slack recovers, without duplicating accepted posts."""
     rows = conn.execute(
-        "SELECT batch_id, reason FROM automerge_blocked_notifications "
-        "WHERE slack_notification_attempted = 0 ORDER BY created_at"
-    ).fetchall()
-    for row in rows:
-        deliver_blocked_notice(
-            conn, transport, str(row["batch_id"]), str(row["reason"])
-        )
-    rows = conn.execute(
         "SELECT * FROM automerge_batches WHERE start_notification_sent = 0 "
         "OR start_pr_list_sent = 0 "
+        "OR (start_notification_role='speculative' AND role_promoted=1 AND phase<>'terminal') "
         "ORDER BY created_at"
     ).fetchall()
     for row in rows:
@@ -1963,6 +1983,14 @@ def retry_pending_notifications(
             send_start_notification(conn, transport, row)
         except Exception as exc:
             log(f"Slack start notification failed for batch {row['batch_id']}: {exc}")
+    rows = conn.execute(
+        "SELECT batch_id, reason FROM automerge_blocked_notifications "
+        "WHERE slack_notification_attempted = 0 ORDER BY created_at"
+    ).fetchall()
+    for row in rows:
+        deliver_blocked_notice(
+            conn, transport, str(row["batch_id"]), str(row["reason"])
+        )
 
 
 def _read_transcript_page(session_id: str, cursor: int) -> tuple[list[dict[str, Any]], int]:
@@ -2000,6 +2028,10 @@ def drain_transcript(
     ).fetchone()
     if row is None:
         raise monitor.MjError(f"automerge batch {batch_id} disappeared")
+    if transport.kind == "chat" and not row["thread_ts"]:
+        # Preserve new progress until its root is accepted. Slack availability
+        # does not stop the agent or change its work/evidence.
+        return []
     cursor = int(row["transcript_after_seq"] or 0)
     items, next_cursor = _read_transcript_page(session_id, cursor)
     texts: list[str] = []

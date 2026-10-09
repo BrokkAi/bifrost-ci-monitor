@@ -125,6 +125,7 @@ def make_db(
             branch TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
             launch_attempted INTEGER NOT NULL DEFAULT 0, launch_attempted_at TEXT,
             session_id TEXT, thread_ts TEXT, start_notification_sent INTEGER NOT NULL DEFAULT 0,
+            speculative_thread_ts TEXT, start_notification_role TEXT,
             start_pr_list_sent INTEGER NOT NULL DEFAULT 0,
             transcript_after_seq INTEGER NOT NULL DEFAULT 0, terminal_status TEXT,
             agent_transcript TEXT NOT NULL DEFAULT '', agent_final_message TEXT NOT NULL DEFAULT '',
@@ -3541,6 +3542,29 @@ class LaunchAndLifecycleTests(TestCase):
             with mock.patch.object(monitor, "slack_send") as send:
                 automerge.retry_pending_notifications(conn, mock.Mock())
             send.assert_not_called()
+            self.assertEqual(conn.execute("SELECT start_notification_role FROM automerge_batches "
+                                          "WHERE batch_id='old-batch'").fetchone()[0], 'primary')
+            for identifier, status, phase in [('live-promoted', 'running', 'building'),
+                                              ('completed-promoted', 'completed', 'terminal')]:
+                automerge.create_batch(conn, [pull(9)], BASE_SHA, batch_id=identifier,
+                                       predecessor_id='old-batch',
+                                       predecessor_candidate={'id': 'pin', 'head': HEAD_ONE, 'tree': BASE_SHA})
+                with conn:
+                    conn.execute("UPDATE automerge_batches SET status=?,phase=?,role_promoted=1,"
+                                 "start_notification_sent=1,start_pr_list_sent=1,thread_ts='spec-history' "
+                                 "WHERE batch_id=?", (status, phase, identifier))
+            conn.close()
+            with mock.patch.object(automerge, 'DB_PATH', path):
+                conn = automerge.connect_db()
+            with mock.patch.object(monitor, 'slack_send', return_value=(True, 'primary-thread')) as send:
+                automerge.retry_pending_notifications(conn, monitor.SlackTransport('chat', token='token', channel='channel'))
+                automerge.retry_pending_notifications(conn, monitor.SlackTransport('chat', token='token', channel='channel'))
+            self.assertEqual(send.call_count, 2)
+            live = conn.execute("SELECT * FROM automerge_batches WHERE batch_id='live-promoted'").fetchone()
+            self.assertEqual(live['thread_ts'], 'primary-thread')
+            self.assertEqual(live['speculative_thread_ts'], 'spec-history')
+            self.assertEqual(conn.execute("SELECT thread_ts FROM automerge_batches WHERE batch_id='completed-promoted'").fetchone()[0],
+                             'spec-history')
             conn.close()
 
     @unchanged_queue()

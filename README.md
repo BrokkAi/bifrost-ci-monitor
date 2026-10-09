@@ -235,7 +235,9 @@ incorporating the actual landed base and recording a fresh assessment. Both CI
 modes use this lifecycle.
 
 When the foreground lands, its successor becomes primary immediately and keeps
-any running checks. Its checkpoint can start a new speculative successor before
+any running checks. Promotion opens a new top-level Slack thread for the primary
+batch; subsequent progress and its outcome appear there. The speculative thread
+retains the earlier history. Its checkpoint can start a new speculative successor before
 validation finishes. After a passing handoff it incorporates the landed merge
 commit and records a fresh assessment; unchanged trees can reuse applicable
 evidence and preserve the next successor's work.
