@@ -26,7 +26,7 @@ CPUS = 2
 MEMORY_GIB = 4
 MODEL = "deepseek-flash"
 INFRASTRUCTURE_CLUSTER_SECONDS = 15 * 60
-INFRASTRUCTURE_SLACK_SUMMARY = ':warning: CI infrastructure incidents'
+INFRASTRUCTURE_SLACK_SUMMARY = 'infrastructure incidents'
 
 
 @contextlib.contextmanager
@@ -344,14 +344,14 @@ def notify_recovery(conn, job, recovery, *, error=None):
     if recovery.get(flag):
         return
     if error:
-        message = (":rotating_light: CI triage recovery needs attention. "
+        message = (f"{monitor.slack_project_prefix()} triage: recovery needs attention. "
                    f"The {recovery.get('failed_step', recovery['stage'])} step failed: {error}. Automatic retries continue. "
                    "Inspect the session and resolve its worker/provider error.")
     else:
         action = ("Respond to the session's structured input request." if recovery['outcome'] == 'input_required'
                   else "Restore provider capacity or quota; Mjolnir will resume its retry.")
         reason = 'needs your input' if recovery['outcome'] == 'input_required' else 'is waiting for provider quota'
-        message = f":warning: CI triage {reason}. {action} New investigations are waiting."
+        message = f"{monitor.slack_project_prefix()} triage: {reason}. {action} New investigations are waiting."
     try:
         transport = monitor.load_slack_transport()
         ok, thread = monitor.slack_send(transport, message)
@@ -575,7 +575,7 @@ def reconcile_resolved(conn) -> int:
 
 def infrastructure_slack_text(finding, captured) -> tuple[str, str]:
     jobs = list(dict.fromkeys(str(o['job_name']) for o in captured))
-    summary = ':warning: CI infrastructure incident: ' + jobs[0][:180]
+    summary = f'{monitor.slack_project_prefix()} triage: infrastructure incident: ' + jobs[0][:180]
     if len(jobs) > 1:
         summary += f' (+{len(jobs) - 1} related jobs)'
     runs = list(dict.fromkeys(o['last_seen_run_url'] for o in captured))[:5]
@@ -622,7 +622,8 @@ def publish_infrastructure_slack(conn, job, report, finding) -> None:
                                   (transport.channel, cutoff)).fetchone()
             thread_ts = recent['thread_ts'] if recent else None
         if not thread_ts:
-            posted, thread_ts = monitor.slack_send(transport, INFRASTRUCTURE_SLACK_SUMMARY)
+            posted, thread_ts = monitor.slack_send(transport,
+                f'{monitor.slack_project_prefix()} triage: {INFRASTRUCTURE_SLACK_SUMMARY}')
             if not posted or not thread_ts:
                 raise RuntimeError('infrastructure Slack notice pending; retry cached report next poll')
             record_infrastructure_thread(conn, transport.channel, thread_ts)
@@ -653,7 +654,7 @@ def queue_product_announcement(conn, job, report, observations) -> None:
         return
     count = len(issues)
     messages = []
-    current = f":mag: CI triage: {count} product issue{'s' if count != 1 else ''}"
+    current = f"{monitor.slack_project_prefix()} triage: {count} product issue{'s' if count != 1 else ''}"
     for url, title in issues.items():
         title = ' '.join(title.split())[:240].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('|', '¦')
         line = f"• <{url}|#{existing_number(url)}: {title}>"

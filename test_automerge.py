@@ -3193,7 +3193,7 @@ class PriorityLaneTests(TestCase):
             )
         self.assertEqual(send.call_count, 2)
         root = send.call_args_list[0]
-        self.assertTrue(root.args[1].startswith("New batch:"))
+        self.assertTrue(root.args[1].startswith("*bifrost-dev* new batch:"))
         self.assertNotIn("Opus", root.args[1])
         self.assertNotIn("Luna", root.args[1])
         self.assertIn("2 PRs", root.args[1])

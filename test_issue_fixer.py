@@ -235,6 +235,7 @@ class IssueFixerTests(TestCase):
             self.assertEqual(slack.call_count, 2)
             self.assertEqual(slack.call_args_list[0], slack.call_args_list[1])
             self.assertIsNone(slack.call_args.kwargs['thread_ts'])
+            self.assertTrue(slack.call_args.args[1].startswith('*bifrost-dev* fixbot:'))
             mj.assert_called_once()
         self.assertEqual(self.conn.execute('SELECT outcome_sent FROM issue_repairs').fetchone()[0], 1)
 
@@ -447,10 +448,14 @@ class IssueFixerTests(TestCase):
     def test_poll_with_live_session_does_not_select_more_work(self):
         job = self.job()
         with self.conn:
-            self.conn.execute("UPDATE issue_repairs SET status='running',session_id='live',start_notified=1 WHERE id=?", (job["id"],))
+            self.conn.execute("UPDATE issue_repairs SET status='running',session_id='live',start_notified=0 WHERE id=?", (job["id"],))
         with mock.patch.object(fixer, "cleanup"), mock.patch.object(fixer, "collect") as collect, \
-             mock.patch.object(fixer, "select_work") as select:
+             mock.patch.object(fixer, "select_work") as select, \
+             mock.patch.object(monitor, 'slack_send', return_value=(True, 'thread')) as slack, \
+             mock.patch.object(monitor, 'REPO_NAME', 'Example/another-project'):
             fixer.tick(self.conn, self.transport)
+        self.assertTrue(slack.call_args.args[1].startswith('*another-project* fixbot: repairing'))
+        self.assertNotIn(monitor.AGENT_LABEL, slack.call_args.args[1])
         self.assertEqual(collect.call_count, 1)
         select.assert_not_called()
 

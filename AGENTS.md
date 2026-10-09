@@ -434,8 +434,11 @@ until ancestry incorporation: the agent continues its existing validation and
 uses `mm-db ready` as before. Passing evidence gates publication, not role
 promotion. A changed actual master tree uses the existing same-session recovery.
 
-Slack start headings are `New batch:`, `Promoted batch:`, or `Speculative batch:`;
-omit model/harness boilerplate. Speculative headings explain that the preceding
+Slack start headings are `*$project* new batch:`, `*$project* promoted batch:`,
+or `*$project* speculative batch:`. Derive `$project` from the repository part
+of `monitor.REPO_NAME` using `monitor.slack_project_prefix()`; never hardcode a
+display name. Triage and fixbot thread headings use the same project prefix.
+Omit model/harness boilerplate. Speculative headings explain that the preceding
 batch gates publication/merge. Batch and predecessor IDs belong in
 the first thread reply, alongside the PR list for multi-PR batches, rather than
 channel-level messages. Start replies use the existing durable reply retry;

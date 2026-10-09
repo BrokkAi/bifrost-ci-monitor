@@ -1873,12 +1873,12 @@ def send_start_notification(
     if _batch_source(row) == "operator":
         lane = "OPERATOR FAST-TRACK"
     predecessor = speculation.get(row, "predecessor_id") if speculation.is_speculative(row) else None
-    heading = ("Speculative batch:" if predecessor else
-               "Promoted batch:" if speculation.get(row, "role_promoted", 0) else "New batch:")
+    heading = ("speculative batch:" if predecessor else
+               "promoted batch:" if speculation.get(row, "role_promoted", 0) else "new batch:")
     qualifiers = [lane] if lane else []
     if _batch_kind(row) == "direct":
         qualifiers.append("direct merge")
-    message = f"{heading} {inline}" + (f" ({'; '.join(qualifiers)})" if qualifiers else "")
+    message = f"{monitor.slack_project_prefix()} {heading} {inline}" + (f" ({'; '.join(qualifiers)})" if qualifiers else "")
     if predecessor:
         message += ("\nPreparing ahead of the current batch; "
                     "publication and merge wait for that batch to land.")

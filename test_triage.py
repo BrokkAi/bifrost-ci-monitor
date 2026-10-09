@@ -202,10 +202,10 @@ class TriageTests(TestCase):
         self.assertEqual(self.slack.call_count, 2)
         summary, detail = self.slack.call_args_list
         self.assertIsNone(summary.kwargs.get('thread_ts'))
-        self.assertIn('CI infrastructure incidents', summary.args[1])
+        self.assertIn('*bifrost-dev* triage: infrastructure incidents', summary.args[1])
         self.assertNotIn('runner_id=0', summary.args[1])
         self.assertEqual(detail.kwargs['thread_ts'], 'notice')
-        self.assertIn('CI infrastructure incident: linux', detail.args[1])
+        self.assertIn('*bifrost-dev* triage: infrastructure incident: linux', detail.args[1])
         self.assertIn('Runner was not acquired', detail.args[1])
         self.assertIn('runner_id=0', detail.args[1])
         self.assertIn('https://github.test/run/1', detail.args[1])
@@ -310,7 +310,7 @@ class TriageTests(TestCase):
         triage.publish(self.conn, self.job())
         reply = self.slack.call_args.args[1]
         self.assertLessEqual(len(reply), monitor.SLACK_MESSAGE_LIMIT)
-        self.assertIn('CI infrastructure incident: linux', reply)
+        self.assertIn('*bifrost-dev* triage: infrastructure incident: linux', reply)
         self.assertIn('https://github.test/run/1', reply)
 
     def test_webhook_fallback_preserves_infrastructure_summary_and_detail(self):
@@ -320,7 +320,7 @@ class TriageTests(TestCase):
         with mock.patch.object(monitor, 'load_slack_transport', return_value=transport):
             triage.publish(self.conn, self.job())
         self.slack.assert_called_once()
-        self.assertIn('CI infrastructure incident: linux', self.slack.call_args.args[1])
+        self.assertIn('*bifrost-dev* triage: infrastructure incident: linux', self.slack.call_args.args[1])
         self.assertIn('runner_id=0', self.slack.call_args.args[1])
         self.assertEqual(self.job()['status'], 'completed')
 
@@ -339,7 +339,8 @@ class TriageTests(TestCase):
         self.slack.return_value = (True, 'notice')
         triage.publish(self.conn, self.job())
         self.assertEqual([c.args[1] for c in self.slack.call_args_list],
-                         [triage.INFRASTRUCTURE_SLACK_SUMMARY, triage.INFRASTRUCTURE_SLACK_SUMMARY,
+                         [f'{monitor.slack_project_prefix()} triage: {triage.INFRASTRUCTURE_SLACK_SUMMARY}',
+                          f'{monitor.slack_project_prefix()} triage: {triage.INFRASTRUCTURE_SLACK_SUMMARY}',
                           cached['slack_text'] + '\n\n' + cached['slack_detail']])
         self.assertEqual(self.slack.call_args_list[-1].kwargs['thread_ts'], 'notice')
         self.assertEqual(self.job()['status'], 'completed')
@@ -408,7 +409,7 @@ class TriageTests(TestCase):
         triage.deliver_product_announcements(self.conn)
         self.assertEqual(self.slack.call_count, 1)
         text = self.slack.call_args.args[1]
-        self.assertIn('2 product issues', text)
+        self.assertTrue(text.startswith('*bifrost-dev* triage: 2 product issues'))
         self.assertIn(f'<https://github.com/{monitor.REPO_NAME}/issues/78|#78: Fix Cargo nextest>', text)
         self.assertIn(f'<https://github.com/{monitor.REPO_NAME}/issues/77|#77: Existing &lt;defect&gt; &amp; regression ¦ fix>', text)
         self.assertNotIn('job', text)

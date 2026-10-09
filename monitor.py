@@ -1513,6 +1513,11 @@ def load_slack_transport() -> SlackTransport:
     return SlackTransport("webhook", webhook=load_webhook())
 
 
+def slack_project_prefix() -> str:
+    """Use the configured repository's name in channel-level headings."""
+    return f"*{REPO_NAME.rsplit('/', 1)[-1]}*"
+
+
 def slack_chat_post(
     token: str, channel: str, text: str, thread_ts: str | None = None
 ) -> tuple[bool, str | None]:

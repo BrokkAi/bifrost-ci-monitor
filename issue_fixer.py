@@ -522,7 +522,7 @@ def cleanup(conn, transport):
         if not job["outcome_sent"]:
             report = json.loads(job["report_json"])
             ok, _ = monitor.slack_send(transport,
-                f"Issue <{job['issue_url']}|#{job['issue_number']}>: {report['outcome']}. "
+                f"{monitor.slack_project_prefix()} fixbot: <{job['issue_url']}|#{job['issue_number']}>: {report['outcome']}. "
                 f"{report['summary']} " + (job["repair_pr_url"] or ""),
                 thread_ts=None if report['outcome'] == 'infrastructure' else job['thread_ts'])
             if ok:
@@ -556,7 +556,7 @@ def tick(conn, transport):
     try:
         if not job["start_notified"]:
             ok, thread = monitor.slack_send(transport,
-                f":wrench: {monitor.AGENT_LABEL} repairing <{job['issue_url']}|issue #{job['issue_number']}>"
+                f"{monitor.slack_project_prefix()} fixbot: repairing <{job['issue_url']}|issue #{job['issue_number']}>"
                 + (f" after merger rejected PR #{job['retry_pr_number']}." if job["retry_pr_number"] else "."))
             with conn:
                 conn.execute("UPDATE issue_repairs SET thread_ts=?,start_notified=? WHERE id=?", (thread, int(ok), job["id"]))
