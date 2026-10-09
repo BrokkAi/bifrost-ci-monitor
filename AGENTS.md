@@ -724,10 +724,11 @@ the restart brief. Persist stable command IDs before submission and reuse them
 after ambiguous replies; only a confirmed failed clear receives a new ID.
 `report_after_seq` fences reports from before that divider. No session-idle
 test or agent deadline participates. Quota/input outcomes await provider or
-operator action instead of clearing work. Recovery/block notices and recovery
-errors alert Slack once per episode, with session IDs in thread replies; Slack
-failure must not stop recovery. Repeated polls of an accepted report correction
-are quiet; a newly completed turn can receive another correction even when its
+operator action instead of clearing work. Routine automatic recovery is silent;
+quota/input blocks and failed recovery steps alert Slack once per episode, with
+session IDs in thread replies. Slack failure must not stop recovery. Repeated
+polls of an accepted report correction are quiet; a newly completed turn can
+receive another correction even when its
 invalid text is unchanged.
 Every finding declares `outcome: product|infrastructure|resolved`. Only product
 findings may contain issue drafts. Infrastructure publishes a short top-level

@@ -791,9 +791,7 @@ class TriageTests(TestCase):
         identity = self.recovery()['id']
         self.assertIn('Cargo nextest', self.recovery()['prompt'])
         self.assertIn('reuse collected evidence', self.recovery()['prompt'])
-        self.assertEqual(self.slack.call_count, 2)  # One notice and its session detail.
-        self.assertNotIn('session', self.slack.call_args_list[0].args[1])
-        self.assertIn('`session`', self.slack.call_args_list[1].args[1])
+        self.slack.assert_not_called()
 
         def mj(args, **kwargs):
             self.assertEqual(args[args.index('--session') + 1], 'session')
@@ -828,7 +826,9 @@ class TriageTests(TestCase):
         self.assertIsNone(self.job()['last_error'])
         self.assertEqual([call.args[3] for call in send.call_args_list],
                          ['triage-clear-' + identity + '-0'] * 2 + ['triage-restart-' + identity] * 2)
-        self.assertEqual(self.slack.call_count, 4)  # A failed-recovery alert, deduplicated too.
+        self.assertEqual(self.slack.call_count, 2)  # Only the failed-recovery alert and its session detail.
+        self.assertNotIn('`session`', self.slack.call_args_list[0].args[1])
+        self.assertIn('`session`', self.slack.call_args_list[1].args[1])
         triage.collect_report(self.conn, self.job())  # Sticky old failed turn cannot reset again.
         self.assertEqual(send.call_count, 4)
         self.wait.return_value = monitor.TurnResult('completed', 'finished', turn_id=55)
@@ -895,16 +895,24 @@ class TriageTests(TestCase):
     def test_slack_outage_does_not_block_recovery_and_notice_retries(self):
         self.slack.return_value = (False, None)
         self.start_recovery()
-        self.assertNotIn('notified', self.recovery())
-        self.patch(monitor, 'require_mj_success', side_effect=['{"state":"running"}', '{}', '{}', '{"latest_seq":2869}'])
+        self.slack.assert_not_called()
+        self.patch(monitor, 'require_mj_success', side_effect=[monitor.MjError('daemon unreachable'),
+            monitor.MjError('daemon unreachable'), '{"state":"running"}', '{}', '{}', '{"latest_seq":2869}'])
         self.patch(monitor, 'interrupt_turn')
+        with self.assertRaises(monitor.MjError):
+            triage.collect_report(self.conn, self.job())
+        self.assertNotIn('failure_notified', self.recovery())
+        self.slack.return_value = (True, 'notice')
+        with self.assertRaises(monitor.MjError):
+            triage.collect_report(self.conn, self.job())
+        self.assertTrue(self.recovery()['failure_notified'])
+        self.assertEqual(self.slack.call_count, 3)
         triage.collect_report(self.conn, self.job())
         self.assertEqual(self.recovery()['stage'], 'clear')
-        self.slack.return_value = (True, 'notice')
         self.patch(triage.speculation, 'send_once')
         triage.collect_report(self.conn, self.job())
-        self.assertTrue(self.recovery()['notified'])
         self.assertEqual(self.recovery()['stage'], 'cleared')
+        self.assertEqual(self.slack.call_count, 3)
 
     def test_new_completed_turn_can_correct_the_same_bad_report_again(self):
         self.add_failure()

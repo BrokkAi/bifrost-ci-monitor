@@ -333,6 +333,8 @@ def save_recovery(conn, job, recovery):
 
 
 def notify_recovery(conn, job, recovery, *, error=None):
+    if not error and recovery['stage'] != 'blocked':
+        return  # Routine recovery is supervisor work, not an operator alert.
     flag = 'failure_notified' if error else 'notified'
     if recovery.get(flag):
         return
@@ -340,17 +342,11 @@ def notify_recovery(conn, job, recovery, *, error=None):
         message = (":rotating_light: CI triage recovery needs attention. "
                    f"The {recovery.get('failed_step', recovery['stage'])} step failed: {error}. Automatic retries continue. "
                    "Inspect the session and resolve its worker/provider error.")
-    elif recovery['stage'] == 'blocked':
+    else:
         action = ("Respond to the session's structured input request." if recovery['outcome'] == 'input_required'
                   else "Restore provider capacity or quota; Mjolnir will resume its retry.")
         reason = 'needs your input' if recovery['outcome'] == 'input_required' else 'is waiting for provider quota'
         message = f":warning: CI triage {reason}. {action} New investigations are waiting."
-    else:
-        reason = {'error': 'encountered an agent error', 'stopped': 'stopped',
-                  'interrupted': 'was interrupted'}.get(recovery['outcome'], 'ended without a report')
-        message = (f":warning: CI triage {reason}. "
-                   "The supervisor is restarting this investigation in the same checkout. "
-                   "New investigations wait for this job to finish.")
     try:
         transport = monitor.load_slack_transport()
         ok, thread = monitor.slack_send(transport, message)
