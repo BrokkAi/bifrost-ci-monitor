@@ -554,11 +554,20 @@ def infrastructure_slack_text(finding, captured) -> tuple[str, str]:
     summary = f'{monitor.slack_project_prefix()} triage: infrastructure incident: ' + jobs[0][:180]
     if len(jobs) > 1:
         summary += f' (+{len(jobs) - 1} related jobs)'
-    runs = list(dict.fromkeys(o['last_seen_run_url'] for o in captured))[:5]
+    runs = []
+    for observation in captured:
+        if observation.get('local_finding_id'):
+            runs.append(f"Local {observation['kind']}: `{observation['identity']}` at "
+                        f"`{observation['last_seen_sha']}`; command: `{observation['command']}`; "
+                        f"batch `{observation['batch_id']}`, merge session `{observation['session_id']}`.")
+        elif observation.get('last_seen_run_url'):
+            runs.append(observation['last_seen_run_url'])
+    runs = list(dict.fromkeys(runs))[:5]
     links = '\n'.join(runs)
     diagnosis = finding['diagnosis'].strip()[:1200]
     prefix = '*Diagnosis*\n' + diagnosis + '\n\n*Evidence*\n'
-    suffix = '\n\n*Runs*\n' + links
+    heading = '*Sources*' if any(o.get('local_finding_id') for o in captured) else '*Runs*'
+    suffix = '\n\n' + heading + '\n' + links
     budget = max(0, monitor.SLACK_MESSAGE_LIMIT - len(summary) - 2 - len(prefix) - len(suffix))
     detail = prefix + finding['evidence'].strip()[:budget] + suffix
     return summary, detail

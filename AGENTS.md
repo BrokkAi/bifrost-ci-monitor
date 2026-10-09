@@ -781,7 +781,9 @@ nearby reports reuse that channel's thread until a 15-minute gap between success
 notices. `triage_infrastructure_threads` persists the window across restarts, while
 cached report thread IDs keep publication retries together even after the window.
 Each reply includes the finding's job summary. Publication's existing fixer lock serializes
-thread selection. Infrastructure checkpoints
+thread selection. Local findings have no CI run URL; render their actual tested
+commit, command and batch/session provenance in the diagnostic reply instead.
+Infrastructure checkpoints
 handled observations in the existing `triage_observations` table. Handled
 infrastructure remains open in the CI ledger until normal completed-run upkeep
 observes recovery; it is never treated as resolved merely because it was reported.

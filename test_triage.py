@@ -139,6 +139,25 @@ class TriageTests(TestCase):
         self.assertEqual(self.conn.execute('SELECT status FROM local_findings').fetchone()[0], 'fixed')
         self.assertEqual(self.conn.execute('SELECT status FROM known_failures').fetchone()[0], 'open')
         self.assertEqual(len(triage.pending(self.conn)), 1)
+
+    def test_local_infrastructure_finding_publishes_without_ci_run_url(self):
+        local = self.add_local_finding()
+        report = self.make_job()
+        finding = report['findings'][0]
+        finding.update(outcome='infrastructure', issue=None,
+                       diagnosis='Host toolchain limitation', evidence='Missing host dependency')
+        with self.conn:
+            self.conn.execute('UPDATE triage_jobs SET report_json=?', (json.dumps(report),))
+        triage.publish(self.conn, self.job())
+        self.assertEqual(self.job()['status'], 'completed')
+        self.assertEqual(self.github.calls, [])
+        detail = self.slack.call_args.args[1]
+        self.assertIn('*Sources*', detail)
+        for value in [local['command'], local['head_sha'], 'batch', 'merge-session']:
+            self.assertIn(value, detail)
+        self.assertNotIn('None', detail)
+        self.assertEqual(self.conn.execute('SELECT triage_outcome FROM local_findings').fetchone()[0], 'infrastructure')
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM known_failures').fetchone()[0], 0)
         self.assertEqual(triage.reconcile_resolved(self.conn), 0)
 
     def test_large_local_findings_are_split_into_bounded_triage_prompts(self):
