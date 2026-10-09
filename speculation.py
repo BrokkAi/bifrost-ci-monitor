@@ -577,6 +577,14 @@ def recheck_waiting(a, conn, transport, row):
             a._append_removed(conn, row['batch_id'], removed)
             latest = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
             a._rebuild_or_finish(conn, transport, latest, keep, 'speculative source changed while waiting')
+            return
+        # Discovery can refresh dependency metadata without removing a source.
+        # The row read before discovery can still show a now-stale handoff.
+        latest = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
+        if not a.ready_candidate(latest):
+            a._queue_missing_handoff(
+                conn, latest, 'the candidate handoff became stale while waiting for the predecessor',
+            )
 
 
 def finished(a, conn, transport, row, final):

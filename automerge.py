@@ -5531,6 +5531,11 @@ def process_batch(conn: sqlite3.Connection, transport: monitor.SlackTransport,
         if phase == "terminal":
             return
     if phase == "waiting_parent":
+        if not ready_candidate(row):
+            _queue_missing_handoff(
+                conn, row, "the candidate handoff became stale while waiting for the predecessor",
+            )
+            return
         if speculation.get(row, "role_promoted", 0):
             parent = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                                   (row["predecessor_id"],)).fetchone()

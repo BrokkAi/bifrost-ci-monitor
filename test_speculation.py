@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from dataclasses import replace
 
 import automerge as a
 import mm_service as service
@@ -299,6 +300,52 @@ class StateTests(unittest.TestCase):
             a._consume_ready_candidate(self.conn, self.transport, self.row())
         self.assertEqual(self.row()['phase'], 'waiting_parent')
         self.assertIsNone(self.row()['integration_pr_number'])
+
+    def test_dependency_refresh_recovers_stale_handoff_before_role_promotion(self):
+        self.assess()
+        self.handoff()
+        before = self.row()
+        self.assertIsNotNone(a.ready_candidate(before))
+        receipt = json.loads(before['ready_json'])
+
+        def refresh(pulls, **kwargs):
+            updated = [replace(p, base_ref='new-prerequisite-branch') for p in pulls]
+            a._capture_batch_dependencies(self.conn, self.child, updated)
+            return updated, []
+
+        with mock.patch.object(a, '_recheck_sources', side_effect=refresh):
+            s.recheck_waiting(a, self.conn, self.transport, before)
+        recovered = self.row()
+        self.assertEqual(recovered['phase'], 'fixing')
+        self.assertIn('handoff became stale', recovered['pending_prompt'])
+        self.assertIn('reuse applicable execution evidence', recovered['pending_prompt'])
+        self.assertEqual(recovered['session_id'], before['session_id'])
+        self.assertEqual(recovered['candidate_json'], before['candidate_json'])
+        command_id = recovered['prompt_command_id']
+        s.recheck_waiting(a, self.conn, self.transport, recovered)
+        self.assertEqual(self.row()['prompt_command_id'], command_id)
+        self.assertEqual(s.latest_tests(self.conn, self.child)['head'], receipt['head'])
+
+    def test_promoted_primary_with_stale_handoff_resumes_without_new_session(self):
+        self.assess()
+        self.handoff()
+        before = self.row()
+        a._capture_batch_dependencies(self.conn, self.child,
+                                     [replace(pull(8, HEAD_TWO), base_ref='new-prerequisite-branch')])
+        with self.conn:
+            self.conn.execute('UPDATE automerge_batches SET role_promoted=1 WHERE batch_id=?', (self.child,))
+        self.assertIsNone(a.ready_candidate(self.row()))
+        with (mock.patch.object(a, 'send_start_notification'),
+              mock.patch.object(s, 'promote') as promote,
+              mock.patch.object(a, 'launch_batch_session') as launch):
+            a.process_batch(self.conn, self.transport, self.child)
+        recovered = self.row()
+        self.assertEqual(recovered['phase'], 'fixing')
+        self.assertEqual(recovered['session_id'], before['session_id'])
+        self.assertEqual(recovered['candidate_json'], before['candidate_json'])
+        self.assertIn('handoff became stale', recovered['pending_prompt'])
+        promote.assert_not_called()
+        launch.assert_not_called()
 
     def test_checkpoint_and_withdrawal_retries_do_not_create_new_identities(self):
         request = {'revision': service.state(self.conn, self.child)['revision'], 'head': HEAD_TWO}

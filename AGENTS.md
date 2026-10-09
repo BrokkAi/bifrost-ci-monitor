@@ -311,9 +311,13 @@ instruction; repeated polls of that outcome cannot replace or resend accepted
 guidance. A new ended turn may receive another continuation. Outcomes without
 turn IDs are deduplicated by outcome within the session/attempt. Errors, stopped
 sessions, quota limits and input requests also produce an actionable channel
-alert; provider/input/lifecycle blockers may need operator intervention. CI-wait
-and merge phases without a valid receipt queue handoff recovery without inspecting
-session idleness. Already-confirmed GitHub landing can still be reconciled.
+alert; provider/input/lifecycle blockers may need operator intervention. CI-wait,
+merge and waiting-for-predecessor phases without a valid receipt queue handoff
+recovery without inspecting session idleness. Waiting successors re-read the row
+after dependency discovery, which may refresh captured metadata and invalidate
+their handoff even when all source heads remain unchanged. Recovery retains the
+checkout and execution evidence; a metadata refresh alone does not require new
+tests. Already-confirmed GitHub landing can still be reconciled.
 
 At creation, integration batches with exactly one source PR select DeepSeek
 Flash (`deepseek-flash`) on `podman` with `--subagents none`; batches with
