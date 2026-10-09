@@ -239,6 +239,17 @@ fetch that matching instruction. Read-only state and diagnostic findings remain
 available after handoff. On upgrade, matching durable publications
 and already parked successors acquire receipts once; incomplete assessments do not.
 
+Reported completion or a blocked merger turn without a valid handoff queues a continuation in the same
+checkout, retaining the current supervisor instruction and applicable evidence.
+Record its Mjolnir turn ID in `automerge_skill_events` atomically with the new
+instruction; repeated polls of that outcome cannot replace or resend accepted
+guidance. A new ended turn may receive another continuation. Outcomes without
+turn IDs are deduplicated by outcome within the session/attempt. Errors, stopped
+sessions, quota limits and input requests also produce an actionable channel
+alert; provider/input/lifecycle blockers may need operator intervention. CI-wait
+and merge phases without a valid receipt queue handoff recovery without inspecting
+session idleness. Already-confirmed GitHub landing can still be reconciled.
+
 Integration sessions use Opus 5.5 (`opus`) on `bedrock-podman` with Mjolnir Luna 6
 (`global.openai.gpt-6-luna`, high effort) subagents. The CI Mjolnir configuration
 allows up to 16 concurrent subagents per session. The primary coordinates the
@@ -432,8 +443,10 @@ must not change stored agent evidence, relay identities/cursors or delivery retr
 Invalidation fences old mutations immediately. Persist a new attempt generation,
 stop queued prompts/turns/background tasks and child sessions. Cancellation
 accepts an already-ended turn; cleanup never infers turn
-activity or waits for session idleness. Existing task/child cleanup and the
-clear boundary (or suspension for aborts) own termination. Then issue typed
+activity or waits for session idleness. Parked children have no live worker:
+suspend them directly without queue/turn/task commands or waking them. Existing
+task/child cleanup and the clear boundary (or suspension for aborts) own
+termination. Then issue typed
 `/clear` with a stable command ID. Wait for its durable context divider before
 submitting a deterministic brief, also with a stable ID. Lost replies retry the
 same command; confirmed failed clears use a new ID. The session, container,

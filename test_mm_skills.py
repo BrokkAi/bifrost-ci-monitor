@@ -474,7 +474,7 @@ class StateTests(unittest.TestCase):
             self.call('comment', revision=updated['revision'], number=7, body='late mutation')
         # A durable handoff advances even while ACP reports an active turn.
         with (mock.patch.object(automerge, '_wait_agent_turn', side_effect=AssertionError('unexpected wait')),
-              mock.patch.object(automerge, '_session_is_idle', side_effect=AssertionError('unexpected idle gate')),
+              mock.patch.object(automerge, '_session_status', side_effect=AssertionError('unexpected idle gate')),
               mock.patch.object(automerge, 'send_start_notification'),
               mock.patch.object(automerge, '_merge_integration') as land):
             automerge.process_batch(self.conn, mock.Mock(), 'batch-test')

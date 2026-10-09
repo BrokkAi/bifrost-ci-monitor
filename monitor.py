@@ -2455,6 +2455,7 @@ class TurnResult:
     status: str
     outcome: str
     timed_out: bool = False
+    turn_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -2702,7 +2703,7 @@ def wait_once(session_id: str, timeout_seconds: int) -> TurnResult:
     if outcome == "timeout":
         return TurnResult("running", outcome, timed_out=True)
     status = "completed" if outcome == "finished" else outcome
-    return TurnResult(status, outcome)
+    return TurnResult(status, outcome, turn_id=data.get("turn_id"))
 
 
 def supervise_turn(

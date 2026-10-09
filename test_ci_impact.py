@@ -209,7 +209,7 @@ class ValidationPolicyTests(TestCase):
         view = {'state': 'OPEN', 'isDraft': False, 'baseRefName': 'master',
                 'headRefOid': HEAD_TWO, 'baseRefOid': BASE_SHA}
         with (
-            mock.patch.object(automerge, '_session_is_idle', return_value=True),
+            mock.patch.object(automerge, '_session_status', side_effect=AssertionError('no idle gate')),
             mock.patch.object(automerge, 'integration_pr_view', return_value=view),
             mock.patch.object(automerge, 'current_master_sha', return_value=BASE_SHA),
             mock.patch.object(automerge, '_record_trusted_rejection_markers', return_value=False),

@@ -22,6 +22,13 @@ ISSUE_URL = "https://github.com/BrokkAi/bifrost-dev/issues/2304"
 
 
 class InterruptTurnTests(unittest.TestCase):
+    def test_wait_retains_the_reported_turn_identity(self):
+        with mock.patch.object(monitor, 'mj_command', return_value=subprocess.CompletedProcess(
+                [], 0, json.dumps({'outcome': 'finished', 'turn_id': 23}), '')):
+            result = monitor.wait_once('session', 1)
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(result.turn_id, 23)
+
     def test_already_ended_replies_are_idempotent(self):
         for detail in ['no active turn', 'nothing is running', 'turn is not running',
                        '409 Conflict: this session has no turn to cancel']:
