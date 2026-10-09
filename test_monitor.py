@@ -877,6 +877,21 @@ class MjRunnerTests(unittest.TestCase):
             ["0", "2"],
         )
 
+    def test_final_agent_message_excludes_reports_before_context_clear(self):
+        pages = [completed(json.dumps(dict(items=[dict(seq=4, text='old report')],
+                                            next_after_seq=6, latest_seq=8))),
+                 completed(json.dumps(dict(items=[dict(seq=8, text='new report')],
+                                            next_after_seq=8, latest_seq=8)))]
+        with mock.patch.object(monitor, 'mj_command', side_effect=pages) as command:
+            self.assertEqual(monitor.read_final_agent_message('session', after_seq=5), 'new report')
+        self.assertEqual([call.args[0][call.args[0].index('--after-seq') + 1]
+                          for call in command.call_args_list], ['5', '6'])
+        empty = completed(json.dumps(dict(items=[dict(seq=4, text='old report')],
+                                          next_after_seq=5, latest_seq=5)))
+        with mock.patch.object(monitor, 'mj_command', return_value=empty):
+            # No new report can fall back to a pre-clear report.
+            self.assertEqual(monitor.read_final_agent_message('session', after_seq=5), '')
+
     def test_restart_reattaches_at_saved_cursor_without_reposting(self):
         insert_invocation(
             self.conn,

@@ -11,11 +11,13 @@ import json
 from pathlib import Path
 import re
 import sqlite3
+import sys
 import tempfile
 import uuid
 
 import monitor
 import local_findings
+import speculation
 
 LOCK_PATH = monitor.STATE_DIR.parent / "bifrost-ci-triage" / "triage.lock"
 KEY = ("workflow", "job_name", "identity_kind", "identity")
@@ -69,6 +71,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         );
     """)
     monitor.ensure_column(conn, "triage_observations", "resolved_run_id", "INTEGER")
+    monitor.ensure_column(conn, "triage_jobs", "recovery_json", "TEXT NOT NULL DEFAULT '{}'")
+    monitor.ensure_column(conn, "triage_jobs", "report_after_seq", "INTEGER NOT NULL DEFAULT 0")
     backfill_outcomes(conn)
 
 
@@ -302,10 +306,13 @@ def launch(conn, job) -> None:
     monitor.log(f"triage {job['id']}: running mj session {session_id}")
 
 
-def request_report_correction(conn, job, final, problem) -> None:
-    digest = hashlib.sha256((str(problem) + final).encode()).hexdigest()
+def request_report_correction(conn, job, final, problem, *, turn_id=None) -> None:
+    identity = str(problem) + final
+    if turn_id is not None:
+        identity += '\nturn:' + str(turn_id)
+    digest = hashlib.sha256(identity.encode()).hexdigest()
     if digest == job['feedback_digest']:
-        raise RuntimeError('waiting for corrected report; correction already submitted')
+        return  # The accepted instruction owns delivery; repeated polls cannot resend it.
     monitor.send_session_message(job['session_id'],
         f"Your report needs correction: {problem}. Return the complete triage-result JSON "
         "with all original failure_ids. Each finding needs outcome product, infrastructure, "
@@ -319,17 +326,126 @@ def request_report_correction(conn, job, final, problem) -> None:
                      (digest, job['id']))
 
 
+def save_recovery(conn, job, recovery):
+    with conn:
+        conn.execute('UPDATE triage_jobs SET recovery_json=? WHERE id=?',
+                     (json.dumps(recovery), job['id']))
+
+
+def notify_recovery(conn, job, recovery, *, error=None):
+    flag = 'failure_notified' if error else 'notified'
+    if recovery.get(flag):
+        return
+    if error:
+        message = (":rotating_light: CI triage recovery needs attention. "
+                   f"The {recovery.get('failed_step', recovery['stage'])} step failed: {error}. Automatic retries continue. "
+                   "Inspect the session and resolve its worker/provider error.")
+    elif recovery['stage'] == 'blocked':
+        action = ("Respond to the session's structured input request." if recovery['outcome'] == 'input_required'
+                  else "Restore provider capacity or quota; Mjolnir will resume its retry.")
+        reason = 'needs your input' if recovery['outcome'] == 'input_required' else 'is waiting for provider quota'
+        message = f":warning: CI triage {reason}. {action} New investigations are waiting."
+    else:
+        reason = {'error': 'encountered an agent error', 'stopped': 'stopped',
+                  'interrupted': 'was interrupted'}.get(recovery['outcome'], 'ended without a report')
+        message = (f":warning: CI triage {reason}. "
+                   "The supervisor is restarting this investigation in the same checkout. "
+                   "New investigations wait for this job to finish.")
+    try:
+        transport = monitor.load_slack_transport()
+        ok, thread = monitor.slack_send(transport, message)
+        if not ok:
+            return
+        recovery[flag] = True
+        save_recovery(conn, job, recovery)
+        if thread and transport.kind == 'chat':
+            monitor.slack_send(transport, f"Triage session: `{job['session_id']}`", thread_ts=thread)
+    except Exception as exc:
+        monitor.log(f"triage recovery alert will retry: {exc}")
+
+
+def recover_session(conn, job, recovery):
+    """Use native cancellation and the existing durable /clear boundary."""
+    session = job['session_id']
+    stage = recovery['stage']
+    clear = f"triage-clear-{recovery['id']}-{recovery.get('clear_retry', 0)}"
+
+    def mj(args):
+        return json.loads(monitor.require_mj_success(args, timeout=60) or '{}')
+
+    if stage == 'stop':
+        state = mj(['sessions', '--session', session, '--json'])
+        if str(state.get('state', '')).lower() in {'stopped', 'suspended', 'lost', 'failed'}:
+            mj(['resume', '--session', session, '--queue', 'discard', '--json'])
+            return
+        mj(['clear-queue', '--session', session, '--json'])
+        monitor.interrupt_turn(session)
+        mj(['stop-task', '--session', session, '--all', '--json'])
+        page = mj(['transcript', '--session', session, '--after-seq', '0', '--json'])
+        recovery.update(stage='clear', cursor=int(page['latest_seq']))
+    elif stage == 'clear':
+        speculation.send_once(sys.modules[__name__], session, '/clear', clear)
+        recovery['stage'] = 'cleared'
+    elif stage == 'cleared':
+        page = mj(['transcript', '--session', session, '--after-seq', str(recovery['cursor']), '--json'])
+        boundary = next((item for item in page.get('items', [])
+                         if item.get('stable_id') == 'context-cleared:' + clear), None)
+        if boundary is None:
+            recovery['cursor'] = int(page.get('next_after_seq', recovery['cursor']))
+            result, recovery['api_cursor'] = speculation.command_outcome(
+                sys.modules[__name__], session, clear, recovery.get('api_cursor', 0))
+            if result and result['outcome'] != 'succeeded':
+                recovery.update(stage='stop', failed_step='clear', clear_retry=recovery.get('clear_retry', 0) + 1)
+                save_recovery(conn, job, recovery)
+                raise RuntimeError('context clear failed: ' + str(result.get('message') or result['outcome']))
+        else:
+            with conn:
+                conn.execute('UPDATE triage_jobs SET report_after_seq=? WHERE id=?', (int(boundary['seq']), job['id']))
+            recovery['stage'] = 'restart'
+    elif stage == 'restart':
+        speculation.send_once(sys.modules[__name__], session, recovery['prompt'], 'triage-restart-' + recovery['id'])
+        recovery['stage'] = 'running'
+        with conn:
+            conn.execute('UPDATE triage_jobs SET feedback_digest=NULL,last_error=NULL WHERE id=?', (job['id'],))
+    else:
+        raise RuntimeError('invalid triage recovery stage: ' + str(stage))
+    save_recovery(conn, job, recovery)
+
+
 def collect_report(conn, job) -> None:
+    recovery = json.loads(job['recovery_json'])
+    if recovery:
+        notify_recovery(conn, job, recovery)
+    if recovery and recovery['stage'] not in {'running', 'blocked'}:
+        try:
+            recover_session(conn, job, recovery)
+        except Exception as exc:
+            notify_recovery(conn, job, recovery, error=exc)
+            raise
+        return
     turn = monitor.wait_once(job["session_id"], 1)
     if turn.status == "running":
         return
     if turn.status != "completed":
-        raise RuntimeError(f"triage session {job['session_id']} needs attention: {turn.outcome}")
-    final = monitor.read_final_agent_message(job["session_id"])
+        if recovery and (turn.turn_id, turn.outcome) == (recovery['turn_id'], recovery['outcome']):
+            return
+        blocked = turn.outcome in {'quota_limit', 'input_required'}
+        recovery = {'id': uuid.uuid4().hex, 'turn_id': turn.turn_id, 'outcome': turn.outcome,
+                    'stage': 'blocked' if blocked else 'stop'}
+        if not blocked:
+            recovery['prompt'] = ("Resume this triage investigation after a failed agent turn. The checkout is preserved. "
+                                  "Reconcile saved notes/logs and reuse collected evidence; do not repeat builds or tests. "
+                                  "Return a complete report for the original observations below.\n\n" + build_prompt(job))
+        save_recovery(conn, job, recovery)
+        notify_recovery(conn, job, recovery)
+        return
+    lower = int(job['report_after_seq'])
+    final = (monitor.read_final_agent_message(job["session_id"], after_seq=lower) if lower
+             else monitor.read_final_agent_message(job["session_id"]))
     try:
         report = parse_report(final, json.loads(job["observations_json"]))
     except (ValueError, TypeError, KeyError) as exc:
-        request_report_correction(conn, job, final, exc)
+        request_report_correction(conn, job, final, exc, turn_id=turn.turn_id)
         return
     with conn:
         conn.execute("UPDATE triage_jobs SET status='publishing',report_json=?,last_error=NULL WHERE id=?",

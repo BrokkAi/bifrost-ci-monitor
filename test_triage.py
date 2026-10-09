@@ -772,10 +772,165 @@ class TriageTests(TestCase):
         self.assertIsNone(self.job()['feedback_digest'])
         triage.collect_report(self.conn, self.job())
         self.reopen()
-        with self.assertRaisesRegex(RuntimeError, "correction already submitted"):
-            triage.collect_report(self.conn, self.job())
+        triage.collect_report(self.conn, self.job())
         self.assertEqual(prompt.call_count, 2)
         self.assertEqual(prompt.call_args_list[0].kwargs['request_id'], prompt.call_args_list[1].kwargs['request_id'])
+
+    def recovery(self):
+        return json.loads(self.job()['recovery_json'])
+
+    def start_recovery(self):
+        self.add_failure()
+        report = self.make_job(status='running')
+        self.wait = self.patch(monitor, 'wait_once', return_value=monitor.TurnResult('error', 'error', turn_id=14))
+        triage.collect_report(self.conn, self.job())
+        return report
+
+    def test_recovery_survives_lost_clear_and_restart_replies_in_same_session(self):
+        report = self.start_recovery()
+        identity = self.recovery()['id']
+        self.assertIn('Cargo nextest', self.recovery()['prompt'])
+        self.assertIn('reuse collected evidence', self.recovery()['prompt'])
+        self.assertEqual(self.slack.call_count, 2)  # One notice and its session detail.
+        self.assertNotIn('session', self.slack.call_args_list[0].args[1])
+        self.assertIn('`session`', self.slack.call_args_list[1].args[1])
+
+        def mj(args, **kwargs):
+            self.assertEqual(args[args.index('--session') + 1], 'session')
+            if args[0] == 'sessions':
+                return json.dumps(dict(state='running', is_idle=False, chat_phase='working'))
+            if args[0] == 'transcript':
+                if args[args.index('--after-seq') + 1] == '0':
+                    return '{"latest_seq":2869}'
+                return json.dumps(dict(items=[dict(seq=2870, stable_id='context-cleared:triage-clear-' + identity + '-0')]))
+            self.assertIn(args[0], ['clear-queue', 'stop-task'])
+            return '{}'
+
+        native = self.patch(monitor, 'require_mj_success', side_effect=mj)
+        interrupt = self.patch(monitor, 'interrupt_turn')
+        send = self.patch(triage.speculation, 'send_once', side_effect=[monitor.MjError('lost clear reply'), {},
+                                                                    monitor.MjError('lost restart reply'), {}])
+        self.reopen()
+        triage.collect_report(self.conn, self.job())
+        self.assertEqual(self.recovery()['stage'], 'clear')
+        interrupt.assert_called_once_with('session')
+        for stage in ('clear', 'restart'):
+            with self.assertRaises(monitor.MjError):
+                triage.collect_report(self.conn, self.job())
+            self.assertEqual(self.recovery()['stage'], stage)
+            self.reopen()
+            triage.collect_report(self.conn, self.job())
+            if stage == 'clear':
+                self.reopen()
+                triage.collect_report(self.conn, self.job())
+                self.assertEqual(self.job()['report_after_seq'], 2870)
+        self.assertEqual(self.recovery()['stage'], 'running')
+        self.assertIsNone(self.job()['last_error'])
+        self.assertEqual([call.args[3] for call in send.call_args_list],
+                         ['triage-clear-' + identity + '-0'] * 2 + ['triage-restart-' + identity] * 2)
+        self.assertEqual(self.slack.call_count, 4)  # A failed-recovery alert, deduplicated too.
+        triage.collect_report(self.conn, self.job())  # Sticky old failed turn cannot reset again.
+        self.assertEqual(send.call_count, 4)
+        self.wait.return_value = monitor.TurnResult('completed', 'finished', turn_id=55)
+        final = self.patch(monitor, 'read_final_agent_message', return_value='triage-result: ' + json.dumps(report))
+        triage.collect_report(self.conn, self.job())
+        final.assert_called_once_with('session', after_seq=2870)
+        self.assertEqual(self.job()['status'], 'publishing')
+        self.assertNotIn('new', [call.args[0][0] for call in native.call_args_list])
+
+    def test_clear_boundary_must_match_and_confirmed_failure_gets_new_command(self):
+        self.start_recovery()
+        recovery = self.recovery()
+        recovery.update(stage='cleared', cursor=2869)
+        triage.save_recovery(self.conn, self.job(), recovery)
+        native = self.patch(monitor, 'require_mj_success', return_value=json.dumps(dict(
+            items=[dict(seq=2870, stable_id='unrelated:triage-clear-' + recovery['id'] + '-0')],
+            next_after_seq=2870)))
+        outcome = self.patch(triage.speculation, 'command_outcome', return_value=(None, 80))
+        triage.collect_report(self.conn, self.job())
+        self.assertEqual(self.recovery()['stage'], 'cleared')
+        self.assertEqual(self.recovery()['cursor'], 2870)
+        self.assertEqual(self.job()['report_after_seq'], 0)
+        self.reopen()
+        outcome.return_value = (dict(outcome='failed', message='clear rejected'), 81)
+        with self.assertRaisesRegex(RuntimeError, 'context clear failed'):
+            triage.collect_report(self.conn, self.job())
+        self.assertEqual(self.recovery()['stage'], 'stop')
+        self.assertEqual(self.recovery()['clear_retry'], 1)
+        self.assertIn('clear step failed', self.slack.call_args_list[-2].args[1])
+        recovery = self.recovery()
+        recovery['stage'] = 'clear'
+        triage.save_recovery(self.conn, self.job(), recovery)
+        send = self.patch(triage.speculation, 'send_once')
+        triage.collect_report(self.conn, self.job())
+        self.assertEqual(send.call_args.args[3], 'triage-clear-' + recovery['id'] + '-1')
+
+    def test_recovery_resumes_a_stopped_session_without_creating_another(self):
+        self.start_recovery()
+        native = self.patch(monitor, 'require_mj_success', side_effect=['{"state":"stopped"}', '{}'])
+        triage.collect_report(self.conn, self.job())
+        self.assertEqual(self.recovery()['stage'], 'stop')
+        self.assertEqual([call.args[0] for call in native.call_args_list],
+                         [['sessions', '--session', 'session', '--json'],
+                          ['resume', '--session', 'session', '--queue', 'discard', '--json']])
+
+    def test_quota_and_input_require_action_without_resetting_or_repeated_notices(self):
+        self.add_failure()
+        native = self.patch(monitor, 'require_mj_success')
+        for outcome, action in [('quota_limit', 'Restore provider capacity'),
+                                ('input_required', 'Respond to the session')]:
+            with self.subTest(outcome=outcome):
+                self.make_job(status='running', job_id=outcome)
+                self.patch(monitor, 'wait_once', return_value=monitor.TurnResult(outcome, outcome, turn_id=14))
+                self.slack.reset_mock()
+                for _ in range(3):
+                    triage.collect_report(self.conn, self.job(outcome))
+                    self.reopen()
+                recovery = json.loads(self.job(outcome)['recovery_json'])
+                self.assertEqual(recovery['stage'], 'blocked')
+                self.assertEqual(self.slack.call_count, 2)
+                self.assertIn(action, self.slack.call_args_list[0].args[1])
+        native.assert_not_called()
+
+    def test_slack_outage_does_not_block_recovery_and_notice_retries(self):
+        self.slack.return_value = (False, None)
+        self.start_recovery()
+        self.assertNotIn('notified', self.recovery())
+        self.patch(monitor, 'require_mj_success', side_effect=['{"state":"running"}', '{}', '{}', '{"latest_seq":2869}'])
+        self.patch(monitor, 'interrupt_turn')
+        triage.collect_report(self.conn, self.job())
+        self.assertEqual(self.recovery()['stage'], 'clear')
+        self.slack.return_value = (True, 'notice')
+        self.patch(triage.speculation, 'send_once')
+        triage.collect_report(self.conn, self.job())
+        self.assertTrue(self.recovery()['notified'])
+        self.assertEqual(self.recovery()['stage'], 'cleared')
+
+    def test_new_completed_turn_can_correct_the_same_bad_report_again(self):
+        self.add_failure()
+        self.make_job(status='running')
+        turn = self.patch(monitor, 'wait_once', return_value=monitor.TurnResult('completed', 'finished', turn_id=14))
+        self.patch(monitor, 'read_final_agent_message', return_value='missing report')
+        send = self.patch(monitor, 'send_session_message')
+        triage.collect_report(self.conn, self.job())
+        self.reopen()
+        triage.collect_report(self.conn, self.job())
+        turn.return_value = monitor.TurnResult('completed', 'finished', turn_id=15)
+        triage.collect_report(self.conn, self.job())
+        self.assertEqual(send.call_count, 2)
+        self.assertNotEqual(send.call_args_list[0].kwargs['request_id'], send.call_args_list[1].kwargs['request_id'])
+
+    def test_existing_job_survives_additive_recovery_migration(self):
+        self.add_failure()
+        self.make_job(status='running')
+        with self.conn:
+            self.conn.execute('ALTER TABLE triage_jobs DROP COLUMN recovery_json')
+            self.conn.execute('ALTER TABLE triage_jobs DROP COLUMN report_after_seq')
+        self.reopen()
+        self.assertEqual(self.job()['session_id'], 'session')
+        self.assertEqual(self.job()['status'], 'running')
+        self.assertEqual(self.job()['recovery_json'], '{}')
+        self.assertEqual(self.job()['report_after_seq'], 0)
 
     def test_poll_cycle_restarts_without_duplicate_session_or_ticket(self):
         self.add_failure()

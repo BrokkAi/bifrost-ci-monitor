@@ -710,6 +710,19 @@ failed steps and commit, not repeated runs of the same observation. Its
 2-CPU/4-GiB session reads logs/source/history but does not build or fix code.
 Validate final JSON, deduplicate causes against open/closed issues, reopen
 matching issues, and persist publication markers to recover lost replies.
+Triage terminal errors, stops and interruptions persist a recovery in
+`triage_jobs.recovery_json` and restart the original observations in the same
+session/checkout. Clear queued work, interrupt the turn and stop background
+tasks, then use typed `/clear` and its durable `context-cleared:` divider before
+the restart brief. Persist stable command IDs before submission and reuse them
+after ambiguous replies; only a confirmed failed clear receives a new ID.
+`report_after_seq` fences reports from before that divider. No session-idle
+test or agent deadline participates. Quota/input outcomes await provider or
+operator action instead of clearing work. Recovery/block notices and recovery
+errors alert Slack once per episode, with session IDs in thread replies; Slack
+failure must not stop recovery. Repeated polls of an accepted report correction
+are quiet; a newly completed turn can receive another correction even when its
+invalid text is unchanged.
 Every finding declares `outcome: product|infrastructure|resolved`. Only product
 findings may contain issue drafts. Infrastructure publishes a short top-level
 Slack notice and the details in its thread; issue bodies and Slack text are

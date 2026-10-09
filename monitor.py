@@ -2651,9 +2651,9 @@ def read_complete_agent_transcript(session_id: str) -> str:
     )
 
 
-def read_final_agent_message(session_id: str) -> str:
+def read_final_agent_message(session_id: str, *, after_seq: int = 0) -> str:
     """Read the latest agent transcript item for structured final-message fields."""
-    cursor = 0
+    cursor = after_seq
     messages: list[tuple[int, str]] = []
     for _ in range(10_000):
         result = mj_command(
@@ -2673,7 +2673,8 @@ def read_final_agent_message(session_id: str) -> str:
         except (ValueError, TypeError, AttributeError) as exc:
             raise MjError(f"mj final transcript returned invalid JSON: {exc}") from exc
         for item in items:
-            if isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"].strip():
+            if (isinstance(item, dict) and int(item.get("seq", next_cursor)) > after_seq
+                    and isinstance(item.get("text"), str) and item["text"].strip()):
                 messages.append((int(item.get("seq", next_cursor)), item["text"].strip()))
         if next_cursor >= latest:
             break
