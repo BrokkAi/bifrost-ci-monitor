@@ -278,9 +278,12 @@ def stop_work(a, row):
         state = agent['session']
         identifier = state['id']
         if not a.monitor.session_is_stopped(state) and state.get('state') != 'stopping':
-            mj(a, ["clear-queue", "--session", identifier, "--json"])
-            a.monitor.interrupt_turn(identifier)
-            mj(a, ["stop-task", "--session", identifier, "--all", "--json"])
+            # Parked children have already handed back and have no worker for
+            # queue/turn/task commands. Suspension closes them without waking them.
+            if state.get('state') != 'parked':
+                mj(a, ["clear-queue", "--session", identifier, "--json"])
+                a.monitor.interrupt_turn(identifier)
+                mj(a, ["stop-task", "--session", identifier, "--all", "--json"])
             mj(a, ["suspend", "--session", identifier, "--acknowledge-unpublished-work", "--json"])
         children_stopped &= a.monitor.session_is_stopped(a._session_status(identifier))
     mj(a, ["stop-task", "--session", session, "--all", "--json"])

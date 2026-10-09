@@ -19,6 +19,25 @@ TREE = '4' * 40
 
 
 class StopWorkTests(unittest.TestCase):
+    def test_parked_children_are_suspended_without_waking_their_workers(self):
+        parent = {'state': 'running', 'chat_phase': 'idle', 'is_idle': False}
+        child = {'id': 'child', 'state': 'parked'}
+
+        def command(_a, args):
+            if args[2] == 'child' and args[0] != 'suspend':
+                self.fail('parked child has no worker for ' + args[0])
+            return {}
+
+        with (mock.patch.object(s, 'mj', side_effect=command) as mj,
+              mock.patch.object(s, 'mj_api', return_value={'subagents': [{'session': child}]}),
+              mock.patch.object(monitor, 'interrupt_turn') as interrupt,
+              mock.patch.object(a, '_session_status', side_effect=lambda identifier:
+                  {'state': 'stopped'} if identifier == 'child' else parent)):
+            self.assertTrue(s.stop_work(a, {'session_id': 'parent'}))
+        interrupt.assert_called_once_with('parent')
+        self.assertIn(mock.call(a, ['suspend', '--session', 'child',
+                                  '--acknowledge-unpublished-work', '--json']), mj.call_args_list)
+
     def test_children_are_cleaned_up_even_when_their_turns_already_ended(self):
         busy = {'state': 'running', 'chat_phase': 'idle', 'is_idle': False}
         child = dict(busy, id='child')
@@ -393,7 +412,7 @@ class StateTests(unittest.TestCase):
             self.conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal',terminal_status='merged',"
                               "ci_head_sha=?,integration_merge_commit_sha=? WHERE batch_id=?",
                               (HEAD_THREE, BASE_SHA, self.parent))
-        with (mock.patch.object(a, '_session_is_idle', return_value=False),
+        with (mock.patch.object(a, '_session_status', side_effect=AssertionError('no idle gate')),
               mock.patch.object(s, 'commit_tree') as tree):
             s.promote(a, self.conn, self.transport, self.row(), self.row(self.parent))
             tree.assert_not_called()
@@ -404,7 +423,7 @@ class StateTests(unittest.TestCase):
             current = service.state(self.conn, self.child)
             service.dispatch(self.conn, self.child, 'ready', {'revision': current['revision'], 'head': HEAD_TWO})
             a._consume_ready_candidate(self.conn, self.transport, self.row())
-        with (mock.patch.object(a, '_session_is_idle', side_effect=AssertionError('ACP is not a gate')),
+        with (mock.patch.object(a, '_session_status', side_effect=AssertionError('ACP is not a gate')),
               mock.patch.object(a, 'compare_commit_ancestry', return_value=True),
               mock.patch.object(s, 'commit_tree', return_value=TREE),
               mock.patch.object(a, 'current_master_sha', return_value=BASE_SHA),
@@ -423,7 +442,7 @@ class StateTests(unittest.TestCase):
         with self.conn:
             self.conn.execute("UPDATE automerge_batches SET phase='waiting_parent' WHERE batch_id=?", (self.child,))
         self.land_parent()
-        with (mock.patch.object(a, '_session_is_idle', return_value=True),
+        with (mock.patch.object(a, '_session_status', side_effect=AssertionError('no idle gate')),
               mock.patch.object(a, 'compare_commit_ancestry', return_value=True),
               mock.patch.object(a, 'current_master_sha', return_value=HEAD_ONE),
               mock.patch.object(s, 'commit_tree', side_effect=[TREE, HEAD_TWO, HEAD_TWO])):
@@ -441,7 +460,7 @@ class StateTests(unittest.TestCase):
               mock.patch.object(a, 'compare_commit_ancestry', return_value=True),
               mock.patch.object(s, 'commit_tree', return_value=TREE),
               mock.patch.object(a, 'current_master_sha', return_value=BASE_SHA),
-              mock.patch.object(a, '_session_is_idle', side_effect=AssertionError('do not wait for checks')),
+              mock.patch.object(a, '_session_status', side_effect=AssertionError('do not wait for checks')),
               mock.patch.object(s, 'stop_work', side_effect=AssertionError('keep running work')),
               mock.patch.object(a, 'process_batch') as process, mock.patch.object(s, 'promote') as promote):
             s.tick(a, self.conn, self.transport, self.row(self.parent))

@@ -1934,7 +1934,7 @@ def deliver_blocked_notice(
         "SELECT * FROM automerge_batches WHERE batch_id = ?", (batch_id,)
     ).fetchone()
     lane = "speculative " if batch is not None and speculation.is_speculative(batch) else ""
-    loud = reason in {
+    loud = reason.startswith('agent_turn_blocked-') or reason in {
         "github_write_retry", "verdict_status_failed",
         "source_ancestry_unverified", "baseline_unavailable", "ci_run_unavailable",
     }
@@ -3297,9 +3297,33 @@ You may include `mergemarshall:verdict: not-worse` and list baseline failures in
 """
 
 
+def _turn_outcome_id(row, turn):
+    return (f"turn-outcome-{row['session_id']}-{row['attempt_generation']}-"
+            f"{turn.turn_id if turn.turn_id is not None else turn.outcome}")
+
+
+def _turn_outcome_seen(conn, row, turn):
+    return conn.execute("SELECT 1 FROM automerge_skill_events WHERE batch_id=? AND event_id=?",
+                        (row['batch_id'], _turn_outcome_id(row, turn))).fetchone() is not None
+
+
+def _record_turn_outcome(conn, row, turn):
+    conn.execute("INSERT INTO automerge_skill_events VALUES (?,?,?,?,?)",
+                 (row['batch_id'], _turn_outcome_id(row, turn), 'turn_outcome',
+                  json.dumps({'turn_id': turn.turn_id, 'outcome': turn.outcome}), utc_now()))
+
+
 def queue_agent_prompt(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, Any],
-                       prompt: str, *, validation_impact: dict[str, Any] | None = None) -> None:
+                       prompt: str, *, validation_impact: dict[str, Any] | None = None,
+                       observed_turn: monitor.TurnResult | None = None) -> bool:
     with conn:
+        if observed_turn is not None:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                               (row["batch_id"],)).fetchone()
+            if ready_candidate(row) or _turn_outcome_seen(conn, row, observed_turn):
+                return False
+            _record_turn_outcome(conn, row, observed_turn)
         conn.execute("UPDATE automerge_batches SET phase='fixing', status='running', "
                      "pending_prompt=?, prompt_delivered=0, turn_started_at=NULL, ready_json='{}', "
                      "prompt_command_id=? WHERE batch_id=?",
@@ -3307,6 +3331,7 @@ def queue_agent_prompt(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, An
         if validation_impact is not None:
             conn.execute("UPDATE automerge_batches SET validation_impact_json=? WHERE batch_id=?",
                          (json.dumps(validation_impact), row["batch_id"]))
+    return True
 
 
 def deliver_pending_prompt(conn: sqlite3.Connection, transport: monitor.SlackTransport,
@@ -3417,25 +3442,52 @@ def _wait_agent_turn(conn: sqlite3.Connection, transport: monitor.SlackTransport
     if turn.timed_out:
         return False
     if turn.outcome in {"interrupted", "cancelled", "canceled"}:
+        if _turn_outcome_seen(conn, latest, turn):
+            return False
         # The agent may have published a rejection before interruption prevented
         # its final report. Honor that evidence before choosing retry membership.
         _record_trusted_rejection_markers(conn, row)
         row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                            (row["batch_id"],)).fetchone()
         _rebuild_or_finish(conn, transport, row, _active_sources(row),
-                           "the agent turn was interrupted; continue in the same live session")
+                           "the agent turn was interrupted; continue in the same live session",
+                           observed_turn=turn)
         return False
-    return turn.status == "completed" or turn.outcome == "finished"
+    if turn.outcome not in {"running", "timeout"}:
+        _queue_missing_handoff(conn, latest,
+                               f"the session wait reported {turn.outcome} without a handoff", observed_turn=turn)
+        current = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                               (row['batch_id'],)).fetchone()
+        if ready_candidate(current):
+            return False
+        if turn.outcome not in {"finished", "completed"}:
+            actions = {
+                "input_required": "Respond to the session's input request if the follow-up cannot resolve it.",
+                "quota_limit": "Restore provider capacity or quota to let the session continue.",
+                "stopped": "Resume the stopped session so it can consume the saved recovery instruction.",
+            }
+            notify_blocked_once(
+                conn, transport, str(row['batch_id']), 'agent_turn_blocked-' + turn.outcome,
+                f"The merge agent reported {turn.outcome} before handing back a candidate. "
+                f"A recovery instruction is saved for session {session_id}. "
+                + actions.get(turn.outcome, "Inspect the session error if automatic continuation fails."),
+            )
+    return False
 
 
-def _session_is_idle(row: sqlite3.Row | dict[str, Any]) -> bool:
-    """Observe the worker without changing its lifecycle or interrupting a turn."""
-    session_id = str(row["session_id"] or "")
-    session = _session_status(session_id)
-    return (
-        (monitor.session_is_stopped(session) or session.get("is_idle") is True)
-        and not monitor.active_mj_turn(session)
-    )
+def _queue_missing_handoff(conn, row, reason, *, observed_turn=None):
+    prefix = "The supervisor has no valid candidate handoff because "
+    prompt = f"""{prefix}{reason}.
+Continue in this same checkout. Read mm-db state and reconcile your progress note, HEAD, pending edits and running checks. Preserve useful work and reuse applicable execution evidence; a missing handoff alone does not require rebuilding or rerunning checks.
+Complete the current supervisor instruction and resolve any remaining validation or publication problem. Record a fresh passing local assessment for the current committed HEAD and source revision. Checkpoint the candidate with mm-db candidate, then hand it back through mm-db ready while it has predecessor metadata, or mm-autopr otherwise. If it was already published, reconcile that same PR through mm-autopr. Do not merge. If blocked, explain the concrete blocker and required next action.
+"""
+    previous = str(row['pending_prompt'] or '')
+    if previous and row['phase'] == 'fixing':
+        if previous.startswith(prefix):
+            prompt = f"{prefix}{reason}.\n" + previous.partition('\n')[2]
+        else:
+            prompt += "\nCurrent supervisor instruction to finish:\n" + previous
+    return queue_agent_prompt(conn, row, prompt, observed_turn=observed_turn)
 
 
 def ready_candidate(row):
@@ -4054,9 +4106,10 @@ def _agent_turn_finished(conn: sqlite3.Connection, transport: monitor.SlackTrans
 def _poll_ci(conn: sqlite3.Connection, transport: monitor.SlackTransport,
              row: sqlite3.Row | dict[str, Any]) -> None:
     receipt = ready_candidate(row)
-    if not receipt and not _session_is_idle(row):
-        return
     number, head, base_ref = _integration_head(row)
+    if not receipt:
+        _queue_missing_handoff(conn, row, "the CI-wait phase has a missing or stale receipt")
+        return
     master = current_master_sha()
     if str(row["base_sha"]).lower() != master or base_ref != master:
         _queue_master_update(conn, transport, row, master, head)
@@ -4254,8 +4307,8 @@ def _end_empty_batch(conn, transport, row, reason) -> None:
     _complete_abort(conn, transport, latest)
 
 
-def _rebuild_or_finish(conn, transport, row, pulls, reason) -> None:
-    if not _request_rebuild(conn, row, pulls, reason):
+def _rebuild_or_finish(conn, transport, row, pulls, reason, *, observed_turn=None) -> None:
+    if not _request_rebuild(conn, row, pulls, reason, observed_turn=observed_turn):
         latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                               (row["batch_id"],)).fetchone()
         _end_empty_batch(conn, transport, latest, "No source PRs remain: " + reason)
@@ -4284,7 +4337,7 @@ def _append_removed(conn: sqlite3.Connection, batch_id: str, removed: list[str],
 
 def _request_rebuild(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, Any],
                      pulls: list[PullRequest], reason: str, *,
-                     only_if_expanded: bool = False) -> bool:
+                     only_if_expanded: bool = False, observed_turn=None) -> bool:
     row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                        (row["batch_id"],)).fetchone()
     excluded = {entry["number"] for entry in _excluded_source_heads(row)}
@@ -4371,6 +4424,10 @@ Do not merge the integration PR. Reason for rebuild: {reason}.
         conn.execute("BEGIN IMMEDIATE")
         current = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                                (row["batch_id"],)).fetchone()
+        if observed_turn is not None:
+            if ready_candidate(current) or _turn_outcome_seen(conn, current, observed_turn):
+                return True
+            _record_turn_outcome(conn, current, observed_turn)
         if any(current[name] != row[name] for name in (
             "base_sha", "pull_requests_json", "active_pull_requests_json", "excluded_source_heads_json",
         )):
@@ -4547,8 +4604,6 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
     if speculation.get(row, "predecessor_id"):
         raise AutomergeError("speculative batch cannot land before promotion", reason="predecessor_pending")
     receipt = ready_candidate(row)
-    if not receipt and not _session_is_idle(row):
-        return
     number = int(row["integration_pr_number"])
     retry_pending = _github_write_retry_pending(row)
     try:
@@ -4572,6 +4627,9 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
     if str(view.get("state", "")).lower() != "open" or bool(view.get("isDraft")) or view.get("baseRefName") != BASE_BRANCH:
         _terminal(conn, transport, row, "integration_pr_not_mergeable",
                   "The integration PR is no longer open, ready, and based on master.")
+        return
+    if not receipt:
+        _queue_missing_handoff(conn, row, "the merge phase has a missing or stale receipt")
         return
     mode = _batch_ci_mode(row)
     if receipt and (receipt["head"] != tested or head != receipt["head"]):
