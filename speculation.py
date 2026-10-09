@@ -14,6 +14,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from urllib.parse import quote
+import read_budget
 
 
 def get(row, name, default=None):
@@ -140,7 +141,8 @@ def selection(a, conn, parent):
     occupied = reserved(a, conn)
     nodes = {n: replace(node, ready=False) if n in occupied else node for n, node in actual.nodes.items()}
     graph = a.pr_dependencies.Graph(nodes, actual.histories, checkpoint["head"],
-        a.compare_commit_ancestry, conn=conn, base_branch=a.BASE_BRANCH).discover()
+        a.compare_commit_ancestry, conn=conn, base_branch=a.BASE_BRANCH,
+        persist_comparisons=True).discover()
     return [a.dependency_pull(graph, n) for n in graph.select() if n not in occupied]
 
 
@@ -202,7 +204,7 @@ def mj_api(a, endpoint):
     token = Path(info["token_path"]).read_text().strip()
     request = urllib.request.Request(info["base_url"].rstrip("/") + endpoint,
                                      headers={"Authorization": "Bearer " + token})
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(request, timeout=read_budget.timeout(30)) as response:
         return json.load(response)
 
 
@@ -216,7 +218,7 @@ def require_recovery_controls(a):
         info['base_url'].rstrip('/') + '/sessions/mm-capability-probe/queued-prompts/clear',
         headers={'Authorization': 'Bearer ' + token}, method='OPTIONS')
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=read_budget.timeout(10)) as response:
             supported = 'POST' in response.headers.get('Allow', '')
     except urllib.error.HTTPError as exc:
         supported = exc.code == 405 and 'POST' in exc.headers.get('Allow', '')
@@ -234,7 +236,7 @@ def command_outcome(a, session, command_id, cursor=0):
         headers={'Authorization': 'Bearer ' + token})
     deadline = time.monotonic() + 2
     try:
-        with urllib.request.urlopen(request, timeout=2) as response:
+        with urllib.request.urlopen(request, timeout=read_budget.timeout(2)) as response:
             while time.monotonic() < deadline:
                 line = response.readline(8 * 1024 * 1024)
                 if not line:
@@ -517,18 +519,18 @@ def _mode(a, row):
     return a._batch_ci_mode(row)
 
 
-def tick(a, conn, transport, parent):
-    launch_child(a, conn, parent)
-    row = child(conn, parent["batch_id"])
-    if row is None:
-        return
+def reconcile(a, conn, transport, row, *, priority_pulls=None):
+    """One durable relationship transition; never select or observe a successor."""
+    parent = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                          (row['predecessor_id'],)).fetchone()
+    if parent is None:
+        invalidate(a, conn, row)
+        return True
     if not a._active_sources(row):
-        a.process_batch(conn, transport, row["batch_id"])
-        return
-    parent = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (parent["batch_id"],)).fetchone()
+        return True
     if parent["phase"] == "aborting" or (parent["terminal_status"] and parent["terminal_status"] != "merged"):
         a.abort_batch_locked(conn, transport, row, "predecessor batch aborted or failed")
-        return
+        return False
     if not parent_current(a, conn, row):
         invalidate(a, conn, row)
         row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (row["batch_id"],)).fetchone()
@@ -542,23 +544,40 @@ def tick(a, conn, transport, parent):
                              (json.dumps(recovery), row['batch_id']))
             row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
     if parent["terminal_status"] == "merged":
-        if not a._batch_priority(row) and any(p.priority for p in a.select_eligible_pull_requests(conn=conn)):
+        pulls = a.select_eligible_pull_requests(conn=conn) if priority_pulls is None else priority_pulls
+        if not a._batch_priority(row) and any(p.priority for p in pulls):
             a.abort_batch_locked(conn, transport, row, 'ready priority work takes precedence over ordinary lookahead')
-            return
+            return False
         if not get(row, 'role_promoted', 0):
             promote_role(a, conn, row, parent)
-        # Refill lookahead before observing B: a running check need not finish
-        # for its already checkpointed tree to become C's base.
+    return True
+
+
+def tick(a, conn, transport, parent):
+    """Compatibility entry point; production schedules these actions separately."""
+    # A fixed worklist replaces recursive promotion/selection/observation.
+    for _ in range(2):
+        launch_child(a, conn, parent)
+        row = child(conn, parent['batch_id'])
+        if row is None:
+            return
+        if not reconcile(a, conn, transport, row):
+            return
         row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
-        launch_child(a, conn, row)
-        a.process_batch(conn, transport, row['batch_id'])
+        if row['status'] == 'completed':
+            return
+        if row['phase'] != 'waiting_parent' or get(row, 'role_promoted', 0) or not a._active_sources(row):
+            a.process_batch(conn, transport, row['batch_id'])
+        else:
+            recheck_waiting(a, conn, transport, row)
         row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
-        tick(a, conn, transport, row)
-    elif row["phase"] in {'resetting', 'restarting'}:
-        recover(a, conn, row)
-    elif row["phase"] != "waiting_parent":
-        a.process_batch(conn, transport, row["batch_id"])
-    else:
+        if not get(row, 'role_promoted', 0):
+            return
+        parent = row
+
+
+def recheck_waiting(a, conn, transport, row):
+    if row['phase'] == 'waiting_parent':
         keep, removed = a._recheck_sources(a._active_sources(row), conn=conn, batch_id=row['batch_id'])
         if removed:
             a._append_removed(conn, row['batch_id'], removed)

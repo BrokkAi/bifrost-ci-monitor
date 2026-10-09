@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import local_findings
+import read_budget
 
 
 REPO_NAME = "BrokkAi/bifrost-dev"
@@ -252,11 +253,13 @@ def run_gh(args: list[str], *, timeout: int = 60) -> str:
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                timeout=timeout,
+                timeout=read_budget.timeout(timeout),
                 check=False,
                 env=env,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
+            if isinstance(exc, subprocess.TimeoutExpired) and read_budget.expired():
+                raise read_budget.Deferred('GitHub command will continue next tick') from exc
             raise CommandError(f"gh {' '.join(args[:3])} failed: {exc}") from exc
 
     result = invoke(token)
@@ -291,10 +294,12 @@ def run_command(args: list[str], *, cwd: Path | None = None, timeout: int = 60) 
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=timeout,
+            timeout=read_budget.timeout(timeout),
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
+        if isinstance(exc, subprocess.TimeoutExpired) and read_budget.expired():
+            raise read_budget.Deferred('command will continue next tick') from exc
         raise CommandError(f"{args[0]} failed to run: {exc}") from exc
     if result.returncode != 0:
         output = result.stdout.strip()
@@ -313,10 +318,12 @@ def mj_command(args: list[str], *, timeout: int = 60) -> subprocess.CompletedPro
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout,
+            timeout=read_budget.timeout(timeout),
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
+        if isinstance(exc, subprocess.TimeoutExpired) and read_budget.expired():
+            raise read_budget.Deferred('Mjolnir command will continue next tick') from exc
         message = f"{MJ_BIN} {' '.join(args[:2])} failed to run: {exc}"
         raise MjError(message, reason="mj_missing" if isinstance(exc, FileNotFoundError) else "daemon_unreachable") from exc
 
@@ -1410,7 +1417,7 @@ def post_slack(webhook: str, text: str) -> bool:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=SLACK_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=read_budget.timeout(SLACK_TIMEOUT_SECONDS)) as response:
             body = response.read(256).decode("utf-8", errors="replace").strip()
             if response.status != 200 or body != "ok":
                 log(f"Slack returned HTTP {response.status}: {body!r}")
@@ -1541,7 +1548,7 @@ def slack_chat_post(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=SLACK_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=read_budget.timeout(SLACK_TIMEOUT_SECONDS)) as response:
             data = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
     except (OSError, urllib.error.URLError, ValueError) as exc:
         log(f"Slack chat.postMessage failed: {exc}")
@@ -2774,7 +2781,7 @@ def send_session_message(session_id: str, text: str, *, request_id: str) -> dict
             headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=read_budget.timeout(30)) as response:
             receipt = json.load(response)
         if (not isinstance(receipt, dict) or receipt.get("session_id") != session_id
                 or receipt.get("via") not in {"mailbox", "turn"}):
@@ -2785,6 +2792,8 @@ def send_session_message(session_id: str, text: str, *, request_id: str) -> dict
         # an HTTP body or request/header dump while reporting delivery errors.
         raise MjError(f"mj message request refused (HTTP {exc.code})", reason="mj_supervision_failed") from None
     except (OSError, urllib.error.URLError):
+        if read_budget.expired():
+            raise read_budget.Deferred('Mjolnir message will continue next tick') from None
         raise MjError("mj message API is unavailable", reason="daemon_unreachable") from None
     except (ValueError, KeyError, TypeError):
         raise MjError("mj message API returned an invalid receipt", reason="mj_supervision_failed") from None

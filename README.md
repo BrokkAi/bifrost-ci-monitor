@@ -150,6 +150,22 @@ shows local jobs without polling GitHub/Mjolnir; it can initialize/migrate
 local schema. `monitor.py --check` checks current CI and prerequisites without
 starting a repair, but can initialize state and send a blocked notice.
 
+For an active merger, `--check` includes pending supervisor actions, retry times,
+and their last errors. The supervisor advances ready primary work before selecting
+or observing a successor. It delivers promotion instructions in the same poll;
+agent idleness is not a completion gate. Queue reads yield within the poll budget
+and resume from saved ancestry comparisons on later polls.
+
+Cold ancestry fetches run separately from the supervisor, under the merger state
+directory in `ancestry-*/objects.git`; `fetch.json` identifies the current request
+and its matching JSON receipt reports success. This cache contains full commit
+history without a working tree and never changes a batch checkout. A pending
+fetch is normal; a failed fetch can fall back to GitHub for unavailable historical
+commits. Do not substitute a shallow clone. When no batch or eligible work remains,
+the last primary Slack thread receives an open-PR summary grouped by draft,
+rejection, and dependency state. Unchanged summaries are quiet; webhook transport
+does not provide these threaded summaries.
+
 ## Monitor and intervene
 
 Inspect the batch's Slack thread and integration PR for source PRs, the tested

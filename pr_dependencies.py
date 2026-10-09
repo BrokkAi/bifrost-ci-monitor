@@ -27,11 +27,55 @@ def ensure_schema(conn):
     )""")
 
 
+def cached_ancestor(conn, ancestor, a, b, *, persist=False):
+    """Immutable pairs survive interrupted discovery; exceptions never become facts."""
+    if a == b:
+        return True
+    pair = (a, b)
+    cached = conn.execute(
+        'SELECT present FROM automerge_commit_ancestry WHERE ancestor=? AND descendant=?',
+        pair).fetchone() if has_table(conn, 'automerge_commit_ancestry') else None
+    if cached is not None:
+        return bool(cached[0])
+    value = ancestor(a, b)
+    if persist and conn is not None:
+        # Graph discovery runs outside membership/publication transactions.
+        # Do not commit a caller's unrelated changes to save a comparison.
+        if conn.in_transaction:
+            raise RuntimeError('ancestry discovery must run outside a state transaction')
+        with conn:
+            conn.execute('INSERT OR IGNORE INTO automerge_commit_ancestry '
+                         '(ancestor,descendant,present) VALUES (?,?,?)', (*pair, int(value)))
+    return value
+
+
 def inventory(conn):
     if not has_table(conn, 'automerge_pr_inventory'):
         return {}
     return {row['number']: (json.loads(row['data_json']), json.loads(row['head_history_json']))
             for row in conn.execute('SELECT * FROM automerge_pr_inventory')}
+
+
+def save_observation(conn, number, head, data, history, ready):
+    data = {key: value for key, value in data.items() if not key.startswith('_mm_')}
+    with conn:
+        conn.execute('INSERT INTO automerge_pr_inventory '
+                     '(number,head_sha,data_json,head_history_json) VALUES (?,?,?,?) '
+                     'ON CONFLICT(number) DO UPDATE SET head_sha=excluded.head_sha,'
+                     'data_json=excluded.data_json,head_history_json=excluded.head_history_json,'
+                     'blocked_reason=CASE WHEN automerge_pr_inventory.head_sha=excluded.head_sha '
+                     'AND ? THEN automerge_pr_inventory.blocked_reason ELSE NULL END '
+                     'WHERE automerge_pr_inventory.head_sha<>excluded.head_sha '
+                     'OR automerge_pr_inventory.data_json<>excluded.data_json '
+                     'OR automerge_pr_inventory.head_history_json<>excluded.head_history_json '
+                     'OR (NOT ? AND automerge_pr_inventory.blocked_reason IS NOT NULL)',
+                     (number, head, json.dumps(data), json.dumps(history), ready, ready))
+
+
+def save_observations(conn, nodes, histories):
+    """Checkpoint the listing even when later ancestry discovery has to yield."""
+    for number, node in nodes.items():
+        save_observation(conn, number, node.head, node.data, histories[number], node.ready)
 
 
 @dataclass(frozen=True)
@@ -60,14 +104,19 @@ class Node:
 class Graph:
     def __init__(self, nodes: dict[int, Node], histories: dict[int, list[str]],
                  master: str, ancestor: Callable[[str, str], bool], *, conn=None,
-                 base_branch='master'):
+                 base_branch='master', persist_comparisons=False):
         self.nodes = nodes
         self.histories = histories
         self.master = master
         self._ancestor = ancestor
         self.conn = conn
         self.base_branch = base_branch
+        self.persist_comparisons = persist_comparisons
         self._comparisons = {}
+        self._known_landed = set()
+        if has_table(conn, 'automerge_commit_ancestry'):
+            self._known_landed.update(row[0] for row in conn.execute(
+                'SELECT ancestor FROM automerge_commit_ancestry WHERE descendant=? AND present=1', (master,)))
         self.dependencies: dict[int, tuple[Dependency, ...]] = {}
         self.problems: dict[int, str] = {}
         self.blocked: dict[int, str] = {}
@@ -83,23 +132,34 @@ class Graph:
             return True
         pair = (a, b)
         if pair not in self._comparisons:
-            cached = self.conn.execute(
-                'SELECT present FROM automerge_commit_ancestry WHERE ancestor=? AND descendant=?',
-                pair).fetchone() if has_table(self.conn, 'automerge_commit_ancestry') else None
-            value = bool(cached[0]) if cached is not None else self._ancestor(a, b)
+            value = cached_ancestor(self.conn, self._ancestor, a, b,
+                                    persist=self.persist_comparisons)
             self._comparisons[pair] = value
         return self._comparisons[pair]
 
     def landed(self, head):
         return self.ancestor(head, self.master)
 
-    def discover(self):
+    def discover(self, roots=None):
+        """Only inspect requested sources and their closure during a batch recheck.
+
+        Hidden inheritance still considers every observed historical head. Pair
+        receipts make unchanged heads incremental, independent of mutable master.
+        """
         branches = {}
         for node in self.nodes.values():
             branches.setdefault((node.repo.casefold(), node.branch), []).append(node.number)
-        for number, node in self.nodes.items():
+        pending = list(self.nodes if roots is None else roots)
+        examined = set()
+        while pending:
+            number = pending.pop()
+            if number in examined or number not in self.nodes:
+                continue
+            examined.add(number)
+            node = self.nodes[number]
             if str(node.data.get('state')).lower() != 'open':
                 self.dependencies[number] = tuple(self.captured.get((number, node.head), ()))
+                pending.extend(d.number for d in self.dependencies[number])
                 continue
             related: dict[int, str] = {}
             # Retargeting must not erase an accepted relationship. Carry a prior
@@ -124,7 +184,11 @@ class Graph:
                 if parent == number:
                     continue
                 for head in self.histories.get(parent, [prior.head]):
-                    if self.landed(head) or not self.ancestor(head, node.head):
+                    if head == self.master or head in self._known_landed or self._comparisons.get((head, self.master)):
+                        continue
+                    # Most pairs are unrelated. Check their immutable relation
+                    # before comparing a historical head to a moving master.
+                    if not self.ancestor(head, node.head) or self.landed(head):
                         continue
                     if head == node.head:
                         self.problems[number] = f'ambiguous shared head with PR #{parent}'
@@ -142,6 +206,7 @@ class Graph:
                     self.problems[number] = f'PR #{parent} changed; its current head is absent from this PR'
                 deps.append(Dependency(parent, required))
             self.dependencies[number] = tuple(deps)
+            pending.extend(d.number for d in deps)
         # Explicit relationships can be cyclic even before ancestry is valid.
         visited = set()
         def visit(number, path):
@@ -157,7 +222,7 @@ class Graph:
                 if not self.landed(dep.head_sha):
                     visit(dep.number, path + [number])
             visited.add(number)
-        for number in self.nodes:
+        for number in self.dependencies:
             visit(number, [])
         return self
 
@@ -202,7 +267,7 @@ class Graph:
         return True
 
     def select(self, *, priority=True):
-        ready = [n for n in sorted(self.nodes) if self.nodes[n].ready
+        ready = [n for n in sorted(self.dependencies) if self.nodes[n].ready
                  and not self.landed(self.nodes[n].head) and self.eligible(n)]
         seeds = [n for n in ready if self.nodes[n].priority] if priority else []
         seeds = seeds or ready

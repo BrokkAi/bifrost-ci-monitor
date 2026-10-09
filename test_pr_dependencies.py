@@ -12,6 +12,8 @@ import mm_service
 import monitor
 import pr_dependencies
 import speculation
+import git_ancestry
+import time
 
 
 class DependencyTests(TestCase):
@@ -129,6 +131,107 @@ class DependencyTests(TestCase):
         self.assertEqual([p.number for p in selected], [30, 20, 10, 40])
         self.assertEqual({d.number for d in selected[2].dependencies}, {20, 30})
         self.assertEqual(self.writes, [])
+
+    def test_unchanged_discovery_reuses_every_pair_and_new_heads_only_add_missing_pairs(self):
+        self.selected()
+        with mock.patch.object(automerge, 'compare_commit_ancestry', side_effect=self.ancestor) as compare:
+            self.selected()
+        compare.assert_not_called()
+        added = self.add_pr(50, 'new', self.base)
+        with mock.patch.object(automerge, 'compare_commit_ancestry', side_effect=self.ancestor) as compare:
+            self.selected()
+        self.assertTrue(compare.called)
+        self.assertTrue(all(added in call.args for call in compare.call_args_list))
+
+    def test_source_recheck_discovers_only_its_dependency_closure(self):
+        graph = automerge.dependency_graph(self.conn, roots=[20])
+        self.assertEqual(set(graph.dependencies), {20, 30})
+        self.assertNotIn(10, graph.dependencies)
+        self.assertNotIn(40, graph.dependencies)
+
+    def test_priority_discovery_omits_unrelated_ready_prs(self):
+        self.items[20]['labels'] = [{'name': 'mergemarshall:immediate'}]
+        selected = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True)
+        self.assertEqual([p.number for p in selected], [30, 20])
+
+    def test_successful_pairs_survive_an_interrupted_discovery(self):
+        graph = pr_dependencies.Graph({}, {}, self.base, self.ancestor, conn=self.conn,
+                                      persist_comparisons=True)
+        self.assertTrue(graph.ancestor(self.base, self.x))
+        self.assertFalse(graph.ancestor(self.w, self.x))
+        with mock.patch.object(graph, '_ancestor', side_effect=git_ancestry.Deferred('fetch pending')):
+            with self.assertRaises(git_ancestry.Deferred):
+                graph.ancestor(self.z, self.x)
+        self.restart()
+        graph = pr_dependencies.Graph({}, {}, self.base, mock.Mock(side_effect=AssertionError('cached')),
+                                      conn=self.conn, persist_comparisons=True)
+        self.assertTrue(graph.ancestor(self.base, self.x))
+        self.assertFalse(graph.ancestor(self.w, self.x))
+        self.assertIsNone(self.conn.execute('SELECT present FROM automerge_commit_ancestry '
+                                            'WHERE ancestor=? AND descendant=?', (self.z, self.x)).fetchone())
+
+    def test_interrupted_closed_pr_refresh_resumes_after_saved_observations(self):
+        self.selected()
+        self.items[10]['state'] = self.items[20]['state'] = 'closed'
+        def read(args, **kwargs):
+            if args[-1].endswith('/20'):
+                raise git_ancestry.Deferred('read budget exhausted')
+            return self.read(args, **kwargs)
+        with mock.patch.object(automerge, 'gh_json', side_effect=read):
+            with self.assertRaises(git_ancestry.Deferred):
+                self.selected()
+        saved = pr_dependencies.inventory(self.conn)
+        self.assertEqual(saved[10][0]['state'], 'closed')
+        self.assertEqual(saved[20][0]['state'], 'open')
+        with mock.patch.object(automerge, 'gh_json', side_effect=self.read) as reads:
+            self.selected()
+        self.assertFalse(any(call.args[0][-1].endswith('/10') for call in reads.call_args_list))
+
+    def test_pinned_production_rechecks_persist_pairs_without_changing_inventory(self):
+        selected = self.selected()
+        inventory = self.conn.execute('SELECT * FROM automerge_pr_inventory ORDER BY number').fetchall()
+        count = self.conn.execute('SELECT count(*) FROM automerge_commit_ancestry').fetchone()[0]
+        self.git('checkout', '-qb', 'candidate', self.x)
+        candidate = self.commit('candidate', 'candidate')
+        automerge.check_source_dependencies(selected, self.conn, master=candidate)
+        self.assertGreater(self.conn.execute('SELECT count(*) FROM automerge_commit_ancestry').fetchone()[0], count)
+        self.assertEqual([tuple(r) for r in inventory], [tuple(r) for r in self.conn.execute(
+            'SELECT * FROM automerge_pr_inventory ORDER BY number')])
+
+    def test_local_cache_matches_real_git_without_github_or_blobs(self):
+        cache = git_ancestry.Cache(self.root / 'ancestry', str(self.repo), lambda: None)
+        self.assertFalse(cache.prepare([self.x, self.y, self.w]))
+        deadline = time.monotonic() + 5
+        while cache.missing([self.x, self.y, self.w]) and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertFalse(cache.missing([self.x, self.y, self.w]))
+        self.assertTrue(cache.wait_for_fetch(5))
+        cache.worker.wait(timeout=5)
+        fallback = mock.Mock(side_effect=AssertionError('unexpected GitHub comparison'))
+        self.assertTrue(cache.ancestor(self.x, self.y, fallback))
+        self.assertFalse(cache.ancestor(self.w, self.y, fallback))
+        self.assertTrue(cache.ancestor(self.base, self.y, fallback))
+        self.assertFalse((cache.git_dir / 'shallow').exists())
+        (cache.git_dir / 'shallow').write_text(self.base + '\n')
+        with self.assertRaises(RuntimeError):
+            cache.ancestor(self.w, self.y, fallback)
+
+    def test_pending_fetch_is_a_deferral_and_failed_fetch_uses_authoritative_fallback(self):
+        cache = git_ancestry.Cache(self.root / 'ancestry', 'owner/repo', lambda: 'private-test-token')
+        with mock.patch.object(git_ancestry, 'launch_worker') as spawn:
+            self.assertFalse(cache.prepare([self.x, self.y]))
+        job = json.loads((cache.directory / 'fetch.json').read_text())
+        request = cache.directory / (job['id'] + '.request.json')
+        self.assertNotIn('private-test-token', request.read_text())
+        self.assertNotIn('private-test-token', (cache.git_dir / 'config').read_text())
+        self.assertNotIn('private-test-token', str(spawn.call_args.args[0]))
+        fallback = mock.Mock(return_value=False)
+        with self.assertRaises(git_ancestry.Deferred):
+            cache.ancestor(self.x, self.y, fallback)
+        fallback.assert_not_called()
+        git_ancestry.atomic_json(cache.directory / (job['id'] + '.json'), {'ok': False})
+        self.assertFalse(cache.ancestor(self.x, self.y, fallback))
+        fallback.assert_called_once_with(self.x, self.y)
 
     def test_changed_dependency_notice_links_prs_and_names_author_action_without_internal_ids(self):
         self.selected()  # Capture the dependency before its prerequisite changes.

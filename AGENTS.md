@@ -51,6 +51,12 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   live-session supervision, local/CI gates, exact-head status and merge writes.
 - `speculation.py`: one-batch lookahead, candidate checkpoints, same-session
   recovery and ordered promotion, shared by sync and async.
+- `supervisor.py`: durable action intents, ordered batch advancement, bounded
+  observation, independent maintenance, and threaded idle queue summaries.
+- `git_ancestry.py`: full commit-history object cache and asynchronous fetch
+  receipts; workers fetch objects but never decide scheduling or mutate batches.
+- `read_budget.py`: invocation-scoped deadlines for shared commands and HTTP reads;
+  other supervisors retain their normal timeouts.
 - `mm_service.py`: batch-scoped HTTP interface over shared state; it records
   test assessments/exclusions and reconciles integration-PR publication.
 - `local_findings.py`: durable local baseline/flaky observations consumed by
@@ -133,6 +139,31 @@ It also holds dependency promotion requests. `automerge_pr_inventory` retains
 observed branch identities and head history, `automerge_pr_dependencies` retains
 relationships for each exact dependent head, and `automerge_commit_ancestry`
 caches only successful comparisons of immutable commit pairs.
+Each production comparison is committed immediately, including negative results
+and pinned speculative views; exceptions and incomplete fetches are never facts.
+Discovery reuses those pairs for unchanged heads and checks new historical heads
+against existing dependents. Batch rechecks discover only their source closure;
+priority checks discover only the priority closure. Retain hidden inherited and
+rejected-head checks. Production ancestry uses a separate bare Git object cache
+under the merger state directory, with full commit history and filtered blobs.
+Missing history starts a fetch worker and leaves the action pending; unavailable
+historical objects use GitHub's comparison API. Reject shallow history. Workers
+receive App authentication only in their environment and write sanitized receipts.
+Operator `--check` remains read-only and does not warm or write this cache.
+
+`automerge_supervisor_actions` records intents bound to current batch inputs.
+Recompute actions after each transition and obsolete changed inputs; batch phases,
+readiness, and the existing landing gates remain authoritative. Recovery and
+pending guidance precede priority checking; eligible immediate work still fences
+landing. Advance the primary before selecting/observing its successor. Promote
+and deliver its next instruction in the same tick. Observation uses short slices
+within the poll budget, with no agent work deadline or idleness gate. Deferred
+reads retain their action without an error alert; other independent actions may
+proceed. Repeated observations are new polls of the same action, not repeated
+message writes. Maintenance and notification retries follow batch advancement.
+An empty eligible queue with no active batch posts a categorized open-PR summary
+in the last primary thread (or a new idle thread); checkpoint accepted replies in
+`automerge_queue_summaries` and suppress unchanged snapshots. This needs Slack chat.
 The merger agent records intents with `mm-db` and publishes through `mm-autopr`;
 it must not make direct `gh` writes. The supervisor retries outbox delivery after
 ambiguous or failed responses. Queue selection honors recorded exact-head

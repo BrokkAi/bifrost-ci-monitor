@@ -27,6 +27,9 @@ from urllib.parse import quote
 import monitor
 import pr_dependencies
 import speculation
+import git_ancestry
+import supervisor
+import read_budget
 import execution_evidence
 
 
@@ -69,6 +72,9 @@ READY_POLICY = "non-draft"  # Change to "approved" to require an APPROVED review
 CI_MODE = "async"  # Bifrost default; supported values are "async" and "sync".
 SPECULATIVE_LOOKAHEAD = os.environ.get("BIFROST_CI_SPECULATIVE_LOOKAHEAD", "1") == "1"
 OBSERVATION_DEADLINE: float | None = None
+ANCESTRY_CACHE = None
+ANCESTRY_CONNECTION = None
+SUPERVISOR_RUNNING = False
 REJECTION_MARKER = re.compile(
     r"(?m)^(?:mergemarshall:rejected-head|automerge-rejected-head):\s*([0-9a-f]{40})\s*$", re.IGNORECASE
 )
@@ -275,10 +281,19 @@ def log(message: str) -> None:
 
 def run_gh(args: list[str], *, timeout: int = 60) -> str:
     """Use the same host-side app-token runner as the CI monitor."""
+    if SUPERVISOR_RUNNING and OBSERVATION_DEADLINE is not None:
+        remaining = OBSERVATION_DEADLINE - time.monotonic()
+        if remaining < 1:
+            raise git_ancestry.Deferred('supervisor read budget exhausted')
+        timeout = min(timeout, max(1, int(remaining)))
     try:
         return monitor.run_gh(args, timeout=timeout)
     except monitor.GitHubAuthError as exc:
         raise AutomergeError(str(exc), reason=exc.reason) from exc
+    except monitor.CommandError:
+        if SUPERVISOR_RUNNING and OBSERVATION_DEADLINE is not None and time.monotonic() >= OBSERVATION_DEADLINE - 1:
+            raise git_ancestry.Deferred('GitHub read will continue next tick')
+        raise
 
 
 def github_app_token() -> str | None:
@@ -770,18 +785,37 @@ def _dependency_node(item, *, conn=None, dry_run=False):
         _queue_ready(item, conn=conn, dry_run=dry_run), priority, immediate)
 
 
-def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True):
+def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roots=None,
+                     persist_comparisons=None, priority_only=False):
     """Refresh open heads and durable prerequisites, then verify their ancestry."""
+    if conn is not None and (not dry_run or persist_comparisons):
+        with conn:
+            pr_dependencies.ensure_schema(conn)
     cached = pr_dependencies.inventory(conn)
     items = {int(p['number']): p for p in list_open_pull_requests() if not _is_integration_pull(p)}
     histories = {number: history for number, (_, history) in cached.items()}
+
+    def remember(item):
+        number = int(item['number'])
+        head = str((item.get('head') or {}).get('sha') or item.get('headRefOid') or '').lower()
+        if not re.fullmatch(r'[0-9a-f]{40}', head):
+            raise AutomergeError(f'invalid observed head for PR #{number}', reason='github_invalid_response')
+        histories[number] = list(dict.fromkeys(histories.get(number, []) + [head]))
+        if conn is not None and not dry_run:
+            ready = str(item.get('state')).lower() == 'open' and not item.get('draft', item.get('isDraft', False))
+            pr_dependencies.save_observation(conn, number, head, item, histories[number], ready)
+
+    for item in items.values():
+        remember(item)
     required = set()
     if pr_dependencies.has_table(conn, 'automerge_pr_dependencies'):
-        required.update(row[0] for row in conn.execute('SELECT DISTINCT prerequisite_number FROM automerge_pr_dependencies'))
+        required.update(row[0] for row in conn.execute('SELECT DISTINCT prerequisite_number '
+                                                       'FROM automerge_pr_dependencies') if row[0] not in cached)
     if pr_dependencies.has_table(conn, 'automerge_github_outbox'):
         for row in conn.execute("SELECT number,head_sha FROM automerge_github_outbox "
                                 "WHERE kind='reject_head' AND cancelled_at IS NULL"):
-            required.add(row['number'])
+            if row['number'] not in cached:
+                required.add(row['number'])
             histories.setdefault(row['number'], []).append(row['head_sha'])
     for number, (item, _) in cached.items():
         if _is_integration_pull(item):
@@ -793,8 +827,11 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True):
     for number in sorted(required):
         if number not in items or (number in cached and items[number] is cached[number][0]):
             items[number] = gh_json(['api', f'repos/{REPO_NAME}/pulls/{number}'])
+            remember(items[number])
     nodes = {number: _dependency_node(item, conn=conn, dry_run=dry_run) for number, item in items.items()
              if not _is_integration_pull(item)}
+    if priority_only:
+        roots = [number for number, node in nodes.items() if node.priority]
     # A non-master base may point to a closed PR never observed by this host.
     searched = set()
     unresolved = list(nodes.values())
@@ -812,6 +849,7 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True):
         for item in _paginated_objects(result, context='prerequisite branch lookup'):
             if _is_integration_pull(item):
                 continue
+            remember(item)
             prior = _dependency_node(item, conn=conn, dry_run=dry_run)
             if prior.number not in nodes:
                 unresolved.append(prior)
@@ -820,14 +858,25 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True):
         rejected = node.data.get('_mm_rejection')
         heads = [node.head] + ([rejected['head_sha']] if rejected else [])
         histories[number] = list(dict.fromkeys(histories.get(number, []) + heads))
-    graph = pr_dependencies.Graph(nodes, histories, master or current_master_sha(), compare_commit_ancestry,
-                                  conn=conn, base_branch=BASE_BRANCH).discover()
+    if conn is not None and not dry_run:
+        pr_dependencies.save_observations(conn, nodes, histories)
+    actual_base = master or current_master_sha()
+    if SUPERVISOR_RUNNING:
+        # Fetch live tips together. Their full commit history usually contains
+        # almost every historical head, without downloading repository blobs.
+        _ancestry_cache().prepare([actual_base] + [n.head for n in nodes.values()
+                                                   if str(n.data.get('state')).lower() == 'open'])
+    graph = pr_dependencies.Graph(nodes, histories, actual_base, compare_commit_ancestry,
+                                  conn=conn, base_branch=BASE_BRANCH,
+                                  persist_comparisons=(not dry_run if persist_comparisons is None
+                                                       else persist_comparisons)).discover(roots)
     graph.select(priority=False)  # Establish block reasons for ready descendants.
     if conn is not None and not dry_run:
         with conn:
             pr_dependencies.ensure_schema(conn)
             graph.save()
-            for number, node in nodes.items():
+            for number in graph.dependencies:
+                node = nodes[number]
                 rejected = node.data.get('_mm_rejection')
                 if (rejected and rejected['active'] and not conn.execute(
                         "SELECT 1 FROM automerge_github_outbox WHERE kind='reject_head' "
@@ -871,7 +920,8 @@ def dependency_order(pulls):
 
 
 def check_source_dependencies(pulls, conn=None, *, master=None):
-    graph = dependency_graph(conn, master=master, promote=master is None, dry_run=master is not None)
+    graph = dependency_graph(conn, master=master, promote=master is None, dry_run=master is not None,
+                             roots=[p.number for p in pulls], persist_comparisons=conn is not None)
     blocked = graph.validate(pulls)
     return [dependency_pull(graph, p.number) for p in pulls if p.number not in blocked], blocked
 
@@ -880,12 +930,14 @@ DEPENDENCY_BLOCKS = []
 
 
 def select_eligible_pull_requests(*, dry_run: bool = False,
-                                  conn: sqlite3.Connection | None = None) -> list[PullRequest]:
+                                  conn: sqlite3.Connection | None = None,
+                                  priority_only: bool = False) -> list[PullRequest]:
     global DEPENDENCY_BLOCKS
-    graph = dependency_graph(conn, dry_run=dry_run)
+    graph = dependency_graph(conn, dry_run=dry_run, priority_only=priority_only)
     DEPENDENCY_BLOCKS = [{'number': n, 'head_sha': graph.nodes[n].head, 'reason': reason}
                          for n, reason in sorted(graph.blocked.items()) if graph.nodes[n].ready]
-    return [dependency_pull(graph, number) for number in graph.select()]
+    pulls = [dependency_pull(graph, number) for number in graph.select()]
+    return pulls if not priority_only or any(p.priority for p in pulls) else []
 
 
 def report_dependency_blocks(conn, transport):
@@ -1075,6 +1127,7 @@ def connect_db() -> sqlite3.Connection:
     ensure_github_outbox_schema(conn)
     execution_evidence.ensure_schema(conn)
     pr_dependencies.ensure_schema(conn)
+    supervisor.ensure_schema(conn)
     speculation.ensure_schema(conn, ensure_column)
     ensure_column(conn, "automerge_batches", "launch_attempted_at", "TEXT")
     ensure_column(conn, "automerge_batches", "agent_final_message", "TEXT NOT NULL DEFAULT ''")
@@ -3494,6 +3547,8 @@ def _wait_agent_turn(conn: sqlite3.Connection, transport: monitor.SlackTransport
                          (utc_now(), row["batch_id"]))
     # Bound this cron poll, never the agent's turn. Later ticks reattach.
     timeout = TURN_TICK_SECONDS
+    if SUPERVISOR_RUNNING:
+        timeout = min(timeout, 5)
     if OBSERVATION_DEADLINE is not None:
         timeout = min(timeout, max(1, int(OBSERVATION_DEADLINE - time.monotonic())))
         if speculation.candidate(sys.modules[__name__], row) or speculation.get(row, 'predecessor_id'):
@@ -3884,11 +3939,32 @@ def _record_trusted_rejection_markers(
     return changed
 
 
+def _ancestry_cache():
+    global ANCESTRY_CACHE
+    if ANCESTRY_CACHE is None:
+        ANCESTRY_CACHE = git_ancestry.Cache(
+            STATE_DIR / ('ancestry-' + hashlib.sha256(REPO_NAME.encode()).hexdigest()[:16]),
+            REPO_NAME, github_app_token, deadline=lambda: OBSERVATION_DEADLINE)
+    return ANCESTRY_CACHE
+
+
 def compare_commit_ancestry(ancestor_sha: str, descendant_sha: str) -> bool:
     if not all(re.fullmatch(r"[0-9a-fA-F]{40}", value)
                for value in (ancestor_sha, descendant_sha)):
         raise AutomergeError("invalid SHA for source ancestry comparison",
                              reason="github_invalid_response")
+    if SUPERVISOR_RUNNING and ANCESTRY_CACHE is None:
+        _ancestry_cache()
+    if ANCESTRY_CACHE is not None:
+        return pr_dependencies.cached_ancestor(
+            ANCESTRY_CONNECTION,
+            lambda a, b: ANCESTRY_CACHE.ancestor(a, b, _github_commit_ancestry),
+            ancestor_sha.lower(), descendant_sha.lower(),
+            persist=ANCESTRY_CONNECTION is not None and not ANCESTRY_CONNECTION.in_transaction)
+    return _github_commit_ancestry(ancestor_sha, descendant_sha)
+
+
+def _github_commit_ancestry(ancestor_sha, descendant_sha):
     data = gh_json([
         "api", f"repos/{REPO_NAME}/compare/{ancestor_sha}...{descendant_sha}",
     ])
@@ -5701,6 +5777,7 @@ def read_active_batch_for_check() -> dict[str, Any] | None:
             "expansion_limit": MAX_BATCH_EXPANSIONS,
             "candidate": speculation.candidate(sys.modules[__name__], row, landed=row['terminal_status'] == 'merged'),
             "speculative_batch": _speculative_check(conn, str(row['batch_id'])),
+            "supervisor_actions": _supervisor_actions_for_check(conn),
         }
     finally:
         conn.close()
@@ -5715,6 +5792,14 @@ def _speculative_check(conn, parent_id):
             'attempt_generation': row['attempt_generation'],
             'predecessor_candidate': json.loads(row['predecessor_candidate_json']),
             'candidate': speculation.candidate(sys.modules[__name__], row)}
+
+
+def _supervisor_actions_for_check(conn):
+    if not pr_dependencies.has_table(conn, 'automerge_supervisor_actions'):
+        return []
+    return [dict(row) for row in conn.execute(
+        "SELECT kind,batch_id,status,attempts,updated_at,last_error,next_attempt_at "
+        "FROM automerge_supervisor_actions WHERE status IN ('pending','running') ORDER BY updated_at")]
 
 
 def check_only() -> int:
@@ -5934,11 +6019,14 @@ def run_land_now(number: int) -> int:
 
 
 def run_automerge() -> int:
-    global OBSERVATION_DEADLINE
+    global OBSERVATION_DEADLINE, ANCESTRY_CACHE, ANCESTRY_CONNECTION, SUPERVISOR_RUNNING
     lock_handle = acquire_lock()
     if lock_handle is None:
         return 0
     monitor.reset_github_auth_cache()
+    OBSERVATION_DEADLINE = time.monotonic() + TURN_TICK_SECONDS
+    budget_token = read_budget.deadline.set(OBSERVATION_DEADLINE)
+    SUPERVISOR_RUNNING = True
     try:
         try:
             transport = monitor.load_slack_transport()
@@ -5946,74 +6034,24 @@ def run_automerge() -> int:
             log(str(exc))
             return 2
         conn = connect_db()
+        ANCESTRY_CONNECTION = conn
         try:
-            retry_pending_notifications(conn, transport)
-            retry_pending_aborted_outcomes(conn, transport)
             if not ensure_runtime_binaries(conn, transport):
                 return 3
             if not ensure_github_auth(conn, transport):
                 return 3
-            enqueue_active_membership_labels(conn)
-            retry_github_outbox(conn, transport)
-            monitor.update_known_failures(conn, transport)
-            check_pending_suspensions(conn, transport)
-            # Completed outcome delivery is independent of foreground selection.
-            for completed in conn.execute("SELECT * FROM automerge_batches WHERE status='completed' "
-                                          "AND outcome_posted=0 AND COALESCE(terminal_status,'')<>'aborted'").fetchall():
-                finish_batch(conn, transport, completed)
-            row = active_batch(conn)
-            try:
-                pulls: list[PullRequest] | None = None
-                if row is not None:
-                    pulls = select_eligible_pull_requests(conn=conn)
-                    report_dependency_blocks(conn, transport)
-                    if preempt_batch_for_priority(conn, transport, row, pulls):
-                        row = active_batch(conn)
-                        if row is None:
-                            # Re-read labels and heads after aborting the prior batch.
-                            pulls = select_eligible_pull_requests(conn=conn)
-                            report_dependency_blocks(conn, transport)
-                if row is None:
-                    if pulls is None:
-                        pulls = select_eligible_pull_requests(conn=conn)
-                        report_dependency_blocks(conn, transport)
-                    if not pulls:
-                        return 0
-                    base_sha = current_master_sha()
-                    batch_id = create_selected_batch(conn, pulls, base_sha)
-                else:
-                    batch_id = str(row["batch_id"])
-            except (AutomergeError, monitor.CommandError, monitor.MjError,
-                    OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
-                reason = (
-                    exc.reason
-                    if isinstance(exc, (AutomergeError, monitor.MjError))
-                    else "automerge_queue_failed"
-                )
-                owner = str(row["batch_id"]) if row is not None else "__automerge_queue__"
-                notify_blocked_once(conn, transport, owner, reason, str(exc))
-                log(f"queue selection blocked ({reason}): {exc}")
-                return 4
-            try:
-                OBSERVATION_DEADLINE = time.monotonic() + TURN_TICK_SECONDS
-                process_batch(conn, transport, batch_id)
-                latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
-                speculation.tick(sys.modules[__name__], conn, transport, latest)
-            except (AutomergeError, monitor.MjError, monitor.CommandError,
-                    OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
-                reason = (
-                    exc.reason
-                    if isinstance(exc, (AutomergeError, monitor.MjError))
-                    else "automerge_failed"
-                )
-                notify_blocked_once(conn, transport, batch_id, reason, str(exc))
-                log(f"batch {batch_id} blocked ({reason}): {exc}")
-                return 4
+            return supervisor.run(sys.modules[__name__], conn, transport)
+        except git_ancestry.Deferred as exc:
+            log(f'supervisor deferred: {exc}')
             return 0
         finally:
+            ANCESTRY_CONNECTION = None
             conn.close()
     finally:
+        ANCESTRY_CACHE = None
         OBSERVATION_DEADLINE = None
+        SUPERVISOR_RUNNING = False
+        read_budget.deadline.reset(budget_token)
         lock_handle.close()
 
 
