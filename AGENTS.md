@@ -352,9 +352,11 @@ while awaiting discovery.
 
 Fixer prompts must fit both 65,536 Unicode characters and 96 KiB after JSON
 encoding, below mj's 128 KiB request cap. `render_prompt` omits general PR
-inventory first, then older comments, then shortens the issue body with
-explicit omission/excerpt metadata. Target and rejection evidence take
-precedence. `bounded_stored_prompt` also handles jobs saved by older code.
+inventory first, then older comments, then shortens the issue body and long
+observation diagnoses/evidence with explicit omission/excerpt metadata.
+Retain observed identities, tested SHAs, commands and provenance. Target and
+rejection evidence take precedence. `bounded_stored_prompt` also handles jobs
+saved by older code.
 Only recognized pre-creation prompt-validation/request-size API rejections
 return to `selected`; unknown failures stay `launching`. Create/write the
 local prompt file before recording a launch attempt so filesystem failures
@@ -369,7 +371,9 @@ There is no pending queue snapshot: each poll with a free slot reads GitHub and
 SQL-orders current work, rejected owned repair PRs first, then oldest issue number.
 `BIFROST_FIXER_CONCURRENCY` overrides `CONFIG_DIR/fixer-concurrency`; absent both,
 the limit is one. Read it each tick. Supervise every active repair before admitting
-new work, and isolate job errors so one failed repair cannot starve the others.
+new work, and isolate job and admission errors so one failed repair cannot starve
+the others. An issue that fails before its repair row is created is retried on a
+later poll; other eligible issues can still fill every free slot this poll.
 Active jobs, ambiguous launches and completed jobs awaiting suspension reserve
 slots and their issue number, even when the issue's evidence/work key changes.
 Slack-only terminal retries do not reserve slots. Lowering the limit lets existing
@@ -378,7 +382,11 @@ One active job addresses only its selected issue and linked observations.
 
 The dossier contains the issue, recent comments, its own ledger observations
 and diagnosis provenance, and an open-PR inventory. The agent judges PR
-relevance. Never add a directive to fix every red test or dump all issues.
+relevance from committed Git changes and applicable local test evidence.
+Issue/PR links, states and descriptions are metadata, not proof of coverage or
+resolution, and do not suppress issue selection. Defer to an existing PR only
+after verifying it addresses the selected issue's outstanding failures.
+Never add a directive to fix every red test or dump all issues.
 It reads Bifrost's AGENTS, claims with `agent-in-progress` and a comment naming
 session/branch, requests `brokk-service` assignment if assignable, and accepts
 the user-approved label/comment claim when assignment is unavailable.

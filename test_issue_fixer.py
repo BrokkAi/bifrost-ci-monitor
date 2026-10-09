@@ -65,7 +65,7 @@ class IssueFixerTests(TestCase):
         selected = fixer.select_work(self.conn, [issue(2), issue(1)], [])
         self.assertEqual(selected[0]["number"], 1)
 
-    def test_local_finding_repair_link_closure_releases_selection(self):
+    def test_local_finding_repair_link_state_is_metadata(self):
         target = issue()
         with self.conn:
             finding = local_findings.record(self.conn, 'batch', 'session', 'baseline', 'b' * 40,
@@ -73,10 +73,43 @@ class IssueFixerTests(TestCase):
             local_findings.classify(self.conn, finding['id'], 'product', 'exit-code regression',
                                     target['html_url'])
             self.conn.execute('UPDATE local_findings SET linked_pr_url=?', (pr()['html_url'],))
-        self.assertIsNone(fixer.select_work(self.conn, [target], []))
+        self.assertIsNotNone(fixer.select_work(self.conn, [target], []))
         with mock.patch.object(monitor, 'run_gh', return_value='{"state":"CLOSED"}'):
             monitor.refresh_known_failure_link_states(self.conn)
         self.assertIsNotNone(fixer.select_work(self.conn, [target], []))
+        self.assertEqual(fixer.observations(self.conn, target['html_url'])[0]['linked_pr_state'], 'CLOSED')
+
+    def test_large_ci_diagnoses_fit_without_losing_observation_provenance(self):
+        for text in ['failure details\n' * 400, '\u754c' * 5000]:
+            with self.subTest(unicode=text.startswith('\u754c')):
+                rows = [dict(workflow='CI', job_name='linux', identity_kind='test',
+                             identity=f'test_{number}', last_seen_sha='a' * 40,
+                             last_seen_run_id=42, last_seen_run_url='run-url',
+                             diagnosis=text, diagnosis_source='triage session',
+                             triage_issue_url=issue()['html_url'], linked_pr_url=pr()['html_url'],
+                             linked_pr_state='OPEN', linked_issue_url=None, linked_issue_state='OPEN')
+                        for number in range(29)]
+                with mock.patch.object(fixer, 'observations', return_value=rows), \
+                     mock.patch.object(fixer, 'api', return_value=[]):
+                    job = dict(id='diagnosis-budget', issue_number=12, issue_url=issue()['html_url'],
+                               branch='repair-12', base_sha='b' * 40)
+                    prompt = fixer.build_prompt(job, fixer.dossier(self.conn, issue(), []))
+                self.assertTrue(fixer.prompt_fits(prompt))
+                context = json.loads(prompt.split('## Issue dossier\n', 1)[1])
+                observed = context['observed_failures']
+                self.assertEqual(len(observed), 29)
+                for number, row in enumerate(observed):
+                    self.assertEqual(row['identity'], f'test_{number}')
+                    self.assertEqual(row['last_seen_sha'], 'a' * 40)
+                    self.assertEqual(row['last_seen_run_id'], 42)
+                    self.assertEqual(row['last_seen_run_url'], 'run-url')
+                    self.assertEqual(row['diagnosis_source'], 'triage session')
+                    self.assertEqual(row['linked_pr_url'], pr()['html_url'])
+                trimmed = [row for row in observed if row.get('diagnosis_truncated')]
+                self.assertTrue(trimmed)
+                for row in trimmed:
+                    self.assertEqual(row['diagnosis_original_characters'], len(text))
+                    self.assertTrue(text.startswith(row['diagnosis']))
 
     def test_local_finding_evidence_is_bounded_in_repair_prompt(self):
         with self.conn:
@@ -91,15 +124,18 @@ class IssueFixerTests(TestCase):
         self.assertEqual(len(context['observed_failures']), 20)
         self.assertTrue(any(row['evidence']['truncated'] for row in context['observed_failures']))
 
-    def test_default_open_link_states_without_urls_do_not_claim_the_issue(self):
+    def test_open_pr_and_issue_links_do_not_claim_or_cover_the_issue(self):
         row = dict(workflow="CI", job_name="linux", identity_kind="step", identity="test",
                    last_seen_sha="a" * 40, last_seen_run_id=42,
                    linked_pr_url=None, linked_pr_state="OPEN", linked_issue_url=None, linked_issue_state="OPEN")
         with mock.patch.object(fixer, "observations", return_value=[row]):
             self.assertIsNotNone(fixer.select_work(self.conn, [issue()], []))
         row["linked_pr_url"] = pr()["html_url"]
-        with mock.patch.object(fixer, "observations", return_value=[row]):
-            self.assertIsNone(fixer.select_work(self.conn, [issue()], []))
+        with mock.patch.object(fixer, "observations", return_value=[row, dict(row, identity='another_failure', linked_pr_url=None)]):
+            self.assertIsNotNone(fixer.select_work(self.conn, [issue()], []))
+        row['linked_issue_url'] = issue(99)['html_url']
+        with mock.patch.object(fixer, 'observations', return_value=[row]):
+            self.assertIsNotNone(fixer.select_work(self.conn, [issue()], []))
 
     def test_aggregate_and_pr_shaped_issues_are_never_work(self):
         aggregate = issue()
@@ -185,6 +221,8 @@ class IssueFixerTests(TestCase):
         self.assertNotIn("Classify EACH failing test independently", prompt)
         self.assertIn("user explicitly permits proceeding with agent-in-progress", prompt)
         self.assertIn("Do not try assigning mergemarshall[bot]", prompt)
+        self.assertIn('committed Git changes and applicable local test evidence', prompt)
+        self.assertIn('a link alone never justifies deferral', prompt)
 
     def test_retry_prompt_uses_same_pr_and_draft_before_pushing(self):
         job = self.job(retry=pr(rejected=True))
@@ -662,6 +700,31 @@ class IssueFixerTests(TestCase):
         self.assertEqual({c.args[2]['issue_number'] for c in poll.call_args_list}, {1, 2, 3})
         self.assertEqual(launch.call_count, 1)
         self.assertEqual(fixer.occupied_slots(self.conn), 4)
+
+    def test_failed_admission_still_fills_all_free_slots_and_can_retry(self):
+        create_job = fixer.create_job
+        def create(conn, target, *args):
+            if target['number'] == 1:
+                raise ValueError('issue evidence alone exceeds mj prompt budget')
+            return create_job(conn, target, *args)
+        def github(endpoint, **kwargs):
+            if endpoint.startswith('issues?'):
+                return [issue(n) for n in range(7, 0, -1)]
+            if endpoint == 'commits/master':
+                return {'sha': 'b' * 40}
+            return []
+        with mock.patch.object(fixer, 'concurrency_limit', return_value=5), \
+             mock.patch.object(fixer, 'api', side_effect=github), mock.patch.object(fixer, 'cleanup'), \
+             mock.patch.object(fixer, 'create_job', side_effect=create) as admission, \
+             mock.patch.object(fixer, 'process_job') as process, mock.patch.object(monitor, 'log') as log:
+            with self.assertRaisesRegex(ValueError, 'issue evidence alone exceeds'):
+                fixer.tick(self.conn, self.transport)
+        self.assertEqual([call.args[1]['number'] for call in admission.call_args_list], [1, 2, 3, 4, 5, 6])
+        self.assertEqual([call.args[2]['issue_number'] for call in process.call_args_list], [2, 3, 4, 5, 6])
+        self.assertEqual(fixer.occupied_slots(self.conn), 5)
+        log.assert_called_once()
+        self.assertIn('issue #1 admission failed', log.call_args.args[0])
+        self.assertEqual(fixer.select_work(self.conn, [issue(1)], [])[0]['number'], 1)
 
     def test_lower_limit_supervises_all_existing_jobs_without_cancelling(self):
         for n in range(1, 6):
