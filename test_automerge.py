@@ -1434,6 +1434,7 @@ class CiSupervisionTests(TestCase):
         self.assertEqual(terminal.call_args.args[3], "ci_failed")
         conn.close()
 
+    @unchanged_queue()
     def test_fourth_ci_round_does_not_advance_to_a_fifth_head(self):
         conn = make_db(phase="waiting_ci", ci_round=4, ci_head_sha=HEAD_ONE)
         with (
@@ -3308,6 +3309,11 @@ class PriorityLaneTests(TestCase):
                     mock.patch.object(automerge, "ensure_github_auth", return_value=True),
                     mock.patch.object(monitor, "update_known_failures"),
                     mock.patch.object(automerge, "check_pending_suspensions"),
+                    mock.patch.object(automerge, "retry_github_outbox"),
+                    mock.patch.object(automerge, "enqueue_active_membership_labels"),
+                    mock.patch.object(automerge, "list_open_pull_requests", return_value=[{
+                        'number': 9, 'labels': [{'name': 'mergemarshall:immediate'}],
+                    }]),
                     mock.patch.object(automerge, "select_eligible_pull_requests",
                                       side_effect=[[pull(9, HEAD_TWO, immediate=True)],
                                                    [pull(9, HEAD_TWO, immediate=True)]]),

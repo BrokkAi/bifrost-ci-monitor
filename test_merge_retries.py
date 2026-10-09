@@ -313,6 +313,8 @@ class MergeRetryTests(TestCase):
         self.patch(monitor, "update_known_failures")
         self.patch(automerge, "ensure_runtime_binaries", return_value=True)
         self.patch(automerge, "ensure_github_auth", return_value=True)
+        self.patch(automerge, "list_open_pull_requests", return_value=[])
+        self.patch(automerge, "_ancestry_cache", return_value=mock.Mock())
         self.patch(automerge, "compare_pr_behind_by", return_value=1)
         self.patch(automerge, "current_master_sha", return_value=BASE_SHA)
         self.patch(automerge, "launch_batch_session", return_value="fresh-session")
