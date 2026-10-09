@@ -510,8 +510,58 @@ class StateTests(unittest.TestCase):
         self.assertEqual(self.row()['role_promoted'], 0)
 
     def test_primary_progress_uses_normal_wording_before_ancestry_incorporation(self):
+        self.assess()
+        transport = monitor.SlackTransport('chat', token='token', channel='channel')
+        with mock.patch.object(monitor, 'slack_send', side_effect=[
+            (True, 'spec-root'), (True, 'spec-details'), (False, None),
+            (True, 'primary-root'), (False, None), (True, 'primary-details'),
+        ]) as send:
+            a.send_start_notification(self.conn, transport, self.row())
+            self.assertIn('SPECULATIVE', send.call_args_list[0].args[1])
+            with self.conn:
+                self.conn.execute('UPDATE automerge_batches SET transcript_after_seq=100,role_promoted=1 WHERE batch_id=?',
+                                  (self.child,))
+                self.conn.execute('INSERT INTO automerge_relayed_messages VALUES (?,?,?)',
+                                  (self.child, 'old-message', 100))
+            original = self.row()
+            evidence = service.state(self.conn, self.child)
+            a.send_start_notification(self.conn, transport, original)
+            self.assertEqual(self.row()['speculative_thread_ts'], 'spec-root')
+            self.assertIsNone(self.row()['thread_ts'])
+            self.assertEqual(self.row()['transcript_after_seq'], 100)
+            with mock.patch.object(a, '_read_transcript_page') as read:
+                self.assertEqual(a.drain_transcript(self.conn, transport, self.child, 'child-session'), [])
+            read.assert_not_called()
+            a.retry_pending_notifications(self.conn, transport)
+            self.assertEqual(self.row()['thread_ts'], 'primary-root')
+            self.assertEqual(self.row()['start_pr_list_sent'], 0)
+            # Retry with the stale pre-transition snapshot; only the reply repeats.
+            a.send_start_notification(self.conn, transport, original)
+            a.retry_pending_notifications(self.conn, transport)
+        self.assertEqual(send.call_count, 6)
+        self.assertNotIn('thread_ts', send.call_args_list[3].kwargs)
+        self.assertNotIn('SPECULATIVE', send.call_args_list[3].args[1])
+        self.assertIn('Now the primary batch', send.call_args_list[3].args[1])
+        self.assertEqual(send.call_args_list[-1].kwargs['thread_ts'], 'primary-root')
+        self.assertEqual(self.row()['start_notification_role'], 'primary')
+        self.assertEqual(self.row()['start_pr_list_sent'], 1)
+        after = service.state(self.conn, self.child)
+        self.assertEqual(after['revision'], evidence['revision'])
+        for key in ('source_revision', 'tests', 'candidate', 'attempt_generation'):
+            self.assertEqual(after[key], evidence[key], key)
+        with (mock.patch.object(a, '_read_transcript_page', return_value=([
+                {'seq': 100, 'stable_id': 'old-message', 'text': 'old progress'},
+                {'seq': 101, 'stable_id': 'new-message', 'text': 'new progress'},
+              ], 101)), mock.patch.object(monitor, 'relay_text', return_value=True) as relay):
+            self.assertEqual(a.drain_transcript(self.conn, transport, self.child, 'child-session'), ['new progress'])
+        relay.assert_called_once_with(transport, 'primary-root', 'new progress')
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM automerge_relayed_messages WHERE batch_id=?',
+                                          (self.child,)).fetchone()[0], 2)
+
+        # An initial primary notification without a speculative root is normal.
         with self.conn:
-            self.conn.execute('UPDATE automerge_batches SET role_promoted=1 WHERE batch_id=?', (self.child,))
+            self.conn.execute("UPDATE automerge_batches SET start_notification_role=NULL,start_notification_sent=0,"
+                              "start_pr_list_sent=0,thread_ts=NULL WHERE batch_id=?", (self.child,))
         with mock.patch.object(monitor, 'slack_send', return_value=(True, 'thread')) as send:
             a.send_start_notification(self.conn, self.transport, self.row())
         self.assertNotIn('SPECULATIVE', send.call_args.args[1])

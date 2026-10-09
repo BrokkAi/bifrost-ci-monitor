@@ -437,8 +437,14 @@ channel-level messages. Start replies use the existing durable reply retry;
 standalone alerts and outcomes attach diagnostic replies on a best-effort basis
 without duplicating an accepted root message. PR-list replies, relayed progress, blocked
 alerts and terminal summaries retain that distinction until role promotion.
-After role promotion, new messages use normal batch wording. Message decoration
-must not change stored agent evidence, relay identities/cursors or delivery retries.
+Role promotion starts a new channel-level primary thread. Persist the original
+thread as `speculative_thread_ts` and use the new `thread_ts` for subsequent
+progress, routine notices and the outcome. `start_notification_role` and the
+existing start/reply flags checkpoint this transition and its retries; migration
+also moves already-promoted live batches, without announcing completed history.
+Preserve transcript cursors and relay identities across the move. If the new
+root is unavailable, retain unrelayed progress for delivery after it is accepted;
+notification failure does not stop agent work or change its test evidence.
 
 Invalidation fences old mutations immediately. Persist a new attempt generation,
 stop queued prompts/turns/background tasks and child sessions. Cancellation
