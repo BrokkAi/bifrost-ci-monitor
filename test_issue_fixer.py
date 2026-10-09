@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import tempfile
 from unittest import TestCase, mock
@@ -35,6 +36,13 @@ class IssueFixerTests(TestCase):
         patch = mock.patch.object(monitor, "DB_PATH", Path(temp.name) / "activity.db")
         patch.start()
         self.addCleanup(patch.stop)
+        config = mock.patch.object(monitor, 'CONFIG_DIR', Path(temp.name) / 'config')
+        config.start()
+        self.addCleanup(config.stop)
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop('BIFROST_FIXER_CONCURRENCY', None)
         self.conn = monitor.connect_db()
         self.addCleanup(self.conn.close)
         fixer.ensure_schema(self.conn)
@@ -48,7 +56,7 @@ class IssueFixerTests(TestCase):
     def owned_pr(self):
         job = self.job()
         with self.conn:
-            self.conn.execute("UPDATE issue_repairs SET status='completed',repair_pr_number=30 WHERE id=?", (job["id"],))
+            self.conn.execute("UPDATE issue_repairs SET status='completed',cleanup_done=1,repair_pr_number=30 WHERE id=?", (job["id"],))
         return job
 
     def test_new_work_requires_no_assignee_and_no_progress_label(self):
@@ -143,7 +151,7 @@ class IssueFixerTests(TestCase):
         self.owned_pr()
         retry = self.job(retry=pr(rejected=True))
         with self.conn:
-            self.conn.execute("UPDATE issue_repairs SET work_key=?,status='completed' WHERE id=?",
+            self.conn.execute("UPDATE issue_repairs SET work_key=?,status='completed',cleanup_done=1 WHERE id=?",
                               ("rejection:30:" + "a" * 40, retry["id"]))
         with mock.patch.object(fixer, "api", return_value=[rejection()]):
             self.assertIsNone(fixer.select_work(self.conn, [issue()], [pr(rejected=True)]))
@@ -163,7 +171,7 @@ class IssueFixerTests(TestCase):
     def test_changed_requirements_can_reengage_but_own_comments_cannot(self):
         job = self.job()
         with self.conn:
-            self.conn.execute("UPDATE issue_repairs SET status='completed' WHERE id=?", (job["id"],))
+            self.conn.execute("UPDATE issue_repairs SET status='completed',cleanup_done=1 WHERE id=?", (job["id"],))
         self.assertIsNone(fixer.select_work(self.conn, [dict(issue(), updated_at="later", comments=10)], []))
         self.assertIsNotNone(fixer.select_work(self.conn, [dict(issue(), body="Revised requirements")], []))
 
@@ -586,3 +594,111 @@ class IssueFixerTests(TestCase):
                 fixer.tick(self.conn, self.transport)
         self.assertEqual(prompt.call_args.args[0], "live")
         self.assertEqual(self.conn.execute("SELECT status FROM issue_repairs").fetchone()[0], "running")
+
+    def test_concurrency_configuration_file_and_environment(self):
+        self.assertEqual(fixer.concurrency_limit(), 1)
+        monitor.CONFIG_DIR.mkdir()
+        (monitor.CONFIG_DIR / 'fixer-concurrency').write_text('5\n')
+        self.assertEqual(fixer.concurrency_limit(), 5)
+        with mock.patch.dict(os.environ, BIFROST_FIXER_CONCURRENCY='3'):
+            self.assertEqual(fixer.concurrency_limit(), 3)
+        for value in ['0', '-1', 'five', '', '1.5']:
+            with self.subTest(value=value), mock.patch.dict(os.environ, BIFROST_FIXER_CONCURRENCY=value):
+                with self.assertRaisesRegex(ValueError, 'positive integer'):
+                    fixer.concurrency_limit()
+
+    def test_changed_evidence_cannot_duplicate_live_issue(self):
+        job = self.job()
+        changed = dict(issue(), body='new evidence')
+        for status in ['selected', 'launching', 'running', 'finishing', 'completed']:
+            with self.subTest(status=status), self.conn:
+                self.conn.execute('UPDATE issue_repairs SET status=? WHERE id=?', (status, job['id']))
+                self.assertIsNone(fixer.select_work(self.conn, [changed], []))
+        with self.conn:
+            self.conn.execute('UPDATE issue_repairs SET cleanup_done=1 WHERE id=?', (job['id'],))
+        self.assertIsNotNone(fixer.select_work(self.conn, [changed], []))
+
+    def test_tick_fills_five_slots_and_preserves_oldest_first(self):
+        existing = self.job(2)
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='running',session_id='live',start_notified=1 WHERE id=?", (existing['id'],))
+        def github(endpoint, **kwargs):
+            if endpoint.startswith('issues?'):
+                return [dict(issue(2), body='changed while running')] + [issue(n) for n in range(6, 0, -1)]
+            if endpoint == 'commits/master':
+                return {'sha': 'b' * 40}
+            return []
+        def launch(conn, job):
+            with conn:
+                conn.execute("UPDATE issue_repairs SET status='running',session_id=? WHERE id=?", (f"session-{job['issue_number']}", job['id']))
+        with mock.patch.object(fixer, 'concurrency_limit', return_value=5), \
+             mock.patch.object(fixer, 'api', side_effect=github), mock.patch.object(fixer, 'cleanup'), \
+             mock.patch.object(fixer, 'collect') as collect, mock.patch.object(fixer, 'launch', side_effect=launch) as create, \
+             mock.patch.object(monitor, 'slack_send', return_value=(True, 'thread')):
+            fixer.tick(self.conn, self.transport)
+        self.assertEqual(collect.call_count, 1)
+        self.assertEqual([c.args[1]['issue_number'] for c in create.call_args_list], [1, 3, 4, 5])
+        self.assertEqual(fixer.occupied_slots(self.conn), 5)
+
+    def test_failed_job_does_not_starve_other_repairs_or_admission(self):
+        jobs = [self.job(n) for n in range(1, 4)]
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='running',session_id='live',start_notified=1")
+        def collect(conn, transport, job):
+            if job['issue_number'] == 1:
+                raise monitor.MjError('failed supervision')
+        def github(endpoint, **kwargs):
+            if endpoint.startswith('issues?'):
+                return [issue(4)]
+            if endpoint == 'commits/master':
+                return {'sha': 'b' * 40}
+            return []
+        with mock.patch.object(fixer, 'concurrency_limit', return_value=5), \
+             mock.patch.object(fixer, 'api', side_effect=github), mock.patch.object(fixer, 'cleanup'), \
+             mock.patch.object(fixer, 'collect', side_effect=collect) as poll, mock.patch.object(fixer, 'launch') as launch, \
+             mock.patch.object(monitor, 'slack_send', return_value=(True, 'thread')):
+            with self.assertRaisesRegex(monitor.MjError, 'failed supervision'):
+                fixer.tick(self.conn, self.transport)
+        self.assertEqual({c.args[2]['issue_number'] for c in poll.call_args_list}, {1, 2, 3})
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(fixer.occupied_slots(self.conn), 4)
+
+    def test_lower_limit_supervises_all_existing_jobs_without_cancelling(self):
+        for n in range(1, 6):
+            self.job(n)
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='running',session_id='live',start_notified=1")
+        with mock.patch.object(fixer, 'concurrency_limit', return_value=2), mock.patch.object(fixer, 'cleanup'), \
+             mock.patch.object(fixer, 'collect') as collect, mock.patch.object(fixer, 'api') as github:
+            fixer.tick(self.conn, self.transport)
+        self.assertEqual(collect.call_count, 5)
+        github.assert_not_called()
+        self.assertEqual(fixer.occupied_slots(self.conn), 5)
+
+    def test_ambiguous_launch_and_pending_cleanup_reserve_slots(self):
+        first, second = self.job(1), self.job(2)
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='launching',start_notified=1 WHERE id=?", (first['id'],))
+            self.conn.execute("UPDATE issue_repairs SET status='completed',outcome_sent=1,report_json='{}' WHERE id=?", (second['id'],))
+        with mock.patch.object(fixer, 'concurrency_limit', return_value=2), mock.patch.object(fixer, 'cleanup'), \
+             mock.patch.object(fixer, 'launch') as launch, mock.patch.object(fixer, 'api') as github:
+            fixer.tick(self.conn, self.transport)
+        launch.assert_called_once()
+        github.assert_not_called()
+        self.assertEqual(fixer.occupied_slots(self.conn), 2)
+        with self.conn:
+            self.conn.execute('UPDATE issue_repairs SET cleanup_done=1,outcome_sent=0 WHERE id=?', (second['id'],))
+        self.assertEqual(fixer.occupied_slots(self.conn), 1)
+
+    def test_terminal_notice_failure_releases_capacity_and_other_jobs_continue(self):
+        first, second = self.job(1), self.job(2)
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='completed',session_id=id,report_json=?",
+                              (json.dumps(dict(outcome='resolved', summary='fixed')),))
+        with mock.patch.object(monitor, 'slack_send', side_effect=[RuntimeError('Slack unavailable'), (True, 'thread')]), \
+             mock.patch.object(monitor, 'require_mj_success') as suspend:
+            fixer.cleanup(self.conn, self.transport)
+        self.assertEqual(suspend.call_count, 2)
+        self.assertEqual(fixer.occupied_slots(self.conn), 0)
+        notices = {r['id']: r['outcome_sent'] for r in self.conn.execute('SELECT * FROM issue_repairs')}
+        self.assertEqual(notices, {first['id']: 0, second['id']: 1})

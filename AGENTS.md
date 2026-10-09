@@ -306,8 +306,15 @@ cannot strand an unsubmitted job. These boundaries are covered by
 
 Select open `buildfailure` issues without someone else's assignment,
 `agent-in-progress`, or `Escalated`; exclude the generated aggregate issue.
-There is no pending queue snapshot: each idle poll reads GitHub and SQL-orders
-current work, rejected owned repair PRs first, then oldest issue number.
+There is no pending queue snapshot: each poll with a free slot reads GitHub and
+SQL-orders current work, rejected owned repair PRs first, then oldest issue number.
+`BIFROST_FIXER_CONCURRENCY` overrides `CONFIG_DIR/fixer-concurrency`; absent both,
+the limit is one. Read it each tick. Supervise every active repair before admitting
+new work, and isolate job errors so one failed repair cannot starve the others.
+Active jobs, ambiguous launches and completed jobs awaiting suspension reserve
+slots and their issue number, even when the issue's evidence/work key changes.
+Slack-only terminal retries do not reserve slots. Lowering the limit lets existing
+repairs finish. Selection and admission stay under the existing fixer lock.
 One active job addresses only its selected issue and linked observations.
 
 The dossier contains the issue, recent comments, its own ledger observations

@@ -200,6 +200,18 @@ sqlite3 -readonly "${BIFROST_CI_DB:-$HOME/Projects/bifrost-ci/activity.db}" \
    FROM issue_repairs ORDER BY created_at DESC LIMIT 10;'
 ```
 
+Fixer concurrency defaults to one. Set the live limit on the CI host with:
+
+```sh
+printf '5\n' > "${BIFROST_CI_CONFIG_DIR:-$HOME/.config/bifrost-ci-monitor}/fixer-concurrency"
+```
+
+`BIFROST_FIXER_CONCURRENCY` in the monitor's environment overrides this file.
+Both accept a positive integer; cron reads the setting every tick without a
+restart. Lowering it lets existing repairs finish before admitting more work.
+Each session still owns one issue. Ambiguous launches and unfinished suspension
+reserve capacity; a failed repair does not stop supervision of the other repairs.
+
 The default mode is **async**: integration agents run targeted local tests;
 GitHub CI need not finish before landing. One eligible PR already current with
 master can land directly without an agent or a new local test run. **Sync**

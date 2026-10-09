@@ -99,7 +99,8 @@ appears as diagnostic context for merge agents, rather than a repair target.
 
 ## Issue-scoped repair
 
-The fixer works on one open, unclaimed failure issue at a time. It respects
+The fixer runs a configurable number of repairs concurrently, with one open,
+unclaimed failure issue per session. It respects
 other people's assignments and claims, checks relevant open PRs, and claims
 its selected issue with a label/comment and service-account assignment when
 available. The dossier includes that issue's comments, failure evidence and

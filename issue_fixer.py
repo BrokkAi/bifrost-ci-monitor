@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import tempfile
@@ -18,6 +19,18 @@ ESCALATION_ASSIGNEE = "DavidBakerEffendi"
 ESCALATION_LABEL = "Escalated"
 MAX_PROMPT_CHARS = 64 * 1024  # mj validates Unicode characters separately from its body limit.
 MAX_PROMPT_BYTES = 96 * 1024  # Leave room in mj's 128 KiB JSON request envelope.
+
+
+def concurrency_limit():
+    value = os.environ.get('BIFROST_FIXER_CONCURRENCY')
+    if value is None:
+        try:
+            value = (monitor.CONFIG_DIR / 'fixer-concurrency').read_text().strip()
+        except FileNotFoundError:
+            return 1
+    if not re.fullmatch(r'[0-9]+', value) or int(value) < 1:
+        raise ValueError('fixer concurrency must be a positive integer')
+    return int(value)
 
 
 def ensure_schema(conn):
@@ -133,6 +146,12 @@ def select_work(conn, issues, prs):
         WHERE NOT EXISTS (
             SELECT 1 FROM issue_repairs AS attempt
             WHERE attempt.work_key = json_extract(candidate.value, '$.work_key')
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM issue_repairs AS attempt
+            WHERE attempt.issue_number = json_extract(candidate.value, '$.issue_number')
+              AND (attempt.status IN ('selected','launching','running','finishing')
+                   OR (attempt.status='completed' AND attempt.cleanup_done=0))
         )
         ORDER BY json_extract(value, '$.rejected_repair') DESC,
                  json_extract(value, '$.issue_number') ASC
@@ -606,6 +625,17 @@ def finish(conn, job):
 def cleanup(conn, transport):
     for job in conn.execute("SELECT * FROM issue_repairs WHERE status='completed' AND "
                             "(cleanup_done=0 OR outcome_sent=0)").fetchall():
+        try:
+            cleanup_job(conn, transport, job)
+        except Exception as exc:
+            monitor.log(f"issue repair {job['id']} terminal cleanup will retry: {exc}")
+            with conn:
+                conn.execute('UPDATE issue_repairs SET last_error=? WHERE id=?', (str(exc), job['id']))
+
+
+def cleanup_job(conn, transport, job):
+    # Notification failures must not delay releasing the completed environment.
+    try:
         if not job["outcome_sent"]:
             report = json.loads(job["report_json"])
             ok, _ = monitor.slack_send(transport,
@@ -615,31 +645,15 @@ def cleanup(conn, transport):
             if ok:
                 with conn:
                     conn.execute("UPDATE issue_repairs SET outcome_sent=1 WHERE id=?", (job["id"],))
-        if not job["cleanup_done"]:
-            try:
-                monitor.require_mj_success(["suspend", "--session", job["session_id"],
-                                           "--acknowledge-unpublished-work", "--json"])
-            except monitor.MjError as exc:
-                monitor.log(f"issue repair {job['id']} terminal cleanup will retry: {exc}")
-            else:
-                with conn:
-                    conn.execute("UPDATE issue_repairs SET cleanup_done=1 WHERE id=?", (job["id"],))
+    finally:
+        if not job['cleanup_done']:
+            monitor.require_mj_success(["suspend", "--session", job["session_id"],
+                                       "--acknowledge-unpublished-work", "--json"])
+            with conn:
+                conn.execute("UPDATE issue_repairs SET cleanup_done=1 WHERE id=?", (job["id"],))
 
 
-def tick(conn, transport):
-    ensure_schema(conn)
-    cleanup(conn, transport)
-    job = conn.execute("SELECT * FROM issue_repairs WHERE status IN ('selected','launching','running','finishing') "
-                       "ORDER BY created_at LIMIT 1").fetchone()
-    if job is None:
-        issues = api("issues?state=open&labels=buildfailure&per_page=100", pages=True)
-        prs = api("pulls?state=open&base=master&per_page=100", pages=True)
-        selected = select_work(conn, issues, prs)
-        if selected is None:
-            return
-        issue, pr, rejection, key = selected
-        base_sha = api("commits/master")["sha"]
-        job = create_job(conn, issue, pr, rejection, key, prs, base_sha)
+def process_job(conn, transport, job):
     try:
         if not job["start_notified"]:
             ok, thread = monitor.slack_send(transport,
@@ -656,7 +670,6 @@ def tick(conn, transport):
                 finish(conn, latest)
         elif job["status"] == "finishing":
             finish(conn, job)
-        cleanup(conn, transport)
     except Exception as exc:
         current = conn.execute("SELECT * FROM issue_repairs WHERE id=?", (job["id"],)).fetchone()
         if isinstance(exc, ValueError) and current["status"] == "finishing":
@@ -664,3 +677,46 @@ def tick(conn, transport):
         with conn:
             conn.execute("UPDATE issue_repairs SET last_error=? WHERE id=?", (str(exc), job["id"]))
         raise
+
+
+def occupied_slots(conn):
+    return conn.execute("SELECT count(*) FROM issue_repairs WHERE "
+                        "status IN ('selected','launching','running','finishing') "
+                        "OR (status='completed' AND cleanup_done=0)").fetchone()[0]
+
+
+def tick(conn, transport):
+    ensure_schema(conn)
+    cleanup(conn, transport)
+    errors = []
+
+    def supervise(job):
+        try:
+            process_job(conn, transport, job)
+        except Exception as exc:
+            monitor.log(f"issue repair {job['id']} supervision failed: {exc}")
+            errors.append(exc)
+
+    for job in conn.execute("SELECT * FROM issue_repairs WHERE "
+                            "status IN ('selected','launching','running','finishing') "
+                            "ORDER BY created_at,id").fetchall():
+        supervise(job)
+    cleanup(conn, transport)
+    limit = concurrency_limit()
+    if occupied_slots(conn) < limit:
+        issues = api("issues?state=open&labels=buildfailure&per_page=100", pages=True)
+        prs = api("pulls?state=open&base=master&per_page=100", pages=True)
+        base_sha = None
+        # Only this poll's GitHub snapshot is used. Persist each admission before
+        # selecting again so changed evidence cannot duplicate a live issue.
+        for _ in range(limit - occupied_slots(conn)):
+            selected = select_work(conn, issues, prs)
+            if selected is None:
+                break
+            issue, pr, rejection, key = selected
+            if base_sha is None:
+                base_sha = api("commits/master")["sha"]
+            supervise(create_job(conn, issue, pr, rejection, key, prs, base_sha))
+        cleanup(conn, transport)
+    if errors:
+        raise errors[0]
