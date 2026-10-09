@@ -136,7 +136,8 @@ rejections and pending drafts before GitHub reflects them. Delivery progress mus
 not change the agent's batch revision. The integration PR create and exact-head
 merge remain synchronous. Fixer tables are
 `issue_repairs` and `issue_repair_messages`; triage uses `triage_jobs`,
-`triage_observations`, and `triage_publications`. Historical `invocations`
+`triage_observations`, `triage_publications`, and `triage_product_announcements`.
+Historical `invocations`
 remain readable. An active legacy invocation blocks new issue repairs until
 it is retired. Never replace or discard the live database to fix scheduling.
 
@@ -720,6 +721,17 @@ failed steps and commit, not repeated runs of the same observation. Its
 2-CPU/4-GiB session reads logs/source/history but does not build or fix code.
 Validate final JSON, deduplicate causes against open/closed issues, reopen
 matching issues, and persist publication markers to recover lost replies.
+Each published investigation announces its product issues in one Slack thread,
+with actual ticket titles and links for created, updated or reopened issues.
+List each ticket once and split long lists into replies within Slack's message
+limit. Omit investigation/session IDs from these headings and omit resolved or
+superseded findings without a published ticket. Persist the announcement in
+`triage_product_announcements` atomically with job completion, caching its text,
+accepted-message count and root thread. Delivery retries do not repeat GitHub
+publication, occupy the investigation slot or block cleanup. Retry only remaining
+messages; an accepted send whose reply is lost can still be duplicated. Upgrade
+does not announce completed history. Infrastructure uses its separate incident
+thread, including in reports that also contain product findings.
 Triage terminal errors, stops and interruptions persist a recovery in
 `triage_jobs.recovery_json` and restart the original observations in the same
 session/checkout. Clear queued work, interrupt the turn and stop background

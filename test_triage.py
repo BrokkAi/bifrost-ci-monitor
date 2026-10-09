@@ -377,9 +377,160 @@ class TriageTests(TestCase):
             triage.publish(self.conn, self.job())
         self.reopen()
         triage.publish(self.conn, self.job())
-        self.assertEqual(self.slack.call_count, 2)
+        self.assertEqual(self.slack.call_count, 3)
+        self.assertIn('1 product issue', self.slack.call_args_list[-1].args[1])
         self.assertEqual(len(self.github.issues), 1)
         self.assertEqual(self.job()['status'], 'completed')
+
+    def separate_product_findings(self):
+        report = self.make_job()
+        observations = json.loads(self.job()['observations_json'])
+        report['findings'] = [dict(failure_ids=[o['failure_id']], outcome='product',
+            diagnosis='Assertion failed', evidence='Failure log',
+            issue=dict(title='Fix ' + o['identity'], body='Product defect evidence', existing_number=None))
+            for o in observations]
+        with self.conn:
+            self.conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=?', (json.dumps(report), 'job'))
+        return report
+
+    def test_product_report_announces_created_and_reopened_issues_once(self):
+        self.add_failure()
+        self.add_failure('Second failure')
+        report = self.separate_product_findings()
+        report['findings'][1]['issue']['existing_number'] = 77
+        self.github.issues[77] = dict(number=77, title='Existing <defect> & regression | fix', body='Original body',
+                                     state='closed', labels=[])
+        with self.conn:
+            self.conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=?', (json.dumps(report), 'job'))
+        triage.publish(self.conn, self.job())
+        self.reopen()
+        triage.publish(self.conn, self.job())
+        triage.deliver_product_announcements(self.conn)
+        self.assertEqual(self.slack.call_count, 1)
+        text = self.slack.call_args.args[1]
+        self.assertIn('2 product issues', text)
+        self.assertIn(f'<https://github.com/{monitor.REPO_NAME}/issues/78|#78: Fix Cargo nextest>', text)
+        self.assertIn(f'<https://github.com/{monitor.REPO_NAME}/issues/77|#77: Existing &lt;defect&gt; &amp; regression ¦ fix>', text)
+        self.assertNotIn('job', text)
+        self.assertNotIn('session', text)
+        self.assertIsNone(self.slack.call_args.kwargs['thread_ts'])
+        self.assertEqual(self.github.issues[77]['state'], 'open')
+
+    def test_product_announcement_deduplicates_a_reused_ticket(self):
+        self.add_failure()
+        self.add_failure('Second failure')
+        report = self.separate_product_findings()
+        for finding in report['findings']:
+            finding['issue']['existing_number'] = 77
+        self.github.issues[77] = dict(number=77, title='Shared cause', body='Original body', state='open', labels=[])
+        with self.conn:
+            self.conn.execute('UPDATE triage_jobs SET report_json=?', (json.dumps(report),))
+        triage.publish(self.conn, self.job())
+        self.assertEqual(self.slack.call_count, 1)
+        text = self.slack.call_args.args[1]
+        self.assertIn('1 product issue', text)
+        self.assertEqual(text.count('/issues/77'), 1)
+
+    def test_partial_product_publication_waits_for_the_complete_report(self):
+        self.add_failure()
+        self.add_failure('Second failure')
+        self.separate_product_findings()
+        original = triage.publish_issue
+        def publish_first(conn, job, index, *args):
+            if index == 1:
+                raise RuntimeError('GitHub unavailable')
+            return original(conn, job, index, *args)
+        with mock.patch.object(triage, 'publish_issue', side_effect=publish_first):
+            with self.assertRaisesRegex(RuntimeError, 'unavailable'):
+                triage.publish(self.conn, self.job())
+        self.slack.assert_not_called()
+        self.assertEqual(len(self.github.issues), 1)
+        # A report partly published by the previous code has no cached issue title.
+        report = json.loads(self.job()['report_json'])
+        report['findings'][0].pop('published_issue')
+        with self.conn:
+            self.conn.execute('UPDATE triage_jobs SET report_json=?', (json.dumps(report),))
+        self.reopen()
+        triage.publish(self.conn, self.job())
+        self.assertEqual(len(self.github.issues), 2)
+        self.assertEqual(self.slack.call_count, 1)
+        self.assertIn('/issues/101', self.slack.call_args.args[1])
+        self.assertIn('/issues/102', self.slack.call_args.args[1])
+
+    def test_product_slack_outage_does_not_block_selection_or_repeat_github_writes(self):
+        self.add_failure()
+        self.make_job()
+        self.slack.return_value = (False, None)
+        triage.publish(self.conn, self.job())
+        self.assertEqual(self.job()['status'], 'completed')
+        self.assertEqual(triage.pending(self.conn), [])
+        cached = self.slack.call_args.args[1]
+        announcement = self.conn.execute('SELECT * FROM triage_product_announcements').fetchone()
+        self.assertIsNone(announcement['completed_at'])
+        self.assertEqual(announcement['posted_count'], 0)
+        self.assertIsNotNone(announcement['last_error'])
+        self.reopen()
+        self.add_failure('New failure')
+        self.patch(monitor, 'update_known_failures')
+        self.patch(triage.uuid, 'uuid4', return_value=SimpleNamespace(hex='next'))
+        self.patch(triage, 'gh_api', side_effect=lambda endpoint, **kwargs:
+                   {'sha': 'a' * 40} if endpoint == 'commits/master' else self.github(endpoint, **kwargs))
+        self.patch(monitor, 'require_mj_success', side_effect=lambda args, **kwargs:
+                   '{"sessions":[]}' if args[0] == 'sessions' else '{"session_id":"next-session"}')
+        triage.tick(self.conn)
+        self.assertEqual(self.job('next')['status'], 'running')
+        calls = copy.deepcopy(self.github.calls)
+        self.github.issues[101]['title'] = 'Later title edit'
+        self.slack.return_value = (True, 'notice')
+        triage.deliver_product_announcements(self.conn)
+        triage.deliver_product_announcements(self.conn)
+        self.assertEqual(self.github.calls, calls)
+        self.assertEqual(self.slack.call_args.args[1], cached)
+        self.assertEqual(self.slack.call_count, 3)
+        self.assertIsNotNone(self.conn.execute('SELECT completed_at FROM triage_product_announcements').fetchone()[0])
+
+    def test_large_issue_list_retries_only_remaining_thread_replies(self):
+        for number in range(20):
+            self.add_failure('Failure ' + str(number) + ' ' + 'x' * 210)
+        self.separate_product_findings()
+        self.slack.side_effect = [(True, 'parent'), (False, None)]
+        triage.publish(self.conn, self.job())
+        self.assertEqual(self.job()['status'], 'completed')
+        announcement = self.conn.execute('SELECT * FROM triage_product_announcements').fetchone()
+        self.assertEqual(announcement['posted_count'], 1)
+        self.assertEqual(announcement['thread_ts'], 'parent')
+        messages = json.loads(announcement['messages_json'])
+        self.assertGreater(len(messages), 1)
+        self.assertTrue(all(len(message) <= monitor.SLACK_MESSAGE_LIMIT for message in messages))
+        for number in self.github.issues:
+            self.assertEqual('\n'.join(messages).count(f'/issues/{number}|'), 1)
+        self.reopen()
+        self.slack.side_effect = None
+        self.slack.return_value = (True, 'reply')
+        triage.deliver_product_announcements(self.conn)
+        triage.deliver_product_announcements(self.conn)
+        self.assertEqual(self.slack.call_count, len(messages) + 1)
+        self.assertEqual(sum(call.kwargs['thread_ts'] is None for call in self.slack.call_args_list), 1)
+        self.assertTrue(all(call.kwargs['thread_ts'] == 'parent' for call in self.slack.call_args_list[1:]))
+
+    def test_product_announcement_supports_webhook_without_timestamp(self):
+        self.add_failure()
+        self.make_job()
+        self.patch(monitor, 'load_slack_transport', return_value=monitor.SlackTransport('webhook', webhook='test'))
+        self.slack.return_value = (True, None)
+        triage.publish(self.conn, self.job())
+        self.assertEqual(self.slack.call_count, 1)
+        self.assertIsNotNone(self.conn.execute('SELECT completed_at FROM triage_product_announcements').fetchone()[0])
+
+    def test_upgrade_does_not_announce_completed_history(self):
+        self.add_failure()
+        self.make_job(status='completed')
+        with self.conn:
+            self.conn.execute('DROP TABLE triage_product_announcements')
+        self.reopen()
+        triage.deliver_product_announcements(self.conn)
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM triage_product_announcements').fetchone()[0], 0)
+        self.slack.assert_not_called()
 
     def test_issue_retry_uses_prepared_body_even_if_a_later_run_arrives(self):
         self.add_failure()
@@ -520,6 +671,7 @@ class TriageTests(TestCase):
                     self.conn.execute("UPDATE known_failures SET status=?,last_seen_sha=?", (status, sha))
                 triage.publish(self.conn, self.job())
                 self.assertEqual(self.github.calls, [])
+                self.slack.assert_not_called()
                 self.assertIsNone(self.conn.execute("SELECT diagnosis FROM known_failures").fetchone()[0])
 
     def test_observation_changed_during_publication_is_not_overwritten(self):
@@ -599,6 +751,7 @@ class TriageTests(TestCase):
         self.make_job(resolved=True)
         triage.publish(self.conn, self.job())
         self.assertEqual(self.github.calls, [])
+        self.slack.assert_not_called()
         row = self.conn.execute("SELECT * FROM known_failures").fetchone()
         self.assertEqual(row["status"], "fixed")
         self.assertIsNotNone(row["fixed_at"])
