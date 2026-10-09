@@ -11,6 +11,7 @@ import uuid
 import automerge
 import monitor
 import local_findings
+import agent_recovery
 
 ASSIGNEE = "brokk-service"
 ESCALATION_ASSIGNEE = "DavidBakerEffendi"
@@ -34,13 +35,17 @@ def ensure_schema(conn):
             transcript_seq INTEGER NOT NULL DEFAULT 0,
             report_json TEXT, feedback_digest TEXT, last_error TEXT,
             cleanup_done INTEGER NOT NULL DEFAULT 0,
-            outcome_sent INTEGER NOT NULL DEFAULT 0
+            outcome_sent INTEGER NOT NULL DEFAULT 0,
+            recovery_json TEXT NOT NULL DEFAULT '{}',
+            report_after_seq INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS issue_repair_messages (
             job_id TEXT NOT NULL, stable_id TEXT NOT NULL,
             PRIMARY KEY (job_id, stable_id)
         );
     """)
+    monitor.ensure_column(conn, 'issue_repairs', 'recovery_json', "TEXT NOT NULL DEFAULT '{}'")
+    monitor.ensure_column(conn, 'issue_repairs', 'report_after_seq', 'INTEGER NOT NULL DEFAULT 0')
 
 
 def api(endpoint, *, pages=False):
@@ -441,10 +446,13 @@ def parse_report(text, number):
     return result
 
 
-def request_correction(conn, job, problem, report_text):
-    digest = hashlib.sha256((problem + report_text).encode()).hexdigest()
+def request_correction(conn, job, problem, report_text, *, turn_id=None):
+    identity = problem + report_text
+    if turn_id is not None:
+        identity += '\nturn:' + str(turn_id)
+    digest = hashlib.sha256(identity.encode()).hexdigest()
     if digest == job["feedback_digest"]:
-        raise RuntimeError("waiting for correction already requested")
+        return  # Accepted guidance owns delivery, including after a lost reply.
     monitor.send_session_message(job["session_id"],
         f"Your issue #{job['issue_number']} completion needs correction: {problem}. "
         "Finish only the missing report/publication/claim handoff, respecting current ownership, "
@@ -454,18 +462,97 @@ def request_correction(conn, job, problem, report_text):
         conn.execute("UPDATE issue_repairs SET status='running',feedback_digest=?,last_error=NULL WHERE id=?", (digest, job["id"]))
 
 
+def save_recovery(conn, job, recovery):
+    with conn:
+        conn.execute('UPDATE issue_repairs SET recovery_json=? WHERE id=?', (json.dumps(recovery), job['id']))
+
+
+def notify_recovery(conn, transport, job, recovery, *, error=None):
+    if not error and recovery['stage'] != 'blocked':
+        return
+    flag = 'failure_notified' if error else 'notified'
+    if recovery.get(flag):
+        return
+    heading = f"{monitor.slack_project_prefix()} fixbot: <{job['issue_url']}|issue #{job['issue_number']}>"
+    if error:
+        message = (f"{heading} needs attention. The {recovery.get('failed_step', recovery['stage'])} step failed: {error}. "
+                   "Automatic retries continue. Inspect the session and resolve its worker/provider error.")
+    else:
+        action = ("Respond to the session's structured input request." if recovery['outcome'] == 'input_required'
+                  else "Restore provider capacity or quota; Mjolnir will resume its retry.")
+        message = f"{heading} is blocked. {action} Other repairs are waiting."
+    try:
+        ok, thread = monitor.slack_send(transport, message)
+        if ok:
+            recovery[flag] = True
+            save_recovery(conn, job, recovery)
+            if thread and transport.kind == 'chat':
+                monitor.slack_send(transport, f"Fixbot session: `{job['session_id']}`", thread_ts=thread)
+    except Exception as exc:
+        monitor.log(f"issue repair recovery alert will retry: {exc}")
+
+
+def recover_session(conn, job, recovery):
+    def checkpoint(value):
+        with conn:
+            conn.execute('UPDATE issue_repairs SET recovery_json=?,report_after_seq=? WHERE id=?',
+                         (json.dumps(value), value.get('boundary_seq', job['report_after_seq']), job['id']))
+            if value['stage'] == 'running':
+                conn.execute('UPDATE issue_repairs SET feedback_digest=NULL,last_error=NULL WHERE id=?', (job['id'],))
+    agent_recovery.advance(job['session_id'], recovery, prefix='fixer', checkpoint=checkpoint)
+
+
 def collect(conn, transport, job):
+    try:
+        collect_step(conn, transport, job)
+    except Exception as exc:
+        current = conn.execute('SELECT * FROM issue_repairs WHERE id=?', (job['id'],)).fetchone()
+        recovery = json.loads(current['recovery_json'])
+        if not recovery:
+            recovery = dict(id=uuid.uuid4().hex, turn_id=None, outcome='supervision', stage='running')
+        recovery.setdefault('failed_step', recovery['stage'] if recovery['stage'] != 'running' else 'supervision')
+        save_recovery(conn, job, recovery)
+        notify_recovery(conn, transport, job, recovery, error=exc)
+        with conn:
+            conn.execute('UPDATE issue_repairs SET last_error=? WHERE id=?', (str(exc), job['id']))
+        raise
+
+
+def collect_step(conn, transport, job):
+    recovery = json.loads(job['recovery_json'])
+    if recovery:
+        notify_recovery(conn, transport, job, recovery)
+        if recovery['stage'] not in {'running', 'blocked'}:
+            recover_session(conn, job, recovery)
+            return
     turn = monitor.wait_once(job["session_id"], 1)
     relay(conn, transport, job)
     if turn.status == "running":
+        with conn:
+            conn.execute('UPDATE issue_repairs SET last_error=NULL WHERE id=?', (job['id'],))
         return
     if turn.status != "completed":
-        raise RuntimeError(f"repair session needs attention: {turn.outcome}")
-    final = monitor.read_final_agent_message(job["session_id"])
+        if recovery and (turn.turn_id, turn.outcome) == (recovery['turn_id'], recovery['outcome']):
+            return
+        blocked = turn.outcome in {'quota_limit', 'input_required'}
+        recovery = dict(id=uuid.uuid4().hex, turn_id=turn.turn_id, outcome=turn.outcome,
+                        stage='blocked' if blocked else 'stop')
+        if not blocked:
+            recovery['prompt'] = bounded_stored_prompt(
+                "Resume this existing repair after an agent error. Preserve HEAD, source edits, built trees, "
+                "logs and worktrees; do not reset or clean the checkout. Reconcile the progress note, git status "
+                "and existing command results before continuing. Recheck issue ownership. Reuse completed "
+                "validation; finish only unresolved work and report/publication handoff. Original instructions:\n\n" + job['prompt'])
+        save_recovery(conn, job, recovery)
+        notify_recovery(conn, transport, job, recovery)
+        return
+    lower = job['report_after_seq']
+    final = (monitor.read_final_agent_message(job['session_id'], after_seq=lower) if lower
+             else monitor.read_final_agent_message(job['session_id']))
     try:
         report = parse_report(final, job["issue_number"])
     except ValueError as exc:
-        request_correction(conn, job, str(exc), final)
+        request_correction(conn, job, str(exc), final, turn_id=turn.turn_id)
         return
     with conn:
         conn.execute("UPDATE issue_repairs SET status='finishing',report_json=?,last_error=NULL WHERE id=?",

@@ -43,6 +43,8 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   helpers for historical state; new work goes through `issue_fixer.py`.
 - `issue_fixer.py`: issue selection, ownership/dossier prompts, one repair
   session per work item, rejected-repair retries, report validation and cleanup.
+- `agent_recovery.py`: shared native cancellation and context-reset steps for
+  failed triage/fixer turns; each supervisor checkpoints through its own tables.
 - `triage.py`: observation-scoped investigations, validated report publication,
   deduplicated failure issues and retirement of exact resolved observations.
 - `automerge.py`: queue selection, batch/direct/operator state machines,
@@ -218,6 +220,18 @@ Legacy timeout helpers in `monitor.py` do not describe the current lifecycle.
 Manual abort and immediate-priority preemption deliberately interrupt work.
 After a verified terminal outcome, checkpoint/suspend through the existing
 cleanup path; supervision errors leave sessions available for later polls.
+Fixer terminal errors, stops and interruptions persist `issue_repairs.recovery_json`
+and recover in the original session/checkout through `agent_recovery.py`, sharing
+triage's native cancellation, typed clear and durable-divider controls. Preserve
+HEAD, source edits, worktrees, caches and logs; restart with the bounded original
+issue prompt and instructions to reconcile saved progress and reuse validation.
+`report_after_seq` fences pre-reset reports. Both recovery columns migrate
+additively in `connect_db`. Recovery is silent while progressing; quota/input
+blocks and failed supervision/recovery alert once per episode without making
+Slack delivery a scheduling gate. A repeated ended-turn result cannot start
+another reset. Accepted report corrections are quiet on subsequent polls;
+a new completed turn may receive another correction. No session-idle checks,
+new environment or elapsed-work deadline participates in recovery.
 
 Integration completion uses a durable `ready_json` handoff in the shared DB.
 Successful `mm-autopr` records it atomically with publication; speculative

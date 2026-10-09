@@ -1340,6 +1340,9 @@ def connect_db() -> sqlite3.Connection:
             "WHERE issue_url IS NOT NULL AND escalated = 0"
         )
     ensure_known_failure_schema(conn)
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='issue_repairs'").fetchone():
+        ensure_column(conn, 'issue_repairs', 'recovery_json', "TEXT NOT NULL DEFAULT '{}'")
+        ensure_column(conn, 'issue_repairs', 'report_after_seq', 'INTEGER NOT NULL DEFAULT 0')
     return conn
 
 

@@ -439,12 +439,127 @@ class IssueFixerTests(TestCase):
             self.assertIsNone(pending['feedback_digest'])
             fixer.request_correction(self.conn, job, "claim handoff", "report")
             latest = self.conn.execute("SELECT * FROM issue_repairs WHERE id=?", (job["id"],)).fetchone()
-            with self.assertRaisesRegex(RuntimeError, "already requested"):
-                fixer.request_correction(self.conn, latest, "claim handoff", "report")
+            fixer.request_correction(self.conn, latest, "claim handoff", "report")
         self.assertEqual(prompt.call_count, 2)
         self.assertEqual(prompt.call_args_list[0].kwargs['request_id'], prompt.call_args_list[1].kwargs['request_id'])
         self.assertLessEqual(len(prompt.call_args.kwargs['request_id']), 64)
         self.assertEqual(latest["status"], "running")
+
+    def running_job(self):
+        job = self.job()
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='running',session_id='session',start_notified=1 WHERE id=?", (job['id'],))
+        return job['id']
+
+    def saved_job(self, identifier):
+        return self.conn.execute('SELECT * FROM issue_repairs WHERE id=?', (identifier,)).fetchone()
+
+    def reopen(self):
+        self.conn.close()
+        self.conn = monitor.connect_db()
+        self.addCleanup(self.conn.close)
+
+    def test_failed_repair_recovers_same_session_with_durable_clear_and_restart(self):
+        identifier = self.running_job()
+        turn = monitor.TurnResult('error', 'error', turn_id=14)
+        with mock.patch.object(monitor, 'wait_once', return_value=turn) as wait, \
+             mock.patch.object(fixer, 'relay'), mock.patch.object(monitor, 'slack_send', return_value=(True, None)) as slack, \
+             mock.patch.object(monitor, 'interrupt_turn') as interrupt:
+            fixer.collect(self.conn, self.transport, self.saved_job(identifier))
+            recovery = json.loads(self.saved_job(identifier)['recovery_json'])
+            self.assertEqual(recovery['stage'], 'stop')
+            self.assertIn('Preserve HEAD, source edits, built trees', recovery['prompt'])
+            self.assertIn('Repair ONLY issue #12', recovery['prompt'])
+            self.assertTrue(fixer.prompt_fits(recovery['prompt']))
+            slack.assert_not_called()
+            identity = recovery['id']
+            def mj(args, **kwargs):
+                self.assertEqual(args[args.index('--session') + 1], 'session')
+                if args[0] == 'sessions':
+                    return '{"state":"running","is_idle":false}'
+                if args[0] == 'transcript':
+                    if args[args.index('--after-seq') + 1] == '0':
+                        return '{"latest_seq":41}'
+                    return json.dumps(dict(items=[dict(seq=45, stable_id='context-cleared:fixer-clear-' + identity + '-0')]))
+                self.assertIn(args[0], ['clear-queue', 'stop-task'])
+                return '{}'
+            with mock.patch.object(monitor, 'require_mj_success', side_effect=mj) as native, \
+                 mock.patch.object(fixer.agent_recovery.speculation, 'send_once',
+                     side_effect=[monitor.MjError('lost clear reply'), {}, monitor.MjError('lost restart reply'), {}]) as send:
+                fixer.collect(self.conn, self.transport, self.saved_job(identifier))
+                interrupt.assert_called_once_with('session')
+                for stage in ['clear', 'restart']:
+                    with self.assertRaises(monitor.MjError):
+                        fixer.collect(self.conn, self.transport, self.saved_job(identifier))
+                    self.assertEqual(json.loads(self.saved_job(identifier)['recovery_json'])['stage'], stage)
+                    self.reopen()
+                    fixer.collect(self.conn, self.transport, self.saved_job(identifier))
+                    if stage == 'clear':
+                        fixer.collect(self.conn, self.transport, self.saved_job(identifier))
+                        self.assertEqual(self.saved_job(identifier)['report_after_seq'], 45)
+                saved = self.saved_job(identifier)
+                self.assertEqual(saved['status'], 'running')
+                self.assertEqual(json.loads(saved['recovery_json'])['stage'], 'running')
+                self.assertIsNone(saved['last_error'])
+                self.assertEqual([c.args[3] for c in send.call_args_list],
+                                 ['fixer-clear-' + identity + '-0'] * 2 + ['fixer-restart-' + identity] * 2)
+                self.assertEqual(slack.call_count, 1)  # Only the failed recovery alert.
+                fixer.collect(self.conn, self.transport, saved)  # Sticky old error is quiet.
+                self.assertEqual(send.call_count, 4)
+                self.assertNotIn('new', [c.args[0][0] for c in native.call_args_list])
+                wait.return_value = monitor.TurnResult('completed', 'finished', turn_id=55)
+                report = dict(issue=12, outcome='resolved', summary='Fixed upstream')
+                with mock.patch.object(monitor, 'read_final_agent_message', return_value='fixer-result: ' + json.dumps(report)) as final:
+                    fixer.collect(self.conn, self.transport, self.saved_job(identifier))
+                final.assert_called_once_with('session', after_seq=45)
+                self.assertEqual(self.saved_job(identifier)['status'], 'finishing')
+                self.assertEqual(json.loads(self.saved_job(identifier)['report_json']), report)
+
+    def test_fixer_quota_and_input_blocks_alert_once_without_resetting_work(self):
+        identifier = self.running_job()
+        with mock.patch.object(fixer, 'relay'), mock.patch.object(monitor, 'require_mj_success') as native, \
+             mock.patch.object(monitor, 'slack_send', return_value=(True, None)) as slack:
+            for turn_id, outcome in [(14, 'quota_limit'), (15, 'input_required')]:
+                with mock.patch.object(monitor, 'wait_once', return_value=monitor.TurnResult(outcome, outcome, turn_id=turn_id)):
+                    for _ in range(3):
+                        fixer.collect(self.conn, self.transport, self.saved_job(identifier))
+                self.assertEqual(json.loads(self.saved_job(identifier)['recovery_json'])['stage'], 'blocked')
+            self.assertEqual(slack.call_count, 2)
+            self.assertIn('Restore provider capacity', slack.call_args_list[0].args[1])
+            self.assertIn('Respond to the session', slack.call_args_list[1].args[1])
+            native.assert_not_called()
+
+    def test_fixer_new_turn_can_receive_another_correction_but_old_turn_is_quiet(self):
+        identifier = self.running_job()
+        with mock.patch.object(monitor, 'wait_once', return_value=monitor.TurnResult('completed', 'finished', turn_id=14)) as wait, \
+             mock.patch.object(fixer, 'relay'), mock.patch.object(monitor, 'read_final_agent_message', return_value='no report'), \
+             mock.patch.object(monitor, 'send_session_message', side_effect=[monitor.MjError('lost reply'), None, None]) as send, \
+             mock.patch.object(monitor, 'slack_send', return_value=(True, None)) as slack:
+            with self.assertRaises(monitor.MjError):
+                fixer.collect(self.conn, self.transport, self.saved_job(identifier))
+            self.assertEqual(slack.call_count, 1)
+            self.reopen()
+            fixer.collect(self.conn, self.transport, self.saved_job(identifier))
+            fixer.collect(self.conn, self.transport, self.saved_job(identifier))
+            wait.return_value = monitor.TurnResult('completed', 'finished', turn_id=15)
+            fixer.collect(self.conn, self.transport, self.saved_job(identifier))
+            self.assertEqual(send.call_count, 3)
+            self.assertEqual(send.call_args_list[0].kwargs['request_id'], send.call_args_list[1].kwargs['request_id'])
+            self.assertNotEqual(send.call_args_list[1].kwargs['request_id'], send.call_args_list[2].kwargs['request_id'])
+            self.assertIsNone(self.saved_job(identifier)['last_error'])
+
+    def test_recovery_columns_upgrade_existing_live_repair_in_connect_db(self):
+        identifier = self.running_job()
+        prompt = self.saved_job(identifier)['prompt']
+        with self.conn:
+            self.conn.execute('ALTER TABLE issue_repairs DROP COLUMN recovery_json')
+            self.conn.execute('ALTER TABLE issue_repairs DROP COLUMN report_after_seq')
+        self.reopen()  # No call to issue_fixer.ensure_schema: the shared DB migrates it.
+        saved = self.saved_job(identifier)
+        self.assertEqual(saved['session_id'], 'session')
+        self.assertEqual(saved['prompt'], prompt)
+        self.assertEqual(saved['recovery_json'], '{}')
+        self.assertEqual(saved['report_after_seq'], 0)
 
     def test_poll_with_live_session_does_not_select_more_work(self):
         job = self.job()

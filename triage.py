@@ -11,13 +11,12 @@ import json
 from pathlib import Path
 import re
 import sqlite3
-import sys
 import tempfile
 import uuid
 
 import monitor
 import local_findings
-import speculation
+import agent_recovery
 
 LOCK_PATH = monitor.STATE_DIR.parent / "bifrost-ci-triage" / "triage.lock"
 KEY = ("workflow", "job_name", "identity_kind", "identity")
@@ -367,65 +366,42 @@ def notify_recovery(conn, job, recovery, *, error=None):
 
 def recover_session(conn, job, recovery):
     """Use native cancellation and the existing durable /clear boundary."""
-    session = job['session_id']
-    stage = recovery['stage']
-    clear = f"triage-clear-{recovery['id']}-{recovery.get('clear_retry', 0)}"
-
-    def mj(args):
-        return json.loads(monitor.require_mj_success(args, timeout=60) or '{}')
-
-    if stage == 'stop':
-        state = mj(['sessions', '--session', session, '--json'])
-        if str(state.get('state', '')).lower() in {'stopped', 'suspended', 'lost', 'failed'}:
-            mj(['resume', '--session', session, '--queue', 'discard', '--json'])
-            return
-        mj(['clear-queue', '--session', session, '--json'])
-        monitor.interrupt_turn(session)
-        mj(['stop-task', '--session', session, '--all', '--json'])
-        page = mj(['transcript', '--session', session, '--after-seq', '0', '--json'])
-        recovery.update(stage='clear', cursor=int(page['latest_seq']))
-    elif stage == 'clear':
-        speculation.send_once(sys.modules[__name__], session, '/clear', clear)
-        recovery['stage'] = 'cleared'
-    elif stage == 'cleared':
-        page = mj(['transcript', '--session', session, '--after-seq', str(recovery['cursor']), '--json'])
-        boundary = next((item for item in page.get('items', [])
-                         if item.get('stable_id') == 'context-cleared:' + clear), None)
-        if boundary is None:
-            recovery['cursor'] = int(page.get('next_after_seq', recovery['cursor']))
-            result, recovery['api_cursor'] = speculation.command_outcome(
-                sys.modules[__name__], session, clear, recovery.get('api_cursor', 0))
-            if result and result['outcome'] != 'succeeded':
-                recovery.update(stage='stop', failed_step='clear', clear_retry=recovery.get('clear_retry', 0) + 1)
-                save_recovery(conn, job, recovery)
-                raise RuntimeError('context clear failed: ' + str(result.get('message') or result['outcome']))
-        else:
-            with conn:
-                conn.execute('UPDATE triage_jobs SET report_after_seq=? WHERE id=?', (int(boundary['seq']), job['id']))
-            recovery['stage'] = 'restart'
-    elif stage == 'restart':
-        speculation.send_once(sys.modules[__name__], session, recovery['prompt'], 'triage-restart-' + recovery['id'])
-        recovery['stage'] = 'running'
+    def checkpoint(value):
         with conn:
-            conn.execute('UPDATE triage_jobs SET feedback_digest=NULL,last_error=NULL WHERE id=?', (job['id'],))
-    else:
-        raise RuntimeError('invalid triage recovery stage: ' + str(stage))
-    save_recovery(conn, job, recovery)
+            conn.execute('UPDATE triage_jobs SET recovery_json=?,report_after_seq=? WHERE id=?',
+                         (json.dumps(value), value.get('boundary_seq', job['report_after_seq']), job['id']))
+            if value['stage'] == 'running':
+                conn.execute('UPDATE triage_jobs SET feedback_digest=NULL,last_error=NULL WHERE id=?', (job['id'],))
+    agent_recovery.advance(job['session_id'], recovery, prefix='triage', checkpoint=checkpoint)
 
 
 def collect_report(conn, job) -> None:
+    try:
+        collect_report_step(conn, job)
+    except Exception as exc:
+        current = conn.execute('SELECT * FROM triage_jobs WHERE id=?', (job['id'],)).fetchone()
+        recovery = json.loads(current['recovery_json'])
+        if not recovery:
+            recovery = dict(id=uuid.uuid4().hex, turn_id=None, outcome='supervision', stage='running')
+        recovery.setdefault('failed_step', recovery['stage'] if recovery['stage'] != 'running' else 'supervision')
+        save_recovery(conn, job, recovery)
+        notify_recovery(conn, job, recovery, error=exc)
+        with conn:
+            conn.execute('UPDATE triage_jobs SET last_error=? WHERE id=?', (str(exc), job['id']))
+        raise
+
+
+def collect_report_step(conn, job) -> None:
     recovery = json.loads(job['recovery_json'])
     if recovery:
         notify_recovery(conn, job, recovery)
     if recovery and recovery['stage'] not in {'running', 'blocked'}:
-        try:
-            recover_session(conn, job, recovery)
-        except Exception as exc:
-            notify_recovery(conn, job, recovery, error=exc)
-            raise
+        recover_session(conn, job, recovery)
         return
     turn = monitor.wait_once(job["session_id"], 1)
     if turn.status == "running":
+        with conn:
+            conn.execute('UPDATE triage_jobs SET last_error=NULL WHERE id=?', (job['id'],))
         return
     if turn.status != "completed":
         if recovery and (turn.turn_id, turn.outcome) == (recovery['turn_id'], recovery['outcome']):

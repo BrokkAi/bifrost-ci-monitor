@@ -961,7 +961,7 @@ class TriageTests(TestCase):
 
         native = self.patch(monitor, 'require_mj_success', side_effect=mj)
         interrupt = self.patch(monitor, 'interrupt_turn')
-        send = self.patch(triage.speculation, 'send_once', side_effect=[monitor.MjError('lost clear reply'), {},
+        send = self.patch(triage.agent_recovery.speculation, 'send_once', side_effect=[monitor.MjError('lost clear reply'), {},
                                                                     monitor.MjError('lost restart reply'), {}])
         self.reopen()
         triage.collect_report(self.conn, self.job())
@@ -1001,7 +1001,7 @@ class TriageTests(TestCase):
         native = self.patch(monitor, 'require_mj_success', return_value=json.dumps(dict(
             items=[dict(seq=2870, stable_id='unrelated:triage-clear-' + recovery['id'] + '-0')],
             next_after_seq=2870)))
-        outcome = self.patch(triage.speculation, 'command_outcome', return_value=(None, 80))
+        outcome = self.patch(triage.agent_recovery.speculation, 'command_outcome', return_value=(None, 80))
         triage.collect_report(self.conn, self.job())
         self.assertEqual(self.recovery()['stage'], 'cleared')
         self.assertEqual(self.recovery()['cursor'], 2870)
@@ -1016,7 +1016,7 @@ class TriageTests(TestCase):
         recovery = self.recovery()
         recovery['stage'] = 'clear'
         triage.save_recovery(self.conn, self.job(), recovery)
-        send = self.patch(triage.speculation, 'send_once')
+        send = self.patch(triage.agent_recovery.speculation, 'send_once')
         triage.collect_report(self.conn, self.job())
         self.assertEqual(send.call_args.args[3], 'triage-clear-' + recovery['id'] + '-1')
 
@@ -1064,7 +1064,7 @@ class TriageTests(TestCase):
         self.assertEqual(self.slack.call_count, 3)
         triage.collect_report(self.conn, self.job())
         self.assertEqual(self.recovery()['stage'], 'clear')
-        self.patch(triage.speculation, 'send_once')
+        self.patch(triage.agent_recovery.speculation, 'send_once')
         triage.collect_report(self.conn, self.job())
         self.assertEqual(self.recovery()['stage'], 'cleared')
         self.assertEqual(self.slack.call_count, 3)
