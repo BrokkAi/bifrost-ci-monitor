@@ -40,7 +40,6 @@ MJ_BUNDLE = monitor.MJ_BUNDLE
 AUTOMERGE_MODEL = "opus"
 AUTOMERGE_SUBAGENT_MODEL = "global.openai.gpt-6-luna"
 AUTOMERGE_SUBAGENT_EFFORT = "high"
-AUTOMERGE_AGENT_LABEL = "Opus 5.5 + Luna 6 (mj)"
 MJ_WAIT_POLL_SECONDS = monitor.MJ_WAIT_POLL_SECONDS
 SLACK_MESSAGE_LIMIT = monitor.SLACK_MESSAGE_LIMIT
 
@@ -54,6 +53,7 @@ REJECTED_LABELS = frozenset({REJECTED_LABEL, "automerge-rejected"})
 INTEGRATION_LABEL = "mergemarshall:batch"
 INTEGRATION_LABELS = frozenset({INTEGRATION_LABEL, "mergemarshall-batch"})
 IN_PROGRESS_LABEL = "mergemarshall:in-progress"
+DEPENDENCY_BLOCKED_LABEL = "mergemarshall:dependency-blocked"
 PRIORITY_LABEL = "mergemarshall-priority"  # Legacy alias for high.
 HIGH_LABELS = frozenset({
     "mergemarshall:high", "mergemarshall-priority:high", PRIORITY_LABEL,
@@ -418,13 +418,14 @@ def enqueue_github_write(conn: sqlite3.Connection, batch_id: str, kind: str,
                          number: int, head_sha: str, payload: dict[str, Any]) -> str:
     """Record a GitHub intent in the caller's transaction, without doing I/O."""
     if kind not in {"reject_head", "draft_changed_head", "clear_rejection_label",
-                    "issue_comment", "integration_metadata", "promote_dependency", "membership_label"}:
+                    "issue_comment", "integration_metadata", "promote_dependency", "membership_label",
+                    "dependency_notice"}:
         raise ValueError("unknown GitHub write intent")
     if type(number) is not int or number <= 0 or not re.fullmatch(r"[0-9a-f]{40}|", head_sha):
         raise ValueError("invalid GitHub write target")
     ensure_github_outbox_schema(conn)
     identity = [batch_id, kind, number, head_sha]
-    if kind in {"issue_comment", "promote_dependency", "membership_label"}:
+    if kind in {"issue_comment", "promote_dependency", "membership_label", "dependency_notice"}:
         identity.append(payload)
     intent_id = hashlib.sha256(json.dumps(
         identity, sort_keys=True, separators=(",", ":")
@@ -516,6 +517,28 @@ def github_api_write(endpoint: str, method: str, payload: dict[str, Any] | None 
     return json.loads(result) if result.strip() else None
 
 
+def _deliver_dependency_notice(conn: sqlite3.Connection, row, detail, current_head: str) -> None:
+    """Reconcile the label from current discovery; comment only on its matching block."""
+    number = int(row["number"])
+    observed = conn.execute("SELECT head_sha,blocked_reason FROM automerge_pr_inventory WHERE number=?",
+                            (number,)).fetchone()
+    reason = observed["blocked_reason"] if observed and observed["head_sha"] == current_head else None
+    blocked = bool(reason and str(detail.get("state") or "").lower() == "open" and not detail.get("draft"))
+    present = DEPENDENCY_BLOCKED_LABEL in _labels(detail)
+    if blocked and not present:
+        ensure_repository_label(DEPENDENCY_BLOCKED_LABEL, "fbca04", "Waiting for a merge prerequisite")
+        github_api_write(f"issues/{number}/labels", "POST", {"labels": [DEPENDENCY_BLOCKED_LABEL]})
+    elif not blocked and present:
+        github_api_write(f"issues/{number}/labels/{quote(DEPENDENCY_BLOCKED_LABEL, safe='')}", "DELETE")
+    payload = json.loads(row["payload_json"])
+    if blocked and row["head_sha"] == current_head and payload["reason"] == reason:
+        marker = f"<!-- mergemarshall-intent:{row['intent_id']} -->"
+        if not _trusted_comment(number, marker):
+            github_api_write(f"issues/{number}/comments", "POST", {
+                "body": f"{dependency_block_comment(number, reason)}\n\n{marker}",
+            })
+
+
 def _trusted_comment(number: int, marker: str) -> bool:
     rejection = REJECTION_MARKER.fullmatch(marker)
     for comment in list_pull_comments(number):
@@ -571,6 +594,11 @@ def deliver_github_write(row: sqlite3.Row | dict[str, Any], *, conn: sqlite3.Con
             raise ValueError("membership labels require current batch state")
         _deliver_membership_label(conn, number, detail, current_head)
         return
+    if kind == "dependency_notice":
+        if conn is None:
+            raise ValueError("dependency notices require current discovery state")
+        _deliver_dependency_notice(conn, row, detail, current_head)
+        return
     if kind == "draft_changed_head":
         if (str(detail.get("state") or "").lower() == "open"
                 and current_head != payload["selected_head"] and not detail.get("draft")):
@@ -622,13 +650,17 @@ def deliver_github_write(row: sqlite3.Row | dict[str, Any], *, conn: sqlite3.Con
 
 
 def retry_github_outbox(conn: sqlite3.Connection, transport: monitor.SlackTransport,
-                        *, limit: int = 2) -> None:
+                        *, limit: int = 2, kind: str | None = None) -> None:
     ensure_github_outbox_schema(conn)
+    # Dependency notices run only after a fresh graph discovery. Other durable
+    # writes can retry even if discovery is unavailable on this poll.
+    kind_filter = "kind=?" if kind else "kind<>'dependency_notice'"
     rows = conn.execute(
         "SELECT * FROM automerge_github_outbox WHERE delivered_at IS NULL AND cancelled_at IS NULL "
         "AND (next_attempt_at IS NULL OR next_attempt_at<=?) "
+        f"AND {kind_filter} "
         "ORDER BY CASE WHEN kind='membership_label' THEN 1 ELSE 0 END,created_at,intent_id LIMIT ?",
-        (utc_now(), limit),
+        (utc_now(), kind, limit) if kind else (utc_now(), limit),
     ).fetchall()
     for row in rows:
         try:
@@ -644,7 +676,7 @@ def retry_github_outbox(conn: sqlite3.Connection, transport: monitor.SlackTransp
                     (attempts, retry_at, str(exc)[:1000], row["intent_id"]),
                 )
             log(f"GitHub {row['kind']} for #{row['number']} failed; retry at {retry_at}: {exc}")
-            if attempts >= 3 and not row["alerted_at"] and row["kind"] != "membership_label":
+            if attempts >= 3 and not row["alerted_at"] and row["kind"] not in {"membership_label", "dependency_notice"}:
                 batch = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                                      (row["batch_id"],)).fetchone()
                 lane = "speculative " if batch is not None and speculation.is_speculative(batch) else ""
@@ -855,35 +887,47 @@ def select_eligible_pull_requests(*, dry_run: bool = False,
 
 
 def report_dependency_blocks(conn, transport):
-    for item in DEPENDENCY_BLOCKS:
-        reason_key = hashlib.sha256(item['reason'].encode()).hexdigest()[:12]
-        notify_blocked_once(conn, transport, f"dependency-{item['number']}-{item['head_sha']}",
-                            f'dependency_blocked-{reason_key}',
-                            item['reason'])
+    """Checkpoint informational GitHub notices from the just-refreshed inventory."""
+    with conn:
+        for observed in conn.execute("SELECT * FROM automerge_pr_inventory").fetchall():
+            present = DEPENDENCY_BLOCKED_LABEL in _labels(json.loads(observed["data_json"]))
+            reason = observed["blocked_reason"]
+            if not reason and not present:
+                continue
+            intent_id = enqueue_github_write(conn, "__dependencies__", "dependency_notice",
+                                            observed["number"], observed["head_sha"], {"reason": reason})
+            # Rearm accepted reconciliation when the next listing shows label
+            # drift. Pending failures retain their original retry backoff.
+            if bool(reason) != present:
+                conn.execute("UPDATE automerge_github_outbox SET delivered_at=NULL,next_attempt_at=NULL,attempts=0 "
+                             "WHERE intent_id=? AND delivered_at IS NOT NULL", (intent_id,))
+    retry_github_outbox(conn, transport, kind="dependency_notice")
 
 
-def dependency_block_message(number: int, reason: str) -> str:
-    pull = f"<https://github.com/{REPO_NAME}/pull/{number}|PR #{number}>"
+def dependency_block_comment(number: int, reason: str) -> str:
+    pull = f"[PR #{number}](https://github.com/{REPO_NAME}/pull/{number})"
     changed = re.fullmatch(r'PR #(\d+) changed; its current head is absent from this PR', reason)
     blocked = re.fullmatch(r'blocked by prerequisite PR #(\d+)', reason)
     if changed:
         parent = int(changed[1])
-        prerequisite = f"<https://github.com/{REPO_NAME}/pull/{parent}|PR #{parent}>"
+        prerequisite = f"[PR #{parent}](https://github.com/{REPO_NAME}/pull/{parent})"
         summary = (f"{pull} needs a dependency update.\n"
                    f"It depends on {prerequisite}, but does not include that PR's latest commit.")
         action = (f"Action for the author: merge PR #{parent}'s latest branch into PR #{number}, "
                   "push the update, and mark the PR ready for merging.")
     elif blocked:
         parent = int(blocked[1])
-        prerequisite = f"<https://github.com/{REPO_NAME}/pull/{parent}|PR #{parent}>"
+        prerequisite = f"[PR #{parent}](https://github.com/{REPO_NAME}/pull/{parent})"
         summary = f"{pull} is waiting for prerequisite {prerequisite} to become eligible."
         action = (f"Action: check PR #{parent} and resolve its draft, rejection, or dependency block. "
                   "The queue will reconsider this PR automatically.")
     else:
-        summary = f"{pull} has a dependency block: {html.escape(reason)}."
+        linked_reason = re.sub(r'#(\d+)', lambda match:
+                              f"[#{match[1]}](https://github.com/{REPO_NAME}/pull/{match[1]})", html.escape(reason))
+        summary = f"{pull} has a dependency block: {linked_reason}."
         action = "Action: check the PR's prerequisite branches and resolve the dependency block."
-    return (f"Bifrost merge queue: {summary}\n{action}\n"
-            "This dependency block affects this PR and its dependents; other PRs remain eligible.")
+    return (f"**Merge queue: dependency blocked**\n\n{summary}\n\n{action}\n\n"
+            "The dependency-blocked label is removed automatically when the block clears.")
 
 
 def current_master_sha() -> str:
@@ -1825,26 +1869,19 @@ def send_start_notification(
     inline = (f"<{only_pull.url}|#{only_pull.number}> "
               f"{_slack_pr_title(only_pull.title)}"
               if only_pull else f"{len(pulls)} PRs")
-    lane = "PRIORITY " if _batch_priority(row) else ""
+    lane = "PRIORITY" if _batch_priority(row) else ""
     if _batch_source(row) == "operator":
-        lane = "OPERATOR FAST-TRACK "
+        lane = "OPERATOR FAST-TRACK"
     predecessor = speculation.get(row, "predecessor_id") if speculation.is_speculative(row) else None
-    if predecessor:
-        lane += "SPECULATIVE "
+    heading = ("Speculative batch:" if predecessor else
+               "Promoted batch:" if speculation.get(row, "role_promoted", 0) else "New batch:")
+    qualifiers = [lane] if lane else []
     if _batch_kind(row) == "direct":
-        message = (
-            f":arrows_counterclockwise: Bifrost {lane}direct merge: "
-            f"{inline}"
-        )
-    else:
-        message = (
-            f":arrows_counterclockwise: Bifrost {lane}{AUTOMERGE_AGENT_LABEL} batch: {inline}"
-        )
+        qualifiers.append("direct merge")
+    message = f"{heading} {inline}" + (f" ({'; '.join(qualifiers)})" if qualifiers else "")
     if predecessor:
         message += ("\nPreparing ahead of the current batch; "
                     "publication and merge wait for that batch to land.")
-    elif speculation.get(row, "role_promoted", 0):
-        message += "\nNow the primary batch; existing work and checks continue."
     thread_ts = row["thread_ts"]
     if not row["start_notification_sent"]:
         ok, thread_ts = monitor.slack_send(transport, message)
@@ -1930,6 +1967,12 @@ def deliver_blocked_notice(
     ).fetchone()
     if notice is None or notice["slack_notification_attempted"]:
         return True
+    if re.fullmatch(r'dependency-\d+-[0-9a-f]{40}', batch_id) and reason.startswith('dependency_blocked-'):
+        # Retire old queued Slack notices. Fresh discovery owns GitHub reporting.
+        with conn:
+            conn.execute("UPDATE automerge_blocked_notifications SET slack_notification_attempted=1 "
+                         "WHERE batch_id=? AND reason=?", (batch_id, reason))
+        return True
     batch = conn.execute(
         "SELECT * FROM automerge_batches WHERE batch_id = ?", (batch_id,)
     ).fetchone()
@@ -1939,16 +1982,8 @@ def deliver_blocked_notice(
         "source_ancestry_unverified", "baseline_unavailable", "ci_run_unavailable",
     }
     prefix = ":rotating_light:" if loud else ":warning:"
-    dependency = re.fullmatch(r'dependency-(\d+)-[0-9a-f]{40}', batch_id)
-    if dependency and reason.startswith('dependency_blocked-'):
-        details = notice['details']
-        # Already-persisted notices retain their identity and retry state.
-        legacy = re.fullmatch(r'PR #\d+ is waiting: (.*)\. Unrelated eligible work continues\.',
-                              details, re.DOTALL)
-        text = f"{prefix} {dependency_block_message(int(dependency[1]), legacy[1] if legacy else details)}"
-    else:
-        subject = f"{lane}automerge batch" if batch is not None else "merge queue"
-        text = f"{prefix} Bifrost {subject} ({reason}): {notice['details']}"
+    subject = f"{lane}automerge batch" if batch is not None else "merge queue"
+    text = f"{prefix} Bifrost {subject} ({reason}): {notice['details']}"
     try:
         ok, _ = send_batch_slack(
             transport, batch,

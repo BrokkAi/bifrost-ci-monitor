@@ -517,7 +517,7 @@ class StateTests(unittest.TestCase):
             (True, 'primary-root'), (False, None), (True, 'primary-details'),
         ]) as send:
             a.send_start_notification(self.conn, transport, self.row())
-            self.assertIn('SPECULATIVE', send.call_args_list[0].args[1])
+            self.assertTrue(send.call_args_list[0].args[1].startswith('Speculative batch:'))
             with self.conn:
                 self.conn.execute('UPDATE automerge_batches SET transcript_after_seq=100,role_promoted=1 WHERE batch_id=?',
                                   (self.child,))
@@ -540,8 +540,7 @@ class StateTests(unittest.TestCase):
             a.retry_pending_notifications(self.conn, transport)
         self.assertEqual(send.call_count, 6)
         self.assertNotIn('thread_ts', send.call_args_list[3].kwargs)
-        self.assertNotIn('SPECULATIVE', send.call_args_list[3].args[1])
-        self.assertIn('Now the primary batch', send.call_args_list[3].args[1])
+        self.assertTrue(send.call_args_list[3].args[1].startswith('Promoted batch:'))
         self.assertEqual(send.call_args_list[-1].kwargs['thread_ts'], 'primary-root')
         self.assertEqual(self.row()['start_notification_role'], 'primary')
         self.assertEqual(self.row()['start_pr_list_sent'], 1)

@@ -39,7 +39,9 @@ class DependencyTests(TestCase):
         self.patch(automerge, 'compare_commit_ancestry', side_effect=self.ancestor)
         self.patch(automerge, 'compare_pr_behind_by', return_value=0)
         self.patch(automerge, 'gh_json', side_effect=self.read)
-        self.patch(automerge, 'list_pull_comments', return_value=[])
+        self.comments = {}
+        self.patch(automerge, 'list_pull_comments', side_effect=lambda number: self.comments.get(number, []))
+        self.patch(automerge, 'ensure_repository_label')
         self.patch(automerge, 'run_gh', side_effect=AssertionError('unexpected external command'))
         self.patch(automerge, 'run_ci_impact', return_value={'mode': 'impact'})
         self.patch(automerge, '_known_failures_prompt', return_value='')
@@ -88,6 +90,16 @@ class DependencyTests(TestCase):
         number = int(endpoint.split('/')[1])
         if method == 'PATCH':
             self.items[number]['base']['ref'] = payload['base']
+        elif '/labels' in endpoint:
+            if method == 'POST':
+                names = automerge._labels(self.items[number]) | set(payload['labels'])
+            else:
+                names = automerge._labels(self.items[number]) - {automerge.DEPENDENCY_BLOCKED_LABEL}
+            self.items[number]['labels'] = [{'name': name} for name in sorted(names)]
+        elif endpoint.endswith('/comments'):
+            self.comments.setdefault(number, []).append({
+                'user': {'login': automerge.TRUSTED_REJECTION_LOGIN}, 'body': payload['body'],
+            })
         return self.items[number]
 
     def view(self, number):
@@ -125,43 +137,126 @@ class DependencyTests(TestCase):
         self.selected()
         item = next(item for item in automerge.DEPENDENCY_BLOCKS if item['number'] == 20)
         transport = monitor.SlackTransport('webhook', webhook='unused')
-        with (mock.patch.object(automerge, 'DEPENDENCY_BLOCKS', [item]),
-              mock.patch.object(monitor, 'slack_send', return_value=(True, 'thread')) as send):
+        with mock.patch.object(monitor, 'slack_send') as send:
             automerge.report_dependency_blocks(self.conn, transport)
+            self.selected()
             automerge.report_dependency_blocks(self.conn, transport)
-        send.assert_called_once()
-        message = send.call_args.args[1]
-        self.assertIn('/pull/20|PR #20>', message)
-        self.assertIn('/pull/30|PR #30>', message)
+        send.assert_not_called()
+        self.assertIn(automerge.DEPENDENCY_BLOCKED_LABEL, automerge._labels(self.items[20]))
+        self.assertEqual(len(self.comments[20]), 1)
+        message = self.comments[20][0]['body']
+        self.assertIn('[PR #20](https://github.com/BrokkAi/bifrost-dev/pull/20)', message)
+        self.assertIn('[PR #30](https://github.com/BrokkAi/bifrost-dev/pull/30)', message)
         self.assertIn('merge PR #30\'s latest branch into PR #20', message)
         self.assertIn('push the update', message)
-        self.assertIn('other PRs remain eligible', message)
+        self.assertIn('removed automatically', message)
         self.assertNotIn(item['head_sha'], message)
         self.assertNotIn('dependency_blocked-', message)
         self.assertNotIn('automerge batch', message)
         self.assertNotIn('work continues', message)
+        # Lost acceptance replies retry the same comment, and missing labels
+        # are restored independently without posting another comment.
+        self.items[20]['labels'] = []
+        self.selected()
+        writer = automerge.github_api_write
+        def lost_ack(endpoint, method, payload=None):
+            result = writer(endpoint, method, payload)
+            raise monitor.CommandError('reply lost after write')
+        with mock.patch.object(automerge, 'github_api_write', side_effect=lost_ack):
+            automerge.report_dependency_blocks(self.conn, transport)
+        pending = self.conn.execute("SELECT * FROM automerge_github_outbox WHERE kind='dependency_notice' "
+                                    "AND number=20 AND delivered_at IS NULL").fetchone()
+        self.assertEqual(pending['attempts'], 1)
+        self.selected()
+        automerge.report_dependency_blocks(self.conn, transport)
+        self.assertEqual(self.conn.execute('SELECT attempts FROM automerge_github_outbox WHERE intent_id=?',
+                                          (pending['intent_id'],)).fetchone()[0], 1)
+        with self.conn:
+            self.conn.execute('UPDATE automerge_github_outbox SET next_attempt_at=NULL WHERE intent_id=?',
+                              (pending['intent_id'],))
+        automerge.report_dependency_blocks(self.conn, transport)
+        self.assertEqual(len(self.comments[20]), 1)
+        # A replaced or closed head clears the informational label, even when
+        # an older add is replayed. It must never comment on the old block.
+        self.items[20]['head']['sha'] = self.w
+        automerge.deliver_github_write(pending, conn=self.conn)
+        self.assertNotIn(automerge.DEPENDENCY_BLOCKED_LABEL, automerge._labels(self.items[20]))
+        self.assertEqual(len(self.comments[20]), 1)
+        self.items[20]['head']['sha'] = self.y
+        self.items[20]['state'] = 'closed'
+        self.items[20]['labels'] = [{'name': automerge.DEPENDENCY_BLOCKED_LABEL}]
+        self.selected()
+        automerge.report_dependency_blocks(self.conn, transport)
+        self.assertNotIn(automerge.DEPENDENCY_BLOCKED_LABEL, automerge._labels(self.items[20]))
 
-    def test_pending_legacy_dependency_notice_gets_the_clear_format_on_retry(self):
+    def test_pending_legacy_dependency_notice_is_retired_without_slack_on_retry(self):
         identifier = 'dependency-20-' + self.y
         reason = 'dependency_blocked-legacy'
         transport = monitor.SlackTransport('webhook', webhook='unused')
-        with mock.patch.object(monitor, 'slack_send', return_value=(False, None)):
-            automerge.notify_blocked_once(self.conn, transport, identifier, reason,
+        with self.conn:
+            self.conn.execute('INSERT INTO automerge_blocked_notifications '
+                '(batch_id,reason,created_at,details,slack_notification_attempted) VALUES (?,?,?,?,0)',
+                (identifier, reason, automerge.utc_now(),
                 'PR #20 is waiting: PR #30 changed; its current head is absent from this PR. '
-                'Unrelated eligible work continues.')
+                'Unrelated eligible work continues.'))
         with mock.patch.object(monitor, 'slack_send', return_value=(True, 'thread')) as send:
             automerge.deliver_blocked_notice(self.conn, transport, identifier, reason)
             automerge.deliver_blocked_notice(self.conn, transport, identifier, reason)
-        send.assert_called_once()
-        self.assertIn('Action for the author:', send.call_args.args[1])
-        self.assertNotIn(identifier, send.call_args.args[1])
+        send.assert_not_called()
+        self.assertEqual(self.conn.execute('SELECT slack_notification_attempted FROM automerge_blocked_notifications '
+                                          'WHERE batch_id=?', (identifier,)).fetchone()[0], 1)
 
     def test_ineligible_prerequisite_notice_points_action_at_the_prerequisite(self):
-        message = automerge.dependency_block_message(20, 'blocked by prerequisite PR #30')
-        self.assertIn('/pull/30|PR #30>', message)
+        message = automerge.dependency_block_comment(20, 'blocked by prerequisite PR #30')
+        self.assertIn('/pull/30)', message)
         self.assertIn('Action: check PR #30', message)
         self.assertIn('reconsider this PR automatically', message)
         self.assertNotIn('merge PR #30', message)
+        self.items[30]['draft'] = True
+        self.selected()
+        transport = monitor.SlackTransport('webhook', webhook='unused')
+        with mock.patch.object(monitor, 'slack_send') as send:
+            writer = automerge.github_api_write
+            def lost_comment_ack(endpoint, method, payload=None):
+                result = writer(endpoint, method, payload)
+                if endpoint == 'issues/20/comments':
+                    raise monitor.CommandError('comment accepted; reply lost')
+                return result
+            with mock.patch.object(automerge, 'github_api_write', side_effect=lost_comment_ack):
+                automerge.report_dependency_blocks(self.conn, transport)
+            self.assertEqual(len(self.comments[20]), 1)
+            pending = self.conn.execute("SELECT * FROM automerge_github_outbox "
+                                        "WHERE kind='dependency_notice' AND number=20").fetchone()
+            self.assertEqual(pending['attempts'], 1)
+            # Normal outbox retries wait for fresh discovery before processing
+            # dependency notices. A dependency retry reconciles the accepted
+            # comment instead of posting it again.
+            with self.conn:
+                self.conn.execute('UPDATE automerge_github_outbox SET next_attempt_at=NULL WHERE intent_id=?',
+                                  (pending['intent_id'],))
+            with mock.patch.object(automerge, 'deliver_github_write') as deliver:
+                automerge.retry_github_outbox(self.conn, transport)
+            deliver.assert_not_called()
+            self.selected()
+            automerge.report_dependency_blocks(self.conn, transport)
+            self.assertEqual(len(self.comments[20]), 1)
+            # Make the prerequisite eligible again without changing either
+            # head. A late old intent uses the refreshed graph, not its payload.
+            self.items[30]['draft'] = False
+            self.selected()
+            automerge.deliver_github_write(pending, conn=self.conn)
+            automerge.report_dependency_blocks(self.conn, transport)
+            self.assertNotIn(automerge.DEPENDENCY_BLOCKED_LABEL, automerge._labels(self.items[20]))
+            self.assertEqual(len(self.comments[20]), 1)
+            # Reblocking the same head restores the label, not the comment.
+            self.items[30]['draft'] = True
+            self.selected()
+            automerge.report_dependency_blocks(self.conn, transport)
+            self.assertIn(automerge.DEPENDENCY_BLOCKED_LABEL, automerge._labels(self.items[20]))
+            self.assertEqual(len(self.comments[20]), 1)
+        send.assert_not_called()
+        for reason in ('unresolved prerequisite PR #30', 'cyclic prerequisites: #20 -> #30 -> #20'):
+            self.assertIn('/pull/30)', automerge.dependency_block_comment(20, reason))
 
     def test_lookahead_selects_disjoint_dependency_closure_without_promoting_unlanded_work(self):
         foreground = [p for p in self.selected() if p.number == 30]

@@ -352,12 +352,15 @@ retries, direct landing, and `--land-now`. Changed, draft, rejected, withdrawn,
 or closed-unmerged prerequisites block descendants while unrelated work proceeds.
 A repair unblocks descendants after they contain the new eligible prerequisite
 head. Ambiguous branches/shared heads, cycles, and unresolved relationships are
-reported through dependency block notices and `--check`.
-
-Dependency notices link the affected PR and prerequisite, state the author's
-next action, and describe the scope of that block without claiming the queue
-is progressing. Keep exact-head and reason identities internal to notification
-deduplication; pending legacy notices use the same readable delivery format.
+reported through `--check` and App-owned GitHub notices. The supervisor applies
+`mergemarshall:dependency-blocked` to ready PRs with ineligible prerequisites
+and comments on the blocked PR with links and the needed action. The existing
+inventory's current block reason owns label reconciliation; changed, closed,
+draft, or unblocked heads lose the label. Exact-head/reason outbox markers
+deduplicate comments after lost replies. Retry these informational writes only
+after fresh dependency discovery, retaining backoff without changing batch
+revisions or creating Slack alerts. Retire pending legacy dependency Slack
+notices without sending them.
 
 Ejection removes dependent descendants with exclusion kind `blocked`; only the
 standalone-broken prerequisite receives a rejection. Recheck captured dependency
@@ -430,8 +433,9 @@ until ancestry incorporation: the agent continues its existing validation and
 uses `mm-db ready` as before. Passing evidence gates publication, not role
 promotion. A changed actual master tree uses the existing same-session recovery.
 
-Slack start headings mark successors as `SPECULATIVE` and explain that the
-preceding batch gates publication/merge. Batch and predecessor IDs belong in
+Slack start headings are `New batch:`, `Promoted batch:`, or `Speculative batch:`;
+omit model/harness boilerplate. Speculative headings explain that the preceding
+batch gates publication/merge. Batch and predecessor IDs belong in
 the first thread reply, alongside the PR list for multi-PR batches, rather than
 channel-level messages. Start replies use the existing durable reply retry;
 standalone alerts and outcomes attach diagnostic replies on a best-effort basis
