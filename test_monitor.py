@@ -1755,6 +1755,22 @@ class MjRunnerTests(unittest.TestCase):
         finally:
             migrated.close()
 
+    def test_connect_db_preserves_legacy_merge_configuration(self):
+        with self.conn:
+            self.conn.execute("CREATE TABLE automerge_batches (batch_id TEXT PRIMARY KEY)")
+            self.conn.execute("INSERT INTO automerge_batches VALUES ('existing-batch')")
+        self.conn.close()
+        self.conn = monitor.connect_db()
+        self.assertEqual(self.conn.execute(
+            "SELECT agent_configuration FROM automerge_batches WHERE batch_id='existing-batch'"
+        ).fetchone()[0], 'multi-pr')
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET agent_configuration='single-pr'")
+        self.conn.close()
+        self.conn = monitor.connect_db()
+        self.assertEqual(self.conn.execute("SELECT agent_configuration FROM automerge_batches").fetchone()[0],
+                         'single-pr')
+
 
 class PromptContractTests(unittest.TestCase):
     def test_repair_prompt_requires_trailer_and_pr_publication(self):

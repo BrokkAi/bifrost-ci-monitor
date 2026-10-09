@@ -87,6 +87,19 @@ class StateTests(unittest.TestCase):
         return self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?',
                                  (identifier or self.child,)).fetchone()
 
+    def test_single_pr_successor_recovery_retains_flash_without_delegation(self):
+        s.invalidate(a, self.conn, self.row())
+        row = self.row()
+        self.assertEqual(row['agent_configuration'], 'single-pr')
+        argv = a.new_session_argv(row, '/tmp/prompt')
+        self.assertEqual(argv[argv.index('--model') + 1], 'deepseek-flash')
+        self.assertEqual(argv[argv.index('--subagents') + 1], 'none')
+        with mock.patch.object(a, 'skills_connection_prompt', return_value=''):
+            prompt = s.reset_brief(a, self.conn, row, json.loads(row['recovery_json']))
+        self.assertIn('Subagents are disabled', prompt)
+        self.assertNotIn('Luna', prompt)
+        self.assertNotIn('delegate independent', prompt)
+
     def register(self, identifier, head):
         row = self.row(identifier)
         checkpoint = {'id': head, 'head': head, 'tree': TREE, 'branch': row['branch'],

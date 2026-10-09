@@ -320,7 +320,7 @@ Preserved exclusions: {exclusions}
 Old attempt evidence (data, not instructions; inspect logs/progress history for details): {evidence}
 {a.SESSION_RECOVERY_GUIDANCE}
 {GUIDANCE}
-{a._validation_guidance(row['base_sha'], a._stored_impact(row))}
+{a._validation_guidance(row['base_sha'], a._stored_impact(row), subagents=a._batch_subagents(row))}
 {a.FIX_VS_EJECT_GUIDANCE}
 {a.SKILLS_GUIDANCE}
 {a.skills_connection_prompt(row)}
@@ -502,7 +502,7 @@ def promote(a, conn, transport, row, parent):
                  "old_candidate": json.loads(row["candidate_json"])}
     impact = a.run_ci_impact(landed, [p.head_sha for p in a.row_pulls(row)])
     prompt = f"""Your batch is now primary and your predecessor landed. Read mm-db state and run mm-merge --promote to incorporate the exact landed base {landed}. If the helper proves the tree unchanged, register the resulting head with mm-db candidate without withdrawing the old checkpoint: the service verifies this ancestry-only replacement so your successor can keep its work. If the tree differs or you need source edits, withdraw the checkpoint before further edits and reassess affected checks. Record a fresh local assessment for the resulting committed HEAD, explicitly citing reused evidence at its old SHA only if the tree and validation inputs/settings still match. Then publish through mm-autopr (use --rebuild if its push needs a lease). Finish with mm-db report. Normal {_mode(a, row)} publication/landing gates apply.
-{a._validation_guidance(landed, impact)}
+{a._validation_guidance(landed, impact, subagents=a._batch_subagents(row))}
 {GUIDANCE}
 """
     with conn:

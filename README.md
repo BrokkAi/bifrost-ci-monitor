@@ -39,12 +39,19 @@ Install Python 3.11 or later, Node.js 18 or later, Git, GitHub CLI (`gh`), Mjoln
 and SQLite's CLI for inspection/backups. The Python programs use the standard
 library; the merger uses host Node.js to run Bifrost's CI impact classifier.
 Configure Mjolnir's `CI` workspace, `bifrost` bundle, and the `podman` and
-`bedrock-podman` targets before enabling cron. Merge sessions use the configured
-Opus 5.5 model (`opus`) with Luna 6 subagents (`global.openai.gpt-6-luna`, high
-effort), with up to 16 concurrent subagents per session. Set
+`bedrock-podman` targets before enabling cron. Batches starting with one source PR
+use DeepSeek Flash (`deepseek-flash`) on `podman`, with subagents disabled.
+Larger batches use Opus 5.5 (`opus`) on `bedrock-podman` with Luna 6 subagents
+(`global.openai.gpt-6-luna`, high effort), with up to 16 concurrent subagents
+per session. Each batch retains its initial configuration through expansion
+and recovery. Set
 `max_concurrent = 16` under `[subagents]` and make the Luna profile eligible
 under `[subagents.eligible_profiles]`.
 Fixer and triage sessions use the `deepseek-flash` model.
+
+For one-hour Opus prompt caching, set `ENABLE_PROMPT_CACHING_1H = "1"` under
+`[profiles.bedrock-claude.environment]` in the CI host's Mjolnir `config.toml`.
+New workers pick up the setting automatically.
 
 Merger/fixer sessions each use 32 CPUs and 28 GiB RAM; triage uses 2 CPUs and
 4 GiB RAM. Provision capacity for overlapping work. The published Mjolnir

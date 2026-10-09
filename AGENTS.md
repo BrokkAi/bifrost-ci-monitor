@@ -267,9 +267,16 @@ alert; provider/input/lifecycle blockers may need operator intervention. CI-wait
 and merge phases without a valid receipt queue handoff recovery without inspecting
 session idleness. Already-confirmed GitHub landing can still be reconciled.
 
-Integration sessions use Opus 5.5 (`opus`) on `bedrock-podman` with Mjolnir Luna 6
-(`global.openai.gpt-6-luna`, high effort) subagents. The CI Mjolnir configuration
-allows up to 16 concurrent subagents per session. The primary coordinates the
+At creation, integration batches with exactly one source PR select DeepSeek
+Flash (`deepseek-flash`) on `podman` with `--subagents none`; batches with
+multiple source PRs select Opus 5.5 (`opus`) on `bedrock-podman` with Mjolnir
+Luna 6 (`global.openai.gpt-6-luna`, high effort) subagents. Persist this choice
+in `automerge_batches.agent_configuration`; expansion, exclusion, recovery and
+promotion retain it. Existing rows migrate to `multi-pr`, preserving their
+Opus/Luna sessions. Prompt delegation guidance follows the persisted choice.
+The CI Opus profile enables one-hour prompt caching via
+`ENABLE_PROMPT_CACHING_1H = "1"`. The CI Mjolnir configuration allows up to
+16 concurrent subagents per session. The primary coordinates the
 checkout and branch and owns Git operations, batch mutations, test assessment,
 and publication; subagents edit assigned files. Work against the captured base
 until the supervisor requests an update; it owns final master/source freshness

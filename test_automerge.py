@@ -119,6 +119,7 @@ def make_db(
         """
         CREATE TABLE automerge_batches (
             batch_id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'batch',
+            agent_configuration TEXT NOT NULL DEFAULT 'multi-pr',
             source TEXT NOT NULL DEFAULT 'queue', priority INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL, base_sha TEXT NOT NULL,
             pull_requests_json TEXT NOT NULL, title TEXT NOT NULL UNIQUE,
@@ -858,7 +859,7 @@ class IdentityAndPromptTests(TestCase):
                 self.assertTrue(automerge._has_not_worse_verdict(f'{verdict}: not-worse\nBaseline failures: test_old'))
 
     def test_mj_new_argv_uses_model_and_branch(self):
-        conn = make_db(phase="building", session_id=None)
+        conn = make_db(phase="building", session_id=None, pulls=[pull(7), pull(9, HEAD_TWO)])
         row = row_for(conn)
         argv = automerge.new_session_argv(row, "/tmp/prompt")
         self.assertEqual(monitor.MJ_CPUS, 32)
@@ -876,6 +877,77 @@ class IdentityAndPromptTests(TestCase):
             "--prompt-file", "/tmp/prompt", "--json",
         ])
         conn.close()
+
+    def test_single_pr_launch_uses_flash_without_subagents(self):
+        conn = make_db(phase="building", session_id=None, status="launching", ci_mode="async")
+        self.addCleanup(conn.close)
+        prompts = []
+
+        def launch(argv, **kwargs):
+            prompts.append(Path(argv[argv.index("--prompt-file") + 1]).read_text())
+            self.assertEqual(argv[argv.index("--model") + 1], "deepseek-flash")
+            self.assertEqual(argv[argv.index("--target") + 1], "podman")
+            self.assertEqual(argv[argv.index("--subagents") + 1], "none")
+            self.assertNotIn("--subagent-model", argv)
+            self.assertNotIn("--subagent-effort", argv)
+            return subprocess.CompletedProcess(argv, 0, '{"session_id":"flash-session"}', '')
+
+        with (mock.patch.object(automerge, "lookup_batch_session", return_value=None),
+              mock.patch.object(automerge, "skills_connection_prompt", return_value=""),
+              mock.patch.object(monitor, "mj_command", side_effect=launch)):
+            self.assertEqual(automerge.launch_batch_session(row_for(conn), [pull()], conn=conn),
+                             "flash-session")
+        self.assertIn("Subagents are disabled", prompts[0])
+        self.assertNotIn("Luna", prompts[0])
+        self.assertNotIn("delegate independent", prompts[0])
+        self.assertNotIn("delegated inspection", prompts[0])
+
+    @unchanged_queue()
+    def test_configuration_survives_expansion_and_source_removal(self):
+        for initial in ([pull()], [pull(), pull(8, HEAD_TWO)]):
+            with self.subTest(initial_count=len(initial)):
+                conn = make_db(ci_mode="async", pulls=initial)
+                self.addCleanup(conn.close)
+                expected = "single-pr" if len(initial) == 1 else "multi-pr"
+                additions = initial + [pull(9, HEAD_THREE)]
+                with (mock.patch.object(automerge, "_recheck_sources", side_effect=lambda pulls, **kw: (pulls, [])),
+                      mock.patch.object(automerge, "select_eligible_pull_requests", return_value=additions)):
+                    self.assertTrue(automerge._request_rebuild(conn, row_for(conn), initial, "expanded"))
+                expanded = row_for(conn)
+                self.assertEqual(len(automerge._active_sources(expanded)), len(initial) + 1)
+                self.assertEqual(expanded['agent_configuration'], expected)
+                self.assertEqual(automerge._batch_subagents(expanded), len(initial) > 1)
+                self.assertEqual("Luna" in expanded['pending_prompt'], len(initial) > 1)
+                with (mock.patch.object(automerge, "_recheck_sources", side_effect=lambda pulls, **kw: (pulls, [])),
+                      mock.patch.object(automerge, "select_eligible_pull_requests", return_value=[])):
+                    self.assertTrue(automerge._request_rebuild(conn, expanded, [initial[0]], "removed"))
+                reduced = row_for(conn)
+                self.assertEqual(len(automerge._active_sources(reduced)), 1)
+                argv = automerge.new_session_argv(reduced, "/tmp/prompt")
+                self.assertEqual(argv[argv.index('--model') + 1],
+                                 'deepseek-flash' if expected == 'single-pr' else 'opus')
+
+    def test_single_pr_feedback_and_sync_prompt_do_not_request_delegation(self):
+        conn = make_db(ci_mode="sync")
+        self.addCleanup(conn.close)
+        prompts = [automerge.build_prompt("batch-test", [pull()], BASE_SHA, subagents=False),
+                   automerge.build_ci_feedback(row_for(conn), {"ci.yml/test"}, set(), "logs", "baseline")]
+        for prompt in prompts:
+            self.assertIn("Subagents are disabled", prompt)
+            self.assertNotIn("Luna", prompt)
+            self.assertNotIn("delegate independent", prompt)
+            self.assertNotIn("delegated inspection", prompt)
+
+    def test_legacy_single_pr_batch_keeps_opus_configuration(self):
+        conn = make_db()
+        self.addCleanup(conn.close)
+        with conn:
+            conn.execute("ALTER TABLE automerge_batches DROP COLUMN agent_configuration")
+            automerge.ensure_column(conn, 'automerge_batches', 'agent_configuration',
+                                    "TEXT NOT NULL DEFAULT 'multi-pr'")
+        argv = automerge.new_session_argv(row_for(conn), '/tmp/prompt')
+        self.assertEqual(argv[argv.index('--model') + 1], 'opus')
+        self.assertEqual(argv[argv.index('--subagents') + 1], 'single-model')
 
     @unchanged_queue()
     def test_build_turn_discovers_and_persists_integration_pr(self):
@@ -3607,6 +3679,7 @@ class LaunchAndLifecycleTests(TestCase):
                         for row in conn.execute("PRAGMA table_info(automerge_batches)")}
             self.assertIn("kind", columns)
             self.assertEqual(defaults["kind"], "'batch'")
+            self.assertEqual(defaults["agent_configuration"], "'multi-pr'")
             self.assertIn("abort_reason", columns)
             self.assertIn("phase", columns)
             self.assertIn("ci_mode", columns)

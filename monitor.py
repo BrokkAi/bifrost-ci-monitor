@@ -1340,6 +1340,8 @@ def connect_db() -> sqlite3.Connection:
             "WHERE issue_url IS NOT NULL AND escalated = 0"
         )
     ensure_known_failure_schema(conn)
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='automerge_batches'").fetchone():
+        ensure_column(conn, 'automerge_batches', 'agent_configuration', "TEXT NOT NULL DEFAULT 'multi-pr'")
     if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='issue_repairs'").fetchone():
         ensure_column(conn, 'issue_repairs', 'recovery_json', "TEXT NOT NULL DEFAULT '{}'")
         ensure_column(conn, 'issue_repairs', 'report_after_seq', 'INTEGER NOT NULL DEFAULT 0')
