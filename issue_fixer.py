@@ -449,9 +449,9 @@ def request_correction(conn, job, problem, report_text):
         f"Your issue #{job['issue_number']} completion needs correction: {problem}. "
         "Finish only the missing report/publication/claim handoff, respecting current ownership, "
         "then return the original fixer-result JSON. Reuse your findings; do not repeat the investigation.",
-        request_id="fixer-feedback-" + hashlib.sha256((job['id'] + digest).encode()).hexdigest())
+        request_id="fixer-feedback-" + hashlib.sha256((job['id'] + digest).encode()).hexdigest()[:32])
     with conn:
-        conn.execute("UPDATE issue_repairs SET status='running',feedback_digest=? WHERE id=?", (digest, job["id"]))
+        conn.execute("UPDATE issue_repairs SET status='running',feedback_digest=?,last_error=NULL WHERE id=?", (digest, job["id"]))
 
 
 def collect(conn, transport, job):

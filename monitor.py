@@ -2755,6 +2755,9 @@ def interrupt_and_wait(
 
 def send_session_message(session_id: str, text: str, *, request_id: str) -> dict[str, Any]:
     """Use mj's send_message route with a producer-owned identity across retries."""
+    if not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', request_id) or request_id in {'.', '..'}:
+        raise MjError('mj message request id must contain 1 to 64 ASCII letters, digits, dots, hyphens or underscores',
+                      reason='mj_message_invalid')
     if not text.strip() or len(text.encode()) > 64 * 1024:
         raise MjError("mj message must contain 1 to 65536 UTF-8 bytes", reason="mj_message_invalid")
     try:

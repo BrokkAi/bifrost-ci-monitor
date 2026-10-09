@@ -325,9 +325,9 @@ def request_report_correction(conn, job, final, problem, *, turn_id=None) -> Non
         "Use the evidence already collected to classify your findings; do not repeat the "
         "investigation or write to GitHub/Slack. Infrastructure findings are channel notices, "
         "never product tickets, including when a later job has recovered.",
-        request_id="triage-feedback-" + hashlib.sha256((job['id'] + digest).encode()).hexdigest())
+        request_id="triage-feedback-" + hashlib.sha256((job['id'] + digest).encode()).hexdigest()[:32])
     with conn:
-        conn.execute("UPDATE triage_jobs SET status='running',feedback_digest=? WHERE id=?",
+        conn.execute("UPDATE triage_jobs SET status='running',feedback_digest=?,last_error=NULL WHERE id=?",
                      (digest, job['id']))
 
 

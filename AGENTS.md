@@ -109,7 +109,9 @@ same route as `send_message`. Automation uses `monitor.send_session_message`
 with a persisted request ID through `/sessions/SESSION_ID/message`; the CLI
 generates a fresh ID per invocation, so it is unsuitable for ambiguous retries.
 Reuse the original request ID after a lost reply. Inspect command `--help` for
-installed flags. Typed `/clear` and the ordered restart brief continue to use
+installed flags. Message request IDs must fit mj's 1-64 ASCII identifier contract;
+the shared client validates this before submission. Correction IDs retain their
+stable identity through retries and fit within that limit. Typed `/clear` and the ordered restart brief continue to use
 `mj prompt --command-id ID --prompt-file FILE` and their durable recovery boundary.
 `mj interrupt-turn` cancels the current turn, `mj stop-task --session SESSION_ID
 TASK_ID` stops a listed background task, and `mj suspend --session SESSION_ID

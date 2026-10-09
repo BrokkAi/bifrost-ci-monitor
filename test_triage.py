@@ -929,6 +929,7 @@ class TriageTests(TestCase):
         triage.collect_report(self.conn, self.job())
         self.assertEqual(prompt.call_count, 2)
         self.assertEqual(prompt.call_args_list[0].kwargs['request_id'], prompt.call_args_list[1].kwargs['request_id'])
+        self.assertLessEqual(len(prompt.call_args.kwargs['request_id']), 64)
 
     def recovery(self):
         return json.loads(self.job()['recovery_json'])

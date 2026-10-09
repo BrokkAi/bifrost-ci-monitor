@@ -22,6 +22,14 @@ ISSUE_URL = "https://github.com/BrokkAi/bifrost-dev/issues/2304"
 
 
 class InterruptTurnTests(unittest.TestCase):
+    def test_invalid_message_ids_are_rejected_before_api_submission(self):
+        for request_id in ['', 'x' * 65, 'has/slash', '\u00e9', '.', '..']:
+            with self.subTest(request_id=request_id), mock.patch.object(monitor, 'require_mj_success') as api:
+                with self.assertRaises(monitor.MjError) as error:
+                    monitor.send_session_message('session', 'correct the report', request_id=request_id)
+                self.assertEqual(error.exception.reason, 'mj_message_invalid')
+                api.assert_not_called()
+
     def test_wait_retains_the_reported_turn_identity(self):
         with mock.patch.object(monitor, 'mj_command', return_value=subprocess.CompletedProcess(
                 [], 0, json.dumps({'outcome': 'finished', 'turn_id': 23}), '')):

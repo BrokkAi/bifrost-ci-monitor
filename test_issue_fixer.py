@@ -443,6 +443,7 @@ class IssueFixerTests(TestCase):
                 fixer.request_correction(self.conn, latest, "claim handoff", "report")
         self.assertEqual(prompt.call_count, 2)
         self.assertEqual(prompt.call_args_list[0].kwargs['request_id'], prompt.call_args_list[1].kwargs['request_id'])
+        self.assertLessEqual(len(prompt.call_args.kwargs['request_id']), 64)
         self.assertEqual(latest["status"], "running")
 
     def test_poll_with_live_session_does_not_select_more_work(self):
