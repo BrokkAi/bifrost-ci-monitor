@@ -331,7 +331,7 @@ def render_prompt(prefix, context):
             body = context["target_issue"]["body"]
             body["text"] = body["text"][:len(body["text"]) // 2]
             body["truncated"] = True
-        elif any(isinstance(row.get('diagnosis'), str) and len(row['diagnosis']) > 500
+        elif any(isinstance(row.get('diagnosis'), str) and len(row['diagnosis']) > 200
                  for row in context.get('observed_failures', [])):
             row = max((row for row in context['observed_failures']
                        if isinstance(row.get('diagnosis'), str)),
@@ -340,7 +340,7 @@ def render_prompt(prefix, context):
             row['diagnosis'] = row['diagnosis'][:len(row['diagnosis']) // 2]
             row['diagnosis_truncated'] = True
         elif any(row.get('local_finding_id') and isinstance(row.get('evidence'), dict)
-                 and len(row['evidence']['text']) > 500 for row in context.get('observed_failures', [])):
+                 and len(row['evidence']['text']) > 200 for row in context.get('observed_failures', [])):
             row = max((row for row in context['observed_failures']
                        if row.get('local_finding_id') and isinstance(row.get('evidence'), dict)),
                       key=lambda row: len(row['evidence']['text']))

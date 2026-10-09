@@ -111,6 +111,29 @@ class IssueFixerTests(TestCase):
                     self.assertEqual(row['diagnosis_original_characters'], len(text))
                     self.assertTrue(text.startswith(row['diagnosis']))
 
+    def test_combined_local_evidence_and_diagnoses_fit_with_all_provenance(self):
+        command = 'cargo nextest run --workspace --all-features -E "' + 'test(golden) | ' * 12 + 'test(policy)"'
+        with self.conn:
+            for number in range(29):
+                finding = local_findings.record(self.conn, 'b' * 32, 's' * 32, 'baseline', 'a' * 40,
+                                                f'golden_suite::failure_{number}', command, 'e' * 12000, 'now')
+                local_findings.classify(self.conn, finding['id'], 'product', 'd' * 6000,
+                                        issue()['html_url'])
+        job = self.job()
+        self.assertTrue(fixer.prompt_fits(job['prompt']))
+        observed = json.loads(job['prompt'].split('## Issue dossier\n', 1)[1])['observed_failures']
+        self.assertEqual(len(observed), 29)
+        self.assertEqual({row['identity'] for row in observed},
+                         {f'golden_suite::failure_{number}' for number in range(29)})
+        for row in observed:
+            self.assertEqual(row['last_seen_sha'], 'a' * 40)
+            self.assertEqual(row['command'], command)
+            self.assertEqual(row['session_id'], 's' * 32)
+            self.assertEqual(row['batch_id'], 'b' * 32)
+            self.assertEqual(row['local_finding_id'], row['id'])
+        self.assertTrue(any(row.get('diagnosis_truncated') for row in observed))
+        self.assertTrue(any(row['evidence']['truncated'] for row in observed))
+
     def test_local_finding_evidence_is_bounded_in_repair_prompt(self):
         with self.conn:
             for number in range(20):
