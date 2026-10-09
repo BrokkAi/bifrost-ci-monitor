@@ -2719,7 +2719,7 @@ class DirectMergeTests(TestCase):
 
     def test_one_up_to_date_pr_is_persisted_as_direct_without_session(self):
         conn = self._empty_db()
-        with mock.patch.object(automerge, "gh_json", return_value={"behind_by": 0}) as gh:
+        with mock.patch.object(automerge, "compare_pr_behind_by", return_value=0) as compare:
             batch_id = automerge.create_selected_batch(
                 conn, [pull()], BASE_SHA, ci_mode="async", batch_id="direct-one",
             )
@@ -2729,7 +2729,7 @@ class DirectMergeTests(TestCase):
         self.assertEqual(row["integration_pr_number"], 7)
         self.assertEqual(row["ci_head_sha"], HEAD_ONE)
         self.assertIsNone(row["session_id"])
-        self.assertIn("compare/master..." + HEAD_ONE, gh.call_args.args[0][1])
+        compare.assert_called_once_with(HEAD_ONE)
         conn.close()
 
     def test_single_up_to_date_priority_pr_uses_direct_path(self):
@@ -2749,7 +2749,7 @@ class DirectMergeTests(TestCase):
 
     def test_behind_pr_uses_normal_batch_path(self):
         conn = self._empty_db()
-        with mock.patch.object(automerge, "gh_json", return_value={"behind_by": 2}):
+        with mock.patch.object(automerge, "compare_pr_behind_by", return_value=2):
             batch_id = automerge.create_selected_batch(
                 conn, [pull()], BASE_SHA, ci_mode="sync", batch_id="behind-one",
             )

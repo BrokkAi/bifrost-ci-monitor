@@ -13,7 +13,6 @@ import time
 import urllib.request
 import urllib.error
 from pathlib import Path
-from urllib.parse import quote
 import read_budget
 
 
@@ -104,16 +103,11 @@ def child(conn, parent_id):
 
 
 def commit_tree(a, head):
-    value = a.gh_json(["api", f"repos/{a.REPO_NAME}/git/commits/{head}"])
-    tree = value.get("tree", {}).get("sha", "") if isinstance(value, dict) else ""
-    if not a.re.fullmatch(r"[0-9a-f]{40}", tree):
-        raise a.AutomergeError("GitHub returned an invalid commit tree", reason="github_invalid_response")
-    return tree
+    return a.commit_tree_sha(head)
 
 
 def verify_candidate(a, current, head, conn):
-    remote = a.gh_json(["api", f"repos/{a.REPO_NAME}/git/ref/heads/" + quote(current["branch"], safe="/")])
-    if remote.get("object", {}).get("sha") != head:
+    if a.remote_branch_sha(current['branch']) != head:
         raise ValueError("remote batch head does not match the checkpoint")
     if not a.compare_commit_ancestry(current["base_sha"], head):
         raise ValueError("candidate does not contain its captured base")

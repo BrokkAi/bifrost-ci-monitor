@@ -866,7 +866,8 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
         # almost every historical head, without downloading repository blobs.
         _ancestry_cache().prepare([actual_base] + [n.head for n in nodes.values()
                                                    if str(n.data.get('state')).lower() == 'open'])
-    graph = pr_dependencies.Graph(nodes, histories, actual_base, compare_commit_ancestry,
+    compare = _read_only_ancestry if dry_run and not persist_comparisons else compare_commit_ancestry
+    graph = pr_dependencies.Graph(nodes, histories, actual_base, compare,
                                   conn=conn, base_branch=BASE_BRANCH,
                                   persist_comparisons=(not dry_run if persist_comparisons is None
                                                        else persist_comparisons)).discover(roots)
@@ -985,26 +986,16 @@ def dependency_block_comment(number: int, reason: str) -> str:
 
 
 def current_master_sha() -> str:
-    payload = gh_json(["api", f"repos/{REPO_NAME}/commits/{BASE_BRANCH}"], timeout=30)
-    sha = payload.get("sha") if isinstance(payload, dict) else None
-    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
-        raise AutomergeError("GitHub returned an invalid master SHA",
-                             reason="github_invalid_response")
-    return sha.lower()
+    return remote_branch_sha(BASE_BRANCH)
+
+
+def remote_branch_sha(branch: str) -> str:
+    return git_ancestry.remote_head(REPO_NAME, branch, github_app_token)
 
 
 def compare_pr_behind_by(head_sha: str) -> int:
     """Return how many commits the PR head is behind current master."""
-    payload = gh_json([
-        "api", f"repos/{REPO_NAME}/compare/{BASE_BRANCH}...{head_sha}",
-    ])
-    behind_by = payload.get("behind_by") if isinstance(payload, dict) else None
-    if type(behind_by) is not int or behind_by < 0:
-        raise AutomergeError(
-            f"GitHub returned invalid behind_by for PR head {head_sha}",
-            reason="github_invalid_response",
-        )
-    return behind_by
+    return _ancestry_cache().behind(head_sha.lower(), current_master_sha())
 
 
 def ensure_column(
@@ -1377,45 +1368,40 @@ def run_ci_impact(base_sha: str, heads: list[str]) -> dict[str, Any]:
     """Run Bifrost's base-pinned classifier on exact source/candidate diffs."""
     identity = {"base_sha": base_sha, "heads": sorted(set(heads))}
     try:
+        cache = _ancestry_cache()
+        cache.require([base_sha, *identity['heads']])
         paths: set[str] = set()
         for head in identity["heads"]:
-            comparison = gh_json(["api", f"repos/{REPO_NAME}/compare/{base_sha}...{head}"])
-            files = comparison["files"]
-            # GitHub caps comparison files at 300. Never infer docs from a
-            # possibly truncated list. Include both sides of renames.
-            if not isinstance(files, list) or len(files) >= 300:
-                raise ValueError("comparison file list is missing or possibly truncated")
-            for entry in files:
-                paths.add(entry["filename"])
-                if entry.get("previous_filename"):
-                    paths.add(entry["previous_filename"])
-        script = run_gh([
-            "api", f"repos/{REPO_NAME}/contents/scripts/public/ci-impact.mjs?ref={base_sha}",
-            "-H", "Accept: application/vnd.github.raw+json",
-        ])
-        with tempfile.TemporaryDirectory(prefix="bifrost-ci-impact-") as directory:
-            script_path = Path(directory) / "ci-impact.mjs"
-            input_path = Path(directory) / "input.json"
-            script_path.write_text(script, encoding="utf-8")
-            input_path.write_text(json.dumps({"eventName": "pull_request",
-                                              "changedPaths": sorted(paths)}), encoding="utf-8")
-            output = monitor.run_command([
-                "node", "--input-type=module", "--eval",
-                "import {readFileSync} from 'node:fs';"
-                "const {classifyChangeSet} = await import(process.argv[1]);"
-                "const result = classifyChangeSet(JSON.parse(readFileSync(process.argv[2], 'utf8')));"
-                "console.log(JSON.stringify({...result, selected: [...result.selected]}));",
-                script_path.as_uri(), str(input_path),
-            ], timeout=15)
-        result = json.loads(output)
-        if not isinstance(result, dict) or result.get("mode") not in {"docs", "impact", "full"}:
-            raise ValueError("classifier returned an invalid mode")
-        return {**result, **identity}
+            paths.update(cache.changed_paths(base_sha, head))
+        script = cache.file(base_sha, 'scripts/public/ci-impact.mjs')
+        key = ['ci-impact-v1', base_sha, identity['heads'], hashlib.sha256(script.encode()).hexdigest()]
+        return cache.memo(key, lambda: _classify_ci_impact(script, paths, identity))
     except (AutomergeError, monitor.CommandError, OSError, ValueError, TypeError, KeyError) as exc:
-        # Classification is an optimization, never a reason to skip tests when
-        # it failed and never a reason to stall the agent launch.
+        # Classification is an optimization; unfinished fetches defer, actual
+        # errors use normal validation and never cache an unknown verdict.
         log(f"ci-impact unavailable at {base_sha}: {exc}")
         return {**identity, "mode": "unknown"}
+
+
+def _classify_ci_impact(script, paths, identity):
+    with tempfile.TemporaryDirectory(prefix="bifrost-ci-impact-") as directory:
+        script_path = Path(directory) / "ci-impact.mjs"
+        input_path = Path(directory) / "input.json"
+        script_path.write_text(script, encoding="utf-8")
+        input_path.write_text(json.dumps({"eventName": "pull_request",
+                                          "changedPaths": sorted(paths)}), encoding="utf-8")
+        output = monitor.run_command([
+            "node", "--input-type=module", "--eval",
+            "import {readFileSync} from 'node:fs';"
+            "const {classifyChangeSet} = await import(process.argv[1]);"
+            "const result = classifyChangeSet(JSON.parse(readFileSync(process.argv[2], 'utf8')));"
+            "console.log(JSON.stringify({...result, selected: [...result.selected]}));",
+            script_path.as_uri(), str(input_path),
+        ], timeout=15)
+    result = json.loads(output)
+    if not isinstance(result, dict) or result.get("mode") not in {"docs", "impact", "full"}:
+        raise ValueError("classifier returned an invalid mode")
+    return {**result, **identity}
 
 
 def _stored_impact(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
@@ -3020,6 +3006,10 @@ def _latest_completed_pr_ci_run_for_head(head_sha: str) -> dict[str, Any] | None
 
 
 def commit_tree_sha(commit_sha: str) -> str:
+    return _ancestry_cache().tree(commit_sha.lower(), _github_commit_tree)
+
+
+def _github_commit_tree(commit_sha: str) -> str:
     payload = gh_json(["api", f"repos/{REPO_NAME}/git/commits/{commit_sha}"])
     tree = payload.get("tree") if isinstance(payload, dict) else None
     sha = tree.get("sha") if isinstance(tree, dict) else None
@@ -3941,11 +3931,12 @@ def _record_trusted_rejection_markers(
 
 def _ancestry_cache():
     global ANCESTRY_CACHE
-    if ANCESTRY_CACHE is None:
-        ANCESTRY_CACHE = git_ancestry.Cache(
-            STATE_DIR / ('ancestry-' + hashlib.sha256(REPO_NAME.encode()).hexdigest()[:16]),
-            REPO_NAME, github_app_token, deadline=lambda: OBSERVATION_DEADLINE)
-    return ANCESTRY_CACHE
+    if ANCESTRY_CACHE is not None:
+        return ANCESTRY_CACHE
+    cache = monitor.git_cache(STATE_DIR, REPO_NAME, github_app_token)
+    if SUPERVISOR_RUNNING:
+        ANCESTRY_CACHE = cache
+    return cache
 
 
 def compare_commit_ancestry(ancestor_sha: str, descendant_sha: str) -> bool:
@@ -3953,15 +3944,12 @@ def compare_commit_ancestry(ancestor_sha: str, descendant_sha: str) -> bool:
                for value in (ancestor_sha, descendant_sha)):
         raise AutomergeError("invalid SHA for source ancestry comparison",
                              reason="github_invalid_response")
-    if SUPERVISOR_RUNNING and ANCESTRY_CACHE is None:
-        _ancestry_cache()
-    if ANCESTRY_CACHE is not None:
-        return pr_dependencies.cached_ancestor(
-            ANCESTRY_CONNECTION,
-            lambda a, b: ANCESTRY_CACHE.ancestor(a, b, _github_commit_ancestry),
-            ancestor_sha.lower(), descendant_sha.lower(),
-            persist=ANCESTRY_CONNECTION is not None and not ANCESTRY_CONNECTION.in_transaction)
-    return _github_commit_ancestry(ancestor_sha, descendant_sha)
+    cache = _ancestry_cache()
+    return pr_dependencies.cached_ancestor(
+        ANCESTRY_CONNECTION,
+        lambda a, b: cache.ancestor(a, b, _github_commit_ancestry),
+        ancestor_sha.lower(), descendant_sha.lower(),
+        persist=ANCESTRY_CONNECTION is not None and not ANCESTRY_CONNECTION.in_transaction)
 
 
 def _github_commit_ancestry(ancestor_sha, descendant_sha):
@@ -3975,6 +3963,11 @@ def _github_commit_ancestry(ancestor_sha, descendant_sha):
         return False
     raise AutomergeError(f"GitHub returned invalid compare status {status!r}",
                          reason="github_invalid_response")
+
+
+def _read_only_ancestry(a, b):
+    with git_ancestry.read_only():
+        return compare_commit_ancestry(a, b)
 
 
 def verify_source_ancestry(
@@ -5802,6 +5795,7 @@ def _supervisor_actions_for_check(conn):
         "FROM automerge_supervisor_actions WHERE status IN ('pending','running') ORDER BY updated_at")]
 
 
+@git_ancestry.read_only()
 def check_only() -> int:
     """Print the next-tick plan without changing GitHub, Mjolnir, or SQLite."""
     try:
@@ -6001,6 +5995,9 @@ def run_land_now(number: int) -> int:
                 if result and str(result["phase"] or "") == "terminal":
                     return 0 if str(result["terminal_status"] or "") == "merged" else 2
                 log(f"PR #{number} fast-track has not been confirmed merged; see the Slack notice")
+                return 4
+            except git_ancestry.Deferred as exc:
+                log(f"land-now for PR #{number} pending: {exc}; retry the same command")
                 return 4
             except (AutomergeError, monitor.CommandError, monitor.MjError,
                     OSError, RuntimeError, ValueError, sqlite3.Error) as exc:

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -45,15 +46,28 @@ class Client:
             headers={"Authorization": "Bearer " + c["token"], "Content-Type": "application/json"},
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=request_timeout) as response:
-                return json.load(response)
-        except urllib.error.HTTPError as exc:
+        deadline = time.monotonic() + request_timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError('state service operation is still pending; retry the same request')
             try:
-                message = json.loads(exc.read()).get("error", str(exc))
-            except (ValueError, AttributeError):
-                message = "state service returned HTTP " + str(exc.code)
-            raise RuntimeError(message) from None
+                with urllib.request.urlopen(request, timeout=remaining) as response:
+                    return json.load(response)
+            except urllib.error.HTTPError as exc:
+                try:
+                    error = json.loads(exc.read())
+                    message = error.get("error", str(exc))
+                except (ValueError, AttributeError):
+                    error = {}
+                    message = "state service returned HTTP " + str(exc.code)
+                # Only an explicit unfinished cache read is automatically
+                # retried. Keep the identical revision/payload and timeout.
+                remaining = deadline - time.monotonic()
+                if exc.code == 503 and error.get('retryable') is True and remaining > 0:
+                    time.sleep(min(1, remaining))
+                    continue
+                raise RuntimeError(message) from None
 
 
 def checkpoint(client, revision, *, rebuild=False, withdraw=False):

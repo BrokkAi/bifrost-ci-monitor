@@ -53,8 +53,8 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   recovery and ordered promotion, shared by sync and async.
 - `supervisor.py`: durable action intents, ordered batch advancement, bounded
   observation, independent maintenance, and threaded idle queue summaries.
-- `git_ancestry.py`: full commit-history object cache and asynchronous fetch
-  receipts; workers fetch objects but never decide scheduling or mutate batches.
+- `git_ancestry.py`: shared full-history Git object/result cache and asynchronous
+  fetch receipts; workers never decide scheduling or mutate batches.
 - `read_budget.py`: invocation-scoped deadlines for shared commands and HTTP reads;
   other supervisors retain their normal timeouts.
 - `mm_service.py`: batch-scoped HTTP interface over shared state; it records
@@ -150,6 +150,23 @@ Missing history starts a fetch worker and leaves the action pending; unavailable
 historical objects use GitHub's comparison API. Reject shallow history. Workers
 receive App authentication only in their environment and write sanitized receipts.
 Operator `--check` remains read-only and does not warm or write this cache.
+All commit-derived reads, including skill-service verification, use that cache.
+Fetch branch and PR refs together with full history and filtered blobs; fetch
+detached historical tips in batches only when still missing. This bare cache uses
+`fetch`, never `pull`, and never changes agent checkouts. Read current master and
+published batch heads freshly with `ls-remote`, including final landing gates.
+Cache immutable tree identities, behind counts, merge-base changed paths, and
+base-pinned classifier results across polls/batches. Changed-path reads include
+rename endpoints without loading file blobs; retrieve only the pinned classifier
+blob when needed. A cache request lock deduplicates fetch launches across cron
+and service clients. Missing objects or incomplete reads are never cached as
+negative facts. Authentication/network fetch failures defer without REST fanout;
+only confirmed unavailable historical tips permit the API fallback. Legacy
+in-flight fetch requests/receipts remain readable. PR/issue metadata, CI state,
+labels, comments and GitHub writes remain API operations.
+The skill service marks unfinished cache reads as retryable HTTP 503 responses;
+its client retries the identical payload within the original command timeout.
+Ordinary transport/service errors and revision conflicts are not auto-retried.
 
 `automerge_supervisor_actions` records intents bound to current batch inputs.
 Recompute actions after each transition and obsolete changed inputs; batch phases,
@@ -860,7 +877,8 @@ This is a Python repository. Pick the relevant existing modules:
 `test_automerge`, `test_merge_retries`, `test_membership_labels`, `test_mm_skills`, `test_issue_fixer`,
 `test_repair_dossier`, `test_triage`, and `test_monitor`. Dependency changes also
 use `test_pr_dependencies`, with temporary Git histories and mocked external
-writes. Never validate scheduling against the live queue. For Python changes,
+writes, and `test_git_ancestry` for cache/ref/diff/blob behavior. Never validate
+scheduling against the live queue. For Python changes,
 run the affected suites, `python3 -m py_compile` on changed files, and
 `git diff --check`. Do not run Bifrost/Mjolnir Rust crate suites for monitor
 changes. For documentation-only changes, verify local links, described CLI

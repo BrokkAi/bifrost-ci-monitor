@@ -98,10 +98,14 @@ def workflow_run(
 
 
 class PollCiTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(monitor, "remote_branch_sha", return_value="head-sha")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @mock.patch.object(monitor, "run_command")
     def test_recent_failure_settles_while_runson_can_request_retry(self, run_command):
         run_command.side_effect = [
-            "head-sha",
             workflow_run("CI", 30, "2026-08-25T17:00:00Z"),
             workflow_run(
                 "Hourly CI",
@@ -127,7 +131,6 @@ class PollCiTests(unittest.TestCase):
         self, run_command
     ):
         run_command.side_effect = [
-            "head-sha",
             workflow_run("CI", 30, "2026-08-25T17:00:00Z"),
             workflow_run(
                 "Hourly CI",
@@ -152,7 +155,6 @@ class PollCiTests(unittest.TestCase):
     @mock.patch.object(monitor, "run_command")
     def test_replacement_attempt_in_progress_blocks_repair(self, run_command):
         run_command.side_effect = [
-            "head-sha",
             workflow_run("CI", 30, "2026-08-25T17:00:00Z"),
             workflow_run(
                 "Hourly CI",
@@ -177,7 +179,6 @@ class PollCiTests(unittest.TestCase):
     @mock.patch.object(monitor, "run_command")
     def test_hourly_failure_takes_precedence_over_newer_green_push(self, run_command):
         run_command.side_effect = [
-            "head-sha",
             workflow_run("CI", 30, "2026-08-20T12:30:00Z"),
             workflow_run(
                 "Hourly CI",
@@ -198,7 +199,6 @@ class PollCiTests(unittest.TestCase):
     @mock.patch.object(monitor, "run_command")
     def test_nightly_failure_is_selected_while_hourly_is_running(self, run_command):
         run_command.side_effect = [
-            "head-sha",
             workflow_run("CI", 30, "2026-08-20T12:30:00Z"),
             workflow_run(
                 "Hourly CI",
@@ -224,7 +224,6 @@ class PollCiTests(unittest.TestCase):
     @mock.patch.object(monitor, "run_command")
     def test_handled_red_does_not_hide_an_unhandled_red(self, run_command):
         run_command.side_effect = [
-            "head-sha",
             workflow_run("CI", 30, "2026-08-20T12:30:00Z", conclusion="failure"),
             workflow_run("Hourly CI", 20, "2026-08-20T12:00:00Z", conclusion="failure"),
             workflow_run("Nightly CI", 10, "2026-08-20T08:00:00Z"),
@@ -239,7 +238,6 @@ class PollCiTests(unittest.TestCase):
     @mock.patch.object(monitor, "run_command")
     def test_all_handled_red_runs_still_prevent_green_reset(self, run_command):
         run_command.side_effect = [
-            "head-sha",
             workflow_run("CI", 30, "2026-08-20T12:30:00Z", conclusion="failure"),
             workflow_run("Hourly CI", 20, "2026-08-20T12:00:00Z", conclusion="failure"),
             workflow_run("Nightly CI", 10, "2026-08-20T08:00:00Z"),
@@ -254,7 +252,6 @@ class PollCiTests(unittest.TestCase):
     @mock.patch.object(monitor, "run_command")
     def test_green_requires_all_three_workflows_to_be_terminal(self, run_command):
         run_command.side_effect = [
-            "head-sha",
             workflow_run("CI", 30, "2026-08-20T12:30:00Z"),
             workflow_run("Hourly CI", 20, "2026-08-20T12:00:00Z"),
             workflow_run(
@@ -265,7 +262,7 @@ class PollCiTests(unittest.TestCase):
         result = monitor.poll_ci()
 
         self.assertEqual(result.state, "completed:success")
-        calls = [call.args[0] for call in run_command.call_args_list[1:]]
+        calls = [call.args[0] for call in run_command.call_args_list]
         self.assertEqual(
             [call[call.index("--workflow") + 1] for call in calls],
             ["CI", "Hourly CI", "Nightly CI"],
@@ -277,7 +274,6 @@ class PollCiTests(unittest.TestCase):
     @mock.patch.object(monitor, "run_command")
     def test_missing_workflow_does_not_report_green(self, run_command):
         run_command.side_effect = [
-            "head-sha",
             workflow_run("CI", 30, "2026-08-20T12:30:00Z"),
             "[]",
             workflow_run("Nightly CI", 10, "2026-08-20T08:00:00Z"),
@@ -290,7 +286,6 @@ class PollCiTests(unittest.TestCase):
     @mock.patch.object(monitor, "run_command")
     def test_running_workflow_blocks_green_reset(self, run_command):
         run_command.side_effect = [
-            "head-sha",
             workflow_run("CI", 30, "2026-08-20T12:30:00Z"),
             workflow_run(
                 "Hourly CI",

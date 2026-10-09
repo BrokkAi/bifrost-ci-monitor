@@ -152,8 +152,7 @@ def integration_metadata(current, head, notes):
 
 def reconcile_publication(current, head, notes):
     branch = current["branch"]
-    remote = gh_api("git/ref/heads/" + quote(branch, safe="/"))
-    if remote.get("object", {}).get("sha") != head:
+    if automerge.remote_branch_sha(branch) != head:
         raise ValueError("remote batch head does not match recorded tested head")
     pulls = gh_api("pulls?state=open&head=" + quote(automerge.GH_OWNER + ":" + branch, safe=""))
     if not isinstance(pulls, list) or len(pulls) > 1:
@@ -372,8 +371,7 @@ def dispatch(conn, batch_id, operation, payload):
                     or current["tests"]["verdict"] != "pass"):
                 raise ValueError("readiness requires the checkpointed passing head and current source set")
             conn.commit()
-            remote = gh_api("git/ref/heads/" + quote(current["branch"], safe="/"))
-            if remote.get("object", {}).get("sha") != head:
+            if automerge.remote_branch_sha(current["branch"]) != head:
                 raise ValueError("remote batch head does not match checkpointed tested head")
             conn.execute("BEGIN IMMEDIATE")
             checked(conn, batch_id, current["revision"])
@@ -458,7 +456,10 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(200, dispatch(conn, batch_id, operation, payload))
         except (ValueError, KeyError) as exc:
             self.respond(409, {"error": str(exc)})
-        except (OSError, sqlite3.Error, automerge.monitor.CommandError, automerge.AutomergeError) as exc:
+        except automerge.git_ancestry.Deferred as exc:
+            self.respond(503, {"error": str(exc), "retryable": True})
+        except (OSError, RuntimeError, sqlite3.Error, automerge.monitor.CommandError,
+                automerge.AutomergeError) as exc:
             self.respond(503, {"error": str(exc)})
         finally:
             if conn is not None:

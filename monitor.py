@@ -29,6 +29,7 @@ from typing import Any, Callable
 
 import local_findings
 import read_budget
+import git_ancestry
 
 
 REPO_NAME = "BrokkAi/bifrost-dev"
@@ -1588,6 +1589,20 @@ class PollResult:
     run: CiRun | None
 
 
+def remote_branch_sha(branch: str) -> str:
+    return git_ancestry.remote_head(REPO_NAME, branch, github_app_token)
+
+
+def git_cache(state_dir=None, repository=None, token=None, **kwargs):
+    """All supervisors and the skill service reuse the same immutable objects."""
+    state_dir = state_dir if state_dir is not None else configured_path(
+        'BIFROST_CI_AUTOMERGE_STATE', HOME_DIR / '.local' / 'state' / 'bifrost-ci-automerge')
+    repository = repository or REPO_NAME
+    return git_ancestry.Cache(
+        state_dir / ('ancestry-' + hashlib.sha256(repository.encode()).hexdigest()[:16]),
+        repository, token or github_app_token, **kwargs)
+
+
 def poll_ci(
     excluded_run_ids: set[int] | None = None,
     *,
@@ -1607,10 +1622,7 @@ def poll_ci(
     handled, still return red so a green workflow cannot incorrectly clear the
     current failure episode.
     """
-    head_sha = run_command(
-        [str(GH_BIN), "api", f"repos/{REPO_NAME}/commits/{BRANCH}", "--jq", ".sha"],
-        timeout=30,
-    )
+    head_sha = remote_branch_sha(BRANCH)
     runs: list[CiRun] = []
     for workflow, event in TRACKED_WORKFLOWS:
         command = [

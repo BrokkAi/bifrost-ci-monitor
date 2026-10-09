@@ -577,7 +577,8 @@ class StateTests(unittest.TestCase):
                 return pr
             return {}
 
-        with mock.patch.object(mm_service, "gh_api", side_effect=api):
+        with (mock.patch.object(mm_service, "gh_api", side_effect=api),
+              mock.patch.object(automerge, "remote_branch_sha", return_value=HEAD_ONE)):
             result = mm_service.reconcile_publication(current, HEAD_ONE, "notes")
         self.assertEqual(result["number"], 211)
         metadata = mm_service.integration_metadata(current, HEAD_ONE, "notes")
@@ -606,6 +607,33 @@ class ClientPublicationTests(GitFixture):
 
 
 class HttpTests(unittest.TestCase):
+    def test_pending_git_read_retries_identical_request_inside_tool_timeout(self):
+        key = b'k' * 32
+        server = mm_service.Server(('127.0.0.1', 0), key, mock.Mock())
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = db.Client({'url': f'http://127.0.0.1:{server.server_port}', 'batch_id': 'batch-test',
+                                'token': mm_service.batch_token(key, 'batch-test')})
+            with (mock.patch.object(mm_service, 'dispatch', side_effect=[
+                    automerge.git_ancestry.Deferred('fetching Git objects'), {'candidate': 'accepted'}]) as dispatch,
+                  mock.patch.object(db.time, 'sleep')):
+                self.assertEqual(client.call('candidate', revision='same-revision', head=HEAD_ONE),
+                                 {'candidate': 'accepted'})
+            self.assertEqual(dispatch.call_count, 2)
+            self.assertEqual(dispatch.call_args_list[0].args[1:], dispatch.call_args_list[1].args[1:])
+            with mock.patch.object(mm_service, 'dispatch', side_effect=OSError('Git transport failed')) as dispatch:
+                with self.assertRaisesRegex(RuntimeError, 'Git transport failed'):
+                    client.call('candidate', revision='same-revision', head=HEAD_ONE)
+                dispatch.assert_called_once()
+            with mock.patch.object(mm_service, 'dispatch', side_effect=automerge.git_ancestry.Deferred('pending')):
+                with self.assertRaisesRegex(RuntimeError, 'pending'):
+                    client.call('candidate', request_timeout=.05, revision='same-revision', head=HEAD_ONE)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_authenticated_client_reads_and_records_shared_state(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "state.db"

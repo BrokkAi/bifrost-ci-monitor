@@ -160,8 +160,14 @@ Cold ancestry fetches run separately from the supervisor, under the merger state
 directory in `ancestry-*/objects.git`; `fetch.json` identifies the current request
 and its matching JSON receipt reports success. This cache contains full commit
 history without a working tree and never changes a batch checkout. A pending
-fetch is normal; a failed fetch can fall back to GitHub for unavailable historical
-commits. Do not substitute a shallow clone. When no batch or eligible work remains,
+fetch is normal. Updates fetch branch and PR refs together; detached historical
+tips are fetched in batches only if absent. The supervisor and skill service share
+cached ancestry, tree identities, behind counts, changed paths and base-pinned
+classification. Only needed classifier blobs are downloaded. Current master and
+published batch heads are read freshly over Git at their validation gates.
+Authentication/network failures defer; confirmed unavailable historical commits
+can fall back to GitHub. `--check` can read existing facts but never warms or
+writes the cache. Do not substitute a shallow clone. When no batch or eligible work remains,
 the last primary Slack thread receives an open-PR summary grouped by draft,
 rejection, and dependency state. Unchanged summaries are quiet; webhook transport
 does not provide these threaded summaries.

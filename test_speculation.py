@@ -130,7 +130,7 @@ class StateTests(unittest.TestCase):
 
     def handoff(self):
         current = service.state(self.conn, self.child)
-        with mock.patch.object(service, 'gh_api', return_value={'object': {'sha': HEAD_TWO}}):
+        with mock.patch.object(a, 'remote_branch_sha', return_value=HEAD_TWO):
             service.dispatch(self.conn, self.child, 'ready', {'revision': current['revision'], 'head': HEAD_TWO})
         a._consume_ready_candidate(self.conn, self.transport, self.row())
 
@@ -284,7 +284,7 @@ class StateTests(unittest.TestCase):
     def test_local_pass_parks_instead_of_publishing(self):
         current = self.assess()
         self.assertIsNone(a.ready_candidate(self.row()))
-        with mock.patch.object(service, 'gh_api', return_value={'object': {'sha': HEAD_TWO}}):
+        with mock.patch.object(a, 'remote_branch_sha', return_value=HEAD_TWO):
             ready = service.dispatch(self.conn, self.child, 'ready',
                                      {'revision': current['revision'], 'head': HEAD_TWO})
         again = service.dispatch(self.conn, self.child, 'ready',
@@ -429,7 +429,7 @@ class StateTests(unittest.TestCase):
               mock.patch.object(s, 'commit_tree') as tree):
             s.promote(a, self.conn, self.transport, self.row(), self.row(self.parent))
             tree.assert_not_called()
-        with mock.patch.object(service, 'gh_api', return_value={'object': {'sha': HEAD_TWO}}):
+        with mock.patch.object(a, 'remote_branch_sha', return_value=HEAD_TWO):
             # Accept handoff while still building, then park via the shared supervisor path.
             with self.conn:
                 self.conn.execute("UPDATE automerge_batches SET phase='building' WHERE batch_id=?", (self.child,))
@@ -450,7 +450,7 @@ class StateTests(unittest.TestCase):
 
     def test_actual_master_advance_uses_fresh_attempt(self):
         current = self.assess()
-        with mock.patch.object(service, 'gh_api', return_value={'object': {'sha': HEAD_TWO}}):
+        with mock.patch.object(a, 'remote_branch_sha', return_value=HEAD_TWO):
             service.dispatch(self.conn, self.child, 'ready', {'revision': current['revision'], 'head': HEAD_TWO})
         with self.conn:
             self.conn.execute("UPDATE automerge_batches SET phase='waiting_parent' WHERE batch_id=?", (self.child,))
@@ -818,15 +818,9 @@ class RecoveryGitTests(GitFixture):
             return subprocess.run(['git', '-C', str(self.repo), 'merge-base', '--is-ancestor', base, head],
                                   capture_output=True).returncode == 0
 
-        def api(args):
-            if '/git/ref/heads/' in args[1]:
-                return {'object': {'sha': result['head']}}
-            if '/git/commits/' in args[1]:
-                return {'tree': {'sha': self.run_git('rev-parse', args[1].rsplit('/', 1)[1] + '^{tree}')}}
-            self.fail('unexpected GitHub request: ' + str(args))
-
         with (mock.patch.object(a, 'compare_commit_ancestry', side_effect=ancestor),
-              mock.patch.object(a, 'gh_json', side_effect=api)):
+              mock.patch.object(a, 'remote_branch_sha', return_value=result['head']),
+              mock.patch.object(a, 'commit_tree_sha', side_effect=lambda head: self.run_git('rev-parse', head + '^{tree}'))):
             updated = service.dispatch(conn, 'batch-test', 'candidate',
                                        {'revision': current['revision'], 'head': result['head']})
             self.assertEqual(updated['candidate']['id'], checkpoint['id'])
