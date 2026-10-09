@@ -85,7 +85,10 @@ Triage groups new observations into an investigation, reads evidence and
 repository history without building/fixing, and proposes one `buildfailure`
 issue per product defect. Infrastructure incidents instead produce channel-visible
 Slack notices without tickets or fixer sessions. It searches existing work, reuses/reopens matching issues,
-and distinguishes observations already fixed on master. Report publication
+and distinguishes observations already fixed on master. Each investigation
+announces its published product issues together in Slack, with ticket titles and
+links. Long lists continue in thread replies. Slack delivery retries separately
+so an outage does not delay new investigations. Report publication
 and resolved-observation cleanup survive interrupted polls and lost replies.
 Unpublished results stay in SQLite and retry without repeating investigation;
 pending delivery does not prevent triage of other observations. Reporting an

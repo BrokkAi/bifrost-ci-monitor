@@ -69,6 +69,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             last_notice_at TEXT NOT NULL,
             PRIMARY KEY (channel, thread_ts)
         );
+        CREATE TABLE IF NOT EXISTS triage_product_announcements (
+            job_id TEXT PRIMARY KEY, messages_json TEXT NOT NULL,
+            posted_count INTEGER NOT NULL DEFAULT 0, thread_ts TEXT,
+            completed_at TEXT, last_error TEXT
+        );
     """)
     monitor.ensure_column(conn, "triage_observations", "resolved_run_id", "INTEGER")
     monitor.ensure_column(conn, "triage_jobs", "recovery_json", "TEXT NOT NULL DEFAULT '{}'")
@@ -510,7 +515,9 @@ def publish_issue(conn, job, index, finding, observations) -> str:
         gh_api(f"issues/{number}/labels", method="POST", payload={"labels": ["buildfailure"]})
     with conn:
         conn.execute("INSERT OR REPLACE INTO triage_publications VALUES (?,?,?)", (job["id"], index, number))
-    return f"https://github.com/{monitor.REPO_NAME}/issues/{number}"
+    url = f"https://github.com/{monitor.REPO_NAME}/issues/{number}"
+    finding['published_issue'] = dict(url=url, title=issue['title'])
+    return url
 
 
 def record_observation(conn, job, finding, observation, url):
@@ -630,6 +637,59 @@ def publish_infrastructure_slack(conn, job, report, finding) -> None:
         cache_report(conn, job, report)
 
 
+def queue_product_announcement(conn, job, report, observations) -> None:
+    """Checkpoint one announcement for the report's successfully published issues."""
+    issues = {}
+    for finding in report['findings']:
+        if finding['outcome'] != 'product':
+            continue
+        for number in finding['failure_ids']:
+            observation = observations[number]
+            recorded = conn.execute('SELECT issue_url FROM triage_observations WHERE fingerprint=? AND job_id=?',
+                                    (observation['fingerprint'], job['id'])).fetchone()
+            if recorded and recorded['issue_url']:
+                issues[recorded['issue_url']] = finding.get('published_issue', {}).get('title', finding['issue']['title'])
+    if not issues:
+        return
+    count = len(issues)
+    messages = []
+    current = f":mag: CI triage: {count} product issue{'s' if count != 1 else ''}"
+    for url, title in issues.items():
+        title = ' '.join(title.split())[:240].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('|', '¦')
+        line = f"• <{url}|#{existing_number(url)}: {title}>"
+        if len(current) + 1 + len(line) > monitor.SLACK_MESSAGE_LIMIT:
+            messages.append(current)
+            current = 'Additional issues from this triage investigation'
+        current += '\n' + line
+    messages.append(current)
+    conn.execute('INSERT OR IGNORE INTO triage_product_announcements(job_id,messages_json) VALUES (?,?)',
+                 (job['id'], json.dumps(messages)))
+
+
+def deliver_product_announcements(conn, *, job_id=None) -> None:
+    query = 'SELECT * FROM triage_product_announcements WHERE completed_at IS NULL'
+    notices = conn.execute(query + (' AND job_id=?' if job_id else ''), (job_id,) if job_id else ()).fetchall()
+    for notice in notices:
+        try:
+            transport = monitor.load_slack_transport()
+            messages = json.loads(notice['messages_json'])
+            thread = notice['thread_ts']
+            for index in range(notice['posted_count'], len(messages)):
+                posted, timestamp = monitor.slack_send(transport, messages[index], thread_ts=thread)
+                if not posted or (transport.kind == 'chat' and index == 0 and not timestamp):
+                    raise RuntimeError('triage issue announcement pending; retry cached notice next poll')
+                if index == 0:
+                    thread = timestamp
+                with conn:
+                    conn.execute('UPDATE triage_product_announcements SET posted_count=?,thread_ts=?,completed_at=?,last_error=NULL '
+                                 'WHERE job_id=?', (index + 1, thread,
+                                     monitor.utc_now() if index + 1 == len(messages) else None, notice['job_id']))
+        except Exception as exc:
+            with conn:
+                conn.execute('UPDATE triage_product_announcements SET last_error=? WHERE job_id=?', (str(exc), notice['job_id']))
+            monitor.log(f"triage {notice['job_id']}: issue announcement will retry: {exc}")
+
+
 def publish(conn, job) -> None:
     observations = {o['failure_id']: o for o in json.loads(job['observations_json'])}
     try:
@@ -670,6 +730,7 @@ def publish(conn, job) -> None:
                 publish_infrastructure_slack(conn, job, report, finding)
             url = publish_issue(conn, job, index, finding, [row for _, row in active]) if active and finding["issue"] else None
             with conn:
+                conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=?', (json.dumps(report), job['id']))
                 for n in finding["failure_ids"]:
                     o = observations[n]
                     record_observation(conn, job, finding, o, url)
@@ -689,8 +750,10 @@ def publish(conn, job) -> None:
                                       f"triage session {job['session_id']}", finding['outcome'], url, url, monitor.utc_now(),
                                       *(o[k] for k in KEY)))
         with conn:
+            queue_product_announcement(conn, job, report, observations)
             conn.execute("UPDATE triage_jobs SET status='completed',finished_at=?,last_error=NULL WHERE id=?",
                          (monitor.utc_now(), job["id"]))
+    deliver_product_announcements(conn, job_id=job['id'])
     monitor._sync_known_failure_issue(conn)
     monitor.log(f"triage {job['id']}: published findings")
 
@@ -708,6 +771,7 @@ def cleanup(conn) -> None:
 
 def tick(conn) -> None:
     monitor.update_known_failures(conn, monitor.load_slack_transport())
+    deliver_product_announcements(conn)
     if reconcile_resolved(conn):
         monitor._sync_known_failure_issue(conn)
     cleanup(conn)
