@@ -43,8 +43,13 @@ Configure Mjolnir's `CI` workspace, `bifrost` bundle, and the `podman` and
 use DeepSeek Flash (`deepseek-flash`) on `podman`, with subagents disabled.
 Larger batches use Opus 5.5 (`opus`) on `bedrock-podman` with Luna 6 subagents
 (`global.openai.gpt-6-luna`, high effort), with up to 16 concurrent subagents
-per session. Each batch retains its initial configuration through expansion
-and recovery. Set
+per session. Each batch retains its configuration through expansion and
+recovery. After two consecutive Bedrock 503 provider errors, the supervisor
+automatically moves that merger to DeepSeek Flash in the same container,
+retaining its session, work, validation evidence and Luna delegation. Successful
+agent or tool progress resets the error count. A threaded notice confirms the
+switch. Native Move failures or uncertain acceptance produce an actionable
+alert; the original session and recovery state remain available. Set
 `max_concurrent = 16` under `[subagents]` and make the Luna profile eligible
 under `[subagents.eligible_profiles]`.
 Fixer and triage sessions use the `deepseek-flash` model.

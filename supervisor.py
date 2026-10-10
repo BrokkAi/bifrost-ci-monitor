@@ -14,6 +14,7 @@ import time
 import git_ancestry
 import monitor
 import speculation
+import merge_failover
 
 
 def digest(value):
@@ -58,6 +59,14 @@ def plan(a, conn, *, priority_checked, queue_checked, maintenance_done, reconcil
         if row['phase'] in {'aborting', 'resetting', 'restarting'}:
             add(0, 'advance_batch', row)
             continue
+        failover = merge_failover.state(conn, row['batch_id'])
+        if merge_failover.pending(failover):
+            add(1, 'advance_provider_failover', row, [snapshot(row), failover])
+            continue
+        if (row['session_id'] and row['phase'] in {'building', 'fixing'}
+                and not a.ready_candidate(row) and a._batch_subagents(row)
+                and row['agent_configuration'] != 'flash-luna'):
+            add(3, 'observe_provider_errors', row)
         # Message acceptance is independent of queue discovery and turn idleness.
         if row['session_id'] and row['pending_prompt'] and not row['prompt_delivered']:
             add(2, 'deliver_guidance', row)
@@ -198,6 +207,10 @@ def run(a, conn, transport):
             row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (owner,)).fetchone()
             if kind == 'deliver_guidance':
                 a.deliver_pending_prompt(conn, transport, row)
+            elif kind == 'observe_provider_errors':
+                merge_failover.probe(a, conn, row)
+            elif kind == 'advance_provider_failover':
+                merge_failover.advance(a, conn, row)
             elif kind == 'check_priority':
                 # One cheap listing avoids global discovery on an ordinary tick.
                 if any(a._priority_flags(a._labels(item))[0] for item in a.list_open_pull_requests()
@@ -227,6 +240,7 @@ def run(a, conn, transport):
                 speculation.launch_child(a, conn, row)
                 a.report_dependency_blocks(conn, transport)
             elif kind == 'maintenance':
+                merge_failover.notify(a, conn, transport)
                 a.retry_pending_notifications(conn, transport)
                 a.retry_pending_aborted_outcomes(conn, transport)
                 a.enqueue_active_membership_labels(conn)
@@ -248,11 +262,15 @@ def run(a, conn, transport):
         except (a.AutomergeError, monitor.CommandError, monitor.MjError,
                 OSError, RuntimeError, ValueError, a.sqlite3.Error) as exc:
             reason = exc.reason if isinstance(exc, (a.AutomergeError, monitor.MjError)) else 'automerge_failed'
+            details = str(exc)
+            if kind in {'observe_provider_errors', 'advance_provider_failover'}:
+                reason = 'mj_provider_failover_failed'
+                details = f"Bedrock failover supervision for session {row['session_id']}: {exc}"
             with conn:
                 conn.execute("UPDATE automerge_supervisor_actions SET status='pending',last_error=?,updated_at=?,"
                              "next_attempt_at=? WHERE action_id=?",
                              (str(exc), a.utc_now(), time.time() + 60, identifier))
-            a.notify_blocked_once(conn, transport, owner, reason, str(exc))
+            a.notify_blocked_once(conn, transport, owner, reason, details)
             a.log(f'{kind} blocked ({reason}): {exc}')
             result = 4
             if kind == 'check_priority':

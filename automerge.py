@@ -31,6 +31,7 @@ import git_ancestry
 import supervisor
 import read_budget
 import execution_evidence
+import merge_failover
 
 
 REPO_NAME = monitor.REPO_NAME
@@ -1119,6 +1120,7 @@ def connect_db() -> sqlite3.Connection:
     execution_evidence.ensure_schema(conn)
     pr_dependencies.ensure_schema(conn)
     supervisor.ensure_schema(conn)
+    merge_failover.ensure_schema(conn)
     speculation.ensure_schema(conn, ensure_column)
     ensure_column(conn, "automerge_batches", "launch_attempted_at", "TEXT")
     ensure_column(conn, "automerge_batches", "agent_final_message", "TEXT NOT NULL DEFAULT ''")
@@ -1433,10 +1435,10 @@ def _batch_subagents(row: sqlite3.Row | dict[str, Any]) -> bool:
     # Old batches retain their Opus/Luna configuration. Membership can expand
     # or shrink, so never derive a live session's configuration from its PR list.
     configuration = row["agent_configuration"] if "agent_configuration" in row.keys() else "multi-pr"
-    if configuration not in {"single-pr", "multi-pr"}:
+    if configuration not in {"single-pr", "multi-pr", "flash-none", "flash-luna"}:
         raise AutomergeError(f"unknown agent configuration: {configuration}",
                              reason="database_state_invalid")
-    return configuration == "multi-pr"
+    return configuration in {"multi-pr", "flash-luna"}
 
 
 def _validation_guidance(
@@ -1703,6 +1705,7 @@ def new_session_argv(
     row: sqlite3.Row | dict[str, Any], prompt_file: str
 ) -> list[str]:
     subagents = _batch_subagents(row)
+    flash = not subagents or speculation.get(row, "agent_configuration") == "flash-luna"
     delegation = (["--subagents", "single-model",
                    "--subagent-model", AUTOMERGE_SUBAGENT_MODEL,
                    "--subagent-effort", AUTOMERGE_SUBAGENT_EFFORT] if subagents
@@ -1710,11 +1713,11 @@ def new_session_argv(
     return [
         "new",
         "--workspace", MJ_WORKSPACE,
-        "--target", MJ_TARGET if subagents else SINGLE_PR_TARGET,
+        "--target", SINGLE_PR_TARGET if flash else MJ_TARGET,
         "--bundle", MJ_BUNDLE,
         "--cpus", str(monitor.MJ_CPUS),
         "--memory-gib", str(monitor.MJ_MEMORY_GIB),
-        "--model", AUTOMERGE_MODEL if subagents else SINGLE_PR_MODEL,
+        "--model", SINGLE_PR_MODEL if flash else AUTOMERGE_MODEL,
         *delegation,
         "--at", str(row["base_sha"]),
         "--branch", str(row["branch"]),
@@ -3422,13 +3425,17 @@ def _record_turn_outcome(conn, row, turn):
 
 def queue_agent_prompt(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, Any],
                        prompt: str, *, validation_impact: dict[str, Any] | None = None,
-                       observed_turn: monitor.TurnResult | None = None) -> bool:
+                       observed_turn: monitor.TurnResult | None = None,
+                       checkpoint=None, preserve_ready: bool = False) -> bool:
     with conn:
-        if observed_turn is not None:
+        if observed_turn is not None or preserve_ready:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                                (row["batch_id"],)).fetchone()
-            if ready_candidate(row) or _turn_outcome_seen(conn, row, observed_turn):
+            if ready_candidate(row):
+                return False
+        if observed_turn is not None:
+            if _turn_outcome_seen(conn, row, observed_turn):
                 return False
             _record_turn_outcome(conn, row, observed_turn)
         conn.execute("UPDATE automerge_batches SET phase='fixing', status='running', "
@@ -3438,6 +3445,8 @@ def queue_agent_prompt(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, An
         if validation_impact is not None:
             conn.execute("UPDATE automerge_batches SET validation_impact_json=? WHERE batch_id=?",
                          (json.dumps(validation_impact), row["batch_id"]))
+        if checkpoint is not None:
+            checkpoint()
     return True
 
 

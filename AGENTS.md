@@ -63,6 +63,8 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   triage and included in the corresponding issue fixer's dossier.
 - `execution_evidence.py`: durable local command receipts and explicit reuse
   links in assessments; evidence intake never changes scheduling or verdicts.
+- `merge_failover.py`: consecutive Bedrock 503 detection and durable native Move
+  to DeepSeek Flash, retaining the same session, container and execution evidence.
 - `skills/mm-*`: agent tools for merge mechanics, state, publication, and
   two-commit checks. `scripts/install-mm-skills.py` installs symlinks and the
   user service. Tool invocation instructions remain in each `SKILL.md`.
@@ -326,6 +328,25 @@ Luna 6 (`global.openai.gpt-6-luna`, high effort) subagents. Persist this choice
 in `automerge_batches.agent_configuration`; expansion, exclusion, recovery and
 promotion retain it. Existing rows migrate to `multi-pr`, preserving their
 Opus/Luna sessions. Prompt delegation guidance follows the persisted choice.
+Two distinct consecutive agent messages beginning `API Error: 503` and naming
+Bedrock trigger automatic same-session failover to DeepSeek Flash. Normal agent
+output or completed tool work resets the count; quoted errors, tool HTTP errors,
+retry prompts and repeated observations do not count as another provider failure.
+Read to the transcript tail before acting, independently of Slack delivery.
+`automerge_provider_failovers` checkpoints the cursor, error identities, native
+Move operation and continuation. Profile-only in-place Move retains the target,
+mounts, resource allocation, Git directory, logs, caches and Luna delegation.
+Confirm Flash configuration before queuing the normal durable continuation;
+persist `flash-luna` for retained delegation (`flash-none` for an operator Move
+that disabled subagents). Native Move owns cancellation/recovery; observe its
+read-only journal after a CLI timeout, without idleness or new work deadlines.
+Never resubmit an ambiguous Move with no matching journal. Report that uncertainty
+or failed native recovery for operator reconciliation. Refuse automatic transfers
+that cannot keep the environment in place; private evidence must be preserved
+before an operator changes environments. Valid handoffs continue through normal
+landing gates. Priority/other batches and maintenance remain independent while
+Move runs; continuation and its checkpoint commit atomically. A completed failover
+posts one threaded notice, retrying delivery without gating agent progress.
 The CI Opus profile enables one-hour prompt caching via
 `ENABLE_PROMPT_CACHING_1H = "1"`. The CI Mjolnir configuration allows up to
 16 concurrent subagents per session. The primary coordinates the

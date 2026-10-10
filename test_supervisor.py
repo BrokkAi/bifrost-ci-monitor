@@ -12,6 +12,7 @@ import monitor
 import speculation
 import supervisor
 import read_budget
+import merge_failover
 from test_automerge import BASE_SHA, HEAD_ONE, pull
 
 
@@ -35,6 +36,7 @@ class SupervisorTests(unittest.TestCase):
                      'check_pending_suspensions', 'finish_batch'):
             self.patch(a, name)
         self.patch(monitor, 'update_known_failures')
+        self.patch(merge_failover, 'probe')
 
     def patch(self, target, name, *args, **kwargs):
         patcher = mock.patch.object(target, name, *args, **kwargs)
@@ -76,6 +78,44 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(supervisor.run(a, self.conn, self.transport), 0)
         self.assertEqual(events, ['guidance', 'primary', 'lookahead'])
         self.select.assert_not_called()
+
+    def test_two_provider_errors_move_and_continue_before_normal_observation(self):
+        identifier = self.batch()
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET agent_configuration='multi-pr' WHERE batch_id=?",
+                              (identifier,))
+        events = []
+        def probe(module, conn, row):
+            if merge_failover.state(conn, row['batch_id']).get('stage') == 'completed':
+                return
+            events.append('errors')
+            merge_failover.save(a, conn, row, {'stage': 'moving'})
+        def advance(module, conn, row):
+            events.append('move')
+            a.queue_agent_prompt(conn, row, 'continue saved work')
+            merge_failover.save(a, conn, row, {'stage': 'completed', 'notice_sent': True})
+        def deliver(*args):
+            events.append('guidance')
+            self.deliver(*args)
+        self.patch(merge_failover, 'probe', side_effect=probe)
+        self.patch(merge_failover, 'advance', side_effect=advance)
+        self.patch(a, 'deliver_pending_prompt', side_effect=deliver)
+        self.patch(a, 'process_batch', side_effect=lambda *args: events.append('observe'))
+        supervisor.run(a, self.conn, self.transport)
+        self.assertEqual(events, ['errors', 'move', 'guidance', 'observe'])
+
+    def test_move_in_progress_does_not_starve_priority_or_maintenance(self):
+        identifier = self.batch()
+        merge_failover.save(a, self.conn, self.row(identifier), {'stage': 'moving'})
+        advance = self.patch(merge_failover, 'advance')
+        observe = self.patch(a, 'process_batch')
+        priority = self.patch(a, 'list_open_pull_requests', return_value=[])
+        maintenance = self.patch(monitor, 'update_known_failures')
+        self.assertEqual(supervisor.run(a, self.conn, self.transport), 0)
+        advance.assert_called_once()
+        observe.assert_not_called()
+        priority.assert_called_once()
+        maintenance.assert_called_once()
 
     def test_promotion_instruction_is_delivered_in_the_same_tick(self):
         identifier = self.batch()
