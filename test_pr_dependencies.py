@@ -28,6 +28,7 @@ class DependencyTests(TestCase):
         self.git('config', 'user.name', 'Test')
         self.base = self.commit('base', 'base')
         self.items = {}
+        self.patch(pr_dependencies, 'REVIEWED_SUPERSESSIONS', ())
         self.x = self.add_pr(30, 'x', self.base)
         self.y = self.add_pr(20, 'y', self.x, base='x')
         self.z = self.add_pr(10, 'z', self.y, base='y')
@@ -121,6 +122,39 @@ class DependencyTests(TestCase):
     def restart(self):
         self.conn.close()
         self.conn = automerge.connect_db()
+
+    def reviewed_pair(self):
+        """Build the B4785/C4788 shape with real local Git ancestry."""
+        retired = self.items.pop(30)
+        retired['number'] = 4788
+        retired['state'] = 'closed'
+        retired['draft'] = False
+        retired.pop('merged_at', None)
+        self.items[4788] = retired
+        replacement = self.add_pr(4785, 'replacement', self.x)
+        self.git('merge', '--no-ff', '-qm', 'external prerequisite', 'w')
+        replacement = self.git('rev-parse', 'HEAD')
+        self.items[4785]['head']['sha'] = replacement
+        self.git('checkout', '-q', 'y')
+        self.git('merge', '--no-ff', '-qm', 'reviewed replacement', 'replacement')
+        self.items[20]['head']['sha'] = self.git('rev-parse', 'HEAD')
+        return pr_dependencies.ReviewedSupersession(
+            pr_dependencies.CANONICAL_REPOSITORY, 4788, self.x, 4785, replacement)
+
+    def reviewed_graph(self, record, verify=True):
+        nodes = {}
+        histories = {}
+        for number, item in self.items.items():
+            head = item['head']['sha']
+            nodes[number] = pr_dependencies.Node(
+                number, head, item['base']['ref'], item['head']['ref'],
+                item['head']['repo']['full_name'], item['base']['repo']['full_name'],
+                copy.deepcopy(item), item['state'] == 'open' and not item['draft'])
+            histories[number] = [head]
+        callback = (lambda _record, _retired, _replacement: True) if verify is True else verify
+        return pr_dependencies.Graph(
+            nodes, histories, self.git('rev-parse', 'master'), self.ancestor,
+            supersessions=(record,), verify_supersession=callback).discover()
 
     def land(self, head):
         self.git('checkout', '-q', 'master')
@@ -496,6 +530,196 @@ class DependencyTests(TestCase):
         reasons = [p['reason'] for p in automerge.DEPENDENCY_BLOCKS]
         self.assertTrue(any('cyclic' in r for r in reasons))
         self.assertTrue(any('unresolved' in r for r in reasons))
+
+    def test_reviewed_supersession_replaces_exact_retired_head_and_keeps_external_edges(self):
+        record = self.reviewed_pair()
+        graph = self.reviewed_graph(record)
+        dependencies = {dep.number: dep.head_sha for dep in graph.dependencies[20]}
+        self.assertNotIn(4788, dependencies)
+        self.assertEqual(dependencies[4785], record.replacement_head)
+        self.assertEqual(dependencies[40], self.w)
+        self.assertNotIn(20, graph.problems)
+        self.assertNotIn(4788, {dep.number for dep in graph.dependencies[4785]})
+
+    def test_reviewed_supersession_keeps_captured_external_closure(self):
+        record = self.reviewed_pair()
+        graph = self.reviewed_graph(record)
+        graph.captured[(record.retired_number, record.retired_head)] = [
+            pr_dependencies.Dependency(40, self.w)]
+        normalized = graph._normalize_dependencies(
+            20, [pr_dependencies.Dependency(record.retired_number, record.retired_head)])
+        self.assertEqual(
+            normalized,
+            (pr_dependencies.Dependency(record.replacement_number, record.replacement_head),
+             pr_dependencies.Dependency(40, self.w)))
+
+    def test_audited_expansion_consumes_only_its_proven_owner_history(self):
+        bold = self.add_pr(4785, 'replacement', self.base)
+        chead = self.add_pr(4788, 'retired-c', bold, base='replacement')
+        self.items[4788]['state'] = 'closed'
+        self.git('checkout', '-q', 'replacement')
+        self.git('merge', '--no-ff', '-qm', 'retired C', 'retired-c')
+        self.git('merge', '--no-ff', '-qm', 'external prerequisite', 'w')
+        bcurrent = self.git('rev-parse', 'HEAD')
+        self.items[4785]['head']['sha'] = bcurrent
+        record = pr_dependencies.ReviewedSupersession(
+            pr_dependencies.CANONICAL_REPOSITORY, 4788, chead, 4785, bcurrent)
+        graph = self.reviewed_graph(record)
+        graph.histories[4785] = [bold, bcurrent]
+        graph.captured[(4788, chead)] = [pr_dependencies.Dependency(4785, bold)]
+        graph.captured[(4785, bcurrent)] = [
+            pr_dependencies.Dependency(4788, chead),
+            pr_dependencies.Dependency(40, self.w)]
+        graph.discover(roots=[4785])
+        dependencies = {dep.number: dep.head_sha for dep in graph.dependencies[4785]}
+        self.assertNotIn(4785, dependencies)
+        self.assertEqual(dependencies[40], self.w)
+        self.assertNotIn(4785, graph.problems)
+        self.assertTrue(graph.eligible(4785))
+
+    def test_unverified_reviewed_supersession_does_not_bypass_closed_prerequisite(self):
+        record = self.reviewed_pair()
+        record = pr_dependencies.ReviewedSupersession(
+            record.repository, record.retired_number, record.retired_head,
+            record.replacement_number, self.w)
+        graph = self.reviewed_graph(record)
+        self.assertIn(20, graph.problems)
+        self.assertIn('supersession', graph.problems[20])
+        self.assertFalse(graph.eligible(20))
+
+    def test_reviewed_supersession_does_not_hide_an_unrelated_true_cycle(self):
+        record = self.reviewed_pair()
+        self.add_pr(60, 'cycle-a', self.base, base='cycle-b')
+        self.add_pr(70, 'cycle-b', self.base, base='cycle-a')
+        graph = self.reviewed_graph(record)
+        self.assertIn('cyclic prerequisites', graph.problems[60])
+        self.assertIn('cyclic prerequisites', graph.problems[70])
+        self.assertFalse(graph.eligible(60))
+        self.assertFalse(graph.eligible(70))
+
+    def test_ordinary_self_dependency_is_retained_without_a_reviewed_record(self):
+        graph = self.reviewed_graph(pr_dependencies.ReviewedSupersession(
+            pr_dependencies.CANONICAL_REPOSITORY, 4788, self.x, 4785, self.y), verify=True)
+        dependency = pr_dependencies.Dependency(20, self.items[20]['head']['sha'])
+        graph = pr_dependencies.Graph(
+            graph.nodes, graph.histories, self.base, self.ancestor, supersessions=())
+        self.assertEqual(graph._normalize_dependencies(20, [dependency]), (dependency,))
+
+    def test_reviewed_record_validation_rejects_bad_heads_numbers_repositories_and_conflicts(self):
+        valid = pr_dependencies.ReviewedSupersession(
+            pr_dependencies.CANONICAL_REPOSITORY, 4788, self.x, 4785, self.y)
+        cases = (
+            pr_dependencies.ReviewedSupersession(valid.repository, 0, valid.retired_head,
+                                                  valid.replacement_number, valid.replacement_head),
+            pr_dependencies.ReviewedSupersession(valid.repository, valid.retired_number, 'x',
+                                                  valid.replacement_number, valid.replacement_head),
+            pr_dependencies.ReviewedSupersession('other/repo', valid.retired_number, valid.retired_head,
+                                                  valid.replacement_number, valid.replacement_head),
+            (valid, pr_dependencies.ReviewedSupersession(valid.repository, valid.retired_number,
+                                                         valid.retired_head, 4786, self.w)),
+            (valid, pr_dependencies.ReviewedSupersession(valid.repository, 4787, self.w,
+                                                         valid.replacement_number, self.w)),
+        )
+        for records in cases:
+            with self.subTest(records=records):
+                with self.assertRaises(ValueError):
+                    pr_dependencies.Graph({}, {}, self.base, self.ancestor, supersessions=(records if isinstance(records, tuple) else (records,)))
+
+        shared = pr_dependencies.ReviewedSupersession(
+            valid.repository, 4787, self.w, valid.replacement_number, valid.replacement_head)
+        pr_dependencies.Graph({}, {}, self.base, self.ancestor, supersessions=(valid, shared))
+
+    def test_replacement_current_head_is_required_in_the_dependent(self):
+        record = self.reviewed_pair()
+        self.add_pr(10, 'near-miss', record.retired_head, base='x')
+        graph = self.reviewed_graph(record)
+        self.assertFalse(graph.eligible(10))
+        self.assertIn(10, graph.problems)
+        self.assertIn('replacement head is absent', graph.problems[10])
+        self.assertEqual(
+            {dep.number: dep.head_sha for dep in graph.dependencies[10]}[4785],
+            record.replacement_head)
+
+    def test_wrong_repository_replacement_remains_blocked(self):
+        record = self.reviewed_pair()
+        self.items[4785]['head']['repo']['full_name'] = 'other/repo'
+        graph = self.reviewed_graph(record)
+        self.assertFalse(graph.eligible(20))
+        self.assertIn(20, graph.problems)
+        self.assertIn(4788, {dep.number for dep in graph.dependencies[20]})
+
+    def test_open_retired_pr_remains_blocked(self):
+        record = self.reviewed_pair()
+        self.items[4788]['state'] = 'open'
+        graph = self.reviewed_graph(record)
+        self.assertFalse(graph.eligible(20))
+        self.assertIn(20, graph.problems)
+        self.assertIn(4788, {dep.number for dep in graph.dependencies[20]})
+
+    def test_draft_replacement_remains_blocked(self):
+        record = self.reviewed_pair()
+        self.items[4785]['draft'] = True
+        graph = self.reviewed_graph(record)
+        self.assertFalse(graph.eligible(20))
+        self.assertIn(20, graph.problems)
+        self.assertIn(4788, {dep.number for dep in graph.dependencies[20]})
+
+    def test_retired_head_mismatch_remains_blocked(self):
+        record = self.reviewed_pair()
+        mismatched = pr_dependencies.ReviewedSupersession(
+            record.repository, record.retired_number, self.y,
+            record.replacement_number, record.replacement_head)
+        graph = self.reviewed_graph(mismatched)
+        self.assertFalse(graph.eligible(20))
+        self.assertIn(4788, {dep.number for dep in graph.dependencies[20]})
+
+    def test_active_rejection_on_retired_head_remains_blocked(self):
+        record = self.reviewed_pair()
+        self.items[4788]['_mm_rejection'] = {'active': True, 'head_sha': self.x}
+        graph = self.reviewed_graph(record)
+        self.assertFalse(graph.eligible(20))
+        self.assertIn(20, graph.problems)
+
+    def test_supersession_requires_a_true_callback_and_does_not_catch_its_failure(self):
+        record = self.reviewed_pair()
+        nodes = {}
+        histories = {}
+        for number, item in self.items.items():
+            head = item['head']['sha']
+            nodes[number] = pr_dependencies.Node(
+                number, head, item['base']['ref'], item['head']['ref'],
+                item['head']['repo']['full_name'], item['base']['repo']['full_name'],
+                copy.deepcopy(item), item['state'] == 'open' and not item['draft'])
+            histories[number] = [head]
+        graph = pr_dependencies.Graph(nodes, histories, self.base, self.ancestor,
+                                      supersessions=(record,))
+        dependency = pr_dependencies.Dependency(record.retired_number, record.retired_head)
+        self.assertEqual(graph._normalize_dependencies(20, [dependency]), (dependency,))
+        self.assertIn(20, graph.problems)
+        graph.discover()
+        self.assertFalse(graph.eligible(20))
+
+        graph = pr_dependencies.Graph(nodes, histories, self.base, self.ancestor,
+                                      supersessions=(record,),
+                                      verify_supersession=lambda *_args: False)
+        self.assertEqual(graph._normalize_dependencies(20, [dependency]), (dependency,))
+
+        def deferred(*_args):
+            raise RuntimeError('deferred')
+
+        graph = pr_dependencies.Graph(nodes, histories, self.base, self.ancestor,
+                                      supersessions=(record,), verify_supersession=deferred)
+        with self.assertRaisesRegex(RuntimeError, 'deferred'):
+            graph._normalize_dependencies(20, [dependency])
+
+    def test_landed_retired_head_does_not_require_an_open_replacement(self):
+        record = self.reviewed_pair()
+        self.land(record.replacement_head)
+        self.items[record.replacement_number]['state'] = 'closed'
+        self.items[record.replacement_number]['merged_at'] = '2026-10-11T00:00:00Z'
+        graph = self.reviewed_graph(record, verify=False)
+        self.assertNotIn(20, graph.problems)
+        self.assertTrue(graph.eligible(20))
 
     def test_exclusion_cascades_without_rejecting_descendants(self):
         batch = automerge.create_batch(self.conn, self.selected(), self.base, batch_id='test-batch')

@@ -141,6 +141,16 @@ It also holds dependency promotion requests. `automerge_pr_inventory` retains
 observed branch identities and head history, `automerge_pr_dependencies` retains
 relationships for each exact dependent head, and `automerge_commit_ancestry`
 caches only successful comparisons of immutable commit pairs.
+Reviewed supersession records in `pr_dependencies.py` can replace a closed,
+unmerged preparation at one exact head with one ready, open consolidated head
+that contains it. The adapter refreshes both PRs and authenticates rejection
+markers and outbox state; unavailable reads defer instead of authorizing an
+alias. Only incorporation edges proven inside that audited expansion disappear.
+External prerequisites, ordinary cycles, rejected ancestors and normal review,
+tests and final exact-head landing gates remain authoritative. A changed
+replacement head needs a new reviewed source record. Once the retired head is
+actually in master, ordinary landed ancestry applies without supersession.
+
 Each production comparison is committed immediately, including negative results
 and pinned speculative views; exceptions and incomplete fetches are never facts.
 Discovery reuses those pairs for unchanged heads and checks new historical heads
