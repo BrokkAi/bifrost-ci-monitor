@@ -472,7 +472,10 @@ draft, or unblocked heads lose the label. Exact-head/reason outbox markers
 deduplicate comments after lost replies. Retry these informational writes only
 after fresh dependency discovery, retaining backoff without changing batch
 revisions or creating Slack alerts. Retire pending legacy dependency Slack
-notices without sending them.
+notices without sending them. Successful dependency-notice delivery checkpoints
+the reconciled dependency label in cached PR metadata atomically with its outbox
+receipt, including labels already absent on GitHub. Preserve other metadata and
+Git facts; closed cached PRs must not rearm completed cleanup on every discovery.
 
 Ejection removes dependent descendants with exclusion kind `blocked`; only the
 standalone-broken prerequisite receives a rejection. Recheck captured dependency

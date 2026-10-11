@@ -535,7 +535,7 @@ def github_api_write(endpoint: str, method: str, payload: dict[str, Any] | None 
     return json.loads(result) if result.strip() else None
 
 
-def _deliver_dependency_notice(conn: sqlite3.Connection, row, detail, current_head: str) -> None:
+def _deliver_dependency_notice(conn: sqlite3.Connection, row, detail, current_head: str) -> bool:
     """Reconcile the label from current discovery; comment only on its matching block."""
     number = int(row["number"])
     observed = conn.execute("SELECT head_sha,blocked_reason FROM automerge_pr_inventory WHERE number=?",
@@ -555,6 +555,28 @@ def _deliver_dependency_notice(conn: sqlite3.Connection, row, detail, current_he
             github_api_write(f"issues/{number}/comments", "POST", {
                 "body": f"{dependency_block_comment(number, reason)}\n\n{marker}",
             })
+    return blocked
+
+
+def _record_dependency_label(conn: sqlite3.Connection, number: int, present: bool) -> None:
+    """Record the reconciled PR label without changing discovery or Git facts."""
+    observed = conn.execute("SELECT data_json FROM automerge_pr_inventory WHERE number=?",
+                            (number,)).fetchone()
+    if observed is None:
+        return
+    data = json.loads(observed["data_json"])
+    if (DEPENDENCY_BLOCKED_LABEL in _labels(data)) == present:
+        return
+    labels = data.get("labels")
+    labels = labels if isinstance(labels, list) else []
+    if present:
+        labels = labels + [{"name": DEPENDENCY_BLOCKED_LABEL}]
+    else:
+        labels = [label for label in labels if not (
+            isinstance(label, dict) and label.get("name") == DEPENDENCY_BLOCKED_LABEL)]
+    data["labels"] = labels
+    conn.execute("UPDATE automerge_pr_inventory SET data_json=? WHERE number=?",
+                 (json.dumps(data), number))
 
 
 def _trusted_comment(number: int, marker: str) -> bool:
@@ -573,8 +595,8 @@ def _trusted_comment(number: int, marker: str) -> bool:
     return False
 
 
-def deliver_github_write(row: sqlite3.Row | dict[str, Any], *, conn: sqlite3.Connection | None = None) -> None:
-    """Reconcile one App-owned write; safe to repeat after a lost response."""
+def deliver_github_write(row: sqlite3.Row | dict[str, Any], *, conn: sqlite3.Connection | None = None) -> bool | None:
+    """Reconcile a write; return dependency label state for its delivery checkpoint."""
     kind, number, head = str(row["kind"]), int(row["number"]), str(row["head_sha"])
     payload = json.loads(str(row["payload_json"]))
     if kind in {"reject_head", "issue_comment"}:
@@ -615,8 +637,7 @@ def deliver_github_write(row: sqlite3.Row | dict[str, Any], *, conn: sqlite3.Con
     if kind == "dependency_notice":
         if conn is None:
             raise ValueError("dependency notices require current discovery state")
-        _deliver_dependency_notice(conn, row, detail, current_head)
-        return
+        return _deliver_dependency_notice(conn, row, detail, current_head)
     if kind == "draft_changed_head":
         if (str(detail.get("state") or "").lower() == "open"
                 and current_head != payload["selected_head"] and not detail.get("draft")):
@@ -682,7 +703,7 @@ def retry_github_outbox(conn: sqlite3.Connection, transport: monitor.SlackTransp
     ).fetchall()
     for row in rows:
         try:
-            deliver_github_write(row, conn=conn)
+            dependency_label_present = deliver_github_write(row, conn=conn)
         except (monitor.CommandError, AutomergeError, OSError, ValueError, KeyError) as exc:
             attempts = int(row["attempts"]) + 1
             delay = min(60 * 2 ** min(attempts - 1, 4), GITHUB_WRITE_RETRY_MAX_SECONDS)
@@ -713,6 +734,10 @@ def retry_github_outbox(conn: sqlite3.Connection, transport: monitor.SlackTransp
                                          (utc_now(), row["intent_id"]))
             continue
         with conn:
+            if row["kind"] == "dependency_notice":
+                # Closed PR metadata is reused across discoveries. Checkpoint
+                # the owned label with delivery so old cleanup cannot rearm.
+                _record_dependency_label(conn, int(row["number"]), dependency_label_present)
             conn.execute(
                 "UPDATE automerge_github_outbox SET delivered_at=?,last_error=NULL,next_attempt_at=NULL "
                 "WHERE intent_id=?", (utc_now(), row["intent_id"]),

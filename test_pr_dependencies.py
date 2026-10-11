@@ -2,6 +2,7 @@
 import copy
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import tempfile
 from unittest import TestCase, mock
@@ -308,6 +309,108 @@ class DependencyTests(TestCase):
         send.assert_not_called()
         self.assertEqual(self.conn.execute('SELECT slack_notification_attempted FROM automerge_blocked_notifications '
                                           'WHERE batch_id=?', (identifier,)).fetchone()[0], 1)
+
+    def assert_closed_cleanup_does_not_starve_notices(self, *, already_absent):
+        label = automerge.DEPENDENCY_BLOCKED_LABEL
+        self.selected()  # Retain both PRs when they disappear from the listing.
+        for number in (30, 40):
+            self.items[number]['state'] = 'closed'
+            self.items[number]['labels'] = [{'name': label}, {'name': 'keep-me', 'color': '123456'}]
+        self.selected()
+        before = pr_dependencies.inventory(self.conn)
+        # Both stale cleanups precede the new blocked-head notices. The normal
+        # two-delivery limit must make progress across polls without rearming.
+        with mock.patch.object(automerge, 'utc_now', return_value='2020-01-01T00:00:00+00:00'), self.conn:
+            for number in (30, 40):
+                automerge.enqueue_github_write(self.conn, '__dependencies__', 'dependency_notice',
+                    number, self.items[number]['head']['sha'], {'reason': None})
+        if already_absent:
+            for number in (30, 40):
+                self.items[number]['labels'] = [{'name': 'keep-me', 'color': '123456'}]
+        transport = monitor.SlackTransport('webhook', webhook='unused')
+        with mock.patch.object(automerge, 'deliver_github_write', wraps=automerge.deliver_github_write) as deliver:
+            for _ in range(3):
+                self.selected()
+                automerge.report_dependency_blocks(self.conn, transport)
+        for number in (30, 40):
+            self.assertEqual(sum(call.args[0]['number'] == number for call in deliver.call_args_list), 1)
+            cached, history = pr_dependencies.inventory(self.conn)[number]
+            expected = copy.deepcopy(before[number][0])
+            expected['labels'] = [{'name': 'keep-me', 'color': '123456'}]
+            self.assertEqual(cached, expected)
+            self.assertEqual(history, before[number][1])
+        self.assertEqual(len(self.comments[20]), 1)
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM automerge_github_outbox "
+            "WHERE kind='dependency_notice' AND delivered_at IS NULL").fetchone()[0], 0)
+        for number in (10, 20):
+            self.assertIn(label, automerge._labels(pr_dependencies.inventory(self.conn)[number][0]))
+
+    def test_closed_dependency_label_cleanup_does_not_starve_new_notices(self):
+        self.assert_closed_cleanup_does_not_starve_notices(already_absent=False)
+
+    def test_already_absent_closed_dependency_labels_repair_stale_inventory(self):
+        self.assert_closed_cleanup_does_not_starve_notices(already_absent=True)
+
+    def test_lost_dependency_label_cleanup_reply_reconciles_cache_on_retry(self):
+        label = automerge.DEPENDENCY_BLOCKED_LABEL
+        self.items[30]['state'] = 'closed'
+        self.items[30]['labels'] = [{'name': label}]
+        self.items[10]['draft'] = self.items[20]['draft'] = True
+        self.selected()
+        transport = monitor.SlackTransport('webhook', webhook='unused')
+        writer = automerge.github_api_write
+        def lost_reply(endpoint, method, payload=None):
+            writer(endpoint, method, payload)
+            raise OSError('cleanup accepted; reply lost')
+        with mock.patch.object(automerge, 'github_api_write', side_effect=lost_reply):
+            automerge.report_dependency_blocks(self.conn, transport)
+        pending = self.conn.execute("SELECT * FROM automerge_github_outbox "
+            "WHERE kind='dependency_notice' AND number=30").fetchone()
+        self.assertIsNone(pending['delivered_at'])
+        self.assertEqual(pending['attempts'], 1)
+        self.assertIsNotNone(pending['next_attempt_at'])
+        self.assertIn(label, automerge._labels(pr_dependencies.inventory(self.conn)[30][0]))
+        self.selected()
+        automerge.report_dependency_blocks(self.conn, transport)
+        self.assertEqual(self.conn.execute('SELECT attempts FROM automerge_github_outbox WHERE intent_id=?',
+            (pending['intent_id'],)).fetchone()[0], 1)
+        with self.conn:
+            self.conn.execute('UPDATE automerge_github_outbox SET next_attempt_at=NULL WHERE intent_id=?',
+                (pending['intent_id'],))
+        for _ in range(3):
+            self.selected()
+            automerge.report_dependency_blocks(self.conn, transport)
+        self.assertNotIn(label, automerge._labels(pr_dependencies.inventory(self.conn)[30][0]))
+        self.assertIsNotNone(self.conn.execute('SELECT delivered_at FROM automerge_github_outbox WHERE intent_id=?',
+            (pending['intent_id'],)).fetchone()[0])
+        self.assertEqual(len(self.writes), 1)
+
+    def test_dependency_label_cache_and_delivery_receipt_commit_together(self):
+        label = automerge.DEPENDENCY_BLOCKED_LABEL
+        self.items[30]['state'] = 'closed'
+        self.items[30]['labels'] = [{'name': label}]
+        self.items[10]['draft'] = self.items[20]['draft'] = True
+        self.selected()
+        transport = monitor.SlackTransport('webhook', webhook='unused')
+        with self.conn:
+            self.conn.execute("CREATE TEMP TRIGGER fail_delivery BEFORE UPDATE OF delivered_at "
+                "ON automerge_github_outbox WHEN NEW.delivered_at IS NOT NULL "
+                "BEGIN SELECT RAISE(ABORT, 'receipt unavailable'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'receipt unavailable'):
+            automerge.report_dependency_blocks(self.conn, transport)
+        # GitHub accepted cleanup, but neither local checkpoint may advance.
+        self.assertNotIn(label, automerge._labels(self.items[30]))
+        self.assertIn(label, automerge._labels(pr_dependencies.inventory(self.conn)[30][0]))
+        self.assertIsNone(self.conn.execute("SELECT delivered_at FROM automerge_github_outbox "
+            "WHERE kind='dependency_notice' AND number=30").fetchone()[0])
+        with self.conn:
+            self.conn.execute('DROP TRIGGER fail_delivery')
+        self.selected()
+        automerge.report_dependency_blocks(self.conn, transport)
+        self.assertNotIn(label, automerge._labels(pr_dependencies.inventory(self.conn)[30][0]))
+        self.assertIsNotNone(self.conn.execute("SELECT delivered_at FROM automerge_github_outbox "
+            "WHERE kind='dependency_notice' AND number=30").fetchone()[0])
+        self.assertEqual(len(self.writes), 1)
 
     def test_ineligible_prerequisite_notice_points_action_at_the_prerequisite(self):
         message = automerge.dependency_block_comment(20, 'blocked by prerequisite PR #30')
