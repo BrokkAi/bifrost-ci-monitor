@@ -811,6 +811,38 @@ def _dependency_node(item, *, conn=None, dry_run=False):
         _queue_ready(item, conn=conn, dry_run=dry_run), priority, immediate)
 
 
+def _verify_supersession_rejections(conn, retired, replacement, compare):
+    """Audited replacement never cancels a trusted rejected ancestor."""
+    for node in (retired, replacement):
+        # Generic dependency nodes tolerate omitted repository metadata. A
+        # supersession authority must instead authenticate explicit fresh refs.
+        head = node.data.get('head')
+        base = node.data.get('base')
+        if (not isinstance(head, dict) or not isinstance(base, dict)
+                or head.get('sha') != node.head
+                or (head.get('repo') or {}).get('full_name') != REPO_NAME
+                or (base.get('repo') or {}).get('full_name') != REPO_NAME):
+            return False
+        comments = list_pull_comments(node.number)
+        markers = {marker.head_sha for comment in comments
+                   if (marker := newest_trusted_rejection([comment])) is not None}
+        active = set()
+        released = set()
+        if pr_dependencies.has_table(conn, 'automerge_github_outbox'):
+            for row in conn.execute(
+                    "SELECT head_sha,cancelled_at FROM automerge_github_outbox "
+                    "WHERE number=? AND kind='reject_head'", (node.number,)):
+                (released if row['cancelled_at'] else active).add(row['head_sha'])
+        # An active intent dominates any older cancelled intent for that head.
+        rejected = active | (markers - (released - active))
+        if REJECTED_LABELS & _labels(node.data) and not markers:
+            return False
+        for head in sorted(rejected):
+            if pr_dependencies.cached_ancestor(conn, compare, head, node.head):
+                return False
+    return True
+
+
 def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roots=None,
                      persist_comparisons=None, priority_only=False):
     """Refresh open heads and durable prerequisites, then verify their ancestry."""
@@ -819,6 +851,8 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
             pr_dependencies.ensure_schema(conn)
     cached = pr_dependencies.inventory(conn)
     items = {int(p['number']): p for p in list_open_pull_requests() if not _is_integration_pull(p)}
+    supersessions = tuple(record for record in pr_dependencies.REVIEWED_SUPERSESSIONS
+                          if record.replacement_number in items)
     histories = {number: history for number, (_, history) in cached.items()}
 
     def remember(item):
@@ -833,7 +867,8 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
 
     for item in items.values():
         remember(item)
-    required = set()
+    required = {number for record in supersessions
+                for number in (record.retired_number, record.replacement_number)}
     if pr_dependencies.has_table(conn, 'automerge_pr_dependencies'):
         required.update(row[0] for row in conn.execute('SELECT DISTINCT prerequisite_number '
                                                        'FROM automerge_pr_dependencies') if row[0] not in cached)
@@ -895,6 +930,9 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
     compare = _read_only_ancestry if dry_run and not persist_comparisons else compare_commit_ancestry
     graph = pr_dependencies.Graph(nodes, histories, actual_base, compare,
                                   conn=conn, base_branch=BASE_BRANCH,
+                                  supersessions=supersessions,
+                                  verify_supersession=lambda record, retired, replacement:
+                                      _verify_supersession_rejections(conn, retired, replacement, compare),
                                   persist_comparisons=(not dry_run if persist_comparisons is None
                                                        else persist_comparisons)).discover(roots)
     graph.select(priority=False)  # Establish block reasons for ready descendants.
