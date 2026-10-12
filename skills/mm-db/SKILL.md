@@ -54,6 +54,20 @@ For source edits or a changed tree, withdraw and replace it normally.
 
 Run your chosen local builds/tests through the execution wrapper:
 
+When `attest.toml` is present, use a configured suite
+whose build/features match your selected nextest check:
+
+```sh
+python3 <this skill>/scripts/mm_db.py attest push-tests --filter 'test(changed_behavior)'
+```
+
+This always uses shadow mode: every selected test executes, and potential reuse
+is reported without skipping tests. Receipts include the Attest run ID, result
+path, storage reference, and coverage/timing summary. If needed, the helper
+downloads the versioned binary through the same authenticated service. Cloud access uses the
+batch-authenticated service; credentials remain on the host. Use `run` below
+for other commands or when Attest is unavailable.
+
 ```sh
 python3 <this skill>/scripts/mm_db.py run -- eatmydata cargo nextest run -E 'test(changed_behavior)'
 python3 <this skill>/scripts/mm_db.py run --script /tmp/check.sh

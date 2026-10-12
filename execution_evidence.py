@@ -59,6 +59,16 @@ def validate(value):
         log = value.get(name)
         if not isinstance(log, dict) or not isinstance(log.get("path"), str) or not log["path"]:
             raise ValueError("execution output must reference retained log paths")
+    attest = value.get("attest")
+    if attest is not None:
+        if (not isinstance(attest, dict) or attest.get("format_version") != 1
+                or not isinstance(attest.get("run_id"), str)
+                or not re.fullmatch(r"[0-9a-f]{32}", attest["run_id"])
+                or attest.get("mode") not in {"shadow", "reuse", "force"}
+                or type(attest.get("published")) is not bool
+                or not isinstance(attest.get("metrics"), dict)
+                or any(not isinstance(attest.get(k), str) for k in ("result", "object", "suite"))):
+            raise ValueError("invalid Attest execution summary")
     return value
 
 
@@ -72,7 +82,7 @@ def record(conn, batch_id, session_id, value):
             return old
         # A late retry of the start cannot overwrite a completed result.
         result_fields = {"status", "finished_at", "duration_seconds", "exit_code", "head_after",
-                         "tree_after", "tracked_source_changed", "stdout", "stderr", "error"}
+                         "tree_after", "tracked_source_changed", "stdout", "stderr", "error", "attest"}
         identity = lambda v: {k: item for k, item in v.items() if k not in result_fields}
         if (identity(old) != identity(value)
                 or any(old[name]["path"] != value[name]["path"] for name in ("stdout", "stderr"))):
@@ -139,6 +149,12 @@ def render(assessment, *, limit=12000):
                  f"stdout {run['stdout']['path']}; stderr {run['stderr']['path']}")
         if run.get("reuse_reason"):
             entry += "\n  Reuse: " + run["reuse_reason"]
+        if run.get("attest"):
+            a = run["attest"]
+            m = a["metrics"]
+            entry += (f"\n  Attest {a['mode']} {a['suite']}: "
+                      f"{m.get('potential_reuse', 0)}/{m.get('discovered', 0)} potential reuse; "
+                      f"{m.get('executed', 0)} executed; result {a['result']}")
         if used + len(entry) + 1 > limit - 150:
             lines.append(f"{len(runs) - index} additional execution records retained in mm-db executions.")
             break

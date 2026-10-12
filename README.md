@@ -507,3 +507,36 @@ does not stop agents or undo GitHub writes.
 
 Copyright 2026 Brokk AI. Licensed under the Apache License, Version 2.0.
 See [LICENSE](LICENSE).
+
+## Attest shadow test evidence
+
+Attest is a separate Go project at `../attest`. Merge agents use
+`mm-db attest SUITE --filter EXPR` for matching nextest suites when
+`attest.toml` is available. This currently executes all selected tests in shadow
+mode; normal assessment and landing policies still apply. Command receipts
+retain the compact summary and a pointer to the detailed result.
+
+The skill service proxies storage through the installed `attest store` CLI.
+Its default configuration is `~/.config/attest/storage.toml`, overridable with
+`ATTEST_STORAGE_CONFIG`; `ATTEST_BIN` overrides `~/.local/bin/attest`. Cloud
+credentials stay on the host. CI uses a repository-scoped read-only OIDC role with separate `ATTEST_AWS_*` credentials, preserving existing build-cache credentials. CI readers have List/Get access; the host alone
+can publish under `attest/results/v1/` in the CI cache bucket. Results expire
+after seven days; the separate versioned binary lives under `agents/attest/`.
+
+Completed master CI and exact-head integration CI upload narrow result
+artifacts. The fixer entry point imports one completed run per tick after
+supervising repairs, checkpointing `attest_ci_imports` only after accepted
+publication. Failed imports retry; they never authorize or block a merge.
+Look for `Attest CI evidence import deferred` in monitor logs and inspect
+`automerge_executions` summaries for potential reuse, contradictions, and
+contract mismatch reasons. Investigate low reuse before changing policy: match
+Git trees, suite/build settings, toolchain, environment and publication status,
+then separate build/discovery overhead from test execution.
+
+Rollback: use native nextest commands or disable the Attest wrapper. CI's
+shadow wrapper falls back to the original command when the tool/configuration
+is unavailable or drifts from native coverage, and preserves native exit status
+if result observation fails. No ruleset or merge-mode change is part of this
+rollout. Material, safe savings authorize a subsequent synchronous merge-mode
+integration; do not enable skipping or change landing policy on a small fixture
+benchmark alone.

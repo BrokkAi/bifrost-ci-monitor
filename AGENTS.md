@@ -63,6 +63,9 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   triage and included in the corresponding issue fixer's dossier.
 - `execution_evidence.py`: durable local command receipts and explicit reuse
   links in assessments; evidence intake never changes scheduling or verdicts.
+- `attest_store.py` and `attest_ci.py`: standalone Attest storage proxy and
+  retryable completed-CI artifact intake. Detailed results live in S3; receipts
+  retain compact summaries. Intake never changes a merge gate.
 - `merge_failover.py`: consecutive Bedrock 503 detection and durable native Move
   to DeepSeek Flash, retaining the same session, container and execution evidence.
 - `skills/mm-*`: agent tools for merge mechanics, state, publication, and
