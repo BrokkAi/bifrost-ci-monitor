@@ -7,3 +7,5 @@ activity.db
 activity.db-*
 monitor.log
 
+web/dist/
+web/node_modules/

@@ -74,6 +74,49 @@ Cron executes `monitor.py` straight from this working tree every five minutes
 - `scripts/apply-mergemarshall-ruleset.sh`: administrator-only normal-policy
   setup. It is never called by cron. Its dry-run and confirmation behavior
   are covered by `test_automerge.py`.
+- `mm_web/` and `web/`: the dashboard service (`mm-web.service`, FastAPI in the
+  uv environment from `pyproject.toml`) and its React UI. Cron entry points and
+  `mm_service.py` stay stdlib-only and must not import `mm_web`.
+
+# Web dashboard contracts
+
+`/api/v1` is the single interface for the UI and for agents; anything the UI
+shows has a JSON route, and `web/openapi.json` is the committed contract
+(`test_mm_web` asserts it equals `app.openapi()`; regenerate it with
+`uv run python -m mm_web.export_openapi`, then `npm run api:generate` in `web/`).
+Every request reads SQLite through a `mode=ro`, `query_only` connection. The
+web process never runs `connect_db`, migrations or other shared-state writes;
+reuse existing read helpers (`mm_service.state`, `automerge.active_batch`,
+`supervisor.queue_groups`) only after checking that they are pure reads.
+
+Exposure is allowlisted. Curated models declare every field and project nested
+payloads; never pass dicts through wholesale. `/sql` and `/schema` expose only
+reviewed columns in `mm_web/allowlist.py`; other columns read as NULL. Stored
+prompts, briefs, agent reports, recovery and instruction text can embed batch
+connection tokens and are never allowlisted. Add a new column there only after
+checking its contents. Short free-text fields pass through the token scrub.
+
+Authorization follows GitHub repository permission, looked up with the App
+installation token and cached ten minutes per login: write views; maintain or
+admin starts or aborts a stabilize campaign. Browsers use the App's OAuth flow
+and a signed cookie holding only the login; agents send a GitHub user token or a
+view-only host-minted `mmw_` service token. Cookie-authenticated POSTs require
+JSON and a matching Origin.
+
+The release form calls `stabilize.py` in process through `mm_web/releases.py`
+only; the web keeps no release state of its own and enforces permission before
+calling it. `requested_by` is always the authenticated login.
+
+In `web/`, `npm run dev:mock` serves the UI on localhost:5173 from typed
+in-memory fixtures (no backend); `npm run dev` proxies `/api` and `/auth` to
+localhost:8770. Fixtures are typed against the generated schema, so update them
+with the snapshot. Every status has a fixed icon and label; chart colors are
+separate from status colors and were checked with the dataviz palette validator.
+
+`entrypoint_heartbeats` records started/finished/skipped for the `monitor`,
+`merger` and `triage` cron ticks through `monitor.record_heartbeat`, which is
+best-effort, never raises, stores only exception class names or exit codes, and
+is not written by operator commands such as `--check`.
 
 This repository's direct-master workflow does not authorize the supervised
 agents to push `bifrost-dev/master`. Those agents publish PRs; only the
@@ -944,7 +987,8 @@ Slack/GitHub messages without user authorization.
 
 This is a Python repository. Pick the relevant existing modules:
 `test_automerge`, `test_merge_retries`, `test_membership_labels`, `test_mm_skills`, `test_issue_fixer`,
-`test_repair_dossier`, `test_triage`, and `test_monitor`. Dependency changes also
+`test_repair_dossier`, `test_triage`, and `test_monitor`. Dashboard changes use
+`uv run python -m unittest test_mm_web` and `npm run build` in `web/`. Dependency changes also
 use `test_pr_dependencies`, with temporary Git histories and mocked external
 writes, and `test_git_ancestry` for cache/ref/diff/blob behavior. Never validate
 scheduling against the live queue. For Python changes,

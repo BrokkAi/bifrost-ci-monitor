@@ -36,8 +36,9 @@ through pull requests.
 ## Initial setup
 
 Install Python 3.11 or later, Node.js 18 or later, Git, GitHub CLI (`gh`), Mjolnir (`mj`), Podman,
-and SQLite's CLI for inspection/backups. The Python programs use the standard
-library; the merger uses host Node.js to run Bifrost's CI impact classifier.
+and SQLite's CLI for inspection/backups. The cron programs and the skill
+service use only the standard library; the merger uses host Node.js to run
+Bifrost's CI impact classifier. The web dashboard (below) also needs `uv`.
 Configure Mjolnir's `CI` workspace, `bifrost` bundle, and the `podman` and
 `bedrock-podman` targets before enabling cron. Batches starting with one source PR
 use DeepSeek Flash (`deepseek-flash`) on `podman`, with subagents disabled.
@@ -105,6 +106,57 @@ The service listens on port 8769. Container agents reach it through
 `host.containers.internal`; verify that route and restrict access to the
 private host/container network. Pass `--github-cli <absolute-gh-path>` to the
 installer if the service needs a different GitHub CLI path.
+
+### Web dashboard
+
+`mm-web.service` serves a read-only dashboard and JSON API over the shared
+database, plus the stable release branch form. It runs from this checkout in a
+uv-managed virtual environment (`pyproject.toml`, `uv.lock`); the React UI in
+`web/` is built at install time. It listens on port 8770.
+
+GitHub sign-in uses the `mergemarshall` App. An App administrator adds the
+callback URL `http://localhost:8770/auth/callback` under the App's "Identifying
+and authorizing users" settings and generates a client secret. Save both on
+the host, readable only by `ubuntu`:
+
+```sh
+install -m 600 /dev/null ~/.config/bifrost-ci-monitor/mm-web-oauth.json
+# then edit it to contain {"client_id": "...", "client_secret": "..."}
+```
+
+Install or update, then check the service:
+
+```sh
+python3 scripts/install-mm-web.py --listen <host-private-IP> \
+  --github-cli /home/ubuntu/.local/bin/gh
+systemctl --user status mm-web.service
+journalctl --user -u mm-web.service
+```
+
+Add `--dry-run` to print the unit and commands without running them. Reach the
+dashboard through an SSH tunnel and open `http://localhost:8770`:
+
+```sh
+ssh -N -L 8770:<host-private-IP>:8770 ubuntu@CURRENT_PUBLIC_IP
+```
+
+Access follows the user's permission on `BrokkAi/bifrost-dev`: write can view,
+maintain or admin can also start or abort a stable release branch. The
+permission is rechecked every ten minutes.
+
+Agents use the same API with `Authorization: Bearer <token>`. A GitHub user
+token (for example `gh auth token`) receives that user's permission. For agents
+without a GitHub user token, mint a view-only service token on the host:
+
+```sh
+.venv/bin/python -m mm_web.tokens mint NAME
+```
+
+Service tokens cannot be revoked one at a time. To revoke all of them, delete
+`~/.local/state/bifrost-ci-monitor/mm-web-service.key` and mint new ones. The
+API schema is at `/api/v1/openapi.json` and interactive documentation at
+`/api/v1/docs`. `POST /api/v1/sql` runs one read-only query over reviewed
+columns; prompt, report and recovery text is never exposed.
 
 ### Slack
 
@@ -490,7 +542,9 @@ PRs that were merged manually.
 
 Use `git pull --ff-only` in the cron checkout. The next tick uses that code;
 there is no monitor daemon to restart. Restart `mm-skills.service` when its
-implementation changes. Preserve credentials, SQLite, and Mjolnir session data
+implementation changes. Rerun `scripts/install-mm-web.py` when `mm_web/`,
+`web/`, `pyproject.toml` or `uv.lock` change; it rebuilds the UI and restarts
+`mm-web.service`. Preserve credentials, SQLite, and Mjolnir session data
 when replacing a host. Before upgrading or repairing state, take a consistent
 backup:
 
