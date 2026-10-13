@@ -697,9 +697,11 @@ class RealReleaseTests(unittest.TestCase):
         self.fixture = WebTests()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
-        patch = mock.patch.object(stabilize, 'deliver_slack')
-        patch.start()
-        self.addCleanup(patch.stop)
+        for name in ('deliver_slack', 'run_campaign_tick'):
+            # create/resume run a first engine tick inline; its GitHub/Slack work has engine tests.
+            patch = mock.patch.object(stabilize, name)
+            patch.start()
+            self.addCleanup(patch.stop)
 
     def write(self, sql, params=()):
         with closing(sqlite3.connect(monitor.DB_PATH)) as conn, conn:

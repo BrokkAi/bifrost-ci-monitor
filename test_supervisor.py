@@ -1,5 +1,7 @@
 """Supervisor ordering and retries operate on isolated state, never the live queue."""
 import json
+import contextlib
+import io
 from pathlib import Path
 import tempfile
 import time
@@ -63,36 +65,358 @@ class SupervisorTests(unittest.TestCase):
         with conn:
             conn.execute('UPDATE automerge_batches SET prompt_delivered=1 WHERE batch_id=?', (row['batch_id'],))
 
+    def campaign(self):
+        with self.conn:
+            self.conn.execute("INSERT INTO stabilize_campaigns "
+                              "(id,branch,anchor_sha,tip_sha,status,created_at,updated_at) "
+                              "VALUES ('test','stabilize/test',?,?,'running','now','now')",
+                              (BASE_SHA, BASE_SHA))
+            self.conn.execute("INSERT INTO stabilize_issues "
+                              "(campaign_id,issue_number,stage,source,round,state,added_at,updated_at) "
+                              "VALUES ('test',1,'push','test',0,'pr_ready','now','now')")
+
+    def campaign_batch(self):
+        source = a.PullRequest(50, 'fix', HEAD_ONE, 'url',
+                               base_ref='stabilize/test', target_ref='stabilize/test')
+        return a.create_batch(self.conn, [source], BASE_SHA, ci_mode='sync')
+
     def test_campaign_selection_captures_campaign_tip_and_forces_async(self):
+        self.campaign()
         target = 'stabilize/test'
         source = a.PullRequest(50, 'fix', HEAD_ONE, 'url', base_ref=target, target_ref=target)
-        self.select.return_value = [source]
+        self.select.side_effect = lambda **kw: [source] if kw.get('target_ref') == target else []
         remote = self.patch(a, 'remote_branch_sha', return_value=BASE_SHA)
         self.patch(a, 'current_master_sha', side_effect=AssertionError('master capture'))
         self.patch(a, '_ancestry_cache', return_value=mock.Mock(behind=mock.Mock(return_value=1)))
         self.patch(a, 'CI_MODE', 'sync')
         self.patch(a, 'process_batch')
         self.assertEqual(supervisor.run(a, self.conn, self.transport), 0)
-        row = a.active_batch(self.conn)
+        self.assertIsNone(a.active_batch(self.conn))
+        row = a.active_campaign_batch(self.conn)
         self.assertEqual(row['target_ref'], target)
         self.assertEqual(row['base_sha'], BASE_SHA)
         self.assertEqual(row['ci_mode'], 'async')
         remote.assert_called_with(target)
 
-    def test_campaign_primary_waits_and_has_no_successor_action(self):
-        identifier = self.batch()
-        with self.conn:
-            self.conn.execute("UPDATE automerge_batches SET target_ref='stabilize/test' WHERE batch_id=?", (identifier,))
-        row = self.row(identifier)
-        value = {'id': 'checkpoint', 'head': HEAD_ONE, 'tree': HEAD_ONE,
-                 'source_revision': speculation.source_revision(a, row)}
-        with self.conn:
-            self.conn.execute('UPDATE automerge_batches SET candidate_json=? WHERE batch_id=?', (json.dumps(value), identifier))
+    def test_campaign_does_not_occupy_master_primary_or_create_successor(self):
+        identifier = self.campaign_batch()
         options = supervisor.plan(a, self.conn, priority_checked=True, queue_checked=False,
                                   maintenance_done=False, reconciled=set())
-        self.assertNotIn('select_primary', [entry[2] for entry in options])
+        self.assertIn('select_primary', [entry[2] for entry in options])
         self.assertNotIn('select_successor', [entry[2] for entry in options])
         self.assertIn('advance_batch', [entry[2] for entry in options])
+        self.assertIsNone(a.active_batch(self.conn))
+        self.assertEqual(a.active_campaign_batch(self.conn)['batch_id'], identifier)
+        master = self.batch()
+        with self.conn:
+            self.conn.execute('UPDATE automerge_batches SET target_ref=? WHERE batch_id=?', (a.BASE_BRANCH, master))
+        self.assertEqual(a.active_batch(self.conn)['batch_id'], master)
+        self.assertEqual(a.active_campaign_batch(self.conn)['batch_id'], identifier)
+
+    def three_batches(self):
+        primary = self.batch()
+        successor = a.create_batch(self.conn, [a.PullRequest(2, 'next', HEAD_ONE, 'url')],
+                                   BASE_SHA, ci_mode='async')
+        with self.conn:
+            self.conn.execute('UPDATE automerge_batches SET predecessor_id=? WHERE batch_id=?',
+                              (primary, successor))
+        campaign = self.campaign_batch()
+        self.patch(speculation, 'reconcile', return_value=True)
+        return primary, successor, campaign
+
+    def test_master_primary_successor_and_campaign_all_advance_in_order(self):
+        expected = self.three_batches()
+        observed = []
+        self.patch(a, 'process_batch', side_effect=lambda conn, transport, owner: observed.append(owner))
+        self.assertEqual(supervisor.run(a, self.conn, self.transport), 0)
+        self.assertEqual(observed, list(expected))
+
+    def test_deferred_or_failed_lane_does_not_block_other_lane(self):
+        for failing_campaign in (True, False):
+            for error in (git_ancestry.Deferred('pending'), RuntimeError('stalled')):
+                with self.subTest(campaign=failing_campaign, error=type(error).__name__):
+                    primary, successor, campaign = self.three_batches()
+                    observed = []
+                    def process(conn, transport, owner):
+                        observed.append(owner)
+                        if owner == (campaign if failing_campaign else primary):
+                            raise error
+                        with conn:
+                            conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal',"
+                                         "terminal_status='merged' WHERE batch_id=?", (owner,))
+                    self.patch(a, 'process_batch', side_effect=process)
+                    supervisor.run(a, self.conn, self.transport)
+                    other = primary if failing_campaign else campaign
+                    self.assertEqual(self.row(other)['terminal_status'], 'merged')
+                    self.assertIn(other, observed)
+                    with self.conn:
+                        self.conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal'")
+
+    def test_immediate_preemption_leaves_campaign_running(self):
+        master = self.batch()
+        campaign = self.campaign_batch()
+        incoming = a.PullRequest(99, 'urgent', HEAD_ONE, 'url', True, True)
+        self.patch(a, 'list_open_pull_requests', return_value=[{'number': 99, 'labels': [{'name': 'mergemarshall:immediate'}]}])
+        self.select.side_effect = lambda **kw: [incoming] if kw.get('priority_only') else []
+        aborted = []
+        def abort(conn, transport, row, reason):
+            aborted.append(row['batch_id'])
+            with conn:
+                conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal',"
+                             "terminal_status='aborted' WHERE batch_id=?", (row['batch_id'],))
+        self.patch(a, 'abort_batch_locked', side_effect=abort)
+        self.patch(a, 'process_batch')
+        supervisor.run(a, self.conn, self.transport)
+        self.assertEqual(aborted, [master])
+        self.assertEqual(self.row(campaign)['status'], 'launching')
+        self.assertIsNone(a._priority_preemption_target(self.row(campaign), [incoming]))
+
+    def test_campaign_slot_and_gate_are_independent_of_master_and_successor(self):
+        self.campaign()
+        primary = self.batch()
+        successor = a.create_batch(self.conn, [a.PullRequest(2, 'next', HEAD_ONE, 'url')], BASE_SHA)
+        with self.conn:
+            self.conn.execute('UPDATE automerge_batches SET predecessor_id=? WHERE batch_id=?', (primary, successor))
+        self.select.return_value = [a.PullRequest(50, 'fix', HEAD_ONE, 'url', base_ref='stabilize/test', target_ref='stabilize/test')]
+        with self.conn:
+            self.conn.execute("UPDATE stabilize_issues SET state='open'")
+        self.assertEqual(a.select_campaign_pull_requests(self.conn), [])
+        self.select.assert_not_called()
+        with self.conn:
+            self.conn.execute("UPDATE stabilize_issues SET state='pr_ready'")
+        self.assertEqual([p.number for p in a.select_campaign_pull_requests(self.conn)], [50])
+        self.campaign_batch()
+        self.select.reset_mock()
+        self.assertEqual(a.select_campaign_pull_requests(self.conn), [])
+        self.select.assert_not_called()
+
+    def test_observation_budget_reserves_time_for_each_live_batch(self):
+        expected = self.three_batches()
+        clock = [100.0]
+        self.patch(time, 'monotonic', side_effect=lambda: clock[0])
+        self.patch(a, 'OBSERVATION_DEADLINE', 150.0)
+        observed = []
+        def process(conn, transport, owner):
+            observed.append((owner, a.OBSERVATION_DEADLINE - clock[0]))
+            self.assertEqual(read_budget.deadline.get(), a.OBSERVATION_DEADLINE)
+            clock[0] = a.OBSERVATION_DEADLINE
+            raise git_ancestry.Deferred('slice exhausted')
+        self.patch(a, 'process_batch', side_effect=process)
+        self.patch(a, 'ANCESTRY_CACHE', None)
+        supervisor.run(a, self.conn, self.transport)
+        self.assertEqual([entry[0] for entry in observed], list(expected))
+        self.assertTrue(all(slice_seconds >= supervisor.UNSERVED_BATCH_SECONDS for _, slice_seconds in observed))
+        self.assertEqual(a.OBSERVATION_DEADLINE, 150.0)
+
+    def test_priority_read_deferral_keeps_master_fence_and_advances_campaign(self):
+        master = self.batch()
+        campaign = self.campaign_batch()
+        self.patch(a, 'list_open_pull_requests', side_effect=git_ancestry.Deferred('priority unreadable'))
+        observed = []
+        self.patch(a, 'process_batch', side_effect=lambda conn, transport, owner: observed.append(owner))
+        supervisor.run(a, self.conn, self.transport)
+        self.assertEqual(observed, [campaign])
+        self.assertNotIn(master, observed)
+
+    def test_check_shows_master_successor_and_campaign(self):
+        primary, successor, campaign = self.three_batches()
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            self.assertEqual(a.check_only(), 0)
+        result = json.loads(stream.getvalue())
+        self.assertEqual(result['active_batch']['batch_id'], primary)
+        self.assertEqual(result['active_batch']['speculative_batch']['batch_id'], successor)
+        self.assertEqual(result['campaign_batch']['batch_id'], campaign)
+        self.assertEqual(result['campaign_batch']['target_ref'], 'stabilize/test')
+
+    def test_operator_abort_selects_either_lane_by_id(self):
+        master = self.batch()
+        campaign = self.campaign_batch()
+        self.patch(a, 'acquire_lock_wait', return_value=mock.Mock())
+        self.patch(monitor, 'runtime_binary_issues', return_value=[])
+        self.patch(monitor, 'load_slack_transport', return_value=self.transport)
+        self.patch(a, 'ensure_github_auth', return_value=True)
+        abort = self.patch(a, 'abort_batch_locked')
+        for identifier in (master, campaign):
+            self.assertEqual(a.run_abort_batch(identifier, 'stop'), 0)
+            self.assertEqual(abort.call_args.args[2]['batch_id'], identifier)
+
+    def test_campaign_direct_selection_runs_beside_master_and_successor(self):
+        self.campaign()
+        primary = self.batch()
+        successor = a.create_batch(self.conn, [a.PullRequest(2, 'next', HEAD_ONE, 'url')], BASE_SHA)
+        with self.conn:
+            self.conn.execute('UPDATE automerge_batches SET predecessor_id=? WHERE batch_id=?', (primary, successor))
+        self.patch(speculation, 'reconcile', return_value=True)
+        self.patch(a, 'process_batch')
+        target = 'stabilize/test'
+        source = a.PullRequest(50, 'fix', HEAD_ONE, 'url', base_ref=target, target_ref=target)
+        self.select.side_effect = lambda **kw: [source] if kw.get('target_ref') == target else []
+        self.patch(a, 'remote_branch_sha', return_value=BASE_SHA)
+        cache = self.patch(a, '_ancestry_cache', return_value=mock.Mock(behind=mock.Mock(return_value=0)))
+        self.assertEqual(supervisor.run(a, self.conn, self.transport), 0)
+        campaign = a.active_campaign_batch(self.conn)
+        self.assertEqual(campaign['target_ref'], target)
+        self.assertEqual(campaign['kind'], 'direct')
+        self.assertEqual(campaign['ci_mode'], 'async')
+        self.assertEqual(campaign['base_sha'], BASE_SHA)
+        self.assertIsNone(campaign['predecessor_id'])
+        self.assertEqual(a.active_batch(self.conn)['batch_id'], primary)
+        cache.return_value.behind.assert_called_with(HEAD_ONE, BASE_SHA)
+
+    def test_land_now_refuses_campaign_even_when_gate_is_open(self):
+        self.campaign()
+        self.patch(a, 'acquire_lock_wait', return_value=mock.Mock())
+        self.patch(monitor, 'runtime_binary_issues', return_value=[])
+        self.patch(monitor, 'load_slack_transport', return_value=self.transport)
+        self.patch(a, 'ensure_github_auth', return_value=True)
+        self.patch(a, 'direct_pull_request_view', return_value={
+            'state': 'OPEN', 'headRefOid': HEAD_ONE, 'baseRefName': 'stabilize/test', 'isDraft': False})
+        process = self.patch(a, 'process_batch')
+        self.assertEqual(a.run_land_now(50), 2)
+        process.assert_not_called()
+        self.assertIsNone(a.active_campaign_batch(self.conn))
+
+    def test_land_now_refuses_source_reserved_by_campaign_after_base_changes(self):
+        self.campaign_batch()
+        self.patch(a, 'acquire_lock_wait', return_value=mock.Mock())
+        self.patch(monitor, 'runtime_binary_issues', return_value=[])
+        self.patch(monitor, 'load_slack_transport', return_value=self.transport)
+        self.patch(a, 'ensure_github_auth', return_value=True)
+        self.patch(a, 'direct_pull_request_view', return_value={
+            'state': 'OPEN', 'headRefOid': HEAD_ONE, 'baseRefName': 'master', 'isDraft': False})
+        process = self.patch(a, 'process_batch')
+        self.assertEqual(a.run_land_now(50), 2)
+        process.assert_not_called()
+
+    def test_reserved_campaign_sources_and_their_dependents_cannot_preempt_master(self):
+        master = self.batch()
+        self.campaign_batch()
+        incoming = a.PullRequest(99, 'urgent', HEAD_ONE, 'url', True, True,
+                                 dependencies=(a.pr_dependencies.Dependency(50, HEAD_ONE),))
+        reserved = a.PullRequest(50, 'retargeted campaign fix', HEAD_ONE, 'url')
+        self.patch(a, 'list_open_pull_requests', return_value=[{'number': 99, 'labels': [{'name': 'mergemarshall:immediate'}]}])
+        self.select.side_effect = lambda **kw: [reserved, incoming] if kw.get('priority_only') else []
+        abort = self.patch(a, 'abort_batch_locked')
+        self.patch(a, 'process_batch')
+        supervisor.run(a, self.conn, self.transport)
+        abort.assert_not_called()
+        self.assertEqual(a.active_batch(self.conn)['batch_id'], master)
+
+    def test_idle_summary_omits_campaign_prs_and_uses_master_thread(self):
+        self.campaign()
+        primary = self.batch()
+        campaign = self.campaign_batch()
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET thread_ts='master-thread' WHERE batch_id=?", (primary,))
+            self.conn.execute("UPDATE automerge_batches SET thread_ts='campaign-thread',created_at='z' WHERE batch_id=?", (campaign,))
+            for number, base in ((1, 'master'), (50, 'stabilize/test')):
+                item = {'number': number, 'state': 'open', 'draft': True, 'title': 'change',
+                        'base': {'ref': base}}
+                self.conn.execute('INSERT INTO automerge_pr_inventory(number,head_sha,data_json) VALUES (?,?,?)',
+                                  (number, HEAD_ONE, json.dumps(item)))
+        supervisor.idle_summary(a, self.conn, self.transport)
+        replies = self.send.call_args_list
+        self.assertTrue(all(call.args[2] == 'master-thread' for call in replies))
+        self.assertIn('1 open PRs', replies[0].args[1])
+        self.assertNotIn('/pull/50', str(replies))
+        self.assertEqual(sum(len(group) for group in supervisor.queue_groups(a, self.conn).values()), 2)
+
+    def test_repeated_master_actions_cannot_spend_campaign_observation_share(self):
+        primary, successor, campaign = self.three_batches()
+        clock = [100.0]
+        self.patch(time, 'monotonic', side_effect=lambda: clock[0])
+        self.patch(a, 'OBSERVATION_DEADLINE', 150.0)
+        observed = []
+        def process(conn, transport, owner):
+            observed.append((owner, a.OBSERVATION_DEADLINE - clock[0]))
+            clock[0] = min(a.OBSERVATION_DEADLINE, clock[0] + 5)
+            if owner == primary:
+                with conn:
+                    conn.execute('UPDATE automerge_batches SET attempt_generation=attempt_generation+1 WHERE batch_id=?', (owner,))
+                if clock[0] >= a.OBSERVATION_DEADLINE:
+                    raise git_ancestry.Deferred('slice exhausted')
+        self.patch(a, 'process_batch', side_effect=process)
+        self.patch(a, 'ANCESTRY_CACHE', None)
+        supervisor.run(a, self.conn, self.transport)
+        campaign_observation = next(seconds for owner, seconds in observed if owner == campaign)
+        self.assertGreaterEqual(campaign_observation, supervisor.UNSERVED_BATCH_SECONDS)
+        self.assertTrue(any(owner == successor for owner, _ in observed))
+
+    def master_budget_case(self, *, successor=False, empty_campaign=False, transitions=False):
+        master = self.batch(checkpoint=successor)
+        if successor:
+            checkpoint = speculation.candidate(a, self.row(master))
+            a.create_batch(self.conn, [a.PullRequest(2, 'next', 'b' * 40, 'url')], checkpoint['head'],
+                           predecessor_id=master, predecessor_candidate=checkpoint)
+        if empty_campaign:
+            self.campaign()
+        clock = [100.0]
+        observations = []
+        self.patch(time, 'monotonic', side_effect=lambda: clock[0])
+        self.patch(a, 'OBSERVATION_DEADLINE', 150.0)
+        self.patch(speculation, 'reconcile', return_value=True)
+        def process(conn, transport, owner):
+            if owner != master:
+                return
+            observations.append(a.OBSERVATION_DEADLINE - clock[0])
+            if transitions:
+                clock[0] += 5
+                with conn:
+                    conn.execute('UPDATE automerge_batches SET attempt_generation=attempt_generation+1 WHERE batch_id=?', (owner,))
+        self.patch(a, 'process_batch', side_effect=process)
+        token = read_budget.deadline.set(150.0)
+        try:
+            supervisor.run(a, self.conn, self.transport)
+        finally:
+            read_budget.deadline.reset(token)
+        return observations
+
+    def test_zero_campaign_primary_with_successor_retains_head_budget(self):
+        self.assertEqual(self.master_budget_case(successor=True)[0], 50)
+
+    def test_zero_campaign_repeated_master_advancement_retains_head_capacity(self):
+        self.assertEqual(self.master_budget_case(successor=True, transitions=True), list(range(50, 0, -5)))
+
+    def test_live_campaign_without_batch_does_not_cut_master_budget(self):
+        self.assertEqual(self.master_budget_case(empty_campaign=True)[0], 50)
+
+    def test_successor_guidance_survives_priority_read_failure(self):
+        parent = self.batch()
+        child = a.create_batch(self.conn, [a.PullRequest(2, 'next', 'b' * 40, 'url')], BASE_SHA)
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET status='running',session_id='child',predecessor_id=?,"
+                              "pending_prompt='saved guidance',prompt_delivered=0 WHERE batch_id=?", (parent, child))
+        self.patch(a, 'list_open_pull_requests', side_effect=monitor.CommandError('priority unavailable'))
+        delivered = self.patch(a, 'deliver_pending_prompt', side_effect=self.deliver)
+        process = self.patch(a, 'process_batch')
+        supervisor.run(a, self.conn, self.transport)
+        self.assertEqual([call.args[2]['batch_id'] for call in delivered.call_args_list], [child])
+        process.assert_not_called()
+
+    def test_successor_recovery_survives_priority_read_failure(self):
+        parent = self.batch()
+        child = a.create_batch(self.conn, [a.PullRequest(2, 'next', 'b' * 40, 'url')], BASE_SHA)
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET predecessor_id=?,phase='resetting' WHERE batch_id=?", (parent, child))
+        self.patch(a, 'list_open_pull_requests', side_effect=monitor.CommandError('priority unavailable'))
+        process = self.patch(a, 'process_batch')
+        supervisor.run(a, self.conn, self.transport)
+        self.assertEqual([call.args[2] for call in process.call_args_list], [child])
+
+    def test_unused_primary_reservation_is_reclaimed_by_successor(self):
+        primary, successor, campaign = self.three_batches()
+        clock = [100.0]
+        self.patch(time, 'monotonic', side_effect=lambda: clock[0])
+        self.patch(a, 'OBSERVATION_DEADLINE', 150.0)
+        observations = []
+        def process(conn, transport, owner):
+            observations.append((owner, a.OBSERVATION_DEADLINE - clock[0]))
+            if owner == primary:
+                clock[0] += 1
+        self.patch(a, 'process_batch', side_effect=process)
+        supervisor.run(a, self.conn, self.transport)
+        self.assertEqual(observations, [(primary, 30), (successor, 39), (campaign, 49)])
 
     def test_guidance_and_primary_progress_precede_lookahead_selection(self):
         identifier = self.batch(checkpoint=True)

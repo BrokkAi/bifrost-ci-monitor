@@ -134,7 +134,7 @@ def selection(a, conn, parent):
     # read-only view treats the unlanded checkpoint as a selection base.
     if a.batch_target(parent) != a.BASE_BRANCH:
         return []
-    actual = a.dependency_graph(conn)
+    actual = a.dependency_graph(conn, **a.lane_discovery_scope(conn, a.BASE_BRANCH))
     checkpoint = candidate(a, parent)
     occupied = reserved(a, conn)
     nodes = {n: replace(node, ready=False) if n in occupied or actual.target(n)[0] != a.BASE_BRANCH else node for n, node in actual.nodes.items()}

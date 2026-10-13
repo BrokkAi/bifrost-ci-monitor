@@ -805,7 +805,7 @@ def _queue_ready(item, *, conn=None, dry_run=False):
     return True
 
 
-def _dependency_node(item, *, conn=None, dry_run=False):
+def _dependency_node(item, *, conn=None, dry_run=False, read_ready=True):
     number = int(item['number'])
     head, base = item.get('head') or {}, item.get('base') or {}
     sha = str(head.get('sha') or item.get('headRefOid') or '').lower()
@@ -816,7 +816,9 @@ def _dependency_node(item, *, conn=None, dry_run=False):
         head.get('ref') or item.get('headRefName') or f'feature-{number}',
         (head.get('repo') or {}).get('full_name') or REPO_NAME,
         (base.get('repo') or {}).get('full_name') or REPO_NAME, item,
-        _queue_ready(item, conn=conn, dry_run=dry_run), priority, immediate)
+        (_queue_ready(item, conn=conn, dry_run=dry_run) if read_ready else
+         str(item.get('state', 'open')).lower() == 'open'
+         and not item.get('draft', item.get('isDraft', False))), priority, immediate)
 
 
 def _campaign_for_branch(conn, branch):
@@ -824,7 +826,7 @@ def _campaign_for_branch(conn, branch):
             if pr_dependencies.has_table(conn, 'stabilize_campaigns') else None)
 
 
-def _graph_targets(conn, nodes, master):
+def _graph_targets(conn, nodes, master, *, selection_target=None):
     targets, gates = {}, {}
     available = {BASE_BRANCH}
     exclusions = []
@@ -833,7 +835,7 @@ def _graph_targets(conn, nodes, master):
         campaign = _campaign_for_branch(conn, node.base)
         if campaign:
             if campaign.branch not in tips:
-                tips[campaign.branch] = (target_sha(campaign.branch) if campaign.live
+                tips[campaign.branch] = (target_sha(campaign.branch) if campaign.live and (selection_target is None or selection_target == campaign.branch)
                                          else campaign.tip_sha or campaign.anchor_sha)
             targets[number] = (campaign.branch, tips[campaign.branch])
             if not campaign.live:
@@ -887,11 +889,13 @@ def _verify_supersession_rejections(conn, retired, replacement, compare):
 
 
 def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roots=None,
-                     persist_comparisons=None, priority_only=False):
+                     persist_comparisons=None, priority_only=False, selection_target=None):
     """Refresh open heads and durable prerequisites, then verify their ancestry."""
     if conn is not None and (not dry_run or persist_comparisons):
         with conn:
             pr_dependencies.ensure_schema(conn)
+    scoped = (selection_target is not None or roots is not None
+              and bool(lane_discovery_scope(conn, BASE_BRANCH)))
     cached = pr_dependencies.inventory(conn)
     items = {int(p['number']): p for p in list_open_pull_requests() if not _is_integration_pull(p)}
     supersessions = tuple(record for record in pr_dependencies.REVIEWED_SUPERSESSIONS
@@ -928,51 +932,128 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
             items[number] = item
             if str(item.get('state')).lower() == 'open':
                 required.add(number)  # It disappeared from the open listing.
+    if scoped:
+        for record in supersessions:
+            histories.setdefault(record.retired_number, []).append(record.retired_head)
+            histories.setdefault(record.replacement_number, []).append(record.replacement_head)
+        if pr_dependencies.has_table(conn, 'automerge_pr_dependencies'):
+            for row in conn.execute('SELECT prerequisite_number,prerequisite_head FROM automerge_pr_dependencies'):
+                histories.setdefault(row['prerequisite_number'], []).append(row['prerequisite_head'])
     for number in sorted(required):
         if number not in items or (number in cached and items[number] is cached[number][0]):
-            items[number] = gh_json(['api', f'repos/{REPO_NAME}/pulls/{number}'])
-            remember(items[number])
-    nodes = {number: _dependency_node(item, conn=conn, dry_run=dry_run) for number, item in items.items()
-             if not _is_integration_pull(item)}
+            if not scoped:
+                items[number] = gh_json(['api', f'repos/{REPO_NAME}/pulls/{number}'])
+                remember(items[number])
+            elif number not in items:
+                # Historical rejected tips remain visible to ancestry discovery;
+                # their mutable metadata is fetched only if the closure needs it.
+                items[number] = {'number': number, 'state': 'unknown',
+                                 'head': {'sha': histories[number][-1]},
+                                 '_mm_metadata_missing': True}
+    nodes = {number: _dependency_node(item, conn=conn, dry_run=dry_run, read_ready=not scoped)
+             for number, item in items.items() if not _is_integration_pull(item)}
     if priority_only:
         roots = [number for number, node in nodes.items() if node.priority]
     # A non-master base may point to a closed PR never observed by this host.
     searched = set()
-    unresolved = list(nodes.values())
-    while unresolved:
-        node = unresolved.pop()
-        key = (node.base_repo.casefold(), node.base)
-        if (node.base == BASE_BRANCH or _campaign_for_branch(conn, node.base)
-                or key in searched or str(node.data.get('state')).lower() != 'open'):
-            continue
-        searched.add(key)
-        if any((p.repo.casefold(), p.branch) == key for p in nodes.values()):
-            continue
-        owner = node.base_repo.split('/')[0]
-        endpoint = f'repos/{REPO_NAME}/pulls?state=all&head={quote(owner + ":" + node.base, safe="")}&per_page=100'
-        result = gh_json(['api', '--paginate', '--slurp', endpoint], timeout=90)
-        for item in _paginated_objects(result, context='prerequisite branch lookup'):
-            if _is_integration_pull(item):
+    def discover_bases(numbers):
+        unresolved = [nodes[n] for n in numbers if n in nodes]
+        while unresolved:
+            node = unresolved.pop()
+            key = (node.base_repo.casefold(), node.base)
+            if (node.base == BASE_BRANCH or _campaign_for_branch(conn, node.base)
+                    or key in searched or str(node.data.get('state')).lower() != 'open'):
                 continue
-            remember(item)
-            prior = _dependency_node(item, conn=conn, dry_run=dry_run)
-            if prior.number not in nodes:
-                unresolved.append(prior)
-            nodes[prior.number] = prior
+            searched.add(key)
+            if any((p.repo.casefold(), p.branch) == key for p in nodes.values()):
+                continue
+            owner = node.base_repo.split('/')[0]
+            endpoint = f'repos/{REPO_NAME}/pulls?state=all&head={quote(owner + ":" + node.base, safe="")}&per_page=100'
+            result = gh_json(['api', '--paginate', '--slurp', endpoint], timeout=90)
+            for item in _paginated_objects(result, context='prerequisite branch lookup'):
+                if _is_integration_pull(item):
+                    continue
+                remember(item)
+                items[int(item['number'])] = item
+                prior = _dependency_node(item, conn=conn, dry_run=dry_run, read_ready=not scoped)
+                if prior.number not in nodes:
+                    unresolved.append(prior)
+                nodes[prior.number] = prior
+    if not scoped:
+        discover_bases(list(nodes))
     for number, node in nodes.items():
         rejected = node.data.get('_mm_rejection')
         heads = [node.head] + ([rejected['head_sha']] if rejected else [])
         histories[number] = list(dict.fromkeys(histories.get(number, []) + heads))
     if conn is not None and not dry_run:
-        pr_dependencies.save_observations(conn, nodes, histories)
-    actual_base = master or current_master_sha()
-    targets, gates, available, exclusions = _graph_targets(conn, nodes, actual_base)
+        pr_dependencies.save_observations(conn, {n: node for n, node in nodes.items()
+                                                if not node.data.get('_mm_metadata_missing')}, histories)
+    target_scope = selection_target
+    if target_scope is None and roots is not None:
+        source_targets = {_campaign_for_branch(conn, nodes[n].base).branch
+                          if _campaign_for_branch(conn, nodes[n].base) else BASE_BRANCH
+                          for n in roots if n in nodes}
+        if len(source_targets) == 1:
+            target_scope = next(iter(source_targets))
+    campaign_only = (target_scope not in {None, BASE_BRANCH} and nodes
+                     and all(_campaign_for_branch(conn, node.base) for node in nodes.values()))
+    actual_base = master or (target_sha(target_scope) if campaign_only else current_master_sha())
+    targets, gates, available, exclusions = _graph_targets(conn, nodes, actual_base, selection_target=target_scope)
+    if conn is not None and not dry_run:
+        # Finished campaign heads stay quiet even when another lane is the only
+        # discovered closure and an old dependency notice was recorded earlier.
+        for n, node in nodes.items():
+            campaign = _campaign_for_branch(conn, node.base)
+            if campaign and not campaign.live:
+                pr_dependencies.save_observation(conn, n, node.head, node.data, histories[n], False)
+    if selection_target is not None:
+        roots = [n for n, node in nodes.items() if targets[n][0] == selection_target
+                 and (not scoped or str(node.data.get('state')).lower() == 'open')
+                 and (not priority_only or node.priority)]
     if SUPERVISOR_RUNNING:
         # Fetch live tips together. Their full commit history usually contains
         # almost every historical head, without downloading repository blobs.
         _ancestry_cache().prepare(list(dict.fromkeys([actual_base] + [tip for _, tip in targets.values()])) + [n.head for n in nodes.values()
                                                    if str(n.data.get('state')).lower() == 'open'])
     compare = _read_only_ancestry if dry_run and not persist_comparisons else compare_commit_ancestry
+    if scoped:
+        # First discover with structural identities and durable historical tips.
+        # Readiness/authenticated markers are loaded only for source closure,
+        # inherited heads and audited aliases. No unknown read becomes a fact.
+        loaded = set()
+        while True:
+            structural = pr_dependencies.Graph(
+                nodes, histories, actual_base, compare, conn=conn, base_branch=BASE_BRANCH,
+                targets=targets, gates=gates, available_targets=available, supersessions=(),
+                persist_comparisons=(not dry_run if persist_comparisons is None else persist_comparisons),
+            ).discover(roots)
+            needed = set(structural.dependencies)
+            for record in supersessions:
+                if record.retired_number in needed or record.replacement_number in needed:
+                    needed.update((record.retired_number, record.replacement_number))
+            pending = (needed & nodes.keys()) - loaded
+            if not pending:
+                break
+            for number in sorted(pending):
+                if number not in nodes:
+                    continue
+                item = items.get(number, nodes[number].data)
+                if (item.get('_mm_metadata_missing')
+                        or number in required and number in cached and item is cached[number][0]):
+                    item = gh_json(['api', f'repos/{REPO_NAME}/pulls/{number}'])
+                    items[number] = item
+                    remember(item)
+                nodes[number] = _dependency_node(item, conn=conn, dry_run=dry_run)
+                rejected = item.get('_mm_rejection')
+                if rejected:
+                    histories[number] = list(dict.fromkeys(histories[number] + [rejected['head_sha']]))
+                loaded.add(number)
+                if conn is not None and not dry_run:
+                    pr_dependencies.save_observation(conn, number, nodes[number].head, item,
+                                                    histories[number], nodes[number].ready)
+            discover_bases(pending)
+            targets, gates, available, exclusions = _graph_targets(
+                conn, nodes, actual_base, selection_target=target_scope)
     graph = pr_dependencies.Graph(nodes, histories, actual_base, compare,
                                   conn=conn, base_branch=BASE_BRANCH, targets=targets, gates=gates,
                                   available_targets=available,
@@ -982,7 +1063,7 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
                                   persist_comparisons=(not dry_run if persist_comparisons is None
                                                        else persist_comparisons)).discover(roots)
     graph.exclusions = exclusions
-    graph.select(priority=False)  # Establish block reasons for ready descendants.
+    graph.select(priority=False, target_ref=selection_target)  # Establish lane-local block reasons.
     if conn is not None and not dry_run:
         with conn:
             pr_dependencies.ensure_schema(conn)
@@ -1046,12 +1127,21 @@ DEPENDENCY_BLOCKS = []
 CAMPAIGN_EXCLUSIONS = []
 
 
+def lane_discovery_scope(conn, target_ref):
+    # Preserve the established no-campaign discovery and read sequence.
+    if (pr_dependencies.has_table(conn, 'stabilize_campaigns')
+            and conn.execute('SELECT 1 FROM stabilize_campaigns LIMIT 1').fetchone()):
+        return {'selection_target': target_ref}
+    return {}
+
+
 def select_eligible_pull_requests(*, dry_run: bool = False,
                                   conn: sqlite3.Connection | None = None,
                                   priority_only: bool = False,
                                   target_ref: str | None = None) -> list[PullRequest]:
     global DEPENDENCY_BLOCKS, CAMPAIGN_EXCLUSIONS
-    graph = dependency_graph(conn, dry_run=dry_run, priority_only=priority_only)
+    graph = dependency_graph(conn, dry_run=dry_run, priority_only=priority_only,
+                             **lane_discovery_scope(conn, target_ref or BASE_BRANCH))
     CAMPAIGN_EXCLUSIONS = graph.exclusions
     DEPENDENCY_BLOCKS = [{'number': n, 'head_sha': graph.nodes[n].head, 'reason': reason}
                          for n, reason in sorted(graph.blocked.items()) if graph.nodes[n].ready]
@@ -5925,24 +6015,70 @@ def acquire_lock_wait(
 
 
 def active_batch(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """The master primary, including a landed parent with a live successor."""
     columns = {c[1] for c in conn.execute("PRAGMA table_info(automerge_batches)")}
+    lane = "COALESCE(b.target_ref, ?) = ?" if "target_ref" in columns else "1=1"
+    args = (BASE_BRANCH, BASE_BRANCH) if "target_ref" in columns else ()
     if "predecessor_id" in columns:
         primary = "(predecessor_id IS NULL OR role_promoted=1)" if "role_promoted" in columns else "predecessor_id IS NULL"
         child_role = "AND c.role_promoted=0 " if "role_promoted" in columns else ""
         return conn.execute(
-            f"SELECT * FROM automerge_batches b WHERE {primary} AND ("
+            f"SELECT * FROM automerge_batches b WHERE {lane} AND {primary} AND ("
             "status IN ('launching','running','finishing') OR EXISTS ("
             "SELECT 1 FROM automerge_batches c WHERE c.predecessor_id=b.batch_id "
             + child_role +
             "AND c.status IN ('launching','running','finishing'))) "
-            "ORDER BY created_at,batch_id LIMIT 1"
+            "ORDER BY created_at,batch_id LIMIT 1", args
         ).fetchone()
     return conn.execute(
-        "SELECT * FROM automerge_batches WHERE status IN ('launching', 'running', 'finishing') "
+        "SELECT * FROM automerge_batches b WHERE " + lane + " AND (status IN ('launching', 'running', 'finishing') "
         "OR (status = 'completed' AND outcome_posted = 0 "
-        "AND COALESCE(terminal_status, '') <> 'aborted') "
-        "ORDER BY created_at, batch_id LIMIT 1"
+        "AND COALESCE(terminal_status, '') <> 'aborted')) "
+        "ORDER BY created_at, batch_id LIMIT 1", args
     ).fetchone()
+
+
+def active_campaign_batch(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """The independent campaign lane; retain in-flight work after gate closure."""
+    columns = {c[1] for c in conn.execute("PRAGMA table_info(automerge_batches)")}
+    if "target_ref" not in columns:
+        return None
+    return conn.execute(
+        "SELECT * FROM automerge_batches WHERE COALESCE(target_ref, ?) <> ? "
+        "AND status IN ('launching','running','finishing') "
+        "ORDER BY created_at,batch_id LIMIT 1", (BASE_BRANCH, BASE_BRANCH),
+    ).fetchone()
+
+
+def selectable_campaigns(conn):
+    if not pr_dependencies.has_table(conn, 'stabilize_campaigns'):
+        return []
+    return [campaign for campaign in stabilize_state.live_campaigns(conn)
+            if stabilize_state.merge_gate_open(conn, campaign.id)]
+
+
+def unreserved_pulls(pulls, occupied):
+    """Hold reserved sources and selected dependents needing those sources."""
+    blocked = {p.number for p in pulls} & occupied
+    while True:
+        inherited = {p.number for p in pulls if any(d.number in blocked for d in p.dependencies)}
+        if inherited <= blocked:
+            return [p for p in pulls if p.number not in blocked]
+        blocked.update(inherited)
+
+
+def select_campaign_pull_requests(conn, *, dry_run=False):
+    """Admit one campaign target only when its own lane and round gate allow it."""
+    if active_campaign_batch(conn) is not None:
+        return []
+    for campaign in selectable_campaigns(conn):
+        pulls = select_eligible_pull_requests(conn=conn, dry_run=dry_run,
+                                             target_ref=campaign.branch)
+        occupied = speculation.reserved(sys.modules[__name__], conn)
+        pulls = unreserved_pulls(pulls, occupied)
+        if pulls:
+            return pulls
+    return []
 
 
 def _batch_is_in_publish_phase(row: sqlite3.Row | dict[str, Any]) -> bool:
@@ -5957,7 +6093,8 @@ def _priority_preemption_target(
     row: sqlite3.Row | dict[str, Any], pulls: list[PullRequest],
 ) -> PullRequest | None:
     """Return an immediate PR that can preempt this not-yet-publishing batch."""
-    if (_batch_kind(row) not in {"batch", "direct"}
+    if (batch_target(row) != BASE_BRANCH
+            or _batch_kind(row) not in {"batch", "direct"}
             or _batch_source(row) == "operator"
             or _batch_is_in_publish_phase(row)
             or str(row["phase"] or "") in {"aborting", "terminal"}):
@@ -6012,7 +6149,7 @@ def preempt_batch_for_priority(
     return True
 
 
-def read_active_batch_for_check() -> dict[str, Any] | None:
+def read_active_batch_for_check(*, campaign=False) -> dict[str, Any] | None:
     """Read durable queue state without creating or migrating database tables."""
     if not DB_PATH.is_file():
         return None
@@ -6025,11 +6162,12 @@ def read_active_batch_for_check() -> dict[str, Any] | None:
         ).fetchone()
         if exists is None:
             return None
-        row = active_batch(conn)
+        row = active_campaign_batch(conn) if campaign else active_batch(conn)
         if row is None:
             return None
         return {
             "batch_id": str(row["batch_id"]),
+            "target_ref": batch_target(row),
             "status": str(row["status"]),
             "phase": str(row["phase"]),
             "mode": str(row["ci_mode"]),
@@ -6070,14 +6208,16 @@ def check_only() -> int:
     """Print the next-tick plan without changing GitHub, Mjolnir, or SQLite."""
     try:
         active = read_active_batch_for_check()
+        campaign_active = read_active_batch_for_check(campaign=True)
     except (OSError, sqlite3.Error) as exc:
         print(json.dumps({"state": "blocked", "reason": "database_unreadable",
                           "details": str(exc)}, indent=2))
         return 3
-    if active is not None:
+    if active is not None or campaign_active is not None:
         print(json.dumps({
             "state": "active_batch",
             "active_batch": active,
+            "campaign_batch": campaign_active,
             "would_do": "continue the persisted batch phase",
         }, indent=2, sort_keys=True))
         return 0
@@ -6090,6 +6230,7 @@ def check_only() -> int:
                               for reason, details in issues],
         }, indent=2, sort_keys=True))
         return 3
+    campaign_pulls = []
     try:
         monitor.github_app_token()
         if DB_PATH.is_file():
@@ -6098,6 +6239,10 @@ def check_only() -> int:
             check_conn.row_factory = sqlite3.Row
             try:
                 pulls = select_eligible_pull_requests(dry_run=True, conn=check_conn)
+                master_blocks, master_exclusions = DEPENDENCY_BLOCKS, CAMPAIGN_EXCLUSIONS
+                campaign_pulls = select_campaign_pull_requests(check_conn, dry_run=True)
+                DEPENDENCY_BLOCKS[:] = master_blocks
+                CAMPAIGN_EXCLUSIONS[:] = master_exclusions
             finally:
                 check_conn.close()
         else:
@@ -6109,16 +6254,19 @@ def check_only() -> int:
                           "details": str(exc)}, indent=2, sort_keys=True))
         return 3
     print(json.dumps({
-        "state": "ready" if pulls else "idle",
+        "state": "ready" if pulls or campaign_pulls else "idle",
         "mode": CI_MODE,
         "base_sha": base_sha,
         "selected_prs": [pull.as_json() for pull in pulls],
+        "campaign_lane": {"selected_prs": [p.as_json() for p in campaign_pulls],
+                          "target_ref": campaign_pulls[0].target_ref if campaign_pulls else None,
+                          "mode": "async"},
         "dependency_blocks": DEPENDENCY_BLOCKS,
         "campaign_exclusions": CAMPAIGN_EXCLUSIONS,
         "target_ref": (pulls[0].target_ref or BASE_BRANCH) if pulls else None,
         "would_do": (
             "create a direct landing or integration batch for the selected PRs"
-            if pulls else "wait for eligible PRs"
+            if pulls or campaign_pulls else "wait for eligible PRs"
         ),
     }, indent=2, sort_keys=True))
     return 0
@@ -6200,9 +6348,12 @@ def run_land_now(number: int) -> int:
                 state = str(view.get("state") or "").lower()
                 head = str(view.get("headRefOid") or "").lower()
                 target = str(view.get("baseRefName") or "")
-                campaign = _campaign_for_branch(conn, target)
-                if target != BASE_BRANCH and (not campaign or not campaign.live or not stabilize_state.merge_gate_open(conn, campaign.id)):
-                    log(f"PR #{number} target {target} is not eligible for landing")
+                if target != BASE_BRANCH:
+                    log(f"PR #{number} --land-now is restricted to {BASE_BRANCH}")
+                    return 2
+                campaign_batch = active_campaign_batch(conn)
+                if campaign_batch is not None and number in {p.number for p in _active_sources(campaign_batch)}:
+                    log(f"PR #{number} is reserved by campaign batch {campaign_batch['batch_id']}")
                     return 2
                 if (state != "open" or bool(view.get("isDraft"))
                         or view.get("baseRefName") != target

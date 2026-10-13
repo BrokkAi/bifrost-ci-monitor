@@ -175,8 +175,13 @@ def cancel_write(conn, row, reason):
                      (monitor.utc_now(), reason, row['campaign_id'], row['checkpoint']))
 
 
-def deliver_writes(conn):
-    for row in conn.execute('SELECT * FROM stabilize_writes WHERE done_at IS NULL AND cancelled_at IS NULL').fetchall():
+def deliver_writes(conn, *, campaign_id=None):
+    query = 'SELECT * FROM stabilize_writes WHERE done_at IS NULL AND cancelled_at IS NULL'
+    args = ()
+    if campaign_id is not None:
+        query += ' AND campaign_id=?'
+        args = (campaign_id,)
+    for row in conn.execute(query, args).fetchall():
         try:
             payload = json.loads(row['payload'])
             number = payload['number']
@@ -215,25 +220,41 @@ def deliver_writes(conn):
             monitor.log(f"stabilize write {row['checkpoint']} deferred: {exc}")
 
 
-def deliver_slack(conn, transport=None):
+def slack_commit(sha):
+    """Keep the immutable full SHA in the link, with a short human-facing label."""
+    return f'<https://github.com/{monitor.REPO_NAME}/commit/{sha}|{sha[:7]}>'
+
+
+def deliver_slack(conn, transport=None, *, campaign_id=None):
     try:
         transport = transport or monitor.load_slack_transport()
         if transport.kind != 'chat':
             return  # A webhook cannot establish the required campaign thread.
-        for row in conn.execute('SELECT * FROM stabilize_campaigns ORDER BY created_at').fetchall():
+        query = 'SELECT * FROM stabilize_campaigns'
+        args = ()
+        if campaign_id is not None:
+            query += ' WHERE id=?'
+            args = (campaign_id,)
+        for row in conn.execute(query + ' ORDER BY created_at', args).fetchall():
             thread = row['thread_ts']
             if not thread:
                 ok, thread = monitor.slack_send(transport,
-                    f"{monitor.slack_project_prefix()} stabilize campaign: `{row['branch']}` "
-                    f"at `{row['anchor_sha']}`")
+                    f"{monitor.slack_project_prefix()} stable release branch started from {slack_commit(row['anchor_sha'])}.")
                 if not ok or not thread:
+                    monitor.log(f"stabilize campaign {row['id']} Slack root deferred")
                     continue
                 with conn:
                     conn.execute('UPDATE stabilize_campaigns SET thread_ts=? WHERE id=?', (thread, row['id']))
+                    branch_url = f"https://github.com/{monitor.REPO_NAME}/tree/{urllib.parse.quote(row['branch'], safe='/')}"
+                    notify(conn, row['id'], 'started',
+                           f"Branch: <{branch_url}|{row['branch']}>; campaign `{row['id']}`; "
+                           f"requested by {row['requested_by'] or 'operator'}.")
             for message in conn.execute('SELECT * FROM stabilize_messages WHERE campaign_id=? '
-                    'AND sent_at IS NULL ORDER BY sequence', (row['id'],)).fetchall():
+                    "AND sent_at IS NULL ORDER BY CASE WHEN checkpoint='started:0' THEN 0 ELSE 1 END,sequence",
+                    (row['id'],)).fetchall():
                 ok, _ = monitor.slack_send(transport, message['text'], thread_ts=thread)
                 if not ok:
+                    monitor.log(f"stabilize campaign {row['id']} Slack reply deferred")
                     break
                 with conn:
                     conn.execute('UPDATE stabilize_messages SET sent_at=? WHERE sequence=?',
@@ -393,13 +414,14 @@ def seed_issues(conn, c):
             continue
         add_issue(conn, c, number, stage, 'seeded', [row])
     if deferred:
+        monitor.log(f'stabilize campaign {c.id} seeding deferred: ancestry is unavailable')
         return False
     lines = ['Seeded issues (red-since evidence):']
     for row in conn.execute('SELECT i.issue_number,i.stage,e.evidence_json FROM stabilize_issues i '
             'JOIN stabilize_issue_identities e ON e.campaign_id=i.campaign_id AND e.issue_number=i.issue_number '
             "WHERE i.campaign_id=? AND i.source='seeded' ORDER BY i.issue_number", (c.id,)):
         evidence = json.loads(row['evidence_json'])
-        lines.append(f"- #{row['issue_number']} [{row['stage']}]: `{evidence['first_seen_sha']}` "
+        lines.append(f"- #{row['issue_number']} [{row['stage']}]: {slack_commit(evidence['first_seen_sha'])} "
                      f"since {evidence['first_seen_at']} — {evidence['first_seen_run_url']}")
     notify(conn, c.id, 'seeded', '\n'.join(lines) if len(lines) > 1 else 'Seeded issues: none.')
     with conn:
@@ -425,11 +447,12 @@ def advance_start(conn, campaign_id):
         conn.execute('UPDATE stabilize_runtime SET stage_rounds=1,ref_error=NULL WHERE campaign_id=?', (c.id,))
 
 
-def pause(conn, c, reason):
+def pause(conn, c, reason, *, commit_sha=None):
     with conn:
         conn.execute("UPDATE stabilize_campaigns SET status='paused',pause_reason=?,updated_at=? WHERE id=?",
                      (reason, monitor.utc_now(), c.id))
-        notify(conn, c.id, 'paused:' + reason, f'Campaign paused: {reason}')
+        slack_reason = reason.replace(commit_sha[:7], slack_commit(commit_sha)) if commit_sha else reason
+        notify(conn, c.id, 'paused:' + reason, f'Campaign paused: {slack_reason}')
 
 
 def branch_runs(c, stage):
@@ -506,7 +529,7 @@ def ingest_run(conn, c, stage, item):
                      (item.get('url') or '', c.id, item['databaseId']))
         if not cancelled:
             notify(conn, c.id, f"result:{item['databaseId']}",
-                   f"Round {c.round}, {stage} at `{item['headSha'][:12]}`: "
+                   f"Round {c.round}, {stage} at {slack_commit(item['headSha'])}: "
                    f"{'green' if green else item.get('conclusion')} — {item.get('url', '')}")
 
 
@@ -520,7 +543,8 @@ def ensure_dispatch(conn, c, stage, runs):
                       _epoch(r['createdAt']) >= _epoch(intent['intent_at'])]
         if not discovered:
             if _expired(intent['intent_at']):
-                pause(conn, c, f'{stage} dispatch at {c.tip_sha[:12]} has no discovered run after 10 minutes; reconcile before retry')
+                pause(conn, c, f'{stage} dispatch at {c.tip_sha[:7]} has no discovered run after 10 minutes; reconcile before retry',
+                      commit_sha=c.tip_sha)
             return
         run_id = min(discovered, key=lambda r: r['databaseId'])['databaseId']
         with conn:
@@ -547,7 +571,8 @@ def ensure_dispatch(conn, c, stage, runs):
                 "AND tip_sha=? AND reason='infrastructure' AND cancelled_at IS NULL AND permission_denied=0",
                 (c.id, stage, c.tip_sha)).fetchone()[0]
             if retries >= 2:
-                pause(conn, c, f'{stage} infrastructure/incomplete jobs persisted after two redispatches at {c.tip_sha[:12]}')
+                pause(conn, c, f'{stage} infrastructure/incomplete jobs persisted after two redispatches at {c.tip_sha[:7]}',
+                      commit_sha=c.tip_sha)
                 return
         else:
             return
@@ -562,7 +587,7 @@ def ensure_dispatch(conn, c, stage, runs):
         conn.execute('INSERT INTO stabilize_dispatches(campaign_id,stage,tip_sha,attempt,intent_at,after_run_id,reason) '
                      'VALUES (?,?,?,?,?,?,?)', (c.id, stage, c.tip_sha, attempt, now, after, reason))
         notify(conn, c.id, f'dispatch:{stage}:{c.tip_sha}:{attempt}',
-               f'Round {c.round}: dispatching {stage} at `{c.tip_sha[:12]}` ({reason}).')
+               f'Round {c.round}: dispatching {stage} at {slack_commit(c.tip_sha)} ({reason}).')
     try:
         monitor.run_gh(['workflow', 'run', WORKFLOW_FILES[stage], '--repo', monitor.REPO_NAME, '--ref', c.branch])
     except monitor.CommandError as exc:
@@ -686,7 +711,7 @@ def open_gate(conn, c):
             conn.execute('INSERT INTO stabilize_gate_intents(campaign_id,stage) VALUES (?,?)', (c.id, c.stage))
         gate = conn.execute('SELECT * FROM stabilize_gate_merges WHERE campaign_id=? AND stage=?', (c.id, c.stage)).fetchone()
     notify(conn, c.id, f'gate-green:{gate["stage"]}:{gate["tip_sha"]}',
-           f"{gate['stage']} gate green at `{gate['tip_sha'][:12]}`.")
+           f"{gate['stage']} gate green at {slack_commit(gate['tip_sha'])}.")
     branch = gate['gate_branch']
     existing_ref = ref_sha(branch)
     if existing_ref and existing_ref != gate['tip_sha']:
@@ -854,20 +879,44 @@ def tick_campaign(conn, campaign_id):
             pause(conn, c, f'Only escalated issues remain in {c.stage} after available fixes landed')
 
 
+def run_campaign_tick(conn, campaign_id, transport=None, *, advance=True):
+    """Best-effort progress/delivery shared by cron and locked operator requests.
+
+    Post the root before slower seed/GitHub reads. An ambiguous create uses
+    advance=False so only its placeholder and existing deliveries are attempted;
+    cron retains ownership of ref reconciliation. Operator calls do not write
+    cron heartbeats. Each accepted action keeps its normal durable checkpoint.
+    """
+    def report_completion():
+        if campaign(conn, campaign_id).status == 'completed':
+            completion_notice(conn, campaign(conn, campaign_id))
+
+    steps = [('Slack root', lambda: deliver_slack(conn, transport, campaign_id=campaign_id))]
+    if advance:
+        steps.append(('advance', lambda: tick_campaign(conn, campaign_id)))
+    steps.extend([
+        ('GitHub writes', lambda: deliver_writes(conn, campaign_id=campaign_id)),
+        ('completion notice', report_completion),
+        ('Slack replies', lambda: deliver_slack(conn, transport, campaign_id=campaign_id)),
+    ])
+    for name, action in steps:
+        try:
+            action()
+        except Exception as exc:
+            if conn.in_transaction:
+                conn.rollback()
+            monitor.log(f'stabilize campaign {campaign_id} {name} deferred: {exc}')
+
+
 def once(conn, transport=None):
     ensure_schema(conn)
-    for c in state.live_campaigns(conn):
-        try:
-            tick_campaign(conn, c.id)
-        except Exception as exc:
-            monitor.log(f'stabilize campaign {c.id} deferred: {exc}')
-    deliver_writes(conn)
-    for row in conn.execute("SELECT id FROM stabilize_campaigns WHERE status='completed'").fetchall():
-        try:
-            completion_notice(conn, campaign(conn, row['id']))
-        except Exception as exc:
-            monitor.log(f'Campaign completion notice deferred: {exc}')
-    deliver_slack(conn, transport)
+    # Finished campaigns still own pending issue closes and outcome replies.
+    marks = ','.join('?' * len(state.LIVE_STATUSES))
+    rows = conn.execute('SELECT id,status FROM stabilize_campaigns '
+                        f'ORDER BY CASE WHEN status IN ({marks}) THEN 0 ELSE 1 END,created_at',
+                        state.LIVE_STATUSES).fetchall()
+    for row in rows:
+        run_campaign_tick(conn, row['id'], transport, advance=row['status'] in state.LIVE_STATUSES)
 
 
 def abort_campaign(conn, campaign_id):
@@ -1044,17 +1093,20 @@ def create(sha, requested_by, idempotency_key):
             except Exception:
                 conn.rollback()
                 raise
+            ref_created = False
             try:
                 if ensure_ref(branch, sha):
                     with conn:
                         conn.execute("UPDATE stabilize_campaigns SET status='running',tip_sha=anchor_sha,round=1,updated_at=? WHERE id=?",
                                      (monitor.utc_now(), campaign_id))
                         conn.execute('UPDATE stabilize_runtime SET stage_rounds=1 WHERE campaign_id=?', (campaign_id,))
+                    ref_created = True
                 else:
                     raise monitor.CommandError('Branch creation is unconfirmed; the tick will reconcile its saved intent')
             except Exception as exc:
                 with conn:
                     conn.execute('UPDATE stabilize_runtime SET ref_error=? WHERE campaign_id=?', (str(exc)[:1000], campaign_id))
+            run_campaign_tick(conn, campaign_id, advance=ref_created)
             return _view(conn, conn.execute('SELECT * FROM stabilize_campaigns WHERE id=?', (campaign_id,)).fetchone())
         finally:
             conn.close()
@@ -1080,7 +1132,7 @@ def resume(campaign_id, requested_by='operator'):
         try:
             ensure_schema(conn)
             resume_campaign(conn, campaign_id, requested_by)
-            deliver_slack(conn)
+            run_campaign_tick(conn, campaign_id)
             return _view(conn, conn.execute('SELECT * FROM stabilize_campaigns WHERE id=?', (campaign_id,)).fetchone())
         finally:
             conn.close()

@@ -787,6 +787,236 @@ class CampaignTests(unittest.TestCase):
         once.assert_not_called()
         self.assertIsNotNone(heartbeat()['last_skipped_at'])
 
+    def test_create_begins_inline_and_cron_does_not_duplicate_start_or_dispatch(self):
+        self.seed_row()
+        self.issue_reads()
+        monitor.CHANNEL_PATH.write_text('C1')
+        real_tick = engine.tick_campaign
+        def locked_tick(conn, identifier):
+            with engine.lock() as acquired:
+                self.assertFalse(acquired, 'inline tick must retain the operator lock')
+            return real_tick(conn, identifier)
+        with mock.patch.object(engine, 'ensure_ref', return_value=True), \
+             mock.patch.object(engine, 'ref_sha', return_value=A), \
+             mock.patch.object(engine, 'branch_runs', return_value=[]), \
+             mock.patch.object(engine, 'tick_campaign', side_effect=locked_tick) as tick, \
+             mock.patch.object(monitor, 'record_heartbeat') as heartbeat, \
+             mock.patch.object(monitor, 'slack_send', return_value=(True, '123.456')) as slack:
+            created = engine.create(A, 'alice', 'begin-now')
+            tick.assert_called_once()
+            self.assertEqual(created['thread_ts'], '123.456')
+            self.assertEqual(created['slack_thread_url'], 'https://app.slack.com/archives/C1/p123456')
+            self.assertEqual(created['issues'][0]['number'], 7)
+            intent = self.conn.execute('SELECT * FROM stabilize_dispatches').fetchone()
+            self.assertEqual((intent['campaign_id'], intent['stage'], intent['tip_sha'], intent['attempt']),
+                             (created['id'], 'push', A, 1))
+            first_messages = [call.args[1] for call in slack.call_args_list]
+            self.assertEqual(first_messages[0], f'{monitor.slack_project_prefix()} stable release branch started from <https://github.com/{monitor.REPO_NAME}/commit/{A}|{A[:7]}>.')
+            self.assertIn(f'<https://github.com/{monitor.REPO_NAME}/tree/{created["branch"]}|{created["branch"]}>', first_messages[1])
+            self.assertIn(f'campaign `{created["id"]}`', first_messages[1])
+            self.assertIn('requested by alice', first_messages[1])
+            self.assertTrue(first_messages[2].startswith('Seeded issues'))
+            self.assertIn(engine.slack_commit(A), first_messages[2])
+            # Reusing the create key is a read of the original result, not another tick.
+            self.assertEqual(engine.create(A, 'alice', 'begin-now'), created)
+            tick.assert_called_once()
+            engine.once(self.conn)
+            self.assertEqual(tick.call_count, 2)
+            self.assertEqual([call.args[1] for call in slack.call_args_list], first_messages)
+            heartbeat.assert_not_called()
+        calls = [call.args[0] for call in self.gh.call_args_list]
+        self.assertEqual(sum(args[:2] == ['workflow', 'run'] for args in calls), 1)
+        self.assertEqual(sum(args[:2] == ['label', 'create'] for args in calls), 1)
+        self.assertEqual(sum(args[:2] == ['api', f'repos/{monitor.REPO_NAME}/issues/7/labels'] for args in calls), 1)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM stabilize_messages WHERE checkpoint='started:0'").fetchone()[0], 1)
+
+    def test_inline_tick_exception_returns_created_campaign_and_cron_can_continue(self):
+        def fail_after_uncommitted_change(conn, identifier):
+            conn.execute("UPDATE stabilize_campaigns SET stage='nightly' WHERE id=?", (identifier,))
+            raise RuntimeError('temporary read failure')
+        with mock.patch.object(engine, 'ensure_ref', return_value=True), \
+             mock.patch.object(engine, 'tick_campaign', side_effect=fail_after_uncommitted_change), \
+             mock.patch.object(monitor, 'log') as log:
+            created = engine.create(A, 'alice', 'failed-inline-tick')
+        self.assertEqual(created['status'], 'running')
+        self.assertEqual(created['stage'], 'push')
+        self.assertIsNone(created['start_error'])
+        self.assertEqual(created['thread_ts'], '123.456')
+        self.assertTrue(any('advance deferred: temporary read failure' in call.args[0] for call in log.call_args_list))
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM stabilize_dispatches').fetchone()[0], 0)
+        with mock.patch.object(engine, 'ref_sha', return_value=A), \
+             mock.patch.object(engine, 'branch_runs', return_value=[]):
+            engine.once(self.conn)
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM stabilize_dispatches').fetchone()[0], 1)
+
+    def test_inline_seed_deferral_returns_campaign_with_visible_placeholder(self):
+        self.seed_row(first=B)
+        self.ancestry.side_effect = git_ancestry.Deferred('history pending')
+        with mock.patch.object(engine, 'ensure_ref', return_value=True), \
+             mock.patch.object(monitor, 'log') as log:
+            created = engine.create(A, 'alice', 'deferred-inline')
+        self.assertEqual((created['status'], created['thread_ts']), ('running', '123.456'))
+        self.assertIsNone(created['start_error'])
+        self.assertTrue(any('seeding deferred' in call.args[0] for call in log.call_args_list))
+        self.assertEqual(self.conn.execute('SELECT seeded FROM stabilize_runtime').fetchone()[0], 0)
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM stabilize_dispatches').fetchone()[0], 0)
+
+    def test_ambiguous_create_posts_root_without_inline_ref_reconciliation(self):
+        with mock.patch.object(engine, 'ensure_ref', return_value=False) as ref, \
+             mock.patch.object(engine, 'tick_campaign') as tick, \
+             mock.patch.object(engine, 'seed_issues') as seed, \
+             mock.patch.object(monitor, 'slack_send', return_value=(True, '123.456')) as slack:
+            created = engine.create(A, 'alice', 'ambiguous-root')
+            ref.assert_called_once()
+            tick.assert_not_called()
+            seed.assert_not_called()
+            self.assertEqual((created['status'], created['thread_ts']), ('starting', '123.456'))
+            self.assertIn('unconfirmed', created['start_error'])
+            self.assertEqual(len(slack.call_args_list), 2)  # root and first details reply
+            self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM stabilize_dispatches').fetchone()[0], 0)
+            self.assertEqual(engine.create(A, 'alice', 'ambiguous-root'), created)
+            self.assertEqual(len(slack.call_args_list), 2)
+        with mock.patch.object(engine, 'ensure_ref', return_value=True), \
+             mock.patch.object(engine, 'ref_sha', return_value=A), \
+             mock.patch.object(engine, 'branch_runs', return_value=[]), \
+             mock.patch.object(monitor, 'slack_send', return_value=(True, 'later')) as slack:
+            engine.once(self.conn)
+        self.assertFalse(any(not call.kwargs.get('thread_ts') for call in slack.call_args_list))
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM stabilize_dispatches').fetchone()[0], 1)
+
+    def test_inline_slack_failure_does_not_block_dispatch_and_cron_retries(self):
+        with mock.patch.object(engine, 'ensure_ref', return_value=True), \
+             mock.patch.object(engine, 'ref_sha', return_value=A), \
+             mock.patch.object(engine, 'branch_runs', return_value=[]), \
+             mock.patch.object(monitor, 'slack_send', return_value=(False, None)):
+            created = engine.create(A, 'alice', 'slack-down')
+        self.assertEqual(created['status'], 'running')
+        self.assertIsNone(created['thread_ts'])
+        self.assertIsNone(created['start_error'])
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM stabilize_dispatches').fetchone()[0], 1)
+        with mock.patch.object(engine, 'ref_sha', return_value=A), \
+             mock.patch.object(engine, 'branch_runs', return_value=[]), \
+             mock.patch.object(monitor, 'slack_send', return_value=(True, '123.456')) as slack:
+            engine.once(self.conn)
+            engine.once(self.conn)
+        messages = [call.args[1] for call in slack.call_args_list]
+        self.assertEqual(sum(not call.kwargs.get('thread_ts') for call in slack.call_args_list), 1)
+        self.assertTrue(messages[1].startswith('Branch:'))
+        self.assertTrue(messages[2].startswith('Seeded issues'))
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM stabilize_dispatches').fetchone()[0], 1)
+
+    def test_resume_runs_inline_and_keeps_next_cron_dispatch_idempotent(self):
+        c = self.campaign(status='paused')
+        monitor.CHANNEL_PATH.write_text('C1')
+        with mock.patch.object(engine, 'ref_sha', return_value=A), \
+             mock.patch.object(engine, 'branch_runs', return_value=[]), \
+             mock.patch.object(engine, 'tick_campaign', wraps=engine.tick_campaign) as tick:
+            resumed = engine.resume(c.id, 'admin')
+            tick.assert_called_once()
+            self.assertEqual((resumed['status'], resumed['thread_ts']), ('running', '123.456'))
+            self.assertEqual(resumed['slack_thread_url'], 'https://app.slack.com/archives/C1/p123456')
+            self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM stabilize_dispatches').fetchone()[0], 1)
+            engine.once(self.conn)
+        self.assertEqual(sum(call.args[0][:2] == ['workflow', 'run'] for call in self.gh.call_args_list), 1)
+
+    def test_resume_inline_exception_keeps_resume_successful(self):
+        c = self.campaign(status='paused')
+        with mock.patch.object(engine, 'tick_campaign', side_effect=git_ancestry.Deferred('fetching history')), \
+             mock.patch.object(monitor, 'log') as log:
+            resumed = engine.resume(c.id, 'admin')
+        self.assertEqual(resumed['status'], 'running')
+        self.assertIsNone(resumed['pause_reason'])
+        self.assertTrue(any('advance deferred: fetching history' in call.args[0] for call in log.call_args_list))
+
+    def test_cli_start_uses_one_inline_tick_without_operator_heartbeat(self):
+        with mock.patch('sys.argv', ['stabilize.py', 'start', '--ref', 'master', '--requested-by', 'alice']), \
+             mock.patch.object(engine, 'resolve', return_value={'sha': A}), \
+             mock.patch.object(engine, 'ensure_ref', return_value=True), \
+             mock.patch.object(engine, 'ref_sha', return_value=A), \
+             mock.patch.object(engine, 'branch_runs', return_value=[]), \
+             mock.patch.object(engine, 'tick_campaign', wraps=engine.tick_campaign) as tick, \
+             mock.patch.object(monitor, 'record_heartbeat') as heartbeat, mock.patch('builtins.print'):
+            self.assertEqual(engine.main(), 0)
+        tick.assert_called_once()
+        heartbeat.assert_not_called()
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM stabilize_dispatches').fetchone()[0], 1)
+
+    def test_cli_resume_uses_one_inline_tick_without_operator_heartbeat(self):
+        c = self.campaign(status='paused')
+        with mock.patch('sys.argv', ['stabilize.py', 'resume', c.id, '--requested-by', 'alice']), \
+             mock.patch.object(engine, 'ref_sha', return_value=A), \
+             mock.patch.object(engine, 'branch_runs', return_value=[]), \
+             mock.patch.object(engine, 'tick_campaign', wraps=engine.tick_campaign) as tick, \
+             mock.patch.object(monitor, 'record_heartbeat') as heartbeat, mock.patch('builtins.print'):
+            self.assertEqual(engine.main(), 0)
+        tick.assert_called_once()
+        heartbeat.assert_not_called()
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM stabilize_dispatches').fetchone()[0], 1)
+
+    def test_inline_delivery_is_scoped_to_its_campaign(self):
+        old = self.campaign(status='completed')
+        engine.notify(self.conn, old.id, 'old-pending', 'Old outcome')
+        engine.queue_write(self.conn, old.id, 'old-label', 'label', {'number': 99, 'label': state.LABEL})
+        with mock.patch.object(engine, 'ensure_ref', return_value=True), \
+             mock.patch.object(engine, 'ref_sha', return_value=A), \
+             mock.patch.object(engine, 'branch_runs', return_value=[]):
+            created = engine.create(A, 'alice', 'scoped-inline')
+        self.assertEqual(created['thread_ts'], '123.456')
+        self.assertIsNone(engine.get(old.id)['thread_ts'])
+        self.assertIsNone(self.conn.execute("SELECT sent_at FROM stabilize_messages WHERE campaign_id='test'").fetchone()[0])
+        self.assertIsNone(self.conn.execute("SELECT done_at FROM stabilize_writes WHERE campaign_id='test'").fetchone()[0])
+
+    def test_accepted_live_root_is_not_reposted_or_given_a_retroactive_start_reply(self):
+        c = self.campaign()
+        with self.conn:
+            self.conn.execute('UPDATE stabilize_campaigns SET thread_ts=? WHERE id=?', ('live-thread', c.id))
+        engine.notify(self.conn, c.id, 'new-progress', f'Checking {engine.slack_commit(B)}.')
+        with mock.patch.object(monitor, 'slack_send', return_value=(True, 'reply')) as slack:
+            engine.deliver_slack(self.conn)
+            engine.deliver_slack(self.conn)
+        slack.assert_called_once()
+        self.assertEqual(slack.call_args.kwargs['thread_ts'], 'live-thread')
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM stabilize_messages WHERE checkpoint='started:0'").fetchone()[0], 0)
+
+    def test_first_reply_retries_in_place_before_prepared_seed_reply(self):
+        c = self.campaign()
+        engine.notify(self.conn, c.id, 'seeded', 'Seeded issues: none.')
+        with mock.patch.object(monitor, 'slack_send', side_effect=[(True, 'root'), (False, None)]) as slack:
+            engine.deliver_slack(self.conn)
+        self.assertTrue(slack.call_args.args[1].startswith('Branch:'))
+        self.assertEqual(self.current().thread_ts, 'root')
+        with mock.patch.object(monitor, 'slack_send', return_value=(True, 'reply')) as slack:
+            engine.deliver_slack(self.conn)
+            engine.deliver_slack(self.conn)
+        self.assertEqual(len(slack.call_args_list), 2)
+        self.assertTrue(slack.call_args_list[0].args[1].startswith('Branch:'))
+        self.assertEqual(slack.call_args_list[1].args[1], 'Seeded issues: none.')
+        self.assertTrue(all(call.kwargs['thread_ts'] == 'root' for call in slack.call_args_list))
+
+    def test_thread_commit_messages_use_short_linked_shas(self):
+        self.assertEqual(engine.slack_commit(B), f'<https://github.com/{monitor.REPO_NAME}/commit/{B}|{B[:7]}>')
+        c = self.campaign(sha=B, seeded=0)
+        self.seed_row()
+        self.issue_reads()
+        engine.seed_issues(self.conn, c)
+        with mock.patch.object(automerge, 'collect_failure_report_for_run', return_value=report(successful=True)):
+            engine.ingest_run(self.conn, c, 'push', run(80, B, conclusion='success'))
+        with mock.patch.object(engine, 'ref_sha', return_value=B):
+            engine.ensure_dispatch(self.conn, c, 'push', [])
+        self.issue_reads()
+        with mock.patch.object(engine, 'ref_sha', return_value=B), mock.patch.object(engine, 'ensure_ref', return_value=True):
+            engine.open_gate(self.conn, c)
+        engine.pause(self.conn, c, f'Checks deferred at {B[:7]}', commit_sha=B)
+        rows = self.conn.execute('SELECT text FROM stabilize_messages').fetchall()
+        commit_messages = [r['text'] for r in rows if '/commit/' in r['text']]
+        self.assertEqual(len(commit_messages), 5)  # seed, result, dispatch, green gate, pause
+        for message in commit_messages:
+            self.assertNotIn(f'`{A}`', message)
+            self.assertNotIn(f'`{B}`', message)
+            self.assertNotIn(f'`{B[:12]}`', message)
+            self.assertTrue(engine.slack_commit(A) in message or engine.slack_commit(B) in message)
+        self.assertEqual(engine.get(c.id)['pause_reason'], f'Checks deferred at {B[:7]}')
+
 
 if __name__ == '__main__':
     unittest.main()

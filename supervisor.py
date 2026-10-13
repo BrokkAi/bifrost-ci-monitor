@@ -15,6 +15,10 @@ import git_ancestry
 import monitor
 import speculation
 import merge_failover
+import read_budget
+
+# One ordinary five-second observation plus room for its commands.
+UNSERVED_BATCH_SECONDS = 10
 
 
 def digest(value):
@@ -43,16 +47,22 @@ def snapshot(row):
         'integration_pr_number', 'terminal_status')}
 
 
-def plan(a, conn, *, priority_checked, queue_checked, maintenance_done, reconciled):
+def plan(a, conn, *, priority_checked, queue_checked, maintenance_done, reconciled, campaign_checked=False):
     actions = []
     primary = a.active_batch(conn)
     rows = conn.execute("SELECT * FROM automerge_batches WHERE status IN ('launching','running','finishing') "
                         "ORDER BY created_at,batch_id").fetchall()
 
     def add(priority, kind, row=None, inputs=None):
-        owner = str(row['batch_id']) if row is not None else '__queue__'
+        owner = (str(row['batch_id']) if row is not None else
+                 '__campaign_queue__' if kind == 'select_campaign' else '__queue__')
         inputs = inputs if inputs is not None else snapshot(row) if row is not None else {}
         identifier = digest([kind, owner, inputs])
+        if row is not None:
+            if a.batch_target(row) != a.BASE_BRANCH:
+                priority += 70
+            elif speculation.is_speculative(row) and priority > 8:
+                priority += 40
         actions.append((priority, identifier, kind, owner, inputs))
 
     for row in rows:
@@ -73,13 +83,13 @@ def plan(a, conn, *, priority_checked, queue_checked, maintenance_done, reconcil
         if row['predecessor_id'] and not row['role_promoted']:
             parent = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?',
                                   (row['predecessor_id'],)).fetchone()
-            add(12, 'reconcile_predecessor', row,
+            add(15, 'reconcile_predecessor', row,
                 [snapshot(row), snapshot(parent) if parent is not None else None])
         urgent = bool(a.ready_candidate(row) or row['phase'] in {'merging','waiting_ci','direct_merging'}
                       or row['role_promoted'] and row['phase'] == 'waiting_parent')
         if not speculation.is_speculative(row) or row['batch_id'] in reconciled:
             add(20 if not speculation.is_speculative(row) and urgent else
-                30 if not speculation.is_speculative(row) else 60,
+                30 if not speculation.is_speculative(row) else 20,
                 'advance_batch', row)
     if not priority_checked:
         add(8, 'check_priority')
@@ -89,12 +99,16 @@ def plan(a, conn, *, priority_checked, queue_checked, maintenance_done, reconcil
             and a.SPECULATIVE_LOOKAHEAD and speculation.candidate(a, primary)):
         if speculation.child(conn, primary['batch_id']) is None:
             add(50, 'select_successor', primary)
+    if not campaign_checked and a.active_campaign_batch(conn) is None:
+        campaigns = a.selectable_campaigns(conn)
+        if campaigns:
+            add(110, 'select_campaign', inputs=[(c.id, c.branch, c.tip_sha) for c in campaigns])
     if not maintenance_done:
-        add(80, 'maintenance')
+        add(150, 'maintenance')
     return sorted(actions)
 
 
-def queue_groups(a, conn) -> dict[str, list[tuple[int, str, str, str | None]]]:
+def queue_groups(a, conn, *, master_only=False) -> dict[str, list[tuple[int, str, str, str | None]]]:
     """Categorize cached open PRs using read-only queries, in Slack order."""
     groups = {'dependency blocked': [], 'rejected': [], 'draft': [], 'otherwise ineligible': []}
     rejected = {(r['number'], r['head_sha']) for r in conn.execute(
@@ -102,6 +116,9 @@ def queue_groups(a, conn) -> dict[str, list[tuple[int, str, str, str | None]]]:
     for row in conn.execute('SELECT * FROM automerge_pr_inventory ORDER BY number'):
         item = json.loads(row['data_json'])
         if str(item.get('state')).lower() != 'open' or a._is_integration_pull(item):
+            continue
+        base = (item.get('base') or {}).get('ref') or item.get('baseRefName') or ''
+        if master_only and a._campaign_for_branch(conn, base):
             continue
         if (row['number'], row['head_sha']) in rejected:
             group = 'rejected'
@@ -119,7 +136,7 @@ def idle_summary(a, conn, transport):
     if transport.kind != 'chat':
         a.log('idle PR summary needs the threaded Slack chat transport')
         return
-    groups = queue_groups(a, conn)
+    groups = queue_groups(a, conn, master_only=True)
     identifier = digest(groups)
     saved = conn.execute('SELECT * FROM automerge_queue_summaries WHERE summary_id=?', (identifier,)).fetchone()
     if saved and saved['completed_at']:
@@ -143,7 +160,9 @@ def idle_summary(a, conn, transport):
                 text += line
             messages.append(text)
         last = conn.execute("SELECT thread_ts FROM automerge_batches WHERE thread_ts IS NOT NULL "
-                            "AND (predecessor_id IS NULL OR role_promoted=1) ORDER BY created_at DESC LIMIT 1").fetchone()
+                            "AND (predecessor_id IS NULL OR role_promoted=1) "
+                            "AND COALESCE(target_ref, ?)=? ORDER BY created_at DESC LIMIT 1",
+                            (a.BASE_BRANCH, a.BASE_BRANCH)).fetchone()
         with conn:
             conn.execute('INSERT INTO automerge_queue_summaries '
                          '(summary_id,thread_ts,messages_json,created_at) VALUES (?,?,?,?)',
@@ -170,7 +189,8 @@ def idle_summary(a, conn, transport):
 def run(a, conn, transport):
     attempted = set()
     deferred = set()
-    priority_checked = queue_checked = maintenance_done = False
+    priority_checked = queue_checked = campaign_checked = maintenance_done = False
+    served = set()
     priority_pulls = []
     reconciled = set()
     result = 0
@@ -178,7 +198,8 @@ def run(a, conn, transport):
         if a.OBSERVATION_DEADLINE is not None and time.monotonic() >= a.OBSERVATION_DEADLINE:
             break
         options = plan(a, conn, priority_checked=priority_checked, queue_checked=queue_checked,
-                       maintenance_done=maintenance_done, reconciled=reconciled)
+                       maintenance_done=maintenance_done, reconciled=reconciled,
+                       campaign_checked=campaign_checked)
         wanted = {item[1] for item in options}
         with conn:
             for _, identifier, kind, owner, inputs in options:
@@ -190,7 +211,7 @@ def run(a, conn, transport):
                     conn.execute("UPDATE automerge_supervisor_actions SET status='obsolete',updated_at=? WHERE action_id=?",
                                  (a.utc_now(), old[0]))
         if not priority_checked:
-            options = [item for item in options if item[0] <= 8]
+            options = [item for item in options if item[0] <= 8 or item[0] >= 70]
         selected = next((item for item in options if item[1] not in attempted and
                          conn.execute('SELECT next_attempt_at FROM automerge_supervisor_actions WHERE action_id=?',
                                       (item[1],)).fetchone()[0] <= time.time()), None)
@@ -210,7 +231,27 @@ def run(a, conn, transport):
         with conn:
             conn.execute("UPDATE automerge_supervisor_actions SET status='running',attempts=attempts+1,updated_at=? "
                          "WHERE action_id=?", (a.utc_now(), identifier))
+        outer_deadline = a.OBSERVATION_DEADLINE
+        token = None
+        budget_owner = owner
+        if kind in {'check_priority', 'select_primary'}:
+            primary = a.active_batch(conn)
+            budget_owner = primary['batch_id'] if primary is not None else '__master_queue__'
+        if outer_deadline is not None and a.active_campaign_batch(conn) is not None:
+            # With no campaign batch, preserve HEAD's entire remaining master
+            # budget. A real campaign reserves only the next observation slice
+            # for each other unserved batch. Unused time is immediately reusable.
+            waiting = {r[0] for r in conn.execute(
+                "SELECT batch_id FROM automerge_batches WHERE status IN ('launching','running','finishing')")}
+            waiting.difference_update(served | {budget_owner})
+            remaining = max(0, outer_deadline - time.monotonic())
+            reserve = (UNSERVED_BATCH_SECONDS if budget_owner in served else
+                       min(UNSERVED_BATCH_SECONDS, remaining / (len(waiting) + 1)))
+            a.OBSERVATION_DEADLINE = outer_deadline - reserve * len(waiting)
+            token = read_budget.deadline.set(a.OBSERVATION_DEADLINE)
         try:
+            if a.OBSERVATION_DEADLINE is not None and time.monotonic() >= a.OBSERVATION_DEADLINE:
+                raise git_ancestry.Deferred('batch observation slice exhausted')
             row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (owner,)).fetchone()
             if kind == 'deliver_guidance':
                 a.deliver_pending_prompt(conn, transport, row)
@@ -223,6 +264,9 @@ def run(a, conn, transport):
                 if any(a._priority_flags(a._labels(item))[0] for item in a.list_open_pull_requests()
                        if not a._is_integration_pull(item)):
                     priority_pulls = a.select_eligible_pull_requests(conn=conn, priority_only=True)
+                    campaign = a.active_campaign_batch(conn)
+                    if campaign is not None:
+                        priority_pulls = a.unreserved_pulls(priority_pulls, {p.number for p in a._active_sources(campaign)})
                 primary = a.active_batch(conn)
                 if primary is not None:
                     a.preempt_batch_for_priority(conn, transport, primary, priority_pulls)
@@ -236,13 +280,20 @@ def run(a, conn, transport):
                 else:
                     a.process_batch(conn, transport, owner)
             elif kind == 'select_primary':
-                pulls = a.select_eligible_pull_requests(conn=conn)
+                occupied = speculation.reserved(a, conn)
+                pulls = a.unreserved_pulls(a.select_eligible_pull_requests(conn=conn), occupied)
                 a.report_dependency_blocks(conn, transport)
                 if pulls:
                     a.create_selected_batch(conn, pulls, a.target_sha(a.pulls_target(conn, pulls)))
                 else:
                     idle_summary(a, conn, transport)
                 queue_checked = True
+            elif kind == 'select_campaign':
+                pulls = a.select_campaign_pull_requests(conn)
+                a.report_dependency_blocks(conn, transport)
+                if pulls:
+                    a.create_selected_batch(conn, pulls, a.target_sha(a.pulls_target(conn, pulls)))
+                campaign_checked = True
             elif kind == 'select_successor':
                 speculation.launch_child(a, conn, row)
                 a.report_dependency_blocks(conn, transport)
@@ -280,9 +331,13 @@ def run(a, conn, transport):
             a.notify_blocked_once(conn, transport, owner, reason, details)
             a.log(f'{kind} blocked ({reason}): {exc}')
             result = 4
-            if kind == 'check_priority':
-                break
             continue
+        finally:
+            if kind == 'advance_batch':
+                served.add(owner)
+            a.OBSERVATION_DEADLINE = outer_deadline
+            if token is not None:
+                read_budget.deadline.reset(token)
         with conn:
             conn.execute("UPDATE automerge_supervisor_actions SET status='complete',last_error=NULL,next_attempt_at=0,"
                          "updated_at=? WHERE action_id=?", (a.utc_now(), identifier))

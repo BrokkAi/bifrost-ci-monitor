@@ -490,16 +490,13 @@ class Graph:
         return True
 
     def select(self, *, priority=True, target_ref=None, priority_only=False):
-        ready = [n for n in sorted(self.dependencies) if self.nodes[n].ready
+        # Selection is lane-local. The default remains the master queue;
+        # campaigns are selected explicitly by the campaign supervisor action.
+        target_ref = target_ref or self.base_branch
+        ready = [n for n in sorted(self.dependencies) if self.target(n)[0] == target_ref
+                 and self.nodes[n].ready
                  and not self.ancestor(self.nodes[n].head, self.target(n)[1]) and self.eligible(n)
                  and (self.available_targets is None or self.target(n)[0] in self.available_targets)]
-        if target_ref is not None:
-            ready = [n for n in ready if self.target(n)[0] == target_ref]
-        elif self.targets:
-            immediate = [n for n in ready if self.nodes[n].immediate and self.target(n)[0] == self.base_branch]
-            campaigns = [n for n in ready if self.target(n)[0] != self.base_branch]
-            chosen = self.base_branch if immediate or priority_only or not campaigns else self.target(campaigns[0])[0]
-            ready = [n for n in ready if self.target(n)[0] == chosen]
         if priority_only and not any(self.nodes[n].priority for n in ready):
             return []
         campaign_lane = bool(ready and self.target(ready[0])[0] != self.base_branch)

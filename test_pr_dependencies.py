@@ -112,8 +112,8 @@ class DependencyTests(TestCase):
                 'headRefOid': item['head']['sha'], 'baseRefName': item['base']['ref'],
                 'labels': item['labels'], 'title': item['title']}
 
-    def selected(self):
-        return automerge.select_eligible_pull_requests(conn=self.conn)
+    def selected(self, target_ref=None):
+        return automerge.select_eligible_pull_requests(conn=self.conn, target_ref=target_ref)
 
     def reject(self, number):
         with self.conn:
@@ -174,6 +174,89 @@ class DependencyTests(TestCase):
                               "VALUES ('test',900,'push','test',0,?,'now','now')", (state,))
         self.patch(automerge, 'remote_branch_sha', side_effect=lambda branch: self.git('rev-parse', branch))
 
+    def lane_campaign_setup(self):
+        with self.conn:
+            self.conn.execute("INSERT INTO stabilize_campaigns(id,branch,anchor_sha,tip_sha,status,created_at,updated_at) VALUES ('test','stabilize/test',?,?,'running','now','now')", (self.base, self.base))
+            self.conn.execute("INSERT INTO stabilize_issues(campaign_id,issue_number,stage,source,round,state,added_at,updated_at) VALUES ('test',1,'push','test',0,'pr_ready','now','now')")
+        self.items[40]['base']['ref'] = 'stabilize/test'
+        self.patch(automerge, 'remote_branch_sha', return_value=self.base)
+        self.assertFalse(self.ancestor(self.w, self.x))
+        self.assertFalse(self.ancestor(self.x, self.w))
+
+    def test_unrelated_campaign_comment_failure_does_not_block_master_selection(self):
+        self.lane_campaign_setup()
+        self.items[40]['labels'] = [{'name': automerge.REJECTED_LABEL}]
+        self.patch(automerge, 'list_pull_comments', side_effect=lambda number: (_ for _ in ()).throw(monitor.CommandError('campaign comments unavailable')) if number == 40 else [])
+        pulls = automerge.select_eligible_pull_requests(conn=self.conn)
+        self.assertEqual([p.number for p in pulls], [30, 20, 10])
+
+    def test_unrelated_campaign_comment_failure_does_not_block_master_landing_recheck(self):
+        self.lane_campaign_setup()
+        selected = automerge.select_eligible_pull_requests(conn=self.conn)
+        self.assertEqual([p.number for p in selected], [30, 20, 10])
+        batch = automerge.create_batch(self.conn, selected, self.base)
+        self.items[40]['labels'] = [{'name': automerge.REJECTED_LABEL}]
+        self.patch(automerge, 'list_pull_comments', side_effect=lambda number: (_ for _ in ()).throw(monitor.CommandError('campaign comments unavailable')) if number == 40 else [])
+        keep, removed = automerge._recheck_sources(selected, conn=self.conn, batch_id=batch)
+        self.assertEqual(keep, selected)
+        self.assertEqual(removed, [])
+
+    def test_unrelated_master_comment_failure_does_not_block_campaign_selection(self):
+        self.lane_campaign_setup()
+        self.items[30]['labels'] = [{'name': automerge.REJECTED_LABEL}]
+        self.patch(automerge, 'list_pull_comments', side_effect=lambda number: (_ for _ in ()).throw(monitor.CommandError('master comments unavailable')) if number == 30 else [])
+        pulls = automerge.select_campaign_pull_requests(self.conn)
+        self.assertEqual([p.number for p in pulls], [40])
+
+    def test_master_ref_failure_does_not_block_campaign_only_selection(self):
+        self.lane_campaign_setup()
+        self.items = {40: self.items[40]}
+        self.patch(automerge, 'current_master_sha', side_effect=monitor.CommandError('master ref unavailable'))
+        pulls = automerge.select_campaign_pull_requests(self.conn)
+        self.assertEqual([p.number for p in pulls], [40])
+
+
+    def test_related_campaign_comment_failure_keeps_historical_fence(self):
+        self.lane_campaign_setup()
+        self.add_pr(50, 'imports-campaign', self.w)
+        self.items[40]['labels'] = [{'name': automerge.REJECTED_LABEL}]
+        def comments(number):
+            if number == 40:
+                raise monitor.CommandError('required campaign comments unavailable')
+            return []
+        self.patch(automerge, 'list_pull_comments', side_effect=comments)
+        with self.assertRaisesRegex(monitor.CommandError, 'required campaign comments'):
+            self.selected()
+
+    def test_unrelated_disappeared_campaign_metadata_is_not_refreshed_by_master(self):
+        self.lane_campaign_setup()
+        self.selected()
+        self.items[40]['state'] = 'closed'
+        def read(args, **kwargs):
+            if args[-1].endswith('/40'):
+                raise monitor.CommandError('campaign metadata unavailable')
+            return self.read(args, **kwargs)
+        reads = self.patch(automerge, 'gh_json', side_effect=read)
+        self.assertEqual([p.number for p in self.selected()], [30, 20, 10])
+        reads.assert_not_called()
+
+    def test_historical_campaign_head_remains_required_after_current_head_changes(self):
+        self.lane_campaign_setup()
+        self.add_pr(50, 'imports-old-campaign', self.w)
+        self.selected()  # Retains the original historical campaign head.
+        self.reject(40)
+        new_head = self.add_pr(60, 'unrelated-replacement', self.base, base='stabilize/test')
+        self.items.pop(60)
+        self.items[40]['head']['sha'] = new_head
+        self.items[40]['labels'] = [{'name': automerge.REJECTED_LABEL}]
+        def comments(number):
+            if number == 40:
+                raise monitor.CommandError('historical campaign comments unavailable')
+            return []
+        self.patch(automerge, 'list_pull_comments', side_effect=comments)
+        with self.assertRaisesRegex(monitor.CommandError, 'historical campaign comments'):
+            self.selected()
+
     def test_campaign_closed_gate_holds_selection_without_dependency_notice(self):
         self.campaign(state='open')
         self.add_pr(50, 'campaign-fix', self.base, base='stabilize/test')
@@ -183,22 +266,23 @@ class DependencyTests(TestCase):
         self.assertEqual(self.writes, [])
         with self.conn:
             self.conn.execute("UPDATE stabilize_issues SET state='pr_ready'")
-        selected = self.selected()
+        selected = self.selected('stabilize/test')
         self.assertEqual([p.number for p in selected], [50])
         self.assertEqual(automerge.pulls_target(self.conn, selected), 'stabilize/test')
 
-    def test_campaign_priority_is_above_high_below_immediate_and_never_preempts(self):
+    def test_campaign_selection_is_independent_of_master_priority_and_never_preempts(self):
         self.campaign()
         self.add_pr(50, 'campaign-fix', self.base, base='stabilize/test')
         self.items[40]['labels'] = [{'name': 'mergemarshall:high'}]
-        self.assertEqual([p.number for p in self.selected()], [50])
+        self.assertEqual([p.number for p in self.selected()], [40])
+        self.assertEqual([p.number for p in self.selected('stabilize/test')], [50])
         self.items[40]['labels'] = [{'name': 'mergemarshall:immediate'}]
         self.assertEqual([p.number for p in self.selected()], [40])
         self.items[50]['labels'] = [{'name': 'mergemarshall:immediate'}]
         priority = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True)
         self.assertEqual([p.number for p in priority], [40])
         self.items[40]['labels'] = []
-        selected = self.selected()
+        selected = self.selected('stabilize/test')
         batch = automerge.create_batch(self.conn, [automerge.dependency_pull(
             automerge.dependency_graph(self.conn), 40)], self.base)
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
@@ -209,8 +293,8 @@ class DependencyTests(TestCase):
         self.add_pr(50, 'campaign-first', self.base, base='stabilize/test')
         self.add_pr(51, 'campaign-second', self.base, base='stabilize/test')
         self.items[50]['labels'] = [{'name': 'mergemarshall:high'}]
-        self.assertEqual([p.number for p in self.selected()], [50, 51])
-        batch = automerge.create_batch(self.conn, self.selected(), self.base)
+        self.assertEqual([p.number for p in self.selected('stabilize/test')], [50, 51])
+        batch = automerge.create_batch(self.conn, self.selected('stabilize/test'), self.base)
         self.add_pr(52, 'campaign-third', self.base, base='stabilize/test')
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
         self.assertTrue(automerge._request_rebuild(self.conn, row, automerge.row_pulls(row), 'expand', only_if_expanded=True))
@@ -234,7 +318,7 @@ class DependencyTests(TestCase):
         self.items[30]['base']['ref'] = 'stabilize/test'
         self.add_pr(50, 'campaign-fix', self.x, base='stabilize/test')
         self.add_pr(51, 'campaign-stack', self.items[50]['head']['sha'], base='campaign-fix')
-        selected = self.selected()
+        selected = self.selected('stabilize/test')
         self.assertEqual([p.number for p in selected], [50])
         self.assertTrue(all(p.target_ref == 'stabilize/test' for p in selected))
         self.assertNotIn(30, {d.number for p in selected for d in p.dependencies})
@@ -264,14 +348,14 @@ class DependencyTests(TestCase):
         # A campaign fix based on the snapshot must remain a campaign PR, never
         # a stacked child of the gate PR targeting master.
         self.add_pr(50, 'campaign-next', self.x, base='stabilize/test')
-        selected = self.selected()
+        selected = self.selected('stabilize/test')
         self.assertEqual([p.number for p in selected], [50])
         self.assertNotIn(60, {d.number for d in selected[0].dependencies})
 
     def test_campaign_expansion_respects_gate_and_target(self):
         self.campaign()
         self.add_pr(50, 'campaign-first', self.base, base='stabilize/test')
-        selected = self.selected()
+        selected = self.selected('stabilize/test')
         batch = automerge.create_batch(self.conn, selected, self.base)
         self.add_pr(51, 'campaign-second', self.base, base='stabilize/test')
         with self.conn:
@@ -1080,12 +1164,12 @@ class DependencyTests(TestCase):
         for number in (20, record.retired_number, record.replacement_number):
             self.items[number]['base']['ref'] = 'stabilize/test'
         with mock.patch.object(pr_dependencies, 'REVIEWED_SUPERSESSIONS', (record,)):
-            selected = self.selected()
+            selected = self.selected('stabilize/test')
             self.assertEqual([p.number for p in selected], [record.replacement_number, 20])
             self.assertTrue(all(p.target_ref == 'stabilize/test' for p in selected))
             self.reject(record.retired_number)
-            self.assertNotIn(record.replacement_number, [p.number for p in self.selected()])
-            self.assertNotIn(20, [p.number for p in self.selected()])
+            self.assertNotIn(record.replacement_number, [p.number for p in self.selected('stabilize/test')])
+            self.assertNotIn(20, [p.number for p in self.selected('stabilize/test')])
 
     def test_reviewed_supersession_cannot_import_unlanded_master_replacement_into_campaign(self):
         record = self.reviewed_pair()

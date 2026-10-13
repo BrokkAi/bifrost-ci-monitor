@@ -1027,11 +1027,26 @@ identity.
 The round gate (`merge_gate_open`) opens when the campaign is running, no issue
 at or before the current stage is `open`, and at least one is `pr_ready`. The
 merger checks it at selection and expansion only. Campaign batches persist
-`automerge_batches.target_ref` (NULL means master), contain one target, rank
-above ordinary and high master work and below immediate, never preempt, always
-use async mode (one up-to-date PR may take the async direct path into the
-branch; the stage suites at the new tip are its check), and never have a
-speculative successor. Base
+`automerge_batches.target_ref` (NULL means master) and contain one target. They
+run in an independent campaign lane: at most one live campaign batch, alongside
+master's primary and speculative successor, with no ranking between lanes.
+`active_batch` is master-only; `active_campaign_batch` supplies the campaign
+slot. Each tick advances the master primary, then its successor, then the
+campaign lane; a deferred read, error or stall leaves only that batch's action
+pending. With no live campaign batch, master keeps the whole 50 s budget as
+before; with one, each batch not yet advanced keeps a 10 s reservation (one
+observation slice plus commands), reclaimed when unused. Successor guidance and
+recovery keep their place ahead of priority discovery. Per-PR comment and review
+reads run only for the lane's own source closure after structural partitioning;
+historical rejection, ancestry and supersession fences still read what they
+need, so an unrelated read failure in one lane cannot block the other's
+selection or landing recheck. Selection reservations stay global, so a source
+cannot enter both lanes if its base changes. Immediate preemption, the
+idle queue summary and `--land-now` are master-only; abort resolves either lane
+by batch ID, and `--check` shows both. Campaign batches always use async mode
+(one up-to-date PR may take the async direct path into the branch; the stage
+suites at the new tip are its check) and never have or follow a speculative
+successor. Base
 capture, freshness, behind counts, verdicts, landing, direct paths, prompts and
 skills use the batch target. Campaign agents never merge master into a stabilize
 batch. PRs based on a finished or aborted campaign branch are excluded quietly
@@ -1061,10 +1076,17 @@ spans refs, so a matching master issue is updated or reopened instead of
 duplicated. Branch product issues carry `mergemarshall:stabilize`. Issue
 evidence and dossiers render `Red since` from first-seen SHA, time and run.
 
-Each campaign posts one Slack root (`*<project>* stabilize campaign:`) with the
-seeded issues in its first reply, then threaded progress. Delivery is durable
-and never gates the engine. The web UI calls `resolve`, `create`, `get`,
-`list_campaigns` and `abort` in process. `resolve` is read-only (REST and
+Each campaign posts one Slack root, `<project prefix> stable release branch
+started from <linked 7-character anchor>.`, with no branch, campaign ID or full
+SHA at channel level. Its first thread reply, checkpointed once, links the
+branch and names the campaign ID and requester; the seeded-issue reply follows.
+Thread messages show commits as linked 7-character SHAs (`slack_commit`).
+Delivery is durable and never gates the engine. `create` and `resume` run the
+campaign's first tick inline under the engine lock (`run_campaign_tick`, shared
+with cron): Slack root, seeding and dispatch happen before they return. That
+tick is best-effort; failures are left for cron and never fail the call. An
+ambiguous ref write still posts the placeholder root. The web UI calls `resolve`, `create`, `get`,
+`list_campaigns`, `abort` and `resume` in process. `resolve` is read-only (REST and
 SQLite). `create` takes a full SHA, requester and idempotency key, waits up to
 120 seconds for the engine lock, and returns `starting` with `start_error` when
 branch creation is ambiguous. `resume(campaign_id, requested_by)` clears a

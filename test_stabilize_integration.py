@@ -203,7 +203,7 @@ class IntegrationTests(_IntegrationFixture):
              mock.patch.object(engine, 'api', return_value=[]):
             engine.refresh_issues(self.conn, c)
         self.assertTrue(state.merge_gate_open(self.conn, c.id))
-        pulls = automerge.select_eligible_pull_requests(conn=self.conn)
+        pulls = automerge.select_eligible_pull_requests(conn=self.conn, target_ref=c.branch)
         self.assertEqual([p.number for p in pulls], [22])
         identifier = automerge.create_batch(self.conn, pulls, self.a, ci_mode='sync')
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (identifier,)).fetchone()
@@ -257,7 +257,7 @@ class IntegrationTests(_IntegrationFixture):
         with self.conn:
             self.conn.execute("UPDATE stabilize_issues SET state='open' WHERE campaign_id=?", (c.id,))
         self.assertFalse(state.merge_gate_open(self.conn, c.id))
-        self.assertEqual(automerge.select_eligible_pull_requests(conn=self.conn), [])
+        self.assertEqual(automerge.select_eligible_pull_requests(conn=self.conn, target_ref=c.branch), [])
         with self.conn:
             self.conn.execute("UPDATE stabilize_issues SET state='pr_ready' WHERE campaign_id=?", (c.id,))
         self.assertTrue(state.merge_gate_open(self.conn, c.id))
@@ -283,7 +283,7 @@ class IntegrationTests(_IntegrationFixture):
               mock.patch.object(automerge, '_direct_sync_gate', side_effect=AssertionError('campaign direct path waited for CI')),
               mock.patch.object(automerge, 'finish_batch'),
               mock.patch.object(automerge, 'run_gh', side_effect=merge) as write):
-            pulls = automerge.select_eligible_pull_requests(conn=self.conn)
+            pulls = automerge.select_eligible_pull_requests(conn=self.conn, target_ref=c.branch)
             self.assertEqual([pull.number for pull in pulls], [22])
             identifier = automerge.create_selected_batch(self.conn, pulls, base, ci_mode='sync')
             row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (identifier,)).fetchone()
@@ -325,14 +325,14 @@ class IntegrationTests(_IntegrationFixture):
              mock.patch.object(engine, 'pull_requests', return_value=[self.engine_pr(p)]), \
              mock.patch.object(engine, 'gh', return_value={'state': 'OPEN', 'labels': []}):
             engine.refresh_issues(self.conn, c)
-            pulls = automerge.select_eligible_pull_requests(conn=self.conn)
+            pulls = automerge.select_eligible_pull_requests(conn=self.conn, target_ref=c.branch)
             self.assertEqual(pulls, [])
             self.assertFalse(state.merge_gate_open(self.conn, c.id),
                              'unapproved repair must not release the round gate under approved policy')
             with mock.patch.object(automerge, 'gh_json', return_value={'reviewDecision': 'APPROVED'}):
                 engine.refresh_issues(self.conn, c)
                 self.assertTrue(state.merge_gate_open(self.conn, c.id))
-                self.assertEqual([pull.number for pull in automerge.select_eligible_pull_requests(conn=self.conn)], [22])
+                self.assertEqual([pull.number for pull in automerge.select_eligible_pull_requests(conn=self.conn, target_ref=c.branch)], [22])
 
 
     def test_linked_branch_issue_has_campaign_priority_before_engine_membership(self):
@@ -416,7 +416,7 @@ class IntegrationTests(_IntegrationFixture):
 
     def test_gate_accepts_proven_merged_repair_of_rejected_ancestor(self):
         c, p = self.ready()
-        self.assertEqual([p.number for p in automerge.select_eligible_pull_requests(conn=self.conn)], [22])
+        self.assertEqual([p.number for p in automerge.select_eligible_pull_requests(conn=self.conn, target_ref=c.branch)], [22])
         repaired = self.commit('repaired-rejected-head')
         with self.conn:
             automerge.enqueue_github_write(self.conn, 'rejection', 'reject_head', 22, self.b, {'reason': 'bad old head'})
