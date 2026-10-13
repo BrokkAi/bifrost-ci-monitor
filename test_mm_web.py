@@ -649,6 +649,20 @@ class ReadRegressionTests(unittest.TestCase):
         self.write("UPDATE automerge_batches SET terminal_status='aborted' WHERE batch_id IN ('primary','speculative')")
         self.assertEqual(data.stats(self.conn, days=1).days[0].batches_failed, 0)
 
+    def test_campaign_lane_is_separate_from_master_pipeline_and_kpis(self):
+        before = data.overview(self.conn)
+        self.assertIsNone(before.pipeline.campaign)
+        self.assertEqual(before.kpis.landed_today, 1)
+        self.write("UPDATE automerge_batches SET target_ref='stabilize/test' WHERE batch_id='landed'")
+        self.write("UPDATE automerge_batches SET status='running',phase='building',terminal_status=NULL,"
+                   "finished_at=NULL,target_ref='stabilize/test' WHERE batch_id='direct'")
+        after = data.overview(self.conn)
+        self.assertEqual(after.pipeline.campaign.batch_id, 'direct')
+        self.assertEqual(after.pipeline.campaign.target_ref, 'stabilize/test')
+        self.assertEqual(after.pipeline.primary.batch_id, 'primary')
+        self.assertEqual(after.kpis.landed_today, 0)
+        self.assertEqual(data.stats(self.conn, days=1).days[0].batches_completed, 0)
+
     def test_spa_index_containment_without_testclient(self):
         from starlette.requests import Request
         from mm_web import app as web_app

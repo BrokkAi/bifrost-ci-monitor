@@ -44,12 +44,17 @@ import {
   EmptyState,
   ExternalLink,
 } from "@/components/common";
-import { duration, durationFromMinutes, display, plural, sentenceCase } from "@/lib/utils";
+import { duration, durationFromMinutes, display, plural, sentenceCase, targetLabel } from "@/lib/utils";
 const SLOTS = {
   primary: {
     label: "01 / Primary batch",
     emptyTitle: "No active batch",
     emptyText: "The next eligible work will appear here.",
+  },
+  campaign: {
+    label: "Release branch batch",
+    emptyTitle: "No release branch batch",
+    emptyText: "Runs alongside the master lane while a stabilize campaign needs fixes merged.",
   },
   speculative: {
     label: "02 / Speculative successor",
@@ -98,8 +103,11 @@ export function PipelineCard({
         Phase: {batch.phase} <span className="mx-1">·</span> {batch.batch_id}
       </div>
       {batch.target_ref !== "master" && (
-        <div className="text-[10px] text-muted-foreground mt-2 break-all">
-          Target: {batch.target_ref}
+        <div
+          className="text-[10px] text-muted-foreground mt-2"
+          title={batch.target_ref}
+        >
+          Target: {targetLabel(batch.target_ref)}
         </div>
       )}
       <div className="pipeline-meta">
@@ -161,6 +169,8 @@ export function overviewStatus(data: Overview) {
     primary ? state(primary, "Batch") : "No primary batch is active.",
   ];
   if (successor) parts.push(state(successor, "Speculative batch"));
+  if (data.pipeline.campaign)
+    parts.push(state(data.pipeline.campaign, "Release branch batch"));
   if (data.outbox.failing)
     parts.push(
       `${plural(data.outbox.failing, "GitHub write is", "GitHub writes are")} failing.`,
@@ -232,7 +242,7 @@ export function OverviewPage() {
         title="Overview"
         description={overviewStatus(d)}
         action={
-          <div className="flex items-center gap-2 mt-3 text-[10px] text-muted-foreground">
+          <div className="flex shrink-0 items-center gap-2 mt-3 whitespace-nowrap text-[10px] text-muted-foreground">
             <Radio size={12} />
             <span>
               Updated <RelativeTime value={d.generated_at} />
@@ -311,6 +321,11 @@ export function OverviewPage() {
           </div>
         </Card>
       </div>
+      {d.pipeline.campaign && (
+        <div className="campaign-lane">
+          <PipelineCard slot="campaign" batch={d.pipeline.campaign} />
+        </div>
+      )}
       <div
         className={`chart-grid ${stats.isFetching && !stats.isPending ? "opacity-65" : ""}`}
       >
@@ -517,8 +532,11 @@ export function OverviewPage() {
                     {duration(batch.duration_seconds)}
                   </div>
                   {batch.target_ref !== "master" && (
-                    <div className="mt-1 text-[9px] text-muted-foreground break-all">
-                      Target: {batch.target_ref}
+                    <div
+                      className="mt-1 text-[9px] text-muted-foreground"
+                      title={batch.target_ref}
+                    >
+                      Target: {targetLabel(batch.target_ref)}
                     </div>
                   )}
                 </div>

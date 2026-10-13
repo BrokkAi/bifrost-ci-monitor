@@ -22,7 +22,7 @@ import {
 } from "@/components/common";
 import { DataTable } from "@/components/data-table";
 import { StatusBadge, StatusIcon, BatchStatus } from "@/components/status";
-import { display, duration, plural, sentenceCase } from "@/lib/utils";
+import { display, duration, plural, sentenceCase, targetLabel } from "@/lib/utils";
 import { batchCheckpoints } from "@/lib/batch-progress";
 const columns: ColumnDef<PullRef>[] = [
   {
@@ -137,8 +137,8 @@ export function BatchPage() {
             {plural(b.sources.length, "source pull request")}. Started{" "}
             <RelativeTime value={b.created_at} />.
             {b.target_ref !== "master" && (
-              <span className="block mt-1 break-all">
-                Target: {b.target_ref}
+              <span className="block mt-1" title={b.target_ref}>
+                Target: {targetLabel(b.target_ref)}
               </span>
             )}
           </>

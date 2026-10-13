@@ -499,6 +499,20 @@ export const fixtures: Endpoints = {
     health,
     pipeline: {
       primary,
+      // `?campaign=1` previews a running release-branch batch.
+      campaign:
+        typeof window !== "undefined" &&
+        new URLSearchParams(window.location.search).get("campaign") === "1"
+          ? {
+              ...speculative,
+              batch_id: "batch-c71e0a",
+              role: "primary",
+              phase: "building",
+              target_ref: "stabilize/20261013-204031-a9e122e8",
+              predecessor_id: null,
+              integration_pr: null,
+            }
+          : null,
       // `?speculative=none` previews the empty successor slot.
       speculative:
         typeof window !== "undefined" &&

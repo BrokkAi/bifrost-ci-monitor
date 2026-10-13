@@ -847,6 +847,8 @@ export interface components {
         };
         /** Pipeline */
         Pipeline: {
+            /** @description Batch in the release-branch lane, which runs alongside the master lane. */
+            campaign?: components["schemas"]["BatchSummary"] | null;
             primary?: components["schemas"]["BatchSummary"] | null;
             speculative?: components["schemas"]["BatchSummary"] | null;
         };

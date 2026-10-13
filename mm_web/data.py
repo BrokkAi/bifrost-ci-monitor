@@ -34,6 +34,16 @@ def batch_columns(conn):
     return BATCH_COLUMNS if 'target_ref' in present else BATCH_COLUMNS.replace('target_ref,', 'NULL AS target_ref,')
 
 
+def master_lane(conn):
+    """SQL condition and parameters selecting batches that land on master, not a release branch."""
+    if not db.has_table(conn, 'automerge_batches'):
+        return '1', ()
+    present = {column[1] for column in conn.execute('PRAGMA table_info(automerge_batches)')}
+    if 'target_ref' not in present:
+        return '1', ()
+    return 'COALESCE(target_ref, ?) = ?', (automerge.BASE_BRANCH, automerge.BASE_BRANCH)
+
+
 def aggregate(conn, table, expression, where='1', params=()):
     db.require(conn)
     if not db.has_table(conn, table):
@@ -243,9 +253,11 @@ def stats(conn, days=30):
     days_data = {start + timedelta(days=i): {'landed_prs': 0, 'rejected_prs': 0, 'batches_completed': 0,
         'batches_failed': 0, 'durations': []} for i in range(days)}
     finish = start + timedelta(days=days)
-    for row in db.rows(conn, 'automerge_batches', where='finished_at>=? AND finished_at<?',
+    lane, lane_params = master_lane(conn)
+    for row in db.rows(conn, 'automerge_batches', where=f'finished_at>=? AND finished_at<? AND {lane}',
         params=(datetime.combine(start, datetime.min.time(), timezone.utc).isoformat(),
-                datetime.combine(finish, datetime.min.time(), timezone.utc).isoformat()), columns=batch_columns(conn)):
+                datetime.combine(finish, datetime.min.time(), timezone.utc).isoformat(), *lane_params),
+        columns=batch_columns(conn)):
         date = parsed(row['finished_at']).date()
         if date not in days_data:
             continue
@@ -268,22 +280,26 @@ def stats(conn, days=30):
 
 def overview(conn):
     db.require(conn)
-    primary = automerge.active_batch(conn) if db.has_table(conn, 'automerge_batches') else None
+    has_batches = db.has_table(conn, 'automerge_batches')
+    primary = automerge.active_batch(conn) if has_batches else None
     child = speculation.child(conn, primary['batch_id']) if primary is not None else None
+    campaign = automerge.active_campaign_batch(conn) if has_batches else None
+    lane, lane_params = master_lane(conn)
     seven = datetime.combine(now().date() - timedelta(days=6), datetime.min.time(), timezone.utc).isoformat()
     tomorrow = datetime.combine(now().date() + timedelta(days=1), datetime.min.time(), timezone.utc).isoformat()
     today = datetime.combine(now().date(), datetime.min.time(), timezone.utc).isoformat()
     landed_expression = "coalesce(sum(json_array_length(coalesce(active_pull_requests_json,pull_requests_json))),0)"
-    landed_where = "terminal_status='merged' AND finished_at>=? AND finished_at<?"
-    landed_today = aggregate(conn, 'automerge_batches', landed_expression, landed_where, (today, tomorrow))
-    landed_seven = aggregate(conn, 'automerge_batches', landed_expression, landed_where, (seven, tomorrow))
+    landed_where = f"terminal_status='merged' AND finished_at>=? AND finished_at<? AND {lane}"
+    landed_today = aggregate(conn, 'automerge_batches', landed_expression, landed_where, (today, tomorrow, *lane_params))
+    landed_seven = aggregate(conn, 'automerge_batches', landed_expression, landed_where, (seven, tomorrow, *lane_params))
     median = None
-    if db.has_table(conn, 'automerge_batches'):
-        median = conn.execute("""WITH durations AS (
+    if has_batches:
+        median = conn.execute(f"""WITH durations AS (
             SELECT max(0,(julianday(finished_at)-julianday(created_at))*1440) AS minutes
-            FROM automerge_batches WHERE finished_at>=? AND finished_at<?), ranked AS (
+            FROM automerge_batches WHERE finished_at>=? AND finished_at<? AND {lane}), ranked AS (
             SELECT minutes,row_number() OVER (ORDER BY minutes) AS position,count(*) OVER () AS total FROM durations)
-            SELECT avg(minutes) FROM ranked WHERE position IN ((total+1)/2,(total+2)/2) LIMIT 1""", (seven, tomorrow)).fetchone()[0]
+            SELECT avg(minutes) FROM ranked WHERE position IN ((total+1)/2,(total+2)/2) LIMIT 1""",
+            (seven, tomorrow, *lane_params)).fetchone()[0]
     pending_where = 'delivered_at IS NULL AND cancelled_at IS NULL'
     pending = aggregate(conn, 'automerge_github_outbox', 'count(*)', pending_where)
     failing = aggregate(conn, 'automerge_github_outbox', 'count(*)', pending_where + " AND coalesce(last_error,'')<>''")
@@ -308,7 +324,8 @@ def overview(conn):
             draft=len(raw.get('draft', [])))
     return m.Overview(generated_at=now().isoformat(), health=health(conn),
         pipeline=m.Pipeline(primary=summary(dict(primary)) if primary is not None else None,
-                            speculative=summary(dict(child)) if child is not None else None),
+                            speculative=summary(dict(child)) if child is not None else None,
+                            campaign=summary(dict(campaign)) if campaign is not None else None),
         queue=queue_counts,
         kpis=m.Kpis(landed_today=landed_today, landed_7_days=landed_seven,
             median_batch_minutes_7_days=median, open_ci_failures=failures,
