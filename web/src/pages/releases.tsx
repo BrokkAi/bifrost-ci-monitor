@@ -97,17 +97,23 @@ const stages = [
   { key: "nightly", label: "Nightly CI", icon: FlaskConical },
   { key: "complete", label: "Complete", icon: PackageCheck },
 ];
+/** Campaigns are named by their master commit; branch and campaign IDs stay in details. */
+function campaignTitle(campaign: Pick<Campaign, "anchor_sha">) {
+  return `Release branch from ${campaign.anchor_sha ? campaign.anchor_sha.slice(0, 7) : "an unknown commit"}`;
+}
 const columns: ColumnDef<Campaign>[] = [
   {
-    accessorKey: "id",
-    header: "Campaign",
+    accessorKey: "anchor_sha",
+    header: "Release branch",
     cell: ({ row }) => (
       <div>
-        <ExternalLink href={row.original.branch_url}>
-          {row.original.id}
-        </ExternalLink>
+        <span title={row.original.branch ?? undefined}>
+          <ExternalLink href={row.original.branch_url}>
+            {campaignTitle(row.original)}
+          </ExternalLink>
+        </span>
         <p className="text-[9px] text-muted-foreground mt-1">
-          {row.original.branch}
+          Started <RelativeTime value={row.original.created_at} />
         </p>
       </div>
     ),
@@ -176,7 +182,7 @@ function LiveCampaign({
       <CardHeader>
         <div>
           <div className="metadata-label mb-2">Live campaign</div>
-          <CardTitle className="text-base">{campaign.id}</CardTitle>
+          <CardTitle className="text-base">{campaignTitle(campaign)}</CardTitle>
           <p className="section-caption">
             Round {campaign.round} <span className="mx-1">·</span> Started{" "}
             <RelativeTime value={campaign.created_at} />
@@ -297,7 +303,7 @@ function LiveCampaign({
                     Resume this stabilization campaign?
                   </AlertDialogTitle>
                   <AlertDialogDescription className="text-sm text-muted-foreground leading-relaxed">
-                    Campaign {campaign.id} will retry its current CI stage.
+                    The campaign will retry its current CI stage.
                     Check that the pause reason has been resolved before
                     resuming.
                   </AlertDialogDescription>
@@ -336,7 +342,7 @@ function LiveCampaign({
                     Abort this stabilization campaign?
                   </AlertDialogTitle>
                   <AlertDialogDescription className="text-sm text-muted-foreground leading-relaxed">
-                    This stops campaign {campaign.id} from advancing through its
+                    This stops the release branch from advancing through its
                     remaining CI stages. Confirm before ending the live release
                     campaign.
                   </AlertDialogDescription>
@@ -519,7 +525,7 @@ export function ReleasesPage() {
     : unavailable
       ? "Release machinery is not available on this host yet."
       : liveId
-        ? `Campaign ${liveId} is live. Finish or abort it before starting another.`
+        ? "A release branch campaign is live. Finish or abort it before starting another."
         : history.isError || anchor.isError
           ? "Campaign state could not be verified. Refresh before creating a release."
           : !resolution
@@ -700,7 +706,7 @@ export function ReleasesPage() {
               )}
               {create.isPending && (
                 <p role="status" className="text-xs text-muted-foreground mt-3">
-                  Waiting for the campaign lock. This can take up to about two
+                  Starting the campaign. This can take up to about four
                   minutes; keep this page open.
                 </p>
               )}
@@ -718,7 +724,7 @@ export function ReleasesPage() {
               {create.isSuccess && (
                 <div role="status" className="info-banner mt-4">
                   <Check size={14} />
-                  Campaign {create.data.id}{" "}
+                  {campaignTitle(create.data)}{" "}
                   {create.data.status === "starting"
                     ? "is starting. Its branch write is being reconciled."
                     : "has started."}
