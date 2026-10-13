@@ -759,6 +759,34 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(self.current().status, 'running')
         self.assertFalse(self.conn.execute('SELECT permission_denied FROM stabilize_dispatches').fetchone()[0])
 
+    def test_once_records_tick_heartbeats_and_busy_lock_skips(self):
+        def heartbeat():
+            return self.conn.execute("SELECT * FROM entrypoint_heartbeats "
+                                     "WHERE entry_point='stabilize'").fetchone()
+
+        def run_once():
+            with mock.patch('sys.argv', ['stabilize.py', 'once']), \
+                    mock.patch.object(monitor, 'connect_db', side_effect=lambda: sqlite3.connect(self.db)):
+                return engine.main()
+
+        with mock.patch.object(engine, 'once') as once:
+            self.assertEqual(run_once(), 0)
+        once.assert_called_once()
+        row = heartbeat()
+        self.assertEqual((row['last_outcome'], row['last_error']), ('ok', None))
+        self.assertIsNotNone(row['last_started_at'])
+
+        with mock.patch.object(engine, 'once', side_effect=RuntimeError('secret detail')):
+            with self.assertRaises(RuntimeError):
+                run_once()
+        self.assertEqual((heartbeat()['last_outcome'], heartbeat()['last_error']), ('error', 'RuntimeError'))
+
+        with engine.lock() as acquired, mock.patch.object(engine, 'once') as once:
+            self.assertTrue(acquired)
+            self.assertEqual(run_once(), 0)
+        once.assert_not_called()
+        self.assertIsNotNone(heartbeat()['last_skipped_at'])
+
 
 if __name__ == '__main__':
     unittest.main()
