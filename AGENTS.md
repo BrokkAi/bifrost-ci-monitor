@@ -1060,6 +1060,10 @@ are omitted from batch source dependencies so mm-merge does not demand them
 again. For a gate source only, a globally rejected ancestor head is acceptable
 when a later head of the same PR descends from it, was merged into that
 campaign branch, and is an ancestor of the gate tip. Unavailable reads defer.
+A gate whose tip is already in master (for example, a stage that passed with no
+campaign fixes) needs no PR: it is recorded as merged with no PR number, its
+landed issues close, and the stage advances. GitHub refuses PRs with no new
+commits, so this check runs before publication and again after PR races.
 A rejected gate PR pauses the campaign. Completion is the nightly gate landing
 in master; remaining branch PRs are reported, never retargeted. Reviewed
 supersession records apply to master-targeted sources only: a gate does not

@@ -696,6 +696,75 @@ def gate_body(conn, c, tip):
     return '\n'.join(lines)
 
 
+def gate_tip_in_master(gate):
+    """Fresh master read plus cached immutable ancestry; None means deferred."""
+    from automerge import current_master_sha
+    try:
+        master = current_master_sha()
+        if not re.fullmatch(r'[0-9a-f]{40}', str(master)):
+            raise monitor.CommandError('Current master did not return a full commit SHA')
+        return ancestor(gate['tip_sha'], master)
+    except Exception as exc:
+        monitor.log(f"stabilize gate {gate['stage']} master inclusion deferred: {type(exc).__name__}")
+        return None
+
+
+def advance_gate_stage(conn, campaign_id, stage):
+    """Opening/landing an older gate cannot advance the newer current stage."""
+    index = state.STAGES.index(stage)
+    if index + 1 < len(state.STAGES):
+        changed = conn.execute('UPDATE stabilize_campaigns SET stage=?,updated_at=? WHERE id=? AND stage=?',
+                               (state.STAGES[index + 1], monitor.utc_now(), campaign_id, stage)).rowcount
+        if changed:
+            conn.execute('UPDATE stabilize_runtime SET stage_rounds=1 WHERE campaign_id=?', (campaign_id,))
+
+
+def gate_close_payloads(conn, c, gate):
+    """The same fix/gate receipts authorize both PR and already-in-master landings."""
+    result = []
+    for issue in conn.execute("SELECT * FROM stabilize_issues WHERE campaign_id=? AND state='landed'", (c.id,)):
+        fix = conn.execute('SELECT fix_sha FROM stabilize_fix_commits WHERE campaign_id=? AND issue_number=?',
+                           (c.id, issue['issue_number'])).fetchone()
+        if fix and ancestor(fix['fix_sha'], gate['tip_sha']):
+            landing = (f"gate PR #{gate['pr_number']} landed `{gate['tip_sha']}` in master."
+                       if gate['pr_number'] is not None else
+                       f"gate tip `{gate['tip_sha']}` is already in master; no gate PR was needed.")
+            identity = gate['pr_number'] if gate['pr_number'] is not None else gate['stage']
+            key = f"close:{issue['issue_number']}:{identity}:{gate['tip_sha']}"
+            payload = {'number': issue['issue_number'], 'gate_stage': gate['stage'], 'gate_tip_sha': gate['tip_sha'],
+                       'gate_pr_number': gate['pr_number'], 'fix_sha': fix['fix_sha'],
+                       'fix_pr_number': issue['pr_number'], 'fix_head_sha': issue['pr_head_sha'],
+                       'comment': f"Fixed by campaign {c.branch}; {gate['stage']} {landing}"}
+            result.append((key, payload))
+    return result
+
+
+def land_gate(conn, c, gate, *, already_in_master=False):
+    # Complete all required immutable reads before atomically publishing the
+    # landing, closes and stage/completion handoff. An unavailable read defers.
+    closes = gate_close_payloads(conn, c, gate)
+    with conn:
+        for key, payload in closes:
+            conn.execute('INSERT OR IGNORE INTO stabilize_writes(campaign_id,checkpoint,kind,payload) '
+                         "VALUES (?,?,'close',?)", (c.id, key, json.dumps(payload)))
+        conn.execute("UPDATE stabilize_gate_merges SET state='merged',updated_at=? WHERE campaign_id=? AND stage=?",
+                     (monitor.utc_now(), c.id, gate['stage']))
+        if gate['stage'] == 'nightly':
+            conn.execute("UPDATE stabilize_campaigns SET status='completed',updated_at=?,finished_at=COALESCE(finished_at,?) WHERE id=?",
+                         (monitor.utc_now(), monitor.utc_now(), c.id))
+        else:
+            advance_gate_stage(conn, c.id, gate['stage'])
+        if already_in_master:
+            text = f"{gate['stage']} gate needs no PR: {slack_commit(gate['tip_sha'])} is already in master."
+            if gate['pr_number'] is not None:
+                text += f" Gate PR #{gate['pr_number']} is no longer needed."
+            notify(conn, c.id, f"gate-in-master:{gate['stage']}:{gate['tip_sha']}", text)
+        else:
+            notify(conn, c.id, f"gate-merged:{gate['pr_number']}", f"{gate['stage']} gate PR #{gate['pr_number']} merged.")
+    if gate['stage'] == 'nightly':
+        completion_notice(conn, c)
+
+
 def open_gate(conn, c):
     # Completed stages may wait for the previous immutable gate to land.
     if conn.execute("SELECT 1 FROM stabilize_gate_merges WHERE campaign_id=? AND state<>'merged' AND stage<>?",
@@ -712,6 +781,12 @@ def open_gate(conn, c):
         gate = conn.execute('SELECT * FROM stabilize_gate_merges WHERE campaign_id=? AND stage=?', (c.id, c.stage)).fetchone()
     notify(conn, c.id, f'gate-green:{gate["stage"]}:{gate["tip_sha"]}',
            f"{gate['stage']} gate green at {slack_commit(gate['tip_sha'])}.")
+    covered = gate_tip_in_master(gate)
+    if covered is None:
+        return False
+    if covered:
+        land_gate(conn, c, gate, already_in_master=True)
+        return True
     branch = gate['gate_branch']
     existing_ref = ref_sha(branch)
     if existing_ref and existing_ref != gate['tip_sha']:
@@ -735,6 +810,15 @@ def open_gate(conn, c):
     if existing:
         pr = existing[0]
         if pr.get('state') == 'CLOSED':
+            covered = gate_tip_in_master(gate)  # Master may have advanced during PR discovery.
+            if covered is None:
+                return False
+            if covered:
+                with conn:
+                    conn.execute('UPDATE stabilize_gate_merges SET pr_number=? WHERE campaign_id=? AND stage=?',
+                                 (pr['number'], c.id, c.stage))
+                land_gate(conn, c, dict(gate, pr_number=pr['number']), already_in_master=True)
+                return True
             pause(conn, c, f"Gate PR #{pr['number']} closed without merging")
             return False
         if pr.get('isDraft'):
@@ -755,7 +839,11 @@ def open_gate(conn, c):
             monitor.run_gh(['pr', 'create', '--repo', monitor.REPO_NAME, '--head', branch, '--base', monitor.BRANCH,
                 '--title', f'Stabilize {c.branch}: {c.stage} green at {gate["tip_sha"][:12]}',
                 '--body', body, '--label', 'mergemarshall:high'])
-        except monitor.CommandError:
+        except monitor.CommandError as exc:
+            monitor.log(f"stabilize gate {gate['stage']} publication failed: {type(exc).__name__}")
+            if gate_tip_in_master(gate) is True:
+                land_gate(conn, c, gate, already_in_master=True)
+                return True
             return False  # Next tick discovers accepted publication by persisted head.
         return False  # Always confirm the PR and exact head before advancing.
     with conn:
@@ -763,47 +851,43 @@ def open_gate(conn, c):
                      (number, monitor.utc_now(), c.id, c.stage))
     queue_write(conn, c.id, f'gate-label:{number}', 'label', {'number': number, 'label': 'mergemarshall:high'})
     notify(conn, c.id, f'gate-open:{number}', f'{c.stage} gate PR opened: https://github.com/{monitor.REPO_NAME}/pull/{number}')
-    index = state.STAGES.index(c.stage)
-    if index + 1 < len(state.STAGES):
+    if pr.get('state') == 'MERGED':
+        land_gate(conn, c, dict(gate, pr_number=number))
+    else:
         with conn:
-            conn.execute('UPDATE stabilize_campaigns SET stage=?,updated_at=? WHERE id=?',
-                         (state.STAGES[index + 1], monitor.utc_now(), c.id))
-            conn.execute('UPDATE stabilize_runtime SET stage_rounds=1 WHERE campaign_id=?', (c.id,))
+            advance_gate_stage(conn, c.id, c.stage)
     return True
 
 
 def observe_gates(conn, c):
-    for gate in conn.execute("SELECT * FROM stabilize_gate_merges WHERE campaign_id=? AND pr_number IS NOT NULL "
-                              "AND state<>'merged'", (c.id,)).fetchall():
+    # Pending no-PR rows from older versions must reconcile before stage work.
+    for gate in conn.execute("SELECT * FROM stabilize_gate_merges WHERE campaign_id=? AND state<>'merged' "
+                             "ORDER BY CASE stage WHEN 'push' THEN 0 WHEN 'hourly' THEN 1 ELSE 2 END", (c.id,)).fetchall():
+        covered = gate_tip_in_master(gate)
+        if covered is None:
+            return
+        if covered:
+            land_gate(conn, c, gate, already_in_master=True)
+            continue
+        if gate['pr_number'] is None:
+            continue
         pr = gh(['pr', 'view', str(gate['pr_number']), '--repo', monitor.REPO_NAME, '--json', 'state,labels,headRefOid'])
         labels = {l['name'].casefold() for l in pr.get('labels', [])}
         if pr.get('headRefOid') and pr['headRefOid'] != gate['tip_sha']:
             pause(conn, c, f"Gate PR #{gate['pr_number']} no longer has its immutable tested head")
             return
         if labels & {'mergemarshall:rejected', 'automerge-rejected'} or pr.get('state') == 'CLOSED':
+            covered = gate_tip_in_master(gate)
+            if covered is None:
+                return
+            if covered:
+                land_gate(conn, c, gate, already_in_master=True)
+                continue
             pause(conn, c, f"Gate PR #{gate['pr_number']} rejected or closed; inspect the merger's rejection evidence")
             return
         if pr.get('state') != 'MERGED':
             continue
-        for issue in conn.execute("SELECT * FROM stabilize_issues WHERE campaign_id=? AND state='landed'", (c.id,)):
-            fix = conn.execute('SELECT fix_sha FROM stabilize_fix_commits WHERE campaign_id=? AND issue_number=?',
-                               (c.id, issue['issue_number'])).fetchone()
-            if fix and ancestor(fix['fix_sha'], gate['tip_sha']):
-                queue_write(conn, c.id, f"close:{issue['issue_number']}:{gate['pr_number']}:{gate['tip_sha']}", 'close',
-                    {'number': issue['issue_number'], 'gate_stage': gate['stage'], 'gate_tip_sha': gate['tip_sha'],
-                     'gate_pr_number': gate['pr_number'], 'fix_sha': fix['fix_sha'],
-                     'fix_pr_number': issue['pr_number'], 'fix_head_sha': issue['pr_head_sha'],
-                     'comment': f"Fixed by campaign {c.branch}; "
-                     f"{gate['stage']} gate PR #{gate['pr_number']} landed `{gate['tip_sha']}` in master."})
-        with conn:
-            conn.execute("UPDATE stabilize_gate_merges SET state='merged',updated_at=? WHERE campaign_id=? AND stage=?",
-                         (monitor.utc_now(), c.id, gate['stage']))
-            notify(conn, c.id, f"gate-merged:{gate['pr_number']}", f"{gate['stage']} gate PR #{gate['pr_number']} merged.")
-        if gate['stage'] == 'nightly':
-            with conn:
-                conn.execute("UPDATE stabilize_campaigns SET status='completed',updated_at=?,finished_at=? WHERE id=?",
-                             (monitor.utc_now(), monitor.utc_now(), c.id))
-            completion_notice(conn, c)
+        land_gate(conn, c, gate)
 
 
 def completion_notice(conn, c):
