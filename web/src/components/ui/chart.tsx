@@ -46,6 +46,7 @@ export function ChartTooltipContent({
   active,
   payload,
   label,
+  valueFormatter,
 }: {
   active?: boolean;
   payload?: {
@@ -54,6 +55,7 @@ export function ChartTooltipContent({
     color?: string;
   }[];
   label?: ReactNode;
+  valueFormatter?: (value: string | number) => ReactNode;
 }) {
   const config = useContext(ChartContext);
   if (!active || !payload?.length) return null;
@@ -63,7 +65,9 @@ export function ChartTooltipContent({
       {payload.map((p, i) => (
         <div key={i} className="flex items-center gap-3 text-xs">
           <span className="h-0.5 w-3" style={{ backgroundColor: p.color }} />
-          <strong className="text-foreground">{p.value}</strong>
+          <strong className="text-foreground">
+            {valueFormatter && p.value != null ? valueFormatter(p.value) : p.value}
+          </strong>
           <span className="text-muted-foreground">
             {config[String(p.dataKey)]?.label ?? p.dataKey}
           </span>

@@ -5,9 +5,16 @@ export function cn(...inputs: ClassValue[]) {
 }
 export const display = (s: string | null | undefined) =>
   s ? s.replaceAll("_", " ").replaceAll("-", " ") : "—";
-export function minutes(seconds: number | null | undefined) {
-  return seconds == null ? "—" : `${Math.round(seconds / 60)} min`;
+export function duration(seconds: number | null | undefined) {
+  if (seconds == null || !Number.isFinite(seconds)) return "—";
+  const total = Math.max(0, Math.round(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return h ? `${h}h ${m}m` : `${m}m ${s}s`;
 }
+export const durationFromMinutes = (value: number | null | undefined) =>
+  value == null ? "—" : duration(value * 60);
 
 export function sentenceCase(value: string | null | undefined) {
   const words = display(value);

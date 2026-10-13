@@ -44,7 +44,7 @@ import {
   EmptyState,
   ExternalLink,
 } from "@/components/common";
-import { minutes, display, sentenceCase } from "@/lib/utils";
+import { duration, durationFromMinutes, display, sentenceCase } from "@/lib/utils";
 export function PipelineCard({
   batch,
 }: {
@@ -188,8 +188,7 @@ export function OverviewPage() {
     },
     {
       label: "Median duration",
-      value: `${d.kpis.median_batch_minutes_7_days ?? "—"}`,
-      unit: "min",
+      value: durationFromMinutes(d.kpis.median_batch_minutes_7_days),
       footnote: "Completed batches · 7 days",
       icon: Clock3,
     },
@@ -236,14 +235,7 @@ export function OverviewPage() {
               {k.label}
               <k.icon size={12} strokeWidth={1.5} />
             </div>
-            <div className="kpi-value">
-              {k.value}
-              {k.unit && (
-                <span className="ml-1.5 text-xs font-normal text-muted-foreground tracking-normal">
-                  {k.unit}
-                </span>
-              )}
-            </div>
+            <div className="kpi-value">{k.value}</div>
             <div className="kpi-footnote">{k.footnote}</div>
           </Card>
         ))}
@@ -387,7 +379,7 @@ export function OverviewPage() {
             <ChartContainer
               config={{
                 median_batch_minutes: {
-                  label: "Minutes",
+                  label: "Median",
                   color: "var(--series-1)",
                 },
               }}
@@ -419,7 +411,11 @@ export function OverviewPage() {
                 />
                 <ChartTooltip
                   cursor={{ strokeWidth: 1 }}
-                  content={<ChartTooltipContent />}
+                  content={
+                    <ChartTooltipContent
+                      valueFormatter={(v) => durationFromMinutes(Number(v))}
+                    />
+                  }
                 />
                 <Line
                   isAnimationActive={false}
@@ -441,7 +437,7 @@ export function OverviewPage() {
                       stroke="var(--card)"
                       strokeWidth={2}
                       label={{
-                        value: `${days[days.length - 1].median_batch_minutes} min`,
+                        value: durationFromMinutes(days[days.length - 1].median_batch_minutes),
                         position: "top",
                         fill: "var(--foreground)",
                         fontSize: 10,
@@ -463,7 +459,7 @@ export function OverviewPage() {
               <tr>
                 <th>Date</th>
                 <th>Landed PRs</th>
-                <th>Median minutes</th>
+                <th>Median duration</th>
               </tr>
             </thead>
             <tbody>
@@ -471,7 +467,7 @@ export function OverviewPage() {
                 <tr key={day.date}>
                   <td>{day.date}</td>
                   <td>{day.landed_prs}</td>
-                  <td>{day.median_batch_minutes ?? "—"}</td>
+                  <td>{durationFromMinutes(day.median_batch_minutes)}</td>
                 </tr>
               ))}
             </tbody>
@@ -507,7 +503,7 @@ export function OverviewPage() {
                   <div className="mt-1 text-[9px] text-muted-foreground">
                     <RelativeTime value={batch.finished_at} />{" "}
                     <span className="mx-1">·</span>{" "}
-                    {minutes(batch.duration_seconds)}
+                    {duration(batch.duration_seconds)}
                   </div>
                   {batch.target_ref !== "master" && (
                     <div className="mt-1 text-[9px] text-muted-foreground break-all">

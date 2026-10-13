@@ -22,7 +22,7 @@ import {
 } from "@/components/common";
 import { DataTable } from "@/components/data-table";
 import { StatusBadge, StatusIcon, BatchStatus } from "@/components/status";
-import { display, minutes, sentenceCase } from "@/lib/utils";
+import { display, duration, sentenceCase } from "@/lib/utils";
 import { batchCheckpoints } from "@/lib/batch-progress";
 const columns: ColumnDef<PullRef>[] = [
   {
@@ -98,7 +98,7 @@ const executions: ColumnDef<Execution>[] = [
     header: "Duration",
     cell: ({ row }) => (
       <span className="numeric text-muted-foreground">
-        {minutes(row.original.duration_seconds)}
+        {duration(row.original.duration_seconds)}
       </span>
     ),
   },
