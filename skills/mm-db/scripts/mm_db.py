@@ -109,6 +109,11 @@ def render_report(state):
                      f"stdout {run['stdout']['path']}; stderr {run['stderr']['path']}")
         if run.get("reuse_reason"):
             lines.append("Reuse: " + run["reuse_reason"])
+        for capture in run.get("attest_runs", []):
+            metrics = capture["metrics"]
+            lines.append(f"Attest {capture['suite']} at {capture['head']}: exit {capture['exit_code']}; "
+                         f"{metrics.get('executed', 0)} executed, "
+                         f"{metrics.get('potential_reuse', 0)} potential reuse; {capture['result']}")
     publication = state.get("publication")
     if publication:
         if publication["head"] != evidence["head"]:
@@ -161,6 +166,10 @@ def main():
     run.add_argument("--output", type=Path)
     run.add_argument("--script", type=Path)
     run.add_argument("command", nargs=argparse.REMAINDER)
+    attest = sub.add_parser("attest", help="run a configured Attest suite in shadow mode")
+    attest.add_argument("suite")
+    attest.add_argument("--filter", dest="filterset")
+    attest.add_argument("--config", default="attest.toml")
     finding = sub.add_parser("finding")
     finding.add_argument("--revision", required=True)
     finding.add_argument("--kind", required=True, choices=["baseline", "flaky"])
@@ -205,6 +214,11 @@ def main():
         print("Configured MergeMarshall connection.")
         return
     client = Client()
+    if operation == "attest":
+        receipt = mm_execution.run_attest(client, **args)
+        print(json.dumps(receipt, indent=2))
+        code = receipt["exit_code"]
+        return code if code >= 0 else 128 - code
     if operation == "run":
         command = args["command"]
         if command and command[0] == "--":

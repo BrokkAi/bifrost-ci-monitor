@@ -140,7 +140,9 @@ def selection(a, conn, parent):
     nodes = {n: replace(node, ready=False) if n in occupied or actual.target(n)[0] != a.BASE_BRANCH else node for n, node in actual.nodes.items()}
     graph = a.pr_dependencies.Graph(nodes, actual.histories, checkpoint["head"],
         a.compare_commit_ancestry, conn=conn, base_branch=a.BASE_BRANCH,
-        persist_comparisons=True, gates=actual.gates).discover()
+        persist_comparisons=True, gates=actual.gates,
+        supersessions=tuple(actual.supersessions.values()),
+        verify_supersession=actual.verify_supersession).discover()
     return [a.dependency_pull(graph, n) for n in graph.select() if n not in occupied]
 
 

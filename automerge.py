@@ -149,6 +149,12 @@ SKILLS_GUIDANCE = (
     "or `mm-db run --script FILE` so execution receipts retain the tested commit/tree, "
     "command, environment, timestamps, duration, exit status and output paths. "
     "mm-compare automatically records both executions when this checkout is configured. "
+    "When attest.toml is present, the execution wrapper invokes standalone `attest exec` "
+    "to record supported native test calls automatically, including calls inside scripts. "
+    "Attest interprets the actual runner arguments and inherited environment; you do not "
+    "need to select an Attest suite. Capture uses shadow mode and executes every selected "
+    "test. Unsupported calls run natively; capture failures are diagnostic, not product "
+    "failures. The helper fetches the versioned binary from the service if needed. "
     "Use `mm-db executions` to inspect recorded checks. The tests assessment automatically "
     "links completed clean-tree executions for its head and captured base in this source "
     "revision/attempt; select a subset with repeated `--execution ID` and cite older "
@@ -537,7 +543,7 @@ def github_api_write(endpoint: str, method: str, payload: dict[str, Any] | None 
     return json.loads(result) if result.strip() else None
 
 
-def _deliver_dependency_notice(conn: sqlite3.Connection, row, detail, current_head: str) -> None:
+def _deliver_dependency_notice(conn: sqlite3.Connection, row, detail, current_head: str) -> bool:
     """Reconcile the label from current discovery; comment only on its matching block."""
     number = int(row["number"])
     observed = conn.execute("SELECT head_sha,blocked_reason FROM automerge_pr_inventory WHERE number=?",
@@ -557,6 +563,28 @@ def _deliver_dependency_notice(conn: sqlite3.Connection, row, detail, current_he
             github_api_write(f"issues/{number}/comments", "POST", {
                 "body": f"{dependency_block_comment(number, reason)}\n\n{marker}",
             })
+    return blocked
+
+
+def _record_dependency_label(conn: sqlite3.Connection, number: int, present: bool) -> None:
+    """Record the reconciled PR label without changing discovery or Git facts."""
+    observed = conn.execute("SELECT data_json FROM automerge_pr_inventory WHERE number=?",
+                            (number,)).fetchone()
+    if observed is None:
+        return
+    data = json.loads(observed["data_json"])
+    if (DEPENDENCY_BLOCKED_LABEL in _labels(data)) == present:
+        return
+    labels = data.get("labels")
+    labels = labels if isinstance(labels, list) else []
+    if present:
+        labels = labels + [{"name": DEPENDENCY_BLOCKED_LABEL}]
+    else:
+        labels = [label for label in labels if not (
+            isinstance(label, dict) and label.get("name") == DEPENDENCY_BLOCKED_LABEL)]
+    data["labels"] = labels
+    conn.execute("UPDATE automerge_pr_inventory SET data_json=? WHERE number=?",
+                 (json.dumps(data), number))
 
 
 def _trusted_comment(number: int, marker: str) -> bool:
@@ -575,8 +603,8 @@ def _trusted_comment(number: int, marker: str) -> bool:
     return False
 
 
-def deliver_github_write(row: sqlite3.Row | dict[str, Any], *, conn: sqlite3.Connection | None = None) -> None:
-    """Reconcile one App-owned write; safe to repeat after a lost response."""
+def deliver_github_write(row: sqlite3.Row | dict[str, Any], *, conn: sqlite3.Connection | None = None) -> bool | None:
+    """Reconcile a write; return dependency label state for its delivery checkpoint."""
     kind, number, head = str(row["kind"]), int(row["number"]), str(row["head_sha"])
     payload = json.loads(str(row["payload_json"]))
     if kind in {"reject_head", "issue_comment"}:
@@ -617,8 +645,7 @@ def deliver_github_write(row: sqlite3.Row | dict[str, Any], *, conn: sqlite3.Con
     if kind == "dependency_notice":
         if conn is None:
             raise ValueError("dependency notices require current discovery state")
-        _deliver_dependency_notice(conn, row, detail, current_head)
-        return
+        return _deliver_dependency_notice(conn, row, detail, current_head)
     if kind == "draft_changed_head":
         if (str(detail.get("state") or "").lower() == "open"
                 and current_head != payload["selected_head"] and not detail.get("draft")):
@@ -684,7 +711,7 @@ def retry_github_outbox(conn: sqlite3.Connection, transport: monitor.SlackTransp
     ).fetchall()
     for row in rows:
         try:
-            deliver_github_write(row, conn=conn)
+            dependency_label_present = deliver_github_write(row, conn=conn)
         except (monitor.CommandError, AutomergeError, OSError, ValueError, KeyError) as exc:
             attempts = int(row["attempts"]) + 1
             delay = min(60 * 2 ** min(attempts - 1, 4), GITHUB_WRITE_RETRY_MAX_SECONDS)
@@ -715,6 +742,10 @@ def retry_github_outbox(conn: sqlite3.Connection, transport: monitor.SlackTransp
                                          (utc_now(), row["intent_id"]))
             continue
         with conn:
+            if row["kind"] == "dependency_notice":
+                # Closed PR metadata is reused across discoveries. Checkpoint
+                # the owned label with delivery so old cleanup cannot rearm.
+                _record_dependency_label(conn, int(row["number"]), dependency_label_present)
             conn.execute(
                 "UPDATE automerge_github_outbox SET delivered_at=?,last_error=NULL,next_attempt_at=NULL "
                 "WHERE intent_id=?", (utc_now(), row["intent_id"]),
@@ -823,6 +854,38 @@ def _graph_targets(conn, nodes, master):
     return targets, gates, available, exclusions
 
 
+def _verify_supersession_rejections(conn, retired, replacement, compare):
+    """Audited replacement never cancels a trusted rejected ancestor."""
+    for node in (retired, replacement):
+        # Generic dependency nodes tolerate omitted repository metadata. A
+        # supersession authority must instead authenticate explicit fresh refs.
+        head = node.data.get('head')
+        base = node.data.get('base')
+        if (not isinstance(head, dict) or not isinstance(base, dict)
+                or head.get('sha') != node.head
+                or (head.get('repo') or {}).get('full_name') != REPO_NAME
+                or (base.get('repo') or {}).get('full_name') != REPO_NAME):
+            return False
+        comments = list_pull_comments(node.number)
+        markers = {marker.head_sha for comment in comments
+                   if (marker := newest_trusted_rejection([comment])) is not None}
+        active = set()
+        released = set()
+        if pr_dependencies.has_table(conn, 'automerge_github_outbox'):
+            for row in conn.execute(
+                    "SELECT head_sha,cancelled_at FROM automerge_github_outbox "
+                    "WHERE number=? AND kind='reject_head'", (node.number,)):
+                (released if row['cancelled_at'] else active).add(row['head_sha'])
+        # An active intent dominates any older cancelled intent for that head.
+        rejected = active | (markers - (released - active))
+        if REJECTED_LABELS & _labels(node.data) and not markers:
+            return False
+        for head in sorted(rejected):
+            if pr_dependencies.cached_ancestor(conn, compare, head, node.head):
+                return False
+    return True
+
+
 def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roots=None,
                      persist_comparisons=None, priority_only=False):
     """Refresh open heads and durable prerequisites, then verify their ancestry."""
@@ -831,6 +894,8 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
             pr_dependencies.ensure_schema(conn)
     cached = pr_dependencies.inventory(conn)
     items = {int(p['number']): p for p in list_open_pull_requests() if not _is_integration_pull(p)}
+    supersessions = tuple(record for record in pr_dependencies.REVIEWED_SUPERSESSIONS
+                          if record.replacement_number in items)
     histories = {number: history for number, (_, history) in cached.items()}
 
     def remember(item):
@@ -845,7 +910,8 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
 
     for item in items.values():
         remember(item)
-    required = set()
+    required = {number for record in supersessions
+                for number in (record.retired_number, record.replacement_number)}
     if pr_dependencies.has_table(conn, 'automerge_pr_dependencies'):
         required.update(row[0] for row in conn.execute('SELECT DISTINCT prerequisite_number '
                                                        'FROM automerge_pr_dependencies') if row[0] not in cached)
@@ -909,7 +975,11 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
     compare = _read_only_ancestry if dry_run and not persist_comparisons else compare_commit_ancestry
     graph = pr_dependencies.Graph(nodes, histories, actual_base, compare,
                                   conn=conn, base_branch=BASE_BRANCH, targets=targets, gates=gates,
-                                  available_targets=available, persist_comparisons=(not dry_run if persist_comparisons is None
+                                  available_targets=available,
+                                  supersessions=supersessions,
+                                  verify_supersession=lambda record, retired, replacement:
+                                      _verify_supersession_rejections(conn, retired, replacement, compare),
+                                  persist_comparisons=(not dry_run if persist_comparisons is None
                                                        else persist_comparisons)).discover(roots)
     graph.exclusions = exclusions
     graph.select(priority=False)  # Establish block reasons for ready descendants.

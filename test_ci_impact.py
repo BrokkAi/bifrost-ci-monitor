@@ -1,5 +1,6 @@
 """Supervisor classification and documentation-only validation policy."""
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -32,72 +33,116 @@ def store_impact(conn, value):
         conn.execute('UPDATE automerge_batches SET validation_impact_json=?', (json.dumps(value),))
 
 
+class AncestryCacheFake:
+    """Small hand fake for the immutable reads used by run_ci_impact."""
+
+    def __init__(self, paths, script=CLASSIFIER, *, failure=None):
+        self.paths = paths
+        self.script = script
+        self.failure = failure
+        self.required = []
+        self.changed_path_calls = []
+        self.file_calls = []
+        self.memo_keys = []
+
+    def require(self, heads):
+        self.required.append(list(heads))
+        if self.failure == 'require':
+            raise OSError('required immutable objects unavailable')
+
+    def changed_paths(self, base, head):
+        self.changed_path_calls.append((base, head))
+        if self.failure == 'changed_paths':
+            raise OSError('changed paths unavailable')
+        return self.paths[(base, head)]
+
+    def file(self, head, path):
+        self.file_calls.append((head, path))
+        if self.failure == 'file':
+            raise OSError('classifier file unavailable')
+        return self.script
+
+    def memo(self, key, compute):
+        self.memo_keys.append(key)
+        if self.failure == 'memo':
+            raise OSError('memo read unavailable')
+        return compute()
+
+
 class ClassifierTests(TestCase):
     def test_imports_base_script_with_union_of_exact_source_diffs(self):
-        with (
-            mock.patch.object(automerge, 'gh_json', side_effect=[
-                {'files': [{'filename': 'docs/a.md'}]},
-                {'files': [{'filename': 'docs/b.md'}]},
-            ]) as compare,
-            mock.patch.object(automerge, 'run_gh', return_value=CLASSIFIER) as script,
-        ):
+        cache = AncestryCacheFake({
+            (BASE_SHA, HEAD_ONE): ['docs/a.md'],
+            (BASE_SHA, HEAD_TWO): ['docs/b.md'],
+        })
+        with mock.patch.object(automerge, '_ancestry_cache', return_value=cache):
             result = automerge.run_ci_impact(BASE_SHA, [HEAD_TWO, HEAD_ONE, HEAD_ONE])
         self.assertEqual(result['mode'], 'docs')
         self.assertEqual(result['schemaVersion'], '4')
         self.assertEqual(result['heads'], [HEAD_ONE, HEAD_TWO])
         self.assertEqual(result['changedPaths'], ['docs/a.md', 'docs/b.md'])
         self.assertEqual(result['selected'], ['fixture'])
-        self.assertEqual(compare.call_args_list, [
-            mock.call(['api', f'repos/{automerge.REPO_NAME}/compare/{BASE_SHA}...{head}'])
-            for head in [HEAD_ONE, HEAD_TWO]
+        self.assertEqual(cache.required, [[BASE_SHA, HEAD_ONE, HEAD_TWO]])
+        self.assertEqual(cache.changed_path_calls, [
+            (BASE_SHA, HEAD_ONE), (BASE_SHA, HEAD_TWO),
         ])
-        self.assertIn(f'?ref={BASE_SHA}', script.call_args.args[0][1])
-        self.assertIn('Accept: application/vnd.github.raw+json', script.call_args.args[0])
+        self.assertEqual(cache.file_calls, [(BASE_SHA, 'scripts/public/ci-impact.mjs')])
+        self.assertEqual(cache.memo_keys, [[
+            'ci-impact-v1', BASE_SHA, [HEAD_ONE, HEAD_TWO],
+            hashlib.sha256(CLASSIFIER.encode()).hexdigest(),
+        ]])
 
     def test_mixed_sources_and_code_renamed_into_docs_do_not_skip_tests(self):
         for files in (
-            [{'filename': 'docs/a.md'}, {'filename': 'src/lib.rs'}],
-            [{'filename': 'docs/new.md', 'previous_filename': 'src/lib.rs'}],
+            ['docs/a.md', 'src/lib.rs'],
+            ['docs/new.md', 'src/lib.rs'],
             [],
         ):
             with (
                 self.subTest(files=files),
-                mock.patch.object(automerge, 'gh_json', return_value={'files': files}),
-                mock.patch.object(automerge, 'run_gh', return_value=CLASSIFIER),
+                mock.patch.object(
+                    automerge,
+                    '_ancestry_cache',
+                    return_value=AncestryCacheFake({(BASE_SHA, HEAD_ONE): files}),
+                ),
             ):
                 result = automerge.run_ci_impact(BASE_SHA, [HEAD_ONE])
             self.assertEqual(result['mode'], 'impact')
 
-    def test_missing_truncated_or_unavailable_diffs_fall_back_to_judgment(self):
-        for payload in ({}, {'files': None}, {'files': [{}]},
-                        {'files': [{'filename': 'docs/a.md'}] * 300}):
+    def test_cache_read_errors_fall_back_to_judgment(self):
+        for failure in ('require', 'changed_paths', 'file', 'memo'):
             with (
-                self.subTest(payload=type(payload)),
-                mock.patch.object(automerge, 'gh_json', return_value=payload),
-                mock.patch.object(automerge, 'run_gh') as script,
+                self.subTest(failure=failure),
+                mock.patch.object(
+                    automerge,
+                    '_ancestry_cache',
+                    return_value=AncestryCacheFake(
+                        {(BASE_SHA, HEAD_ONE): ['docs/a.md']}, failure=failure
+                    ),
+                ),
                 mock.patch.object(automerge, 'log'),
             ):
                 self.assertEqual(automerge.run_ci_impact(BASE_SHA, [HEAD_ONE])['mode'], 'unknown')
-                script.assert_not_called()
-        with (
-            mock.patch.object(automerge, 'gh_json', side_effect=monitor.CommandError('unavailable')),
-            mock.patch.object(automerge, 'log'),
-        ):
-            self.assertEqual(automerge.run_ci_impact(BASE_SHA, [HEAD_ONE])['mode'], 'unknown')
 
     def test_classifier_errors_and_invalid_output_fall_back_to_judgment(self):
         for output in ('[]', '{}', '{"mode":"unexpected"}', 'invalid JSON'):
             with (
                 self.subTest(output=output),
-                mock.patch.object(automerge, 'gh_json', return_value={'files': []}),
-                mock.patch.object(automerge, 'run_gh', return_value=CLASSIFIER),
+                mock.patch.object(
+                    automerge,
+                    '_ancestry_cache',
+                    return_value=AncestryCacheFake({(BASE_SHA, HEAD_ONE): []}),
+                ),
                 mock.patch.object(monitor, 'run_command', return_value=output),
                 mock.patch.object(automerge, 'log'),
             ):
                 self.assertEqual(automerge.run_ci_impact(BASE_SHA, [HEAD_ONE])['mode'], 'unknown')
         with (
-            mock.patch.object(automerge, 'gh_json', return_value={'files': []}),
-            mock.patch.object(automerge, 'run_gh', return_value=CLASSIFIER),
+            mock.patch.object(
+                automerge,
+                '_ancestry_cache',
+                return_value=AncestryCacheFake({(BASE_SHA, HEAD_ONE): []}),
+            ),
             mock.patch.object(monitor, 'run_command', side_effect=monitor.CommandError('node timeout')),
             mock.patch.object(automerge, 'log'),
         ):

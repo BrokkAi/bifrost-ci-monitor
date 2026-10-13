@@ -46,14 +46,15 @@ class InstallerTests(unittest.TestCase):
 
     def test_service_uses_the_configured_github_cli(self):
         with mock.patch.dict(installer.os.environ, {"BIFROST_GH_BIN": "/opt/github/gh"}):
-            self.assertIn('Environment="BIFROST_GH_BIN=/opt/github/gh"',
+            self.assertIn(f'Environment="BIFROST_GH_BIN={Path("/opt/github/gh").resolve()}"',
                           installer.service_unit(ROOT, "172.31.3.117"))
-            self.assertIn('Environment="BIFROST_GH_BIN=/opt/override/gh"',
+            self.assertIn(f'Environment="BIFROST_GH_BIN={Path("/opt/override/gh").resolve()}"',
                           installer.service_unit(ROOT, "172.31.3.117", "/opt/override/gh"))
         with (mock.patch.dict(installer.os.environ, {}, clear=True),
               mock.patch.object(installer.Path, "home", return_value=Path("/home/test")),
               mock.patch.object(installer.os, "access", return_value=True)):
-            self.assertIn('Environment="BIFROST_GH_BIN=/home/test/.local/bin/gh"',
+            expected = (Path("/home/test") / ".local/bin/gh").resolve()
+            self.assertIn(f'Environment="BIFROST_GH_BIN={expected}"',
                           installer.service_unit(ROOT, "172.31.3.117"))
 
     def test_install_is_idempotent_and_preserves_existing_skills(self):
@@ -279,6 +280,86 @@ class ExecutionTests(GitFixture):
             with self.assertRaisesRegex(ValueError, "not accepting new checks"):
                 db.mm_execution.run(client, command=["true"])
 
+    def test_automatic_capture_uses_standalone_interface_and_preserves_command(self):
+        (self.repo / "attest.toml").write_text("version=1\nrepository='fixture'\n")
+        self.run_git("add", "attest.toml")
+        self.run_git("commit", "-qm", "Attest configuration")
+        client = mock.Mock(connection={"batch_id": "batch-test", "url": "http://localhost",
+                                       "token": "private-connection-token"})
+        binary = self.root / "attest"
+        binary.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys
+assert sys.argv[1] == "exec"
+assert os.environ["ATTEST_HTTP_TOKEN"] == "private-connection-token"
+args = sys.argv[2:]
+output = pathlib.Path(args[args.index("--output") + 1])
+output.mkdir()
+command = args[args.index("--") + 1:]
+code = subprocess.run(command).returncode
+head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip()
+for i in range(3):
+    folder = output / str(i)
+    folder.mkdir()
+    summary = dict(format_version=i+1, run_id=str(i)*32, head=head, tree=tree,
+        mode="shadow", suite="future-test-system", exit_code=0, published=True,
+        result=str(folder/"result.json"), object="s3://bucket/result",
+        metrics={"executed": 1, "failed": 0, "potential_reuse": 0}, warnings=["not retained"])
+    (folder/"summary.json").write_text(json.dumps(summary))
+sys.exit(code)
+''')
+        binary.chmod(0o700)
+        command = ["bash", "-c", "echo exactly-once; exit 7"]
+        with mock.patch.object(db.mm_execution, "ensure_attest", return_value=str(binary)):
+            receipt = db.mm_execution.execute(command, self.repo, self.root / "automatic",
+                                              client=client, state=self.context())
+        self.assertEqual(receipt["exit_code"], 7)
+        self.assertEqual(receipt["argv"], command)
+        self.assertEqual(Path(receipt["stdout"]["path"]).read_text(), "exactly-once\n")
+        self.assertEqual(receipt["attest_capture"], dict(recorded=3, unavailable=0, native_fallbacks=0, omitted=0))
+        self.assertEqual(len(receipt["attest_runs"]), 3)
+        self.assertNotIn("private-connection-token", json.dumps(receipt))
+        self.assertNotIn("warnings", receipt["attest_runs"][0])
+        self.assertEqual([c.kwargs["receipt"]["status"] for c in client.call.call_args_list],
+                         ["running", "completed"])
+
+    def test_capture_setup_failure_still_runs_native_check_once(self):
+        (self.repo / "attest.toml").write_text("version=1\n")
+        with mock.patch.object(db.mm_execution, "ensure_attest", side_effect=RuntimeError("unavailable")):
+            receipt = db.mm_execution.execute(["bash", "-c", "echo once; exit 8"], self.repo,
+                                              self.root / "fallback", client=self.client(), state=self.context())
+        self.assertEqual(receipt["exit_code"], 8)
+        self.assertEqual(Path(receipt["stdout"]["path"]).read_text(), "once\n")
+        self.assertEqual(receipt["attest_capture"]["unavailable"], 1)
+
+    def test_missing_observer_executable_runs_original_command_once(self):
+        (self.repo / "attest.toml").write_text("version=1\n")
+        client = mock.Mock(connection={"batch_id": "batch-test", "url": "http://localhost", "token": "private"})
+        with mock.patch.object(db.mm_execution, "ensure_attest", return_value="/missing-attest-executable"):
+            receipt = db.mm_execution.execute(["bash", "-c", "echo once; exit 9"], self.repo,
+                                              self.root / "missing", client=client, state=self.context())
+        self.assertEqual(receipt["exit_code"], 9)
+        self.assertEqual(Path(receipt["stdout"]["path"]).read_text(), "once\n")
+        self.assertEqual(receipt["attest_capture"]["unavailable"], 1)
+
+    def test_summary_collection_bounds_and_rejects_invalid_results(self):
+        root = self.root / "captures"
+        root.mkdir()
+        for i in range(18):
+            path = root / str(i)
+            path.mkdir()
+            value = dict(format_version=1, run_id=f"{i:032x}", head=self.base, tree="a"*40,
+                         mode="shadow", suite="unit", exit_code=0, published=True,
+                         result="/result", object="s3://bucket/result", metrics={"executed": 1})
+            (path / "summary.json").write_text(json.dumps(value))
+        (root / "bad").mkdir()
+        (root / "bad/summary.json").write_text("null")
+        (root / "fallback").mkdir()
+        (root / "fallback/capture-status.json").write_text("{}")
+        receipt = db.mm_execution.mm_attest_capture.collect({}, root)
+        self.assertEqual(len(receipt["attest_runs"]), 16)
+        self.assertEqual(receipt["attest_capture"], dict(recorded=18, unavailable=1, native_fallbacks=1, omitted=2))
+
 
 class StateTests(unittest.TestCase):
     def setUp(self):
@@ -321,6 +402,25 @@ class StateTests(unittest.TestCase):
         terminal = self.state()
         self.call("execution", receipt=self.execution(identifier="2" * 32))
         self.assertEqual(self.state()["revision"], terminal["revision"])
+
+    def test_multiple_attest_summaries_are_validated_snapshotted_and_immutable(self):
+        summary = dict(format_version=3, run_id="a"*32, head=HEAD_ONE, tree="c"*40,
+                       mode="shadow", suite="native-test-system", exit_code=0, published=True,
+                       result="/logs/result.json", object="s3://bucket/result", metrics={"executed": 2})
+        receipt = self.execution(attest_runs=[summary],
+                                 attest_capture=dict(recorded=1, unavailable=0, native_fallbacks=0, omitted=0))
+        self.call("execution", receipt=receipt)
+        assessment = self.assessment()
+        self.assertEqual(assessment["tests"]["executions"][0]["attest_runs"], [summary])
+        rendered = automerge.execution_evidence.render(assessment["tests"])
+        self.assertIn("2 executed", rendered)
+        self.assertIn("Attest native-test-system", db.render_report(assessment))
+        with self.assertRaisesRegex(ValueError, "immutable"):
+            self.call("execution", receipt=dict(receipt, attest_runs=[]))
+        with self.assertRaisesRegex(ValueError, "invalid automatic"):
+            self.call("execution", receipt=self.execution(identifier="b"*32, attest_runs=[dict(summary, mode="reuse")]))
+        with self.assertRaisesRegex(ValueError, "invalid automatic"):
+            self.call("execution", receipt=self.execution(identifier="c"*32, attest_runs=[dict(summary, format_version=4)]))
 
     def test_execution_start_finish_and_late_start_preserve_completed_evidence(self):
         complete = self.execution()

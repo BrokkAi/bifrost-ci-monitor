@@ -63,6 +63,9 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   triage and included in the corresponding issue fixer's dossier.
 - `execution_evidence.py`: durable local command receipts and explicit reuse
   links in assessments; evidence intake never changes scheduling or verdicts.
+- `attest_store.py` and `attest_ci.py`: standalone Attest storage proxy and
+  retryable completed-CI artifact intake. Detailed results live in S3; receipts
+  retain compact summaries. Intake never changes a merge gate.
 - `merge_failover.py`: consecutive Bedrock 503 detection and durable native Move
   to DeepSeek Flash, retaining the same session, container and execution evidence.
 - `stabilize_state.py`: the shared campaign contract (tables and read API) used
@@ -144,6 +147,16 @@ It also holds dependency promotion requests. `automerge_pr_inventory` retains
 observed branch identities and head history, `automerge_pr_dependencies` retains
 relationships for each exact dependent head, and `automerge_commit_ancestry`
 caches only successful comparisons of immutable commit pairs.
+Reviewed supersession records in `pr_dependencies.py` can replace a closed,
+unmerged preparation at one exact head with one ready, open consolidated head
+that contains it. The adapter refreshes both PRs and authenticates rejection
+markers and outbox state; unavailable reads defer instead of authorizing an
+alias. Only incorporation edges proven inside that audited expansion disappear.
+External prerequisites, ordinary cycles, rejected ancestors and normal review,
+tests and final exact-head landing gates remain authoritative. A changed
+replacement head needs a new reviewed source record. Once the retired head is
+actually in master, ordinary landed ancestry applies without supersession.
+
 Each production comparison is committed immediately, including negative results
 and pinned speculative views; exceptions and incomplete fetches are never facts.
 Discovery reuses those pairs for unchanged heads and checks new historical heads
@@ -475,7 +488,10 @@ draft, or unblocked heads lose the label. Exact-head/reason outbox markers
 deduplicate comments after lost replies. Retry these informational writes only
 after fresh dependency discovery, retaining backoff without changing batch
 revisions or creating Slack alerts. Retire pending legacy dependency Slack
-notices without sending them.
+notices without sending them. Successful dependency-notice delivery checkpoints
+the reconciled dependency label in cached PR metadata atomically with its outbox
+receipt, including labels already absent on GitHub. Preserve other metadata and
+Git facts; closed cached PRs must not rearm completed cleanup on every discovery.
 
 Ejection removes dependent descendants with exclusion kind `blocked`; only the
 standalone-broken prerequisite receives a rejection. Recheck captured dependency
@@ -691,6 +707,26 @@ command registry is implemented.
 
 Run selected local builds/tests through `mm-db run -- COMMAND...` or
 `mm-db run --script FILE`; configured `mm-compare` records both sides automatically.
+When the tested checkout has `attest.toml`, the wrapper invokes standalone
+`attest exec -- COMMAND` in shadow mode. Attest owns child-scoped runner
+interception, adapter registration, native argument parsing and per-test results;
+Merge Marshall only supplies authenticated storage and retains compact summaries
+in the command receipt. Nextest is the first adapter, not a language boundary.
+Native calls inside scripts are captured without agent suite selection. Actual
+flags/profile/environment remain authoritative. Unsupported calls or failed
+preflight run natively; report failures after execution never rerun tests or
+replace the native exit status. Multiple calls retain bounded `attest_runs` and
+capture diagnostics; legacy singular `attest` summaries remain readable. Suite
+labels do not establish equivalence: Attest compares source, test identity and
+adapter-defined build variants and declared runtime test inputs. Its single
+compatibility policy records platform and tool versions as diagnostics;
+environment-certification jobs use native runners. Format 3 adds required runtime
+inputs gathered from project-wide env_inputs declarations. Native capture preserves
+actual inherited values, including script overrides, without imposing suite defaults.
+Formats 1/2 remain readable but cannot supply passes without recorded runtime inputs.
+Consumers accept summary formats 1/2/3, request CLI 0.1.4, retain
+summaries and leave compatibility decisions to Attest.
+Automatic capture never skips tests, changes assessments or authorizes a merge.
 `automerge_executions` retains command/arguments, committed head/tree, safe build
 settings and host metadata, start/end times, duration, exit status, source changes,
 output paths, source revision and attempt generation. The helper retains output,
@@ -967,7 +1003,9 @@ again. For a gate source only, a globally rejected ancestor head is acceptable
 when a later head of the same PR descends from it, was merged into that
 campaign branch, and is an ancestor of the gate tip. Unavailable reads defer.
 A rejected gate PR pauses the campaign. Completion is the nightly gate landing
-in master; remaining branch PRs are reported, never retargeted.
+in master; remaining branch PRs are reported, never retargeted. Reviewed
+supersession records apply to master-targeted sources only: a gate does not
+qualify a reviewed replacement that was merged into its campaign branch.
 
 The fixer sorts open campaign issues first (`issue_priorities`), admits only
 owned exact-head rejection retries for `pr_ready` issues and nothing for

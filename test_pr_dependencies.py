@@ -2,6 +2,7 @@
 import copy
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import tempfile
 from unittest import TestCase, mock
@@ -28,6 +29,7 @@ class DependencyTests(TestCase):
         self.git('config', 'user.name', 'Test')
         self.base = self.commit('base', 'base')
         self.items = {}
+        self.patch(pr_dependencies, 'REVIEWED_SUPERSESSIONS', ())
         self.x = self.add_pr(30, 'x', self.base)
         self.y = self.add_pr(20, 'y', self.x, base='x')
         self.z = self.add_pr(10, 'z', self.y, base='y')
@@ -121,6 +123,39 @@ class DependencyTests(TestCase):
     def restart(self):
         self.conn.close()
         self.conn = automerge.connect_db()
+
+    def reviewed_pair(self):
+        """Build the B4785/C4788 shape with real local Git ancestry."""
+        retired = self.items.pop(30)
+        retired['number'] = 4788
+        retired['state'] = 'closed'
+        retired['draft'] = False
+        retired.pop('merged_at', None)
+        self.items[4788] = retired
+        replacement = self.add_pr(4785, 'replacement', self.x)
+        self.git('merge', '--no-ff', '-qm', 'external prerequisite', 'w')
+        replacement = self.git('rev-parse', 'HEAD')
+        self.items[4785]['head']['sha'] = replacement
+        self.git('checkout', '-q', 'y')
+        self.git('merge', '--no-ff', '-qm', 'reviewed replacement', 'replacement')
+        self.items[20]['head']['sha'] = self.git('rev-parse', 'HEAD')
+        return pr_dependencies.ReviewedSupersession(
+            pr_dependencies.CANONICAL_REPOSITORY, 4788, self.x, 4785, replacement)
+
+    def reviewed_graph(self, record, verify=True):
+        nodes = {}
+        histories = {}
+        for number, item in self.items.items():
+            head = item['head']['sha']
+            nodes[number] = pr_dependencies.Node(
+                number, head, item['base']['ref'], item['head']['ref'],
+                item['head']['repo']['full_name'], item['base']['repo']['full_name'],
+                copy.deepcopy(item), item['state'] == 'open' and not item['draft'])
+            histories[number] = [head]
+        callback = (lambda _record, _retired, _replacement: True) if verify is True else verify
+        return pr_dependencies.Graph(
+            nodes, histories, self.git('rev-parse', 'master'), self.ancestor,
+            supersessions=(record,), verify_supersession=callback).discover()
 
     def land(self, head):
         self.git('checkout', '-q', 'master')
@@ -530,6 +565,108 @@ class DependencyTests(TestCase):
         self.assertEqual(self.conn.execute('SELECT slack_notification_attempted FROM automerge_blocked_notifications '
                                           'WHERE batch_id=?', (identifier,)).fetchone()[0], 1)
 
+    def assert_closed_cleanup_does_not_starve_notices(self, *, already_absent):
+        label = automerge.DEPENDENCY_BLOCKED_LABEL
+        self.selected()  # Retain both PRs when they disappear from the listing.
+        for number in (30, 40):
+            self.items[number]['state'] = 'closed'
+            self.items[number]['labels'] = [{'name': label}, {'name': 'keep-me', 'color': '123456'}]
+        self.selected()
+        before = pr_dependencies.inventory(self.conn)
+        # Both stale cleanups precede the new blocked-head notices. The normal
+        # two-delivery limit must make progress across polls without rearming.
+        with mock.patch.object(automerge, 'utc_now', return_value='2020-01-01T00:00:00+00:00'), self.conn:
+            for number in (30, 40):
+                automerge.enqueue_github_write(self.conn, '__dependencies__', 'dependency_notice',
+                    number, self.items[number]['head']['sha'], {'reason': None})
+        if already_absent:
+            for number in (30, 40):
+                self.items[number]['labels'] = [{'name': 'keep-me', 'color': '123456'}]
+        transport = monitor.SlackTransport('webhook', webhook='unused')
+        with mock.patch.object(automerge, 'deliver_github_write', wraps=automerge.deliver_github_write) as deliver:
+            for _ in range(3):
+                self.selected()
+                automerge.report_dependency_blocks(self.conn, transport)
+        for number in (30, 40):
+            self.assertEqual(sum(call.args[0]['number'] == number for call in deliver.call_args_list), 1)
+            cached, history = pr_dependencies.inventory(self.conn)[number]
+            expected = copy.deepcopy(before[number][0])
+            expected['labels'] = [{'name': 'keep-me', 'color': '123456'}]
+            self.assertEqual(cached, expected)
+            self.assertEqual(history, before[number][1])
+        self.assertEqual(len(self.comments[20]), 1)
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM automerge_github_outbox "
+            "WHERE kind='dependency_notice' AND delivered_at IS NULL").fetchone()[0], 0)
+        for number in (10, 20):
+            self.assertIn(label, automerge._labels(pr_dependencies.inventory(self.conn)[number][0]))
+
+    def test_closed_dependency_label_cleanup_does_not_starve_new_notices(self):
+        self.assert_closed_cleanup_does_not_starve_notices(already_absent=False)
+
+    def test_already_absent_closed_dependency_labels_repair_stale_inventory(self):
+        self.assert_closed_cleanup_does_not_starve_notices(already_absent=True)
+
+    def test_lost_dependency_label_cleanup_reply_reconciles_cache_on_retry(self):
+        label = automerge.DEPENDENCY_BLOCKED_LABEL
+        self.items[30]['state'] = 'closed'
+        self.items[30]['labels'] = [{'name': label}]
+        self.items[10]['draft'] = self.items[20]['draft'] = True
+        self.selected()
+        transport = monitor.SlackTransport('webhook', webhook='unused')
+        writer = automerge.github_api_write
+        def lost_reply(endpoint, method, payload=None):
+            writer(endpoint, method, payload)
+            raise OSError('cleanup accepted; reply lost')
+        with mock.patch.object(automerge, 'github_api_write', side_effect=lost_reply):
+            automerge.report_dependency_blocks(self.conn, transport)
+        pending = self.conn.execute("SELECT * FROM automerge_github_outbox "
+            "WHERE kind='dependency_notice' AND number=30").fetchone()
+        self.assertIsNone(pending['delivered_at'])
+        self.assertEqual(pending['attempts'], 1)
+        self.assertIsNotNone(pending['next_attempt_at'])
+        self.assertIn(label, automerge._labels(pr_dependencies.inventory(self.conn)[30][0]))
+        self.selected()
+        automerge.report_dependency_blocks(self.conn, transport)
+        self.assertEqual(self.conn.execute('SELECT attempts FROM automerge_github_outbox WHERE intent_id=?',
+            (pending['intent_id'],)).fetchone()[0], 1)
+        with self.conn:
+            self.conn.execute('UPDATE automerge_github_outbox SET next_attempt_at=NULL WHERE intent_id=?',
+                (pending['intent_id'],))
+        for _ in range(3):
+            self.selected()
+            automerge.report_dependency_blocks(self.conn, transport)
+        self.assertNotIn(label, automerge._labels(pr_dependencies.inventory(self.conn)[30][0]))
+        self.assertIsNotNone(self.conn.execute('SELECT delivered_at FROM automerge_github_outbox WHERE intent_id=?',
+            (pending['intent_id'],)).fetchone()[0])
+        self.assertEqual(len(self.writes), 1)
+
+    def test_dependency_label_cache_and_delivery_receipt_commit_together(self):
+        label = automerge.DEPENDENCY_BLOCKED_LABEL
+        self.items[30]['state'] = 'closed'
+        self.items[30]['labels'] = [{'name': label}]
+        self.items[10]['draft'] = self.items[20]['draft'] = True
+        self.selected()
+        transport = monitor.SlackTransport('webhook', webhook='unused')
+        with self.conn:
+            self.conn.execute("CREATE TEMP TRIGGER fail_delivery BEFORE UPDATE OF delivered_at "
+                "ON automerge_github_outbox WHEN NEW.delivered_at IS NOT NULL "
+                "BEGIN SELECT RAISE(ABORT, 'receipt unavailable'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'receipt unavailable'):
+            automerge.report_dependency_blocks(self.conn, transport)
+        # GitHub accepted cleanup, but neither local checkpoint may advance.
+        self.assertNotIn(label, automerge._labels(self.items[30]))
+        self.assertIn(label, automerge._labels(pr_dependencies.inventory(self.conn)[30][0]))
+        self.assertIsNone(self.conn.execute("SELECT delivered_at FROM automerge_github_outbox "
+            "WHERE kind='dependency_notice' AND number=30").fetchone()[0])
+        with self.conn:
+            self.conn.execute('DROP TRIGGER fail_delivery')
+        self.selected()
+        automerge.report_dependency_blocks(self.conn, transport)
+        self.assertNotIn(label, automerge._labels(pr_dependencies.inventory(self.conn)[30][0]))
+        self.assertIsNotNone(self.conn.execute("SELECT delivered_at FROM automerge_github_outbox "
+            "WHERE kind='dependency_notice' AND number=30").fetchone()[0])
+        self.assertEqual(len(self.writes), 1)
+
     def test_ineligible_prerequisite_notice_points_action_at_the_prerequisite(self):
         message = automerge.dependency_block_comment(20, 'blocked by prerequisite PR #30')
         self.assertIn('/pull/30)', message)
@@ -717,6 +854,265 @@ class DependencyTests(TestCase):
         reasons = [p['reason'] for p in automerge.DEPENDENCY_BLOCKS]
         self.assertTrue(any('cyclic' in r for r in reasons))
         self.assertTrue(any('unresolved' in r for r in reasons))
+
+    def test_reviewed_supersession_replaces_exact_retired_head_and_keeps_external_edges(self):
+        record = self.reviewed_pair()
+        graph = self.reviewed_graph(record)
+        dependencies = {dep.number: dep.head_sha for dep in graph.dependencies[20]}
+        self.assertNotIn(4788, dependencies)
+        self.assertEqual(dependencies[4785], record.replacement_head)
+        self.assertEqual(dependencies[40], self.w)
+        self.assertNotIn(20, graph.problems)
+        self.assertNotIn(4788, {dep.number for dep in graph.dependencies[4785]})
+
+    def test_reviewed_supersession_keeps_captured_external_closure(self):
+        record = self.reviewed_pair()
+        graph = self.reviewed_graph(record)
+        graph.captured[(record.retired_number, record.retired_head)] = [
+            pr_dependencies.Dependency(40, self.w)]
+        normalized = graph._normalize_dependencies(
+            20, [pr_dependencies.Dependency(record.retired_number, record.retired_head)])
+        self.assertEqual(
+            normalized,
+            (pr_dependencies.Dependency(record.replacement_number, record.replacement_head),
+             pr_dependencies.Dependency(40, self.w)))
+
+    def test_audited_expansion_consumes_only_its_proven_owner_history(self):
+        bold = self.add_pr(4785, 'replacement', self.base)
+        chead = self.add_pr(4788, 'retired-c', bold, base='replacement')
+        self.items[4788]['state'] = 'closed'
+        self.git('checkout', '-q', 'replacement')
+        self.git('merge', '--no-ff', '-qm', 'retired C', 'retired-c')
+        self.git('merge', '--no-ff', '-qm', 'external prerequisite', 'w')
+        bcurrent = self.git('rev-parse', 'HEAD')
+        self.items[4785]['head']['sha'] = bcurrent
+        record = pr_dependencies.ReviewedSupersession(
+            pr_dependencies.CANONICAL_REPOSITORY, 4788, chead, 4785, bcurrent)
+        graph = self.reviewed_graph(record)
+        graph.histories[4785] = [bold, bcurrent]
+        graph.captured[(4788, chead)] = [pr_dependencies.Dependency(4785, bold)]
+        graph.captured[(4785, bcurrent)] = [
+            pr_dependencies.Dependency(4788, chead),
+            pr_dependencies.Dependency(40, self.w)]
+        graph.discover(roots=[4785])
+        dependencies = {dep.number: dep.head_sha for dep in graph.dependencies[4785]}
+        self.assertNotIn(4785, dependencies)
+        self.assertEqual(dependencies[40], self.w)
+        self.assertNotIn(4785, graph.problems)
+        self.assertTrue(graph.eligible(4785))
+
+    def test_unverified_reviewed_supersession_does_not_bypass_closed_prerequisite(self):
+        record = self.reviewed_pair()
+        record = pr_dependencies.ReviewedSupersession(
+            record.repository, record.retired_number, record.retired_head,
+            record.replacement_number, self.w)
+        graph = self.reviewed_graph(record)
+        self.assertIn(20, graph.problems)
+        self.assertIn('supersession', graph.problems[20])
+        self.assertFalse(graph.eligible(20))
+
+    def test_reviewed_supersession_does_not_hide_an_unrelated_true_cycle(self):
+        record = self.reviewed_pair()
+        self.add_pr(60, 'cycle-a', self.base, base='cycle-b')
+        self.add_pr(70, 'cycle-b', self.base, base='cycle-a')
+        graph = self.reviewed_graph(record)
+        self.assertIn('cyclic prerequisites', graph.problems[60])
+        self.assertIn('cyclic prerequisites', graph.problems[70])
+        self.assertFalse(graph.eligible(60))
+        self.assertFalse(graph.eligible(70))
+
+    def test_ordinary_self_dependency_is_retained_without_a_reviewed_record(self):
+        graph = self.reviewed_graph(pr_dependencies.ReviewedSupersession(
+            pr_dependencies.CANONICAL_REPOSITORY, 4788, self.x, 4785, self.y), verify=True)
+        dependency = pr_dependencies.Dependency(20, self.items[20]['head']['sha'])
+        graph = pr_dependencies.Graph(
+            graph.nodes, graph.histories, self.base, self.ancestor, supersessions=())
+        self.assertEqual(graph._normalize_dependencies(20, [dependency]), (dependency,))
+
+    def test_reviewed_record_validation_rejects_bad_heads_numbers_repositories_and_conflicts(self):
+        valid = pr_dependencies.ReviewedSupersession(
+            pr_dependencies.CANONICAL_REPOSITORY, 4788, self.x, 4785, self.y)
+        cases = (
+            pr_dependencies.ReviewedSupersession(valid.repository, 0, valid.retired_head,
+                                                  valid.replacement_number, valid.replacement_head),
+            pr_dependencies.ReviewedSupersession(valid.repository, valid.retired_number, 'x',
+                                                  valid.replacement_number, valid.replacement_head),
+            pr_dependencies.ReviewedSupersession('other/repo', valid.retired_number, valid.retired_head,
+                                                  valid.replacement_number, valid.replacement_head),
+            (valid, pr_dependencies.ReviewedSupersession(valid.repository, valid.retired_number,
+                                                         valid.retired_head, 4786, self.w)),
+            (valid, pr_dependencies.ReviewedSupersession(valid.repository, 4787, self.w,
+                                                         valid.replacement_number, self.w)),
+        )
+        for records in cases:
+            with self.subTest(records=records):
+                with self.assertRaises(ValueError):
+                    pr_dependencies.Graph({}, {}, self.base, self.ancestor, supersessions=(records if isinstance(records, tuple) else (records,)))
+
+        shared = pr_dependencies.ReviewedSupersession(
+            valid.repository, 4787, self.w, valid.replacement_number, valid.replacement_head)
+        pr_dependencies.Graph({}, {}, self.base, self.ancestor, supersessions=(valid, shared))
+
+    def test_replacement_current_head_is_required_in_the_dependent(self):
+        record = self.reviewed_pair()
+        self.add_pr(10, 'near-miss', record.retired_head, base='x')
+        graph = self.reviewed_graph(record)
+        self.assertFalse(graph.eligible(10))
+        self.assertIn(10, graph.problems)
+        self.assertIn('replacement head is absent', graph.problems[10])
+        self.assertEqual(
+            {dep.number: dep.head_sha for dep in graph.dependencies[10]}[4785],
+            record.replacement_head)
+
+    def test_wrong_repository_replacement_remains_blocked(self):
+        record = self.reviewed_pair()
+        self.items[4785]['head']['repo']['full_name'] = 'other/repo'
+        graph = self.reviewed_graph(record)
+        self.assertFalse(graph.eligible(20))
+        self.assertIn(20, graph.problems)
+        self.assertIn(4788, {dep.number for dep in graph.dependencies[20]})
+
+    def test_open_retired_pr_remains_blocked(self):
+        record = self.reviewed_pair()
+        self.items[4788]['state'] = 'open'
+        graph = self.reviewed_graph(record)
+        self.assertFalse(graph.eligible(20))
+        self.assertIn(20, graph.problems)
+        self.assertIn(4788, {dep.number for dep in graph.dependencies[20]})
+
+    def test_draft_replacement_remains_blocked(self):
+        record = self.reviewed_pair()
+        self.items[4785]['draft'] = True
+        graph = self.reviewed_graph(record)
+        self.assertFalse(graph.eligible(20))
+        self.assertIn(20, graph.problems)
+        self.assertIn(4788, {dep.number for dep in graph.dependencies[20]})
+
+    def test_retired_head_mismatch_remains_blocked(self):
+        record = self.reviewed_pair()
+        mismatched = pr_dependencies.ReviewedSupersession(
+            record.repository, record.retired_number, self.y,
+            record.replacement_number, record.replacement_head)
+        graph = self.reviewed_graph(mismatched)
+        self.assertFalse(graph.eligible(20))
+        self.assertIn(4788, {dep.number for dep in graph.dependencies[20]})
+
+    def test_active_rejection_on_retired_head_remains_blocked(self):
+        record = self.reviewed_pair()
+        self.items[4788]['_mm_rejection'] = {'active': True, 'head_sha': self.x}
+        graph = self.reviewed_graph(record)
+        self.assertFalse(graph.eligible(20))
+        self.assertIn(20, graph.problems)
+
+    def test_supersession_requires_a_true_callback_and_does_not_catch_its_failure(self):
+        record = self.reviewed_pair()
+        nodes = {}
+        histories = {}
+        for number, item in self.items.items():
+            head = item['head']['sha']
+            nodes[number] = pr_dependencies.Node(
+                number, head, item['base']['ref'], item['head']['ref'],
+                item['head']['repo']['full_name'], item['base']['repo']['full_name'],
+                copy.deepcopy(item), item['state'] == 'open' and not item['draft'])
+            histories[number] = [head]
+        graph = pr_dependencies.Graph(nodes, histories, self.base, self.ancestor,
+                                      supersessions=(record,))
+        dependency = pr_dependencies.Dependency(record.retired_number, record.retired_head)
+        self.assertEqual(graph._normalize_dependencies(20, [dependency]), (dependency,))
+        self.assertIn(20, graph.problems)
+        graph.discover()
+        self.assertFalse(graph.eligible(20))
+
+        graph = pr_dependencies.Graph(nodes, histories, self.base, self.ancestor,
+                                      supersessions=(record,),
+                                      verify_supersession=lambda *_args: False)
+        self.assertEqual(graph._normalize_dependencies(20, [dependency]), (dependency,))
+
+        def deferred(*_args):
+            raise RuntimeError('deferred')
+
+        graph = pr_dependencies.Graph(nodes, histories, self.base, self.ancestor,
+                                      supersessions=(record,), verify_supersession=deferred)
+        with self.assertRaisesRegex(RuntimeError, 'deferred'):
+            graph._normalize_dependencies(20, [dependency])
+
+    def test_landed_retired_head_does_not_require_an_open_replacement(self):
+        record = self.reviewed_pair()
+        self.land(record.replacement_head)
+        self.items[record.replacement_number]['state'] = 'closed'
+        self.items[record.replacement_number]['merged_at'] = '2026-10-11T00:00:00Z'
+        graph = self.reviewed_graph(record, verify=False)
+        self.assertNotIn(20, graph.problems)
+        self.assertTrue(graph.eligible(20))
+
+    def test_supersession_uses_dependent_campaign_tip_for_already_landed_preparation(self):
+        self.campaign(tip=self.x)
+        self.items[20]['base']['ref'] = 'stabilize/test'
+        self.items[30]['state'] = self.items[40]['state'] = 'closed'
+        record = pr_dependencies.ReviewedSupersession(
+            automerge.REPO_NAME, 30, self.x, 40, self.w)
+        with self.conn:
+            self.conn.execute('INSERT INTO automerge_pr_dependencies VALUES (20,?,30,?)', (self.y, self.x))
+        nodes = {number: automerge._dependency_node(self.items[number], conn=self.conn)
+                 for number in (20, 30, 40)}
+        graph = pr_dependencies.Graph(nodes, {n: [node.head] for n, node in nodes.items()},
+            self.base, self.ancestor, conn=self.conn, targets={20: ('stabilize/test', self.x)},
+            supersessions=(record,), verify_supersession=mock.Mock(side_effect=AssertionError('already landed'))).discover([20])
+        self.assertNotIn(20, graph.problems)
+        self.assertTrue(graph.eligible(20))
+        self.assertEqual(graph.dependencies[20], (pr_dependencies.Dependency(30, self.x),))
+
+    def test_gate_satisfied_repair_is_not_reinterpreted_as_unmerged_supersession(self):
+        row, rejected, _, landed = self.gate_repair_fixture()
+        record = pr_dependencies.ReviewedSupersession(automerge.REPO_NAME, 50, rejected, 60, landed)
+        with self.conn:
+            self.conn.execute('INSERT INTO automerge_pr_dependencies VALUES (60,?,50,?)', (landed, rejected))
+        with (mock.patch.object(pr_dependencies, 'REVIEWED_SUPERSESSIONS', (record,)),
+              mock.patch.object(automerge, '_verify_supersession_rejections', side_effect=AssertionError('already satisfied gate'))):
+            selected = self.selected()
+        self.assertEqual([p.number for p in selected], [60])
+        self.assertEqual(selected[0].dependencies, ())
+        self.assertTrue(automerge.verify_source_ancestry(row, landed, conn=self.conn)[0])
+
+    def test_reviewed_supersession_campaign_closure_stays_in_one_target_and_keeps_rejections(self):
+        record = self.reviewed_pair()
+        self.campaign(tip=self.w)
+        for number in (20, record.retired_number, record.replacement_number):
+            self.items[number]['base']['ref'] = 'stabilize/test'
+        with mock.patch.object(pr_dependencies, 'REVIEWED_SUPERSESSIONS', (record,)):
+            selected = self.selected()
+            self.assertEqual([p.number for p in selected], [record.replacement_number, 20])
+            self.assertTrue(all(p.target_ref == 'stabilize/test' for p in selected))
+            self.reject(record.retired_number)
+            self.assertNotIn(record.replacement_number, [p.number for p in self.selected()])
+            self.assertNotIn(20, [p.number for p in self.selected()])
+
+    def test_reviewed_supersession_cannot_import_unlanded_master_replacement_into_campaign(self):
+        record = self.reviewed_pair()
+        self.campaign(tip=self.w)
+        self.items[20]['base']['ref'] = 'stabilize/test'
+        with mock.patch.object(pr_dependencies, 'REVIEWED_SUPERSESSIONS', (record,)):
+            graph = automerge.dependency_graph(self.conn)
+        self.assertFalse(graph.eligible(20))
+        selected = [automerge.dependency_pull(graph, n) for n in graph.select()]
+        self.assertTrue(selected)
+        self.assertTrue(all(p.target_ref == 'master' for p in selected))
+
+    def test_lookahead_preserves_authenticated_reviewed_supersession(self):
+        record = self.reviewed_pair()
+        identifier = automerge.create_batch(self.conn, [automerge.PullRequest(40, 'w', self.w, 'url')],
+                                           self.base, ci_mode='async')
+        row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (identifier,)).fetchone()
+        checkpoint = dict(id='checkpoint', head=self.w, tree=self.git('rev-parse', self.w + '^{tree}'),
+                          source_revision=speculation.source_revision(automerge, row))
+        with self.conn:
+            self.conn.execute('UPDATE automerge_batches SET candidate_json=? WHERE batch_id=?',
+                              (json.dumps(checkpoint), identifier))
+        row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (identifier,)).fetchone()
+        with mock.patch.object(pr_dependencies, 'REVIEWED_SUPERSESSIONS', (record,)):
+            selected = speculation.selection(automerge, self.conn, row)
+        self.assertEqual([p.number for p in selected], [record.replacement_number, 20])
+        self.assertTrue(all(p.target_ref == 'master' for p in selected))
 
     def test_exclusion_cascades_without_rejecting_descendants(self):
         batch = automerge.create_batch(self.conn, self.selected(), self.base, batch_id='test-batch')

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import re
 from typing import Callable
 
 
@@ -87,6 +88,84 @@ class Dependency:
         return {'number': self.number, 'head_sha': self.head_sha}
 
 
+@dataclass(frozen=True)
+class ReviewedSupersession:
+    """Source-owned replacement for one retired PR exact head."""
+    repository: str
+    retired_number: int
+    retired_head: str
+    replacement_number: int
+    replacement_head: str
+
+
+# Records are scheduler source inputs, never ordinary PR metadata.
+CANONICAL_REPOSITORY = 'BrokkAi/bifrost-dev'
+
+# Records supply both full exact heads. PR descriptions, manifests and
+# selection state are not supersession authority.
+# The four retired preparations are contained by the consolidated exact head.
+# Fresh state, ancestry and authenticated rejection checks still apply on every
+# use; these records grant neither merge approval nor runtime qualification.
+REVIEWED_SUPERSESSIONS: tuple[ReviewedSupersession, ...] = (
+    ReviewedSupersession(CANONICAL_REPOSITORY, 4776,
+        '0b9a463fe6e3b69ebb9a4346d7b8c76753f2406b', 4785,
+        'cfd7bc3aff89a7aa3539045d9c964ecb384bf298'),
+    ReviewedSupersession(CANONICAL_REPOSITORY, 4781,
+        'c2a2e40205852981ebe104b76b857f54c1a12643', 4785,
+        'cfd7bc3aff89a7aa3539045d9c964ecb384bf298'),
+    ReviewedSupersession(CANONICAL_REPOSITORY, 4788,
+        'f776e72b9fe9cc4f6aff72768c9d66a6c6d2d59e', 4785,
+        'cfd7bc3aff89a7aa3539045d9c964ecb384bf298'),
+    ReviewedSupersession(CANONICAL_REPOSITORY, 4833,
+        '4059d967b675fe740921f587888a9852bf8f6784', 4785,
+        'cfd7bc3aff89a7aa3539045d9c964ecb384bf298'),
+)
+
+
+def _validated_supersessions(records):
+    records = tuple(records)
+    by_retired = {}
+    by_replacement = {}
+    for record in records:
+        if not isinstance(record, ReviewedSupersession):
+            raise ValueError('supersession registry contains a non-record value')
+        if record.repository != CANONICAL_REPOSITORY:
+            raise ValueError('supersession record uses a non-canonical repository')
+        if (type(record.retired_number) is not int or record.retired_number <= 0
+                or type(record.replacement_number) is not int
+                or record.replacement_number <= 0):
+            raise ValueError('supersession record PR numbers must be positive integers')
+        if record.retired_number == record.replacement_number:
+            raise ValueError('supersession record cannot replace a PR with itself')
+        if (not isinstance(record.retired_head, str)
+                or not re.fullmatch(r'[0-9a-f]{40}', record.retired_head)
+                or not isinstance(record.replacement_head, str)
+                or not re.fullmatch(r'[0-9a-f]{40}', record.replacement_head)):
+            raise ValueError('supersession record heads must be lowercase full SHAs')
+        if record.retired_number in by_retired:
+            raise ValueError('supersession registry has conflicting retired PR records')
+        prior_replacement_head = by_replacement.get(record.replacement_number)
+        if (prior_replacement_head is not None
+                and prior_replacement_head != record.replacement_head):
+            raise ValueError('supersession registry has conflicting replacement PR heads')
+        by_retired[record.retired_number] = record
+        by_replacement[record.replacement_number] = record.replacement_head
+
+    # Alias chains may be useful, but a source record cycle cannot establish a
+    # replacement. Reject it before graph discovery rather than hiding it in
+    # dependency normalization.
+    for start in by_retired:
+        path = set()
+        number = start
+        while number in by_retired:
+            if number in path:
+                raise ValueError('supersession registry contains an alias cycle')
+            path.add(number)
+            number = by_retired[number].replacement_number
+    return {(record.retired_number, record.retired_head): record
+            for record in records}
+
+
 @dataclass
 class Node:
     number: int
@@ -105,7 +184,7 @@ class Graph:
     def __init__(self, nodes: dict[int, Node], histories: dict[int, list[str]],
                  master: str, ancestor: Callable[[str, str], bool], *, conn=None,
                  base_branch='master', persist_comparisons=False, targets=None, gates=None,
-                 available_targets=None):
+                 available_targets=None, supersessions=None, verify_supersession=None):
         self.nodes = nodes
         self.histories = histories
         self.master = master
@@ -116,6 +195,7 @@ class Graph:
         self.conn = conn
         self.base_branch = base_branch
         self.persist_comparisons = persist_comparisons
+        self.verify_supersession = verify_supersession
         self._comparisons = {}
         self._known_landed = set()
         if has_table(conn, 'automerge_commit_ancestry'):
@@ -125,6 +205,10 @@ class Graph:
         self.problems: dict[int, str] = {}
         self.blocked: dict[int, str] = {}
         self.captured = {}
+        if supersessions is None:
+            supersessions = REVIEWED_SUPERSESSIONS
+        self.supersessions = _validated_supersessions(supersessions)
+        self._verified_replacement_targets = set()
         self._eligibility = {}
         if has_table(conn, 'automerge_pr_dependencies'):
             for row in conn.execute('SELECT * FROM automerge_pr_dependencies'):
@@ -134,6 +218,8 @@ class Graph:
     def ancestor(self, a, b):
         if a == b:
             return True
+        if not callable(self._ancestor):
+            raise RuntimeError('dependency discovery requires an ancestry callback')
         pair = (a, b)
         if pair not in self._comparisons:
             value = cached_ancestor(self.conn, self._ancestor, a, b,
@@ -155,6 +241,109 @@ class Graph:
                        and self.ancestor(node.head, gate['tip_sha'])
                        for node in self.nodes.values())
         return False
+
+    def _normalize_dependencies(self, owner, dependencies):
+        """Replace only verified retired heads and retain their other edges."""
+        pending = list(dependencies)
+        normalized = []
+        seen = set()
+        audited_owner_history = set()
+        while pending:
+            dependency = pending.pop(0)
+            identity = (dependency.number, dependency.head_sha)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if self.landed(dependency.head_sha, owner):
+                if dependency not in normalized:
+                    normalized.append(dependency)
+                continue
+            if identity in audited_owner_history and identity not in self.supersessions:
+                continue
+            record = self.supersessions.get(identity)
+            if record is None:
+                replacement = dependency
+                verified = False
+            else:
+                retired = self.nodes.get(record.retired_number)
+                replacement_node = self.nodes.get(record.replacement_number)
+                owner_node = self.nodes.get(owner)
+                verified = False
+                valid = (
+                    callable(self.verify_supersession)
+                    and owner_node is not None
+                    and retired is not None
+                    and replacement_node is not None
+                    and all(node.repo == CANONICAL_REPOSITORY
+                            for node in (owner_node, retired, replacement_node))
+                    and all(node.base_repo == CANONICAL_REPOSITORY
+                            for node in (owner_node, retired, replacement_node))
+                    and str(retired.data.get('state')).lower() == 'closed'
+                    and not self._merged(retired.data)
+                    and retired.head == record.retired_head
+                    and not self._active_rejection_in_history(retired)
+                    and str(replacement_node.data.get('state')).lower() == 'open'
+                    and replacement_node.ready is True
+                    and replacement_node.head == record.replacement_head
+                    and not self._active_rejection_in_history(replacement_node)
+                )
+                if valid:
+                    # The primary adapter owns fresh source loading and
+                    # rejection/outbox authentication. The callback is still
+                    # mandatory for every matching source record.
+                    verified = self.verify_supersession(record, retired, replacement_node) is True
+                    valid = verified and self.ancestor(record.retired_head, replacement_node.head)
+                if not valid:
+                    self.problems[owner] = (
+                        f'audited supersession for PR #{record.retired_number} '
+                        f'cannot verify closed unmerged retired head and ready open '
+                        f'replacement PR #{record.replacement_number}'
+                    )
+                    replacement = dependency
+                else:
+                    replacement = Dependency(record.replacement_number, record.replacement_head)
+                    self._verified_replacement_targets.add((replacement.number, replacement.head_sha))
+                    # The retired edge is the expected incorporation edge for
+                    # the replacement. Carry forward any separately captured
+                    # prerequisites instead of dropping the old closure.
+                    for captured in self.captured.get(identity, ()):
+                        if (replacement.number == owner
+                                and captured.number == owner
+                                and captured.head_sha != owner_node.head
+                                and self.ancestor(captured.head_sha, record.retired_head)):
+                            captured_identity = (captured.number, captured.head_sha)
+                            audited_owner_history.add(captured_identity)
+                            normalized[:] = [item for item in normalized
+                                              if (item.number, item.head_sha) != captured_identity]
+                    if replacement.number != owner:
+                        pending.append(replacement)
+                    pending.extend(self.captured.get(identity, ()))
+            # Only an actually verified record may erase its owner's alias.
+            # An ordinary self dependency remains a real cycle edge.
+            owner_node = self.nodes.get(owner)
+            if (verified and owner_node is not None and replacement.number == owner
+                    and owner_node.head == replacement.head_sha):
+                continue
+            if replacement not in normalized:
+                normalized.append(replacement)
+        return tuple(normalized)
+
+    @staticmethod
+    def _merged(data):
+        return bool(data.get('merged_at') or data.get('mergedAt')
+                    or data.get('merged') is True
+                    or data.get('mergeCommit') or data.get('merge_commit'))
+
+    def _active_rejection_in_history(self, node):
+        marker = node.data.get('_mm_rejection')
+        if not isinstance(marker, dict) or marker.get('active') is not True:
+            return False
+        rejected_head = marker.get('head_sha')
+        if not isinstance(rejected_head, str):
+            return False
+        history = {node.head.lower()}
+        history.update(head.lower() for head in self.histories.get(node.number, ()))
+        return rejected_head.lower() in history
 
     def discover(self, roots=None):
         """Only inspect requested sources and their closure during a batch recheck.
@@ -211,19 +400,35 @@ class Graph:
                         self.problems[number] = f'ambiguous shared head with PR #{parent}'
                     related.setdefault(parent, head)
                     break
+            captured = [Dependency(parent, captured_head)
+                        for parent, captured_head in sorted(related.items())]
+            exact_deps = self._normalize_dependencies(number, captured)
             deps = []
-            for parent, captured_head in sorted(related.items()):
+            for dependency in exact_deps:
+                parent, captured_head = dependency.number, dependency.head_sha
+                # A matching source record is either verified or retained as
+                # an exact blocked edge. Never promote either form to a mutable
+                # current head. Verified replacement targets are also exact.
+                if (parent, captured_head) in self.supersessions:
+                    deps.append(dependency)
+                    continue
+                if (parent, captured_head) in self._verified_replacement_targets:
+                    if not self.ancestor(captured_head, node.head):
+                        self.problems[number] = (
+                            f'PR #{parent} replacement head is absent from PR #{number}')
+                    deps.append(dependency)
+                    continue
                 prior = self.nodes.get(parent)
                 if prior is None:
                     self.problems[number] = f'unresolved prerequisite PR #{parent}'
-                    deps.append(Dependency(parent, captured_head))
+                    deps.append(dependency)
                     continue
                 required = captured_head if self.landed(captured_head, number) else prior.head
                 if not self.ancestor(required, node.head):
                     self.problems[number] = f'PR #{parent} changed; its current head is absent from this PR'
                 deps.append(Dependency(parent, required))
-            self.dependencies[number] = tuple(deps)
-            pending.extend(d.number for d in deps)
+            self.dependencies[number] = tuple(dict.fromkeys(deps))
+            pending.extend(d.number for d in self.dependencies[number])
         # Explicit relationships can be cyclic even before ancestry is valid.
         visited = set()
         def visit(number, path):

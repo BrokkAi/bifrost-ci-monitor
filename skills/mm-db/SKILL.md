@@ -54,6 +54,18 @@ For source edits or a changed tree, withdraw and replace it normally.
 
 Run your chosen local builds/tests through the execution wrapper:
 
+When `attest.toml` is present, `run` invokes standalone `attest exec` to capture
+supported native test calls automatically, including calls inside scripts.
+Choose your normal command and flags; no Attest suite selection is required.
+Attest owns the test-system adapters, parsing and capture. Nextest is the first
+adapter. Capture always uses shadow mode: every selected test executes.
+Receipts link each Attest result, its tested head/tree and coverage/timing summary.
+Unsupported arguments or unavailable capture run natively and retain command
+evidence. Observation failures after execution do not rerun tests or replace
+their native exit status. If needed, the helper downloads the versioned binary
+through the authenticated service; cloud credentials remain on the host.
+`attest SUITE --filter EXPR` is still available for an explicit configured suite.
+
 ```sh
 python3 <this skill>/scripts/mm_db.py run -- eatmydata cargo nextest run -E 'test(changed_behavior)'
 python3 <this skill>/scripts/mm_db.py run --script /tmp/check.sh

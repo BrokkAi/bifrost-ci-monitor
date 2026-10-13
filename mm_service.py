@@ -18,6 +18,7 @@ from urllib.parse import quote
 
 import automerge
 import execution_evidence
+import attest_store
 import local_findings
 import speculation
 
@@ -193,6 +194,9 @@ def handoff(conn, current, kind, *, publication=None, notes=""):
 
 
 def dispatch(conn, batch_id, operation, payload):
+    if operation == "attest":
+        state(conn, batch_id)
+        return attest_store.request(payload)
     if operation == "state":
         return state(conn, batch_id)
     if operation == "findings":
@@ -436,6 +440,33 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        match = re.fullmatch(r"/batch/([a-z0-9-]{1,64})/attestbinary", self.path)
+        if match:
+            batch_id = match[1]
+            expected = "Bearer " + batch_token(self.server.key, batch_id)
+            if not hmac.compare_digest(self.headers.get("Authorization", "").encode(), expected.encode()):
+                self.respond(403, {"error": "invalid batch token"})
+                return
+            conn = self.server.connect()
+            try:
+                if not conn.execute("SELECT 1 FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone():
+                    raise ValueError("unknown batch")
+                binary = Path(os.environ.get("ATTEST_BIN", str(Path.home() / ".local/bin/attest")))
+                size = binary.stat().st_size
+                if not 0 < size <= 64 * 1024 * 1024:
+                    raise ValueError("invalid Attest binary size")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(size))
+                self.end_headers()
+                with binary.open("rb") as handle:
+                    while chunk := handle.read(64 * 1024):
+                        self.wfile.write(chunk)
+            except (OSError, ValueError):
+                self.respond(503, {"error": "Attest binary unavailable"})
+            finally:
+                conn.close()
+            return
         self.respond(200 if self.path == "/health" else 404, {"service": "mm-skills", "version": 1})
 
     def do_POST(self):
@@ -451,8 +482,9 @@ class Handler(BaseHTTPRequestHandler):
         conn = None
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if not 0 < length <= 65536:
-                raise ValueError("request must be at most 64 KiB")
+            maximum = 48 * 1024 * 1024 if operation == "attest" else 65536
+            if not 0 < length <= maximum:
+                raise ValueError(f"request exceeds {maximum} bytes")
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
                 raise ValueError("request must be an object")

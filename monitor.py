@@ -3809,6 +3809,11 @@ def run_monitor() -> int:
                 return 0
             update_known_failures(conn, transport)
             issue_fixer.tick(conn, transport)
+            try:
+                import attest_ci
+                attest_ci.tick(conn)
+            except (OSError, ValueError, RuntimeError, CommandError, subprocess.TimeoutExpired) as exc:
+                log(f"Attest CI evidence import deferred: {type(exc).__name__}")
             return 0
         finally:
             GH_AUTH_FAILURE_HANDLER = previous
