@@ -109,16 +109,16 @@ CANONICAL_REPOSITORY = 'BrokkAi/bifrost-dev'
 REVIEWED_SUPERSESSIONS: tuple[ReviewedSupersession, ...] = (
     ReviewedSupersession(CANONICAL_REPOSITORY, 4776,
         '0b9a463fe6e3b69ebb9a4346d7b8c76753f2406b', 4785,
-        '417b982a556450b811f09804bb1c9499fa38ca61'),
+        'dff2d815c2fc90dd7d76f72f307759767daa93e5'),
     ReviewedSupersession(CANONICAL_REPOSITORY, 4781,
         'c2a2e40205852981ebe104b76b857f54c1a12643', 4785,
-        '417b982a556450b811f09804bb1c9499fa38ca61'),
+        'dff2d815c2fc90dd7d76f72f307759767daa93e5'),
     ReviewedSupersession(CANONICAL_REPOSITORY, 4788,
         'f776e72b9fe9cc4f6aff72768c9d66a6c6d2d59e', 4785,
-        '417b982a556450b811f09804bb1c9499fa38ca61'),
+        'dff2d815c2fc90dd7d76f72f307759767daa93e5'),
     ReviewedSupersession(CANONICAL_REPOSITORY, 4833,
         '4059d967b675fe740921f587888a9852bf8f6784', 4785,
-        '417b982a556450b811f09804bb1c9499fa38ca61'),
+        'dff2d815c2fc90dd7d76f72f307759767daa93e5'),
 )
 
 
