@@ -32,6 +32,7 @@ import supervisor
 import read_budget
 import execution_evidence
 import merge_failover
+import stabilize_state
 
 
 REPO_NAME = monitor.REPO_NAME
@@ -226,6 +227,7 @@ class PullRequest:
     immediate: bool = False
     base_ref: str = BASE_BRANCH
     dependencies: tuple[pr_dependencies.Dependency, ...] = ()
+    target_ref: str | None = field(default=None, compare=False)
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -657,19 +659,19 @@ def deliver_github_write(row: sqlite3.Row | dict[str, Any], *, conn: sqlite3.Con
         return
     if kind == "promote_dependency":
         if (current_head != head or str(detail.get('state')).lower() != 'open'
-                or detail.get('base', {}).get('ref') == BASE_BRANCH):
+                or detail.get('base', {}).get('ref') == payload.get('target_ref', BASE_BRANCH)):
             return
         if detail.get('base', {}).get('ref') != payload['base_ref']:
             return  # A later discovery owns a changed dependency relationship.
-        master = current_master_sha()
+        master = target_sha(payload.get('target_ref', BASE_BRANCH))
         for dep in payload['dependencies']:
             if (not compare_commit_ancestry(dep['head_sha'], master)
                     or not compare_commit_ancestry(dep['head_sha'], head)):
-                raise AutomergeError(f"PR #{number} promotion prerequisite #{dep['number']} is not in master/head",
+                raise AutomergeError(f"PR #{number} promotion prerequisite #{dep['number']} is not in target/head",
                                      reason='dependency_promotion_pending')
-        github_api_write(f'pulls/{number}', 'PATCH', {'base': BASE_BRANCH})
+        github_api_write(f'pulls/{number}', 'PATCH', {'base': payload.get('target_ref', BASE_BRANCH)})
         confirmed = gh_json(['api', f'repos/{REPO_NAME}/pulls/{number}'])
-        if not isinstance(confirmed, dict) or confirmed.get('base', {}).get('ref') != BASE_BRANCH:
+        if not isinstance(confirmed, dict) or confirmed.get('base', {}).get('ref') != payload.get('target_ref', BASE_BRANCH):
             raise AutomergeError(f'PR #{number} promotion not confirmed', reason='github_write_unconfirmed')
         return
     if kind == "clear_rejection_label":
@@ -817,6 +819,41 @@ def _dependency_node(item, *, conn=None, dry_run=False):
         _queue_ready(item, conn=conn, dry_run=dry_run), priority, immediate)
 
 
+def _campaign_for_branch(conn, branch):
+    return (stabilize_state.campaign_for_branch(conn, branch)
+            if pr_dependencies.has_table(conn, 'stabilize_campaigns') else None)
+
+
+def _graph_targets(conn, nodes, master):
+    targets, gates = {}, {}
+    available = {BASE_BRANCH}
+    exclusions = []
+    tips = {BASE_BRANCH: master}
+    for number, node in nodes.items():
+        campaign = _campaign_for_branch(conn, node.base)
+        if campaign:
+            if campaign.branch not in tips:
+                tips[campaign.branch] = (target_sha(campaign.branch) if campaign.live
+                                         else campaign.tip_sha or campaign.anchor_sha)
+            targets[number] = (campaign.branch, tips[campaign.branch])
+            if not campaign.live:
+                node.ready = False
+                exclusions.append({'number': number, 'reason': f'campaign {campaign.id} is {campaign.status}'})
+            elif stabilize_state.merge_gate_open(conn, campaign.id):
+                available.add(campaign.branch)
+            else:
+                exclusions.append({'number': number, 'reason': f'campaign {campaign.id} merge gate is closed'})
+        else:
+            # Other bases retain the normal stacked-PR resolution to master.
+            targets[number] = (BASE_BRANCH, master)
+        if pr_dependencies.has_table(conn, 'stabilize_gate_merges'):
+            gate = stabilize_state.gate_for_branch(conn, node.branch)
+            if gate:
+                row, campaign = gate
+                gates[number] = dict(row, campaign_branch=campaign.branch)
+    return targets, gates, available, exclusions
+
+
 def _verify_supersession_rejections(conn, retired, replacement, compare):
     """Audited replacement never cancels a trusted rejected ancestor."""
     for node in (retired, replacement):
@@ -905,7 +942,8 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
     while unresolved:
         node = unresolved.pop()
         key = (node.base_repo.casefold(), node.base)
-        if node.base == BASE_BRANCH or key in searched or str(node.data.get('state')).lower() != 'open':
+        if (node.base == BASE_BRANCH or _campaign_for_branch(conn, node.base)
+                or key in searched or str(node.data.get('state')).lower() != 'open'):
             continue
         searched.add(key)
         if any((p.repo.casefold(), p.branch) == key for p in nodes.values()):
@@ -928,19 +966,22 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
     if conn is not None and not dry_run:
         pr_dependencies.save_observations(conn, nodes, histories)
     actual_base = master or current_master_sha()
+    targets, gates, available, exclusions = _graph_targets(conn, nodes, actual_base)
     if SUPERVISOR_RUNNING:
         # Fetch live tips together. Their full commit history usually contains
         # almost every historical head, without downloading repository blobs.
-        _ancestry_cache().prepare([actual_base] + [n.head for n in nodes.values()
+        _ancestry_cache().prepare(list(dict.fromkeys([actual_base] + [tip for _, tip in targets.values()])) + [n.head for n in nodes.values()
                                                    if str(n.data.get('state')).lower() == 'open'])
     compare = _read_only_ancestry if dry_run and not persist_comparisons else compare_commit_ancestry
     graph = pr_dependencies.Graph(nodes, histories, actual_base, compare,
-                                  conn=conn, base_branch=BASE_BRANCH,
+                                  conn=conn, base_branch=BASE_BRANCH, targets=targets, gates=gates,
+                                  available_targets=available,
                                   supersessions=supersessions,
                                   verify_supersession=lambda record, retired, replacement:
                                       _verify_supersession_rejections(conn, retired, replacement, compare),
                                   persist_comparisons=(not dry_run if persist_comparisons is None
                                                        else persist_comparisons)).discover(roots)
+    graph.exclusions = exclusions
     graph.select(priority=False)  # Establish block reasons for ready descendants.
     if conn is not None and not dry_run:
         with conn:
@@ -956,19 +997,23 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
                         rejected['head_sha'], {'reason': 'MergeMarshall recorded a trusted rejection.',
                                                'evidence': REJECTION_MARKER.sub('', rejected['evidence']).strip()})
                 deps = graph.dependencies[number]
-                if (promote and node.base != BASE_BRANCH and str(node.data.get('state')).lower() == 'open'
+                if (promote and node.base != graph.target(number)[0] and str(node.data.get('state')).lower() == 'open'
                         and deps and number not in graph.problems
-                        and all(graph.landed(dep.head_sha) for dep in deps)):
+                        and all(graph.landed(dep.head_sha, number) for dep in deps)):
                     enqueue_github_write(conn, '__dependencies__', 'promote_dependency', number, node.head,
-                                         {'base_ref': node.base, 'dependencies': [dep.as_json() for dep in deps]})
+                                         {'base_ref': node.base, 'target_ref': graph.target(number)[0], 'dependencies': [dep.as_json() for dep in deps]})
     return graph
 
 
 def dependency_pull(graph, number):
     node = graph.nodes[number]
+    deps = graph.dependencies[number]
+    if number in graph.gates:
+        deps = tuple(dep for dep in deps if not graph.landed(dep.head_sha, number)
+                     or graph.ancestor(dep.head_sha, graph.target(number)[1]))
     return PullRequest(number, str(node.data.get('title') or f'PR #{number}'), node.head,
                        str(node.data.get('html_url') or node.data.get('url') or f'https://github.com/{REPO_NAME}/pull/{number}'),
-                       node.priority, node.immediate, node.base, graph.dependencies[number])
+                       node.priority, node.immediate, node.base, deps, graph.target(number)[0])
 
 
 def dependency_order(pulls):
@@ -998,16 +1043,19 @@ def check_source_dependencies(pulls, conn=None, *, master=None):
 
 
 DEPENDENCY_BLOCKS = []
+CAMPAIGN_EXCLUSIONS = []
 
 
 def select_eligible_pull_requests(*, dry_run: bool = False,
                                   conn: sqlite3.Connection | None = None,
-                                  priority_only: bool = False) -> list[PullRequest]:
-    global DEPENDENCY_BLOCKS
+                                  priority_only: bool = False,
+                                  target_ref: str | None = None) -> list[PullRequest]:
+    global DEPENDENCY_BLOCKS, CAMPAIGN_EXCLUSIONS
     graph = dependency_graph(conn, dry_run=dry_run, priority_only=priority_only)
+    CAMPAIGN_EXCLUSIONS = graph.exclusions
     DEPENDENCY_BLOCKS = [{'number': n, 'head_sha': graph.nodes[n].head, 'reason': reason}
                          for n, reason in sorted(graph.blocked.items()) if graph.nodes[n].ready]
-    pulls = [dependency_pull(graph, number) for number in graph.select()]
+    pulls = [dependency_pull(graph, number) for number in graph.select(target_ref=target_ref, priority_only=priority_only)]
     return pulls if not priority_only or any(p.priority for p in pulls) else []
 
 
@@ -1187,6 +1235,8 @@ def connect_db() -> sqlite3.Connection:
         """
     )
     ensure_github_outbox_schema(conn)
+    stabilize_state.ensure_schema(conn)
+    ensure_column(conn, "automerge_batches", "target_ref", "TEXT")
     execution_evidence.ensure_schema(conn)
     pr_dependencies.ensure_schema(conn)
     supervisor.ensure_schema(conn)
@@ -1293,6 +1343,31 @@ def _new_batch_id() -> str:
     return uuid.uuid4().hex
 
 
+def batch_target(row):
+    """NULL and legacy rows retain the default landing branch."""
+    return speculation.get(row, 'target_ref') or BASE_BRANCH
+
+
+def target_sha(target_ref):
+    return current_master_sha() if target_ref == BASE_BRANCH else remote_branch_sha(target_ref)
+
+
+def pulls_target(conn, pulls):
+    targets = set()
+    for pull in pulls:
+        campaign = (stabilize_state.campaign_for_branch(conn, pull.base_ref)
+                    if pr_dependencies.has_table(conn, 'stabilize_campaigns') else None)
+        targets.add(pull.target_ref or (campaign.branch if campaign else BASE_BRANCH))
+    if len(targets) != 1:
+        raise ValueError('a merge batch must have exactly one landing target')
+    return targets.pop()
+
+
+def target_behind(head, target_ref):
+    return (compare_pr_behind_by(head) if target_ref == BASE_BRANCH else
+            _ancestry_cache().behind(head.lower(), target_sha(target_ref)))
+
+
 def create_batch(
     conn: sqlite3.Connection,
     pulls: list[PullRequest],
@@ -1306,10 +1381,13 @@ def create_batch(
     predecessor_candidate: dict[str, Any] | None = None,
 ) -> str:
     speculation.ensure_schema(conn, ensure_column)
+    ensure_column(conn, "automerge_batches", "target_ref", "TEXT")
     if not pulls:
         raise ValueError("cannot create an empty automerge batch")
     identifier = batch_id or _new_batch_id()
-    selected_mode = _validate_ci_mode(CI_MODE if ci_mode is None else ci_mode)
+    target = pulls_target(conn, pulls)
+    selected_mode = ('async' if target != BASE_BRANCH else
+                     _validate_ci_mode(CI_MODE if ci_mode is None else ci_mode))
     if kind not in {"batch", "direct"}:
         raise ValueError(f"unsupported automerge record kind: {kind}")
     if kind == "direct" and len(pulls) != 1:
@@ -1330,8 +1408,8 @@ def create_batch(
                 (batch_id, kind, agent_configuration, source, priority, status, base_sha,
                  pull_requests_json, title, branch, created_at,
                  active_pull_requests_json, phase, ci_mode, integration_pr_number,
-                 integration_pr_url, ci_head_sha, predecessor_id, predecessor_candidate_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 integration_pr_url, ci_head_sha, predecessor_id, predecessor_candidate_json, target_ref)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 identifier,
@@ -1353,6 +1431,7 @@ def create_batch(
                 direct_head,
                 predecessor_id,
                 json.dumps(predecessor_candidate or {}),
+                target if target != BASE_BRANCH else None,
             ),
         )
         enqueue_membership_labels(conn, identifier)
@@ -1368,11 +1447,12 @@ def create_selected_batch(
     batch_id: str | None = None,
     source: str | None = None,
 ) -> str:
-    """Use direct landing only for one PR whose head already contains master."""
+    """Use direct landing for one PR whose head already contains its target."""
     kind = "batch"
-    if len(pulls) == 1 and pulls[0].base_ref == BASE_BRANCH:
+    target = pulls_target(conn, pulls)
+    if len(pulls) == 1 and pulls[0].base_ref == target:
         try:
-            if compare_pr_behind_by(pulls[0].head_sha) == 0:
+            if target_behind(pulls[0].head_sha, target) == 0:
                 kind = "direct"
         except (AutomergeError, monitor.CommandError) as exc:
             log(f"could not verify whether PR #{pulls[0].number} is up to date; using batch path: {exc}")
@@ -1391,6 +1471,8 @@ def _validate_ci_mode(mode: Any) -> str:
 
 
 def _batch_ci_mode(row: sqlite3.Row | dict[str, Any]) -> str:
+    if batch_target(row) != BASE_BRANCH:
+        return "async"
     try:
         value = row["ci_mode"]
     except (KeyError, IndexError):
@@ -1628,6 +1710,7 @@ def row_pulls(row: sqlite3.Row | dict[str, Any]) -> list[PullRequest]:
                 priority=bool(item.get("priority", False)),
                 immediate=bool(item.get("immediate", False)),
                 base_ref=str(item.get('base_ref') or BASE_BRANCH),
+                target_ref=batch_target(row),
                 dependencies=tuple(pr_dependencies.Dependency(int(dep['number']), str(dep['head_sha']))
                                    for dep in item.get('dependencies', [])),
             )
@@ -1651,13 +1734,14 @@ def build_prompt(
     known_failures_context: str = "",
     validation_impact: dict[str, Any] | None = None,
     subagents: bool = True,
+    target_ref: str = BASE_BRANCH,
 ) -> str:
-    if _validate_ci_mode(ci_mode) == "async":
+    if target_ref != BASE_BRANCH or _validate_ci_mode(ci_mode) == "async":
         return build_async_prompt(
             batch_id, pulls, base_sha,
             known_failures_context=known_failures_context,
             validation_impact=validation_impact,
-            subagents=subagents,
+            subagents=subagents, target_ref=target_ref,
         )
     pr_list = "\n".join(
         f"{index}. PR #{pull.number}: {pull.title}\n"
@@ -1730,6 +1814,7 @@ def _known_failures_prompt(conn: sqlite3.Connection) -> str:
 
 def build_async_prompt(
     batch_id: str, pulls: list[PullRequest], base_sha: str, *,
+    target_ref: str = BASE_BRANCH,
     known_failures_context: str = "",
     validation_impact: dict[str, Any] | None = None,
     subagents: bool = True,
@@ -1743,9 +1828,18 @@ def build_async_prompt(
     branch = f"mergemarshall/batch-{batch_id}"
     integration_title = "Merge batch: " + " ".join(f"#{pull.number}" for pull in pulls)
     ledger_context = _format_known_failure_prompt(known_failures_context)
-    return f"""You are preparing one integration pull request for {REPO_NAME}. This batch is {batch_id}; your integration branch is {branch}, based at the exact master commit {base_sha}. Do not create or switch branches. Do not push master or any branch other than {branch}.
+    prompt_base = 'master'
+    recovery_guidance = SESSION_RECOVERY_GUIDANCE
+    if target_ref != BASE_BRANCH:
+        prompt_base = target_ref
+        recovery_guidance = (
+            SESSION_RECOVERY_GUIDANCE.replace('master', target_ref)
+            + f"\n\nLanding target: `{target_ref}`. Publish the integration PR against this branch.\n"
+            + 'Never merge master into a stabilize batch; only incorporate the captured campaign base and requested campaign updates.'
+        )
+    return f"""You are preparing one integration pull request for {REPO_NAME}. This batch is {batch_id}; your integration branch is {branch}, based at the exact {prompt_base} commit {base_sha}. Do not create or switch branches. Do not push master or any branch other than {branch}.
 
-{SESSION_RECOVERY_GUIDANCE}
+{recovery_guidance}
 
 {ledger_context}
 
@@ -1767,7 +1861,7 @@ Use the same safe removal and rejection rules as sync mode. Diagnose the availab
 
 Your final message must contain exactly one standalone verdict line `mergemarshall:local: pass` or `mergemarshall:local: fail`, a one-line `Tests run: ...` listing every targeted test/command run (or `none` for a docs batch), and a one-line `Baseline failures: ...` listing reproduced failures or `none`. Name the validated full HEAD SHA. Include a short explanation for any failure and one `known-failure: <workflow> | <job> | <test or step> | <one-line diagnosis>` line per ledger failure you diagnose; do not invent identities. Record the exact-head pass and both evidence summaries with mm-db tests before mm-autopr. Its accepted DB handoff authorizes supervisor processing; the final message is informational. The supervisor does not interpret CI state in async mode.
 
-Keep the captured base for this turn. After you finish, the supervisor checks master freshness and source PR heads. If either changed, it sends this live session the exact update or rebuild needed. Do not suspend the session yourself.
+Keep the captured base for this turn. After you finish, the supervisor checks {prompt_base} freshness and source PR heads. If either changed, it sends this live session the exact update or rebuild needed. Do not suspend the session yourself.
 """
 
 
@@ -1846,6 +1940,15 @@ def lookup_batch_session(row: sqlite3.Row | dict[str, Any]) -> str | None:
     return session_id
 
 
+def batch_speculation_guidance(row):
+    if batch_target(row) == BASE_BRANCH:
+        return speculation.GUIDANCE
+    return ("Candidate checkpoints: mm-db candidate records and pushes only the batch branch. "
+            "Withdraw a checkpoint before changing it and register the replacement when ready. "
+            "This stabilize batch has no speculative successor. After local pass, record the "
+            "assessment and publish against the campaign target through mm-autopr.")
+
+
 def launch_batch_session(
     row: sqlite3.Row | dict[str, Any],
     pulls: list[PullRequest],
@@ -1876,12 +1979,12 @@ def launch_batch_session(
     impact = _validation_impact(row, heads=[p.head_sha for p in pulls])
     prompt = build_prompt(
         str(row["batch_id"]), pulls, str(row["base_sha"]),
-        ci_mode=_batch_ci_mode(row),
+        ci_mode=_batch_ci_mode(row), target_ref=batch_target(row),
         known_failures_context=_known_failures_prompt(conn) if conn is not None else "",
         validation_impact=impact,
         subagents=_batch_subagents(row),
     )
-    prompt += "\n\n" + speculation.GUIDANCE + skills_connection_prompt(row)
+    prompt += "\n\n" + batch_speculation_guidance(row) + skills_connection_prompt(row)
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", prefix="bifrost-automerge-",
         suffix=".prompt", delete=False,
@@ -2016,6 +2119,8 @@ def send_start_notification(
     predecessor = speculation.get(row, "predecessor_id") if speculation.is_speculative(row) else None
     heading = ("speculative batch:" if predecessor else
                "promoted batch:" if speculation.get(row, "role_promoted", 0) else "new batch:")
+    if batch_target(row) != BASE_BRANCH:
+        heading = "stabilize batch:"
     qualifiers = [lane] if lane else []
     if _batch_kind(row) == "direct":
         qualifiers.append("direct merge")
@@ -2043,6 +2148,8 @@ def send_start_notification(
         for pull in pulls
     )
     details = batch_slack_details(row)
+    if batch_target(row) != BASE_BRANCH:
+        details = f"Campaign branch: `{batch_target(row)}`\n" + details
     if only_pull is None:
         details += f"\n\nPRs in this {'speculative ' if predecessor else ''}batch:\n{items}"
     ok, _ = monitor.slack_send(
@@ -3497,6 +3604,9 @@ def queue_agent_prompt(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, An
                        prompt: str, *, validation_impact: dict[str, Any] | None = None,
                        observed_turn: monitor.TurnResult | None = None,
                        checkpoint=None, preserve_ready: bool = False) -> bool:
+    if batch_target(row) != BASE_BRANCH:
+        prompt = (f"Landing target: `{batch_target(row)}`; captured base: {row['base_sha']}. "
+                  "Never merge master into this stabilize batch. Publish only against the campaign branch.\n\n" + prompt)
     with conn:
         if observed_turn is not None or preserve_ready:
             conn.execute("BEGIN IMMEDIATE")
@@ -3542,7 +3652,7 @@ def deliver_pending_prompt(conn: sqlite3.Connection, transport: monitor.SlackTra
              f"attempt {row['attempt_generation']}, source revision {speculation.source_revision(sys.modules[__name__], row)}. "
              "Before acting, read mm-db state: apply this instruction only if its prompt_command_id, "
              "attempt_generation and source_revision match. Discard stale messages and keep newer work.\n\n")
-    guidance = "\n\n" + SKILLS_GUIDANCE + speculation.GUIDANCE + skills_connection_prompt(row)
+    guidance = "\n\n" + SKILLS_GUIDANCE + batch_speculation_guidance(row) + skills_connection_prompt(row)
     message = scope + str(prompt) + guidance
     if len(message.encode()) > 64 * 1024:
         # CI evidence can exceed mj's message limit. Keep it intact in the DB
@@ -4049,6 +4159,61 @@ def _read_only_ancestry(a, b):
         return compare_commit_ancestry(a, b)
 
 
+def _source_gate(conn, pull):
+    """Resolve a pinned source's observed branch to an immutable gate."""
+    if not pr_dependencies.has_table(conn, 'stabilize_gate_merges'):
+        return None
+    observed = (conn.execute('SELECT data_json FROM automerge_pr_inventory WHERE number=?',
+                             (pull.number,)).fetchone()
+                if pr_dependencies.has_table(conn, 'automerge_pr_inventory') else None)
+    detail = json.loads(observed[0]) if observed else {}
+    head = detail.get('head') or {}
+    if str(head.get('sha') or detail.get('headRefOid') or '').lower() != pull.head_sha.lower():
+        # Operator/read-only selection may not have saved an inventory row.
+        # Only known gate candidates need this extra GitHub metadata read.
+        if not conn.execute('SELECT 1 FROM stabilize_gate_merges WHERE pr_number=?',
+                            (pull.number,)).fetchone():
+            return None
+        detail = gh_json(['api', f'repos/{REPO_NAME}/pulls/{pull.number}'])
+        if not isinstance(detail, dict):
+            raise AutomergeError('invalid gate source metadata', reason='github_invalid_response')
+        head = detail.get('head') or {}
+        if str(head.get('sha') or '').lower() != pull.head_sha.lower():
+            return None
+    branch = head.get('ref') or detail.get('headRefName')
+    gate = stabilize_state.gate_for_branch(conn, branch) if branch else None
+    if gate and not compare_commit_ancestry(gate[0]['tip_sha'], pull.head_sha):
+        return None  # A changed gate source cannot omit its immutable snapshot.
+    return gate
+
+
+def _gate_repair_satisfies_rejection(gate, number, rejected_head, details):
+    """Prove this same PR's later merged head repairs a gate's rejected ancestor."""
+    if gate is None:
+        return False
+    rejected_head = rejected_head.lower()
+    snapshot, campaign = gate
+    if number not in details:
+        details[number] = gh_json(['api', f'repos/{REPO_NAME}/pulls/{number}'])
+    detail = details[number]
+    if not isinstance(detail, dict):
+        raise AutomergeError('invalid campaign repair metadata', reason='github_invalid_response')
+    if (str(detail.get('state') or '').lower() != 'closed'
+            or not (detail.get('merged') or detail.get('merged_at'))
+            or detail.get('merged') is False
+            or (detail.get('base') or {}).get('ref') != campaign.branch):
+        return False
+    repaired_head = str((detail.get('head') or {}).get('sha') or '').lower()
+    merge_sha = str(detail.get('merge_commit_sha') or '').lower()
+    if not all(re.fullmatch(r'[0-9a-f]{40}', sha) for sha in (repaired_head, merge_sha)):
+        raise AutomergeError('merged campaign repair has incomplete commit metadata',
+                             reason='github_invalid_response')
+    return (repaired_head != rejected_head
+            and compare_commit_ancestry(rejected_head, repaired_head)
+            and compare_commit_ancestry(repaired_head, merge_sha)
+            and compare_commit_ancestry(repaired_head, snapshot['tip_sha']))
+
+
 def verify_source_ancestry(
     row: sqlite3.Row | dict[str, Any], integration_head: str,
     *, base_sha: str | None = None, conn=None,
@@ -4070,6 +4235,9 @@ def verify_source_ancestry(
                 continue
             return False, f"excluded PR #{entry['number']} head is still an ancestor of the integration head"
     if pr_dependencies.has_table(conn, 'automerge_github_outbox'):
+        source_gates, repair_details = {}, {}
+        have_gate_snapshots = (pr_dependencies.has_table(conn, 'stabilize_gate_merges')
+                               and conn.execute('SELECT 1 FROM stabilize_gate_merges LIMIT 1').fetchone())
         for entry in conn.execute("SELECT DISTINCT number,head_sha FROM automerge_github_outbox "
                                   "WHERE kind='reject_head' AND cancelled_at IS NULL"):
             head = entry['head_sha']
@@ -4077,6 +4245,18 @@ def verify_source_ancestry(
                 continue
             repaired = next((p for p in included if p.number == entry['number']), None)
             if repaired is None or repaired.head_sha == head or not compare_commit_ancestry(head, repaired.head_sha):
+                importing = ([pull for pull in included if compare_commit_ancestry(head, pull.head_sha)]
+                             if have_gate_snapshots else [])
+                permitted = bool(importing)
+                for pull in importing:
+                    if pull.number not in source_gates:
+                        source_gates[pull.number] = _source_gate(conn, pull)
+                    if not _gate_repair_satisfies_rejection(source_gates[pull.number], entry['number'],
+                                                          head, repair_details):
+                        permitted = False
+                        break
+                if permitted:
+                    continue
                 return False, f"rejected prerequisite PR #{entry['number']} is imported without its eligible repaired head"
     return True, "all included and excluded source heads match the integration tree"
 
@@ -4322,7 +4502,7 @@ def _poll_ci(conn: sqlite3.Connection, transport: monitor.SlackTransport,
     if not receipt:
         _queue_missing_handoff(conn, row, "the CI-wait phase has a missing or stale receipt")
         return
-    master = current_master_sha()
+    master = target_sha(batch_target(row))
     if str(row["base_sha"]).lower() != master or base_ref != master:
         _queue_master_update(conn, transport, row, master, head)
         return
@@ -4428,6 +4608,8 @@ def _recheck_sources(pulls: list[PullRequest], *, conn: sqlite3.Connection | Non
                      batch_id: str | None = None) -> tuple[list[PullRequest], list[str]]:
     keep: list[PullRequest] = []
     removed: list[str] = []
+    owner = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch_id,)).fetchone() if conn is not None and batch_id else None
+    target = batch_target(owner) if owner is not None else BASE_BRANCH
     for pull in pulls:
         state = _source_pr_state(pull)
         _draft_changed_source(pull, state, conn=conn, batch_id=batch_id)
@@ -4436,7 +4618,7 @@ def _recheck_sources(pulls: list[PullRequest], *, conn: sqlite3.Connection | Non
             reason = "closed"
         elif bool(state.get("isDraft")):
             reason = "draft"
-        elif state.get('baseRefName') not in {BASE_BRANCH, pull.base_ref}:
+        elif state.get('baseRefName') not in {target, pull.base_ref}:
             reason = f"base changed to {state.get('baseRefName')}"
         elif str(state.get("headRefOid", "")).lower() != pull.head_sha.lower():
             reason = "head changed"
@@ -4568,9 +4750,11 @@ def _request_rebuild(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]
     seen = {pull.number for pull in original}
     additions = []
     if int(row["expansion_count"]) < MAX_BATCH_EXPANSIONS:
-        selected = select_eligible_pull_requests(conn=conn)
-        lane_matches = bool(any(p.priority for p in selected)) == _batch_priority(row)
-        if lane_matches and _batch_priority(row):
+        selected = select_eligible_pull_requests(conn=conn, target_ref=batch_target(row)) if batch_target(row) != BASE_BRANCH else select_eligible_pull_requests(conn=conn)
+        selected = [p for p in selected if pulls_target(conn, [p]) == batch_target(row)]
+        campaign_lane = batch_target(row) != BASE_BRANCH
+        lane_matches = campaign_lane or bool(any(p.priority for p in selected)) == _batch_priority(row)
+        if lane_matches and _batch_priority(row) and not campaign_lane:
             by_number = {p.number: p for p in selected}
             closure = {p.number for p in selected if p.priority}
             pending = list(closure)
@@ -4672,10 +4856,10 @@ def _queue_master_update(
     impact = _validation_impact(row, base_sha=master_sha)
     _try_post_verdict_status(
         conn, transport, row, tested_head, "pending",
-        "master advanced; integration branch must be updated and re-tested",
+        f"{batch_target(row)} advanced; integration branch must be updated and re-tested",
     )
     if _batch_ci_mode(row) == "async":
-        prompt = (f"Merge current origin/master at {master_sha} into `{row['branch']}` as a "
+        prompt = (f"Merge current origin/{batch_target(row)} at {master_sha} into `{row['branch']}` as a "
                   f"merge commit with trailer `Automerge-Batch: {row['batch_id']}`. Resolve "
                   f"conflicts preserving both sides. {_validation_guidance(master_sha, impact, subagents=_batch_subagents(row))} "
                   f"{FIX_VS_EJECT_GUIDANCE} "
@@ -4687,7 +4871,7 @@ def _queue_master_update(
                   "Final message must include `mergemarshall:local: pass|fail`, `Tests run: ...`, "
                   "and `Baseline failures: ...`. " + ledger_context)
     else:
-        prompt = (f"Merge current origin/master at {master_sha} into `{row['branch']}` as a "
+        prompt = (f"Merge current origin/{batch_target(row)} at {master_sha} into `{row['branch']}` as a "
                   f"merge commit with trailer `Automerge-Batch: {row['batch_id']}`. Resolve "
                   f"conflicts preserving both sides. {_validation_guidance(master_sha, impact, subagents=_batch_subagents(row))} "
                   f"{FIX_VS_EJECT_GUIDANCE} "
@@ -4703,7 +4887,7 @@ def _queue_master_update(
     latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                           (row["batch_id"],)).fetchone()
     if _request_rebuild(conn, latest, _active_sources(latest),
-                        "master advanced; retry with newly ready PRs", only_if_expanded=True):
+                        f"{batch_target(row)} advanced; retry with newly ready PRs", only_if_expanded=True):
         return
     queue_agent_prompt(conn, latest, prompt)
 
@@ -4836,9 +5020,9 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
         return
     if retry_pending:
         return
-    if str(view.get("state", "")).lower() != "open" or bool(view.get("isDraft")) or view.get("baseRefName") != BASE_BRANCH:
+    if str(view.get("state", "")).lower() != "open" or bool(view.get("isDraft")) or view.get("baseRefName") != batch_target(row):
         _terminal(conn, transport, row, "integration_pr_not_mergeable",
-                  "The integration PR is no longer open, ready, and based on master.")
+                  f"The integration PR is no longer open, ready, and based on {batch_target(row)}.")
         return
     if not receipt:
         _queue_missing_handoff(conn, row, "the merge phase has a missing or stale receipt")
@@ -4864,7 +5048,7 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
                               (row["batch_id"],)).fetchone()
         _try_post_verdict_status(conn, transport, latest, head, "pending", "CI pending")
         return
-    master = current_master_sha()
+    master = target_sha(batch_target(row))
     base_ref = str(view.get("baseRefOid") or "").lower()
     if str(row["base_sha"]).lower() != master or base_ref != master:
         _queue_master_update(conn, transport, row, master, tested)
@@ -4953,11 +5137,11 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
                 "--match-head-commit", tested], timeout=120)
     except (AutomergeError, monitor.CommandError) as exc:
         try:
-            fresh_master = current_master_sha()
+            fresh_master = target_sha(batch_target(row))
             fresh_view = integration_pr_view(number)
         except (AutomergeError, monitor.CommandError) as state_exc:
             if not _try_post_verdict_status(conn, transport, row, tested, "pending",
-                                            "GitHub merge was refused; rechecking master and PR state",
+                                            f"GitHub merge was refused; rechecking {batch_target(row)} and PR state",
                                             retry_on_failure=True):
                 return
             reason = state_exc.reason if isinstance(state_exc, AutomergeError) else "github_state_unavailable"
@@ -5074,6 +5258,8 @@ def _direct_premerge_check(
     batch_id: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Recheck every state and diff gate before a direct PR can land."""
+    owner = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch_id,)).fetchone() if conn is not None and batch_id else None
+    target = batch_target(owner) if owner is not None else pulls_target(conn, [pull])
     view = direct_pull_request_view(pull.number)
     _draft_changed_source(pull, view, conn=conn, batch_id=batch_id)
     state = str(view.get("state") or "").lower()
@@ -5081,7 +5267,7 @@ def _direct_premerge_check(
         return "merged", view
     head = str(view.get("headRefOid") or "").lower()
     if (state != "open" or bool(view.get("isDraft"))
-            or view.get("baseRefName") != BASE_BRANCH
+            or view.get("baseRefName") != target
             or head != pull.head_sha.lower()):
         return "source_changed", view
     if conn is not None and conn.execute(
@@ -5104,7 +5290,7 @@ def _direct_premerge_check(
         ).fetchone())
         if marker is not None and marker.head_sha == pull.head_sha.lower() and not released:
             return "rejected", view
-    if compare_pr_behind_by(pull.head_sha) != 0:
+    if target_behind(pull.head_sha, target) != 0:
         return "master_advanced", view
     _, blocked = check_source_dependencies([pull], conn)
     if blocked:
@@ -5168,7 +5354,7 @@ def _finish_direct_rejection(
     view = direct_pull_request_view(pull.number)
     if (str(view.get("state") or "").lower() != "open"
             or bool(view.get("isDraft"))
-            or view.get("baseRefName") != BASE_BRANCH
+            or view.get("baseRefName") != batch_target(row)
             or str(view.get("headRefOid") or "").lower() != head):
         _direct_terminal(
             conn, transport, row, "direct_source_changed",
@@ -5446,9 +5632,9 @@ def _process_direct_batch(
         return
     if gate == "master_advanced":
         message = (
-            "PR is behind master; update the branch and retry --land-now"
+            f"PR is behind {batch_target(row)}; update the branch and retry --land-now"
             if _batch_source(row) == "operator"
-            else "master advanced; PR will enter the normal batch path next tick"
+            else f"{batch_target(row)} advanced; PR will enter the normal batch path next tick"
         )
         _try_post_verdict_status(
             conn, transport, row, pull.head_sha, "pending",
@@ -5457,7 +5643,7 @@ def _process_direct_batch(
         _direct_terminal(
             conn, transport, row, "direct_fell_back_to_batch",
             message if _batch_source(row) == "operator" else
-            "master advanced before direct landing; PR remains eligible for a normal batch.",
+            f"{batch_target(row)} advanced before direct landing; PR remains eligible for a normal batch.",
             verdict_state=None,
         )
         return
@@ -5470,7 +5656,7 @@ def _process_direct_batch(
     if gate != "ready":
         _direct_terminal(
             conn, transport, row, "direct_source_changed",
-            "PR is no longer open, non-draft, based on master, at its selected head, and eligible.",
+            f"PR is no longer open, non-draft, based on {batch_target(row)}, at its selected head, and eligible.",
             verdict_state="pending",
         )
         return
@@ -5489,11 +5675,11 @@ def _process_direct_batch(
         if gate == "master_advanced":
             _try_post_verdict_status(
                 conn, transport, row, pull.head_sha, "pending",
-                "master advanced; PR will enter the normal batch path next tick",
+                f"{batch_target(row)} advanced; PR will enter the normal batch path next tick",
             )
             _direct_terminal(
                 conn, transport, row, "direct_fell_back_to_batch",
-                "master advanced before direct landing; PR remains eligible for a normal batch.",
+                f"{batch_target(row)} advanced before direct landing; PR remains eligible for a normal batch.",
                 verdict_state=None,
             )
             return
@@ -5533,7 +5719,7 @@ def _process_direct_batch(
             if fresh.get("mergedAt") or str(fresh.get("state") or "").lower() == "merged":
                 _complete_direct_merge(conn, transport, row, fresh)
                 return
-            behind_by = compare_pr_behind_by(pull.head_sha)
+            behind_by = target_behind(pull.head_sha, batch_target(row))
         except (AutomergeError, monitor.CommandError) as state_exc:
             if not _try_post_verdict_status(
                 conn, transport, row, pull.head_sha, "pending",
@@ -5543,17 +5729,17 @@ def _process_direct_batch(
                 return
             _schedule_github_write_retry(
                 conn, transport, row, "direct_merge_state_unavailable",
-                f"merge failed ({exc}); could not confirm master freshness ({state_exc})",
+                f"merge failed ({exc}); could not confirm {batch_target(row)} freshness ({state_exc})",
             )
             return
         if behind_by > 0:
             _try_post_verdict_status(
                 conn, transport, row, pull.head_sha, "pending",
-                "master advanced; PR will enter the normal batch path next tick",
+                f"{batch_target(row)} advanced; PR will enter the normal batch path next tick",
             )
             _direct_terminal(
                 conn, transport, row, "direct_fell_back_to_batch",
-                f"GitHub refused direct merge after master advanced: {exc}",
+                f"GitHub refused direct merge after {batch_target(row)} advanced: {exc}",
                 verdict_state=None,
             )
             return
@@ -5778,7 +5964,7 @@ def _priority_preemption_target(
         return None
     already_in_batch = {pull.number for pull in _all_batch_pulls(row)}
     candidates = [pull for pull in pulls
-                  if pull.immediate and (
+                  if pull.immediate and (pull.target_ref or BASE_BRANCH) == BASE_BRANCH and (
                       pull.number not in already_in_batch or not _batch_priority(row)
                   )]
     return min(candidates, key=lambda pull: pull.number) if candidates else None
@@ -5916,7 +6102,7 @@ def check_only() -> int:
                 check_conn.close()
         else:
             pulls = select_eligible_pull_requests(dry_run=True)
-        base_sha = current_master_sha() if pulls else None
+        base_sha = target_sha(pulls[0].target_ref or BASE_BRANCH) if pulls else None
     except (monitor.GitHubAuthError, AutomergeError,
             monitor.CommandError, monitor.MjError, OSError, ValueError) as exc:
         print(json.dumps({"state": "blocked", "reason": getattr(exc, "reason", "inspection_failed"),
@@ -5928,6 +6114,8 @@ def check_only() -> int:
         "base_sha": base_sha,
         "selected_prs": [pull.as_json() for pull in pulls],
         "dependency_blocks": DEPENDENCY_BLOCKS,
+        "campaign_exclusions": CAMPAIGN_EXCLUSIONS,
+        "target_ref": (pulls[0].target_ref or BASE_BRANCH) if pulls else None,
         "would_do": (
             "create a direct landing or integration batch for the selected PRs"
             if pulls else "wait for eligible PRs"
@@ -6011,10 +6199,15 @@ def run_land_now(number: int) -> int:
                 view = direct_pull_request_view(number)
                 state = str(view.get("state") or "").lower()
                 head = str(view.get("headRefOid") or "").lower()
+                target = str(view.get("baseRefName") or "")
+                campaign = _campaign_for_branch(conn, target)
+                if target != BASE_BRANCH and (not campaign or not campaign.live or not stabilize_state.merge_gate_open(conn, campaign.id)):
+                    log(f"PR #{number} target {target} is not eligible for landing")
+                    return 2
                 if (state != "open" or bool(view.get("isDraft"))
-                        or view.get("baseRefName") != BASE_BRANCH
+                        or view.get("baseRefName") != target
                         or not re.fullmatch(r"[0-9a-f]{40}", head)):
-                    log(f"PR #{number} must be open, non-draft, based on master, with a valid head")
+                    log(f"PR #{number} must be open, non-draft, based on {target}, with a valid head")
                     return 2
                 intent = conn.execute(
                     "SELECT 1 FROM automerge_github_outbox WHERE number=? AND "
@@ -6038,18 +6231,18 @@ def run_land_now(number: int) -> int:
                     with conn:
                         enqueue_github_write(conn, "__queue__", "clear_rejection_label",
                                              number, head, {})
-                behind_by = compare_pr_behind_by(head)
+                behind_by = target_behind(head, target)
                 if behind_by != 0:
                     log(
-                        f"PR #{number} is behind master by {behind_by} commit(s); "
+                        f"PR #{number} is behind {target} by {behind_by} commit(s); "
                         "update the branch, then retry --land-now"
                     )
                     return 2
-                base_sha = current_master_sha()
+                base_sha = target_sha(target)
                 priority, immediate = _priority_flags(_labels(view))
                 pull = PullRequest(number, str(view.get('title') or f'PR #{number}'), head,
                                    str(view.get('url') or f'https://github.com/{REPO_NAME}/pull/{number}'),
-                                   priority, immediate)
+                                   priority, immediate, target, (), target)
                 verified, blocked = check_source_dependencies([pull], conn, master=base_sha)
                 if blocked:
                     log(f'PR #{number} cannot land alone: {blocked[number]}')

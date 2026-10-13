@@ -2677,3 +2677,22 @@ class HeartbeatTests(unittest.TestCase):
               mock.patch.object(monitor, 'record_heartbeat') as record):
             self.assertEqual(monitor.main(), 0)
             record.assert_not_called()
+
+
+class CampaignLedgerParameterTests(unittest.TestCase):
+    def test_run_reads_keep_master_default_and_accept_campaign_branch(self):
+        with mock.patch.object(monitor, 'run_gh', return_value='[]') as gh:
+            monitor._known_failure_runs('CI', 'push')
+            args = gh.call_args.args[0]
+            self.assertEqual(args[args.index('--branch') + 1], monitor.BRANCH)
+            monitor._known_failure_runs('CI', 'workflow_dispatch', branch='stabilize/test')
+            args = gh.call_args.args[0]
+            self.assertEqual(args[args.index('--branch') + 1], 'stabilize/test')
+            self.assertEqual(args[args.index('--event') + 1], 'workflow_dispatch')
+
+    def test_campaign_requires_valid_stage_before_parsing_or_writes(self):
+        import automerge
+        with sqlite3.connect(':memory:') as conn, mock.patch.object(automerge, 'collect_failure_report_for_run') as collect:
+            with self.assertRaises(ValueError):
+                monitor._process_known_failure_run(conn, 'CI', {}, campaign_id='campaign', stage='invalid')
+            collect.assert_not_called()

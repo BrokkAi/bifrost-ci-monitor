@@ -68,6 +68,9 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   retain compact summaries. Intake never changes a merge gate.
 - `merge_failover.py`: consecutive Bedrock 503 detection and durable native Move
   to DeepSeek Flash, retaining the same session, container and execution evidence.
+- `stabilize_state.py`: the shared campaign contract (tables and read API) used
+  by the merger, fixer and triage. `stabilize.py`: the campaign engine, cron
+  entry point and in-process API for the web UI.
 - `skills/mm-*`: agent tools for merge mechanics, state, publication, and
   two-commit checks. `scripts/install-mm-skills.py` installs symlinks and the
   user service. Tool invocation instructions remain in each `SKILL.md`.
@@ -983,11 +986,100 @@ GitHub write and CI/baseline/ancestry lookup failures are deliberately top-level
 Never manually send extra
 Slack/GitHub messages without user authorization.
 
+# Stabilize campaigns
+
+A campaign cuts `stabilize/<id>` from one master commit so other landings cannot
+keep it red. One campaign is live at a time. `stabilize_state.py` is the shared
+contract: `stabilize_campaigns`, `stabilize_issues`, `stabilize_gate_merges` and
+the campaign-scoped ledger `stabilize_failures`. `stabilize.py` owns every write
+to them except `stabilize_state.classify`, which triage calls under its
+publication lock. Its internal tables (`stabilize_runtime`, `_dispatches`,
+`_runs`, `_issue_identities`, `_fix_commits`, `_messages`, `_writes`,
+`_gate_intents`) are private to the engine. With no campaign rows, the merger,
+fixer and triage behave as before.
+
+Stages run push (`CI`), hourly and nightly in order. Nothing triggers on the
+branch by itself, so the engine dispatches each suite with `workflow_dispatch`.
+Stage S passes only when every stage up to S has a completed run with real
+successful jobs at one tip. Each landing starts a round at the new tip and
+dispatches all stages up to S there. Persist dispatch intent first and discover
+runs by branch, event, exact tip, intent time and run-ID floor. Never resubmit
+an ambiguous dispatch; an undiscovered one pauses after the ten-minute grace.
+Cancelled runs, and runs classified as infrastructure or incomplete, are the
+only redispatches (infrastructure at most twice per tip). Eight rounds in one
+stage, or blockers that are only escalated issues, pause the campaign. A
+refused dispatch (HTTP 403; the App needs `actions: write`) pauses once and is
+retried only after `resume`, which never replays an ambiguous dispatch.
+
+Branch runs use the master ledger's parser and proof rules but write only
+`stabilize_failures`. Incomplete jobs can add identities, never retire them.
+Seeds are open triage-linked master rows, excluding infrastructure, whose
+`first_seen_sha` is an ancestor of the anchor by the shared Git cache;
+unavailable ancestry defers. Seeds keep their master provenance.
+
+Issue states are `open`, `pr_ready`, `landed`, `escalated`, `closed` and
+`dropped`. A PR whose current head has a trusted or recorded exact-head
+rejection keeps its issue `open`. `Fixes #N` closes issues only on the default
+branch, so the engine closes landed campaign issues when the gate merge that
+contains their fix lands in master. Dropping needs later-tip proof for every
+identity.
+
+The round gate (`merge_gate_open`) opens when the campaign is running, no issue
+at or before the current stage is `open`, and at least one is `pr_ready`. The
+merger checks it at selection and expansion only. Campaign batches persist
+`automerge_batches.target_ref` (NULL means master), contain one target, rank
+above ordinary and high master work and below immediate, never preempt, always
+use async mode (one up-to-date PR may take the async direct path into the
+branch; the stage suites at the new tip are its check), and never have a
+speculative successor. Base
+capture, freshness, behind counts, verdicts, landing, direct paths, prompts and
+skills use the batch target. Campaign agents never merge master into a stabilize
+batch. PRs based on a finished or aborted campaign branch are excluded quietly
+and listed in `--check` as `campaign_exclusions`.
+
+A passed stage records an immutable snapshot branch at its tip and opens a
+ready PR from it to master labeled `mergemarshall:high`; the normal merger lands
+it. Only one gate PR is open at a time. Gate snapshots satisfy prerequisites
+proven merged into their campaign branch and ancestral to the gate tip; these
+are omitted from batch source dependencies so mm-merge does not demand them
+again. For a gate source only, a globally rejected ancestor head is acceptable
+when a later head of the same PR descends from it, was merged into that
+campaign branch, and is an ancestor of the gate tip. Unavailable reads defer.
+A rejected gate PR pauses the campaign. Completion is the nightly gate landing
+in master; remaining branch PRs are reported, never retargeted. Reviewed
+supersession records apply to master-targeted sources only: a gate does not
+qualify a reviewed replacement that was merged into its campaign branch.
+
+The fixer sorts open campaign issues first (`issue_priorities`), admits only
+owned exact-head rejection retries for `pr_ready` issues and nothing for
+`landed`. It persists `issue_repairs.target_branch` (NULL means master),
+branches from the campaign tip, merges only `origin/<target>`, and opens PRs
+with `--base <target>`, `Fixes #N` and `CI-Repair-Issue: N`. A stored target
+survives campaign end. Triage reads `stabilize_state.observations` beside the
+ledger and local findings; campaign IDs scope fingerprints, while cause matching
+spans refs, so a matching master issue is updated or reopened instead of
+duplicated. Branch product issues carry `mergemarshall:stabilize`. Issue
+evidence and dossiers render `Red since` from first-seen SHA, time and run.
+
+Each campaign posts one Slack root (`*<project>* stabilize campaign:`) with the
+seeded issues in its first reply, then threaded progress. Delivery is durable
+and never gates the engine. The web UI calls `resolve`, `create`, `get`,
+`list_campaigns` and `abort` in process. `resolve` is read-only (REST and
+SQLite). `create` takes a full SHA, requester and idempotency key, waits up to
+120 seconds for the engine lock, and returns `starting` with `start_error` when
+branch creation is ambiguous. `resume(campaign_id, requested_by)` clears a
+pause. Issue readiness calls the merger's own `_queue_ready` predicate in
+dry-run mode, so the round gate and selection agree on drafts, policy, pending
+draft intents and rejections. Gate close receipts bind the fix and gate and
+are cancelled if the failure recurs after the gate tip. Errors derive from `StabilizeError`: `InvalidRef`,
+`CampaignNotFound`, `CampaignAlreadyLive` and `LockTimeout`. Terminal statuses
+are `completed` and `aborted`, with `finished_at`.
+
 # Validation
 
 This is a Python repository. Pick the relevant existing modules:
 `test_automerge`, `test_merge_retries`, `test_membership_labels`, `test_mm_skills`, `test_issue_fixer`,
-`test_repair_dossier`, `test_triage`, and `test_monitor`. Dashboard changes use
+`test_repair_dossier`, `test_triage`, `test_stabilize`, and `test_monitor`. Dashboard changes use
 `uv run python -m unittest test_mm_web` and `npm run build` in `web/`. Dependency changes also
 use `test_pr_dependencies`, with temporary Git histories and mocked external
 writes, and `test_git_ancestry` for cache/ref/diff/blob behavior. Never validate

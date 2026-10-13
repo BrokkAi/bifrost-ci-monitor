@@ -38,7 +38,7 @@ def snapshot(row):
     return {key: digest(row[key]) if key.endswith('_json') else row[key] for key in (
         'status', 'phase', 'attempt_generation', 'pull_requests_json', 'active_pull_requests_json',
         'excluded_source_heads_json',
-        'base_sha', 'session_id', 'predecessor_id', 'role_promoted', 'candidate_json',
+        'base_sha', 'target_ref', 'session_id', 'predecessor_id', 'role_promoted', 'candidate_json',
         'ready_json', 'prompt_command_id', 'prompt_delivered', 'recovery_json',
         'integration_pr_number', 'terminal_status')}
 
@@ -85,7 +85,8 @@ def plan(a, conn, *, priority_checked, queue_checked, maintenance_done, reconcil
         add(8, 'check_priority')
     if primary is None and not queue_checked:
         add(40, 'select_primary')
-    if primary is not None and a.SPECULATIVE_LOOKAHEAD and speculation.candidate(a, primary):
+    if (primary is not None and a.batch_target(primary) == a.BASE_BRANCH
+            and a.SPECULATIVE_LOOKAHEAD and speculation.candidate(a, primary)):
         if speculation.child(conn, primary['batch_id']) is None:
             add(50, 'select_successor', primary)
     if not maintenance_done:
@@ -238,7 +239,7 @@ def run(a, conn, transport):
                 pulls = a.select_eligible_pull_requests(conn=conn)
                 a.report_dependency_blocks(conn, transport)
                 if pulls:
-                    a.create_selected_batch(conn, pulls, a.current_master_sha())
+                    a.create_selected_batch(conn, pulls, a.target_sha(a.pulls_target(conn, pulls)))
                 else:
                     idle_summary(a, conn, transport)
                 queue_checked = True

@@ -661,6 +661,42 @@ class StateTests(unittest.TestCase):
                 automerge._request_rebuild(self.conn, original, [pull(7), pull(8, HEAD_TWO)], "rebuild")
         self.assertEqual([p["number"] for p in self.state()["sources"]], [8])
 
+    def test_campaign_publication_creates_target_pr_and_fences_changed_base(self):
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET target_ref='stabilize/test'")
+        current = self.assessment()
+        self.assertEqual(current['target_ref'], 'stabilize/test')
+        self.assertEqual(current['ci_mode'], 'async')
+        pr = {'number': 211, 'html_url': 'url', 'state': 'open', 'draft': False,
+              'head': {'sha': HEAD_ONE, 'ref': current['branch']}, 'base': {'ref': 'stabilize/test'}}
+        calls = []
+        def api(endpoint, **kwargs):
+            calls.append((endpoint, kwargs))
+            return [] if endpoint.startswith('pulls?') else pr
+        with (mock.patch.object(mm_service, 'gh_api', side_effect=api),
+              mock.patch.object(automerge, 'remote_branch_sha', return_value=HEAD_ONE)):
+            result = mm_service.reconcile_publication(current, HEAD_ONE, 'notes')
+        self.assertEqual(result['number'], 211)
+        creation = next(kwargs['payload'] for endpoint, kwargs in calls if endpoint == 'pulls')
+        self.assertEqual(creation['base'], 'stabilize/test')
+        pr['base']['ref'] = 'master'
+        with (mock.patch.object(mm_service, 'gh_api', side_effect=lambda endpoint, **kwargs: [pr] if endpoint.startswith('pulls?') else pr),
+              mock.patch.object(automerge, 'remote_branch_sha', return_value=HEAD_ONE),
+              self.assertRaisesRegex(ValueError, 'batch target')):
+            mm_service.reconcile_publication(current, HEAD_ONE, 'notes')
+
+    def test_campaign_publication_reconciles_ambiguous_create_against_target(self):
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET target_ref='stabilize/test'")
+        current = self.assessment()
+        pr = {'number': 211, 'html_url': 'url', 'state': 'open', 'draft': False,
+              'head': {'sha': HEAD_ONE, 'ref': current['branch']}, 'base': {'ref': 'stabilize/test'}}
+        with (mock.patch.object(mm_service, 'gh_api', side_effect=[[], automerge.monitor.CommandError('reply lost'), [pr], pr]) as api,
+              mock.patch.object(automerge, 'remote_branch_sha', return_value=HEAD_ONE)):
+            self.assertEqual(mm_service.reconcile_publication(current, HEAD_ONE, '')['number'], 211)
+        self.assertEqual(api.call_args_list[1].kwargs['payload']['base'], 'stabilize/test')
+        self.assertEqual(len([call for call in api.call_args_list if call.kwargs.get('method') == 'POST']), 1)
+
     def test_publication_reconciles_existing_pr_using_rest_and_actual_membership(self):
         current = self.assessment()
         pr = {"number": 211, "html_url": "https://example.invalid/211", "state": "open", "draft": False,

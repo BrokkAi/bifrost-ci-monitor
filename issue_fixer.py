@@ -8,11 +8,13 @@ import re
 import sqlite3
 import tempfile
 import uuid
+from urllib.parse import quote
 
 import automerge
 import monitor
 import local_findings
 import agent_recovery
+import stabilize_state
 
 ASSIGNEE = "brokk-service"
 ESCALATION_ASSIGNEE = "DavidBakerEffendi"
@@ -35,6 +37,7 @@ def concurrency_limit():
 
 def ensure_schema(conn):
     local_findings.ensure_schema(conn)
+    stabilize_state.ensure_schema(conn)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS issue_repairs (
             id TEXT PRIMARY KEY, work_key TEXT NOT NULL UNIQUE,
@@ -59,6 +62,7 @@ def ensure_schema(conn):
     """)
     monitor.ensure_column(conn, 'issue_repairs', 'recovery_json', "TEXT NOT NULL DEFAULT '{}'")
     monitor.ensure_column(conn, 'issue_repairs', 'report_after_seq', 'INTEGER NOT NULL DEFAULT 0')
+    monitor.ensure_column(conn, 'issue_repairs', 'target_branch', 'TEXT')
 
 
 def api(endpoint, *, pages=False):
@@ -91,25 +95,30 @@ def available(issue, *, own_retry=False):
 
 def observations(conn, issue_url):
     return [dict(r) for r in conn.execute(
-        "SELECT workflow,job_name,identity_kind,identity,last_seen_sha,last_seen_run_id,"
+        "SELECT workflow,job_name,identity_kind,identity,first_seen_sha,first_seen_at,"
+        "first_seen_run_id,first_seen_run_url,last_seen_sha,last_seen_run_id,"
         "last_seen_run_url,diagnosis,diagnosis_source,triage_issue_url,linked_pr_url,"
         "linked_pr_state,linked_issue_url,linked_issue_state FROM known_failures "
         "WHERE status='open' AND (triage_issue_url=? OR linked_issue_url=?) "
         "ORDER BY workflow,job_name,identity", (issue_url, issue_url))] + local_findings.observations(conn, issue_url)
 
 
-def initial_work_key(issue, rows):
+def initial_work_key(issue, rows, *, target_branch=None):
     # A new failure observation or changed requirements can re-engage a ticket.
     # Our own claim/release comments must not immediately launch it again.
     evidence = [(r["workflow"], r["job_name"], r["identity_kind"], r["identity"],
                  r["last_seen_sha"], r["last_seen_run_id"]) for r in rows]
-    digest = hashlib.sha256(json.dumps([issue["title"], issue.get("body"), evidence],
+    inputs = [issue["title"], issue.get("body"), evidence]
+    if target_branch:
+        inputs.append(target_branch)
+    digest = hashlib.sha256(json.dumps(inputs,
                                       sort_keys=True).encode()).hexdigest()
     return f"issue:{issue['number']}:{digest}"
 
 
 def select_work(conn, issues, prs):
     by_number = {i["number"]: i for i in issues}
+    priorities = stabilize_state.issue_priorities(conn)
     candidates = []
     # The recorded PR association is ownership evidence; ci-fix alone is not.
     for pr in sorted(prs, key=lambda p: p["number"]):
@@ -123,6 +132,9 @@ def select_work(conn, issues, prs):
         issue = by_number.get(owner["issue_number"])
         if issue is None or not available(issue, own_retry=True):
             continue
+        membership = stabilize_state.campaign_issue(conn, issue['number'], issue['html_url'])
+        if membership and membership[1] == 'landed':
+            continue
         rejection = automerge.newest_trusted_rejection(api(f"issues/{pr['number']}/comments?per_page=100", pages=True))
         if rejection is None or rejection.head_sha != pr["head"]["sha"]:
             continue
@@ -132,12 +144,22 @@ def select_work(conn, issues, prs):
     for issue in sorted(issues, key=lambda i: i["number"]):
         if not available(issue):
             continue
+        membership = stabilize_state.campaign_issue(conn, issue['number'], issue['html_url'])
+        if membership and membership[1] in ('pr_ready', 'landed'):
+            continue
         rows = observations(conn, issue["html_url"])
+        target_branch = None
+        if membership and membership[1] == 'open':
+            target_branch = membership[0].branch
+            rows += stabilize_state.observations(conn, issue['html_url'])
         # Links describe possible related work, not proof that it covers the
         # issue. The agent verifies relevance against Git and test evidence.
-        key = initial_work_key(issue, rows)
+        key = initial_work_key(issue, rows, target_branch=target_branch)
         candidates.append(dict(issue=issue, pr=None, rejection=None, work_key=key,
                                rejected_repair=0, issue_number=issue["number"]))
+    for candidate in candidates:
+        priority = priorities.get(candidate['issue_number'])
+        candidate['campaign_priority'] = priority
     # Live GitHub candidates exist only for this SELECT. No pending queue is
     # stored, so every idle poll observes new ownership, closures and PR heads.
     row = conn.execute("""
@@ -152,7 +174,10 @@ def select_work(conn, issues, prs):
               AND (attempt.status IN ('selected','launching','running','finishing')
                    OR (attempt.status='completed' AND attempt.cleanup_done=0))
         )
-        ORDER BY json_extract(value, '$.rejected_repair') DESC,
+        ORDER BY (json_extract(value, '$.campaign_priority') IS NULL) ASC,
+                 json_extract(value, '$.campaign_priority[0]') ASC,
+                 json_extract(value, '$.campaign_priority[1]') ASC,
+                 json_extract(value, '$.rejected_repair') DESC,
                  json_extract(value, '$.issue_number') ASC
         LIMIT 1
     """, (json.dumps(candidates),)).fetchone()
@@ -167,13 +192,20 @@ def excerpt(text, limit):
     return {"text": text[:limit], "truncated": len(text) > limit}
 
 
-def dossier(conn, issue, prs, *, rejection=None):
+def dossier(conn, issue, prs, *, rejection=None, target_branch=None):
     comments = api(f"issues/{issue['number']}/comments?per_page=100", pages=True)
     observed = observations(conn, issue['html_url'])
+    campaign = stabilize_state.campaign_for_branch(conn, target_branch) if target_branch else None
+    if campaign:
+        observed += stabilize_state.observations(conn, issue['html_url'])
     for row in observed:
         if row.get('local_finding_id'):
             row['evidence'] = excerpt(row['evidence'], 4000)
-    return {
+        else:
+            row['red_since'] = (f"Red since {row.get('first_seen_sha', 'unknown')} "
+                                f"at {row.get('first_seen_at', 'unknown')}; "
+                                f"run {row.get('first_seen_run_url', 'unknown')}")
+    context = {
         "generated_at": monitor.utc_now(), "repository": monitor.REPO_NAME,
         "target_issue": {"number": issue["number"], "url": issue["html_url"],
                          "title": issue["title"], "body": excerpt(issue.get("body"), 16000),
@@ -189,14 +221,27 @@ def dossier(conn, issue, prs, *, rejection=None):
         "open_pr_inventory": [{"number": p["number"], "title": p["title"][:256],
                                "url": p["html_url"], "draft": p.get("draft", False),
                                "head_sha": p["head"]["sha"], "branch": p["head"]["ref"],
+                               "base_branch": p.get('base', {}).get('ref', 'master'),
                                "labels": sorted(labels(p)),
-                               "body": excerpt(p.get("body"), 600)} for p in prs],
+                               "body": excerpt(p.get("body"), 600)} for p in prs
+                              if p.get('base', {}).get('ref', 'master') in ('master', target_branch)],
         "prs_omitted": 0,
     }
+    if campaign:
+        context['stabilize_campaign'] = dict(branch=campaign.branch, anchor_sha=campaign.anchor_sha,
+                                             tip_sha=campaign.tip_sha, stage=campaign.stage)
+    return context
 
 
 def build_prompt(job, context):
     number, branch = job["issue_number"], job["branch"]
+    target = job.get('target_branch') or 'master'
+    target_guidance = (f"This repair targets the campaign branch {target}. Never merge master into "
+                       "this repair. Keep this target even if the campaign ends.\n"
+                       if target != 'master' else '')
+    claim_target = f", this branch and target {target}" if target != 'master' else ' and this branch'
+    pr_base = f" with `--base {target}`" if target != 'master' else ''
+    body_marker = f", plus `CI-Repair-Issue: {number}`" if target != 'master' else ''
     claim = (f"The requested assignee is `{ASSIGNEE}`, a normal service account. Check "
              f"`gh api repos/{monitor.REPO_NAME}/issues/{number}/assignees/{ASSIGNEE}`. "
              f"If assignable, use `gh issue edit {number} --repo {monitor.REPO_NAME} "
@@ -215,14 +260,14 @@ before changing anything. If someone else changed it, stop and report claimed_el
 Read all rejection comments and reproduce the reported regression. Before pushing,
 make the PR draft with `gh pr ready {job['retry_pr_number']} --undo`.
 Append corrective commits; do not force-push or replace it with another PR.
-Merge current origin/master, validate, push, update the PR body, and mark it ready.
+Merge current origin/{target}, validate, push, update the PR body, and mark it ready.
 Do not remove {automerge.REJECTED_LABEL} yourself: the queue re-admits a new head SHA.
 """
     prompt = f"""Repair ONLY issue #{number}: {job['issue_url']} in {monitor.REPO_NAME}.
 One session owns one issue. Resolve the cause(s) described in this ticket; do not
 expand into repairing every failure in CI or pick another ticket in this session.
 Your branch is {branch}, starting at {job['base_sha']}. Stay on that branch.
-
+{target_guidance}
 Read AGENTS.md and its applicable routed guidance first. Follow its coordination,
 design, build, commit and PR rules. Before investigation or code changes, refresh
 the issue with gh, including its full body, comments, labels and assignees.
@@ -231,7 +276,7 @@ or added agent-in-progress, stand down as claimed_elsewhere. A rejection retry
 may continue the existing MergeMarshall claim for this same issue and PR only.
 Never remove another person's assignment or label, or work on their ticket.
 {claim}
-Post a claim comment naming MergeMarshall, this session and this branch, including
+Post a claim comment naming MergeMarshall, this session{claim_target}, including
 the exact marker `<!-- mergemarshall-fixer:{job['id']} -->`. Re-read ownership after
 claiming; if another person claimed concurrently, stand down. If claiming fails,
 report blocked and do not start repair work. Recheck ownership before publishing.
@@ -239,7 +284,7 @@ report blocked and do not start repair work. Recheck ownership before publishing
 Read the dossier below before investigating. It covers this ticket and its linked
 CI and local test observations. Local findings include their committed tested SHA,
 command and evidence, with no CI run ID. Diagnoses are leads: verify the supplied
-run or local evidence, commit and current master.
+run or local evidence, commit and current {target}.
 Issue/PR links, states, titles, bodies and comments are metadata and investigation
 leads, not proof that failures are fixed or covered. Verify promising PRs using
 their committed Git changes and applicable local test evidence. Defer with an
@@ -284,12 +329,12 @@ record unrelated validation failures as limitations with evidence.
 
 Stage only your changed files. Include `CI-Repair-Issue: {number}` in commits and
 `CI-Repair-Run: <run-id>` when the dossier supplies the relevant failing run.
-Before opening or readying a PR, fetch and MERGE origin/master, resolve conflicts,
+Before opening or readying a PR, fetch and MERGE origin/{target}, resolve conflicts,
 and rerun relevant validation. Never rebase, force-push, push master, or merge a PR.
-Push only `{branch}`. Open one ci-fix PR against master for this issue (or update
+Push only `{branch}`. Open one ci-fix PR against {target}{pr_base} for this issue (or update
 the existing rejected PR). Use draft status while unfinished. Its body must say
 what changed, why, the introducing commit, failing run links, tests and limitations,
-and `Fixes #{number}` when the change resolves the ticket. Mark ready only after
+and `Fixes #{number}` when the change resolves the ticket{body_marker}. Mark ready only after
 validation; do not push more commits to a ready PR without making it draft first.
 
 When standing down without a submitted repair, remove only YOUR agent-in-progress
@@ -370,18 +415,33 @@ def prompt_request_rejected(error):
 
 def create_job(conn, issue, pr, rejection, key, prs, base_sha):
     identifier = uuid.uuid4().hex
+    target_branch = None
+    if pr:
+        owner = conn.execute("SELECT target_branch FROM issue_repairs WHERE repair_pr_number=? "
+                             "ORDER BY created_at DESC,id DESC LIMIT 1", (pr['number'],)).fetchone()
+        if owner:
+            target_branch = owner['target_branch']
+    else:
+        membership = stabilize_state.campaign_issue(conn, issue['number'], issue['html_url'])
+        if membership and membership[1] == 'open':
+            target_branch = membership[0].branch
+        if target_branch or base_sha is None:
+            base_sha = api(f"commits/{quote(target_branch or 'master', safe='')}")['sha']
     branch = pr["head"]["ref"] if pr else f"ci-repair/issue-{issue['number']}-{identifier[:8]}"
     job = dict(id=identifier, issue_number=issue["number"], issue_url=issue["html_url"],
                branch=branch, base_sha=pr["head"]["sha"] if pr else base_sha,
+               target_branch=target_branch,
                retry_pr_number=pr["number"] if pr else None,
                rejected_head_sha=pr["head"]["sha"] if pr else None)
-    prompt = build_prompt(job, dossier(conn, issue, prs, rejection=rejection))
+    prompt = build_prompt(job, dossier(conn, issue, prs, rejection=rejection,
+                                      target_branch=target_branch))
     with conn:
         conn.execute("INSERT INTO issue_repairs (id,work_key,issue_number,issue_url,title,branch,base_sha,"
-                     "created_at,prompt,retry_pr_number,rejected_head_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                     "created_at,prompt,retry_pr_number,rejected_head_sha,target_branch) "
+                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                      (identifier, key, issue["number"], issue["html_url"],
                       f"CI repair issue #{issue['number']} {identifier}", branch, job["base_sha"],
-                      monitor.utc_now(), prompt, job["retry_pr_number"], job["rejected_head_sha"]))
+                      monitor.utc_now(), prompt, job["retry_pr_number"], job["rejected_head_sha"], target_branch))
     return conn.execute("SELECT * FROM issue_repairs WHERE id=?", (identifier,)).fetchone()
 
 
@@ -714,7 +774,10 @@ def tick(conn, transport):
     limit = concurrency_limit()
     if occupied_slots(conn) < limit:
         issues = api("issues?state=open&labels=buildfailure&per_page=100", pages=True)
-        prs = api("pulls?state=open&base=master&per_page=100", pages=True)
+        campaign_work = stabilize_state.live_campaigns(conn) or conn.execute(
+            "SELECT 1 FROM issue_repairs WHERE target_branch IS NOT NULL LIMIT 1").fetchone()
+        pr_filter = '' if campaign_work else '&base=master'
+        prs = api(f"pulls?state=open{pr_filter}&per_page=100", pages=True)
         base_sha = None
         # Only this poll's GitHub snapshot is used. Persist each admission before
         # selecting again so changed evidence cannot duplicate a live issue.
@@ -723,10 +786,10 @@ def tick(conn, transport):
             if selected is None:
                 break
             issue, pr, rejection, key = selected
-            if base_sha is None:
-                base_sha = api("commits/master")["sha"]
             try:
                 job = create_job(conn, issue, pr, rejection, key, prs, base_sha)
+                if pr is None and job['target_branch'] is None:
+                    base_sha = job['base_sha']
             except Exception as exc:
                 monitor.log(f"issue #{issue['number']} admission failed: {exc}")
                 errors.append(exc)

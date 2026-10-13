@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Poll the master failure ledger and supervise one small diagnosis session."""
+"""Poll CI and local failure observations and supervise one small diagnosis session."""
 from __future__ import annotations
 
 import argparse
@@ -13,9 +13,11 @@ import re
 import sqlite3
 import tempfile
 import uuid
+from urllib.parse import quote
 
 import monitor
 import local_findings
+import stabilize_state
 import agent_recovery
 
 LOCK_PATH = monitor.STATE_DIR.parent / "bifrost-ci-triage" / "triage.lock"
@@ -45,6 +47,7 @@ def lock(path: Path):
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     local_findings.ensure_schema(conn)
+    stabilize_state.ensure_schema(conn)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS triage_jobs (
             id TEXT PRIMARY KEY, title TEXT NOT NULL, base_sha TEXT NOT NULL,
@@ -97,6 +100,8 @@ def backfill_outcomes(conn) -> None:
                     continue  # Old unclassified reports cannot establish infrastructure.
                 for number in finding['failure_ids']:
                     observation = observations[number]
+                    if observation.get('stabilize_campaign_id') or observation.get('local_finding_id'):
+                        continue  # This migration only upgrades the master ledger.
                     if current_observation(conn, observation) is not None:
                         conn.execute(f"UPDATE known_failures SET triage_outcome=? "
                                      f"WHERE {WHERE_KEY} AND triage_outcome IS NULL",
@@ -109,7 +114,17 @@ def fingerprint(row) -> str:
         return 'local:' + row['local_finding_id']
     # Repeated hourly runs of the same tree are the same investigation.
     data = [row[k] for k in (*KEY, "last_seen_sha", "last_seen_failed_steps_json")]
+    if 'stabilize_campaign_id' in row.keys():
+        data.insert(0, row['stabilize_campaign_id'])
+        return 'stabilize:' + hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+
+
+def branch_observations(conn) -> list[dict]:
+    anchors = {row['id']: row['anchor_sha'] for row in conn.execute(
+        'SELECT id,anchor_sha FROM stabilize_campaigns')}
+    return [dict(row, stabilize_anchor_sha=anchors[row['stabilize_campaign_id']])
+            for row in stabilize_state.observations(conn)]
 
 
 def pending(conn) -> list[dict]:
@@ -119,7 +134,7 @@ def pending(conn) -> list[dict]:
         for o in json.loads(job['observations_json'])}
     rows = conn.execute("SELECT * FROM known_failures WHERE status='open' "
                         "ORDER BY last_seen_at DESC,workflow,job_name,identity").fetchall()
-    rows = sorted([*rows, *local_findings.observations(conn)],
+    rows = sorted([*rows, *local_findings.observations(conn), *branch_observations(conn)],
                   key=lambda row: row['last_seen_at'], reverse=True)
     result = []
     size = 0
@@ -144,6 +159,10 @@ def pending(conn) -> list[dict]:
 
 
 def current_observation(conn, observation):
+    if observation.get('stabilize_campaign_id'):
+        return next((row for row in branch_observations(conn)
+                     if row['stabilize_campaign_id'] == observation['stabilize_campaign_id']
+                     and fingerprint(row) == observation['fingerprint']), None)
     if observation.get('local_finding_id'):
         return next((row for row in local_findings.observations(conn)
                      if row['local_finding_id'] == observation['local_finding_id']), None)
@@ -167,7 +186,29 @@ def gh_api(endpoint: str, *, method: str = "GET", payload=None, pages=False):
 
 
 def build_prompt(job) -> str:
-    return f"""Diagnose master CI failures and local merge-test findings in {monitor.REPO_NAME}. This is triage job {job['id']}.
+    branches = [o for o in json.loads(job['observations_json']) if o.get('stabilize_campaign_id')]
+    subjects = 'master CI failures and local merge-test findings'
+    branch_guidance = branch_recovery = branch_dedup = ''
+    if branches:
+        subjects = 'master CI failures, stabilize branch observations and local merge-test findings'
+        branch_context = '\n'.join(
+            f"Failure {o['failure_id']}: stabilize branch `{o['stabilize_branch']}` cut from master "
+            f"at `{o['stabilize_anchor_sha']}`, observed SHA `{o['last_seen_sha']}`."
+            for o in branches)
+        branch_guidance = f"""Observations with stabilize_campaign_id come from stabilize branch
+stabilize_branch, cut from master at stabilize_anchor_sha, at the observed
+last_seen_sha. Investigate that branch's source/history and completed results,
+including fetching its observed commit when absent from your master checkout.
+Master recovery does not prove branch recovery. The campaign id scopes the
+observation, not its cause: group the same cause across master and branch refs.
+{branch_context}
+
+"""
+        branch_recovery = " (or the observation's stabilize branch)"
+        branch_dedup = """Use one issue per cause across refs: a matching master-only issue also covers
+stabilize observations. Update or reopen that issue instead of creating another.
+"""
+    return f"""Diagnose {subjects} in {monitor.REPO_NAME}. This is triage job {job['id']}.
 Your checkout starts at master {job['base_sha']}. You have {CPUS} CPUs and {MEMORY_GIB} GiB RAM.
 Investigate logs, source, history, existing issues and repair PRs. Do not run builds or
 test suites, modify source, commit, push, or write to GitHub or Slack. The supervisor
@@ -189,7 +230,7 @@ master source/history and available results before deciding whether the defect i
 still applicable. A passing rerun alone does not resolve a flaky product test.
 Use the supplied logs/evidence; do not rebuild or rerun tests to investigate them.
 
-Classify each finding's outcome as product, infrastructure, or resolved. Product
+{branch_guidance}Classify each finding's outcome as product, infrastructure, or resolved. Product
 defects include code regressions and flaky product tests. Infrastructure means runner
 acquisition/loss, provider capacity/quota, or external service failures; report those
 as infrastructure with issue:null, never a Bifrost ticket or a request to change the
@@ -197,14 +238,14 @@ owner's Spot policy. State the observed mechanism, uncertainty, impact and usefu
 operator diagnostic step. Do not claim capacity or quota without provider evidence.
 An unpinned introducing commit alone is not evidence of infrastructure.
 
-Check current origin/master and the latest completed result for each affected job,
+Check current origin/master{branch_recovery} and the latest completed result for each affected job,
 even if its containing workflow is still running. For a recovered product failure,
 return outcome:resolved and issue:null with concrete evidence (fix commit or passing
 run). For infrastructure, include any later recovery in the notice and still use
 outcome:infrastructure. A repair PR alone is not proof of recovery.
 Search open AND closed issues and the linked tickets before drafting product tickets.
 Reuse an existing issue only for the same cause; it will be reopened if closed.
-Never reuse the aggregate 'Known CI failures on master' issue. An observed product
+{branch_dedup}Never reuse the aggregate 'Known CI failures on master' issue. An observed product
 failure can need a ticket even when its root cause remains unknown.
 
 Return your complete result in your final message as `triage-result: ` followed by a
@@ -440,12 +481,30 @@ def issue_body(job, index, finding, observations) -> str:
             return (f"- Local {row['kind']}: `{row['identity']}` at `{row['last_seen_sha']}`; "
                     f"command: `{row['command']}`; batch `{row['batch_id']}`, "
                     f"merge session `{row['session_id']}`.\n\n{row['evidence']}")
+        ref = (f"Stabilize branch `{row['stabilize_branch']}` cut from master at "
+               f"`{row['stabilize_anchor_sha']}` (campaign `{row['stabilize_campaign_id']}`); "
+               if 'stabilize_campaign_id' in row.keys() else '')
         return (f"- {row['workflow']} / {row['job_name']} / `{row['identity']}`: "
-                f"{row['last_seen_run_url']} (`{row['last_seen_sha']}`)")
+                f"{ref}{row['last_seen_run_url']} (`{row['last_seen_sha']}`)\n"
+                f"  Red since {row['first_seen_sha']} ({row['first_seen_at']}, {row['first_seen_run_url']})")
     return (finding['issue']['body'] + '\n\n### Triage evidence\n\n' + finding['diagnosis']
             + '\n\n' + finding['evidence'] + '\n\n' + '\n'.join(source(row) for row in observations)
             + f"\n\nTriage session: `{job['session_id']}`.\n\n"
             + f"<!-- mergemarshall-triage:{job['id']}:{index} -->")
+
+
+def ensure_stabilize_label() -> None:
+    name = stabilize_state.LABEL
+    try:
+        label = gh_api('labels/' + quote(name, safe=''))
+    except monitor.CommandError as exc:
+        if 'HTTP 404' not in str(exc):
+            raise
+        gh_api('labels', method='POST', payload={
+            'name': name, 'color': '1d76db', 'description': 'Stabilize campaign failure'})
+    else:
+        if not isinstance(label, dict) or label.get('name') != name:
+            raise ValueError('GitHub returned invalid stabilize label')
 
 
 def publish_issue(conn, job, index, finding, observations) -> str:
@@ -461,6 +520,10 @@ def publish_issue(conn, job, index, finding, observations) -> str:
             raise ValueError("finding spans multiple escalation tickets; review grouping before publication")
         number = next(iter(linked))
     body = finding['issue_body']
+    labels = ['buildfailure']
+    if any('stabilize_campaign_id' in row.keys() for row in observations):
+        ensure_stabilize_label()
+        labels.append(stabilize_state.LABEL)
     if not number:
         # REST enumeration also finds a successful POST whose response was lost.
         issues = gh_api("issues?state=all&labels=buildfailure&per_page=100", pages=True)
@@ -469,7 +532,7 @@ def publish_issue(conn, job, index, finding, observations) -> str:
             number = match["number"]
         else:
             created = gh_api("issues", method="POST", payload={
-                "title": finding["issue"]["title"], "body": body, "labels": ["buildfailure"]})
+                "title": finding["issue"]["title"], "body": body, "labels": labels})
             number = created["number"]
         with conn:
             conn.execute("INSERT OR REPLACE INTO triage_publications VALUES (?,?,?)", (job["id"], index, number))
@@ -487,10 +550,10 @@ def publish_issue(conn, job, index, finding, observations) -> str:
             gh_api(f"issues/{number}/comments", method="POST", payload={"body": body})
     if issue["state"] != "open":
         gh_api(f"issues/{number}", method="PATCH", payload={"state": "open"})
-    if not any(label["name"] == "buildfailure" for label in issue.get("labels", [])):
-        gh_api(f"issues/{number}/labels", method="POST", payload={"labels": ["buildfailure"]})
-    with conn:
-        conn.execute("INSERT OR REPLACE INTO triage_publications VALUES (?,?,?)", (job["id"], index, number))
+    missing_labels = [name for name in labels if not any(
+        label['name'] == name for label in issue.get('labels', []))]
+    if missing_labels:
+        gh_api(f"issues/{number}/labels", method="POST", payload={"labels": missing_labels})
     url = f"https://github.com/{monitor.REPO_NAME}/issues/{number}"
     finding['published_issue'] = dict(url=url, title=issue['title'])
     return url
@@ -512,6 +575,11 @@ def retire_resolved_observation(conn, job, finding, observation) -> bool:
     current = current_observation(conn, observation)
     if current is None or current["last_seen_run_id"] != observation["last_seen_run_id"]:
         return False
+    if observation.get('stabilize_campaign_id'):
+        stabilize_state.classify(conn, observation['stabilize_campaign_id'],
+                                 tuple(observation[k] for k in KEY), 'resolved',
+                                 finding['diagnosis'] + ' Evidence: ' + finding['evidence'])
+        return True  # Campaign upkeep, not triage, owns branch retirement.
     if observation.get('local_finding_id'):
         local_findings.classify(conn, observation['local_finding_id'], 'resolved',
                                finding['diagnosis'] + ' Evidence: ' + finding['evidence'])
@@ -717,12 +785,22 @@ def publish(conn, job) -> None:
             url = publish_issue(conn, job, index, finding, [row for _, row in active]) if active and finding["issue"] else None
             with conn:
                 conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=?', (json.dumps(report), job['id']))
+                if url:
+                    # The earlier publication row pins the external-write target;
+                    # accepted publication and its classification checkpoint together.
+                    conn.execute('INSERT OR REPLACE INTO triage_publications VALUES (?,?,?)',
+                                 (job['id'], index, existing_number(url)))
                 for n in finding["failure_ids"]:
                     o = observations[n]
                     record_observation(conn, job, finding, o, url)
                     if finding['outcome'] == 'resolved':
                         retire_resolved_observation(conn, job, finding, o)
                     elif current_observation(conn, o) is not None:
+                        if o.get('stabilize_campaign_id'):
+                            stabilize_state.classify(conn, o['stabilize_campaign_id'],
+                                                     tuple(o[k] for k in KEY), finding['outcome'],
+                                                     finding['diagnosis'] + ' Evidence: ' + finding['evidence'], url)
+                            continue
                         if o.get('local_finding_id'):
                             local_findings.classify(conn, o['local_finding_id'], finding['outcome'],
                                                     finding['diagnosis'] + ' Evidence: ' + finding['evidence'], url)

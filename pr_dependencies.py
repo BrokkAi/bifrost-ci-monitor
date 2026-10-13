@@ -183,11 +183,14 @@ class Node:
 class Graph:
     def __init__(self, nodes: dict[int, Node], histories: dict[int, list[str]],
                  master: str, ancestor: Callable[[str, str], bool], *, conn=None,
-                 base_branch='master', persist_comparisons=False,
-                 supersessions=None, verify_supersession=None):
+                 base_branch='master', persist_comparisons=False, targets=None, gates=None,
+                 available_targets=None, supersessions=None, verify_supersession=None):
         self.nodes = nodes
         self.histories = histories
         self.master = master
+        self.targets = targets or {}
+        self.gates = gates or {}
+        self.available_targets = available_targets
         self._ancestor = ancestor
         self.conn = conn
         self.base_branch = base_branch
@@ -224,8 +227,20 @@ class Graph:
             self._comparisons[pair] = value
         return self._comparisons[pair]
 
-    def landed(self, head):
-        return self.ancestor(head, self.master)
+    def target(self, number):
+        return self.targets.get(number, (self.base_branch, self.master))
+
+    def landed(self, head, number=None):
+        if self.ancestor(head, self.target(number)[1]):
+            return True
+        gate = self.gates.get(number)
+        if gate and self.ancestor(head, gate['tip_sha']):
+            return any(node.base == gate['campaign_branch']
+                       and (node.data.get('merged_at') or node.data.get('merged'))
+                       and head in self.histories.get(node.number, [node.head])
+                       and self.ancestor(node.head, gate['tip_sha'])
+                       for node in self.nodes.values())
+        return False
 
     def _normalize_dependencies(self, owner, dependencies):
         """Replace only verified retired heads and retain their other edges."""
@@ -239,7 +254,7 @@ class Graph:
             if identity in seen:
                 continue
             seen.add(identity)
-            if self.landed(dependency.head_sha):
+            if self.landed(dependency.head_sha, owner):
                 if dependency not in normalized:
                     normalized.append(dependency)
                 continue
@@ -357,9 +372,9 @@ class Graph:
             for (owner, head), deps in self.captured.items():
                 if owner == number and self.ancestor(head, node.head):
                     for dep in deps:
-                        if dep.number not in related or self.landed(dep.head_sha):
+                        if dep.number not in related or self.landed(dep.head_sha, number):
                             related[dep.number] = dep.head_sha
-            if node.base != self.base_branch:
+            if node.base != self.target(number)[0]:
                 matches = branches.get((node.base_repo.casefold(), node.base), [])
                 open_matches = [n for n in matches if str(self.nodes[n].data.get('state')).lower() == 'open']
                 matches = open_matches or matches
@@ -374,11 +389,12 @@ class Graph:
                 if parent == number:
                     continue
                 for head in self.histories.get(parent, [prior.head]):
-                    if head == self.master or head in self._known_landed or self._comparisons.get((head, self.master)):
+                    if (self._comparisons.get((head, self.target(number)[1])) or head == self.target(number)[1]
+                            or (self.target(number)[1] == self.master and head in self._known_landed)):
                         continue
                     # Most pairs are unrelated. Check their immutable relation
                     # before comparing a historical head to a moving master.
-                    if not self.ancestor(head, node.head) or self.landed(head):
+                    if not self.ancestor(head, node.head) or self.landed(head, number):
                         continue
                     if head == node.head:
                         self.problems[number] = f'ambiguous shared head with PR #{parent}'
@@ -407,7 +423,7 @@ class Graph:
                     self.problems[number] = f'unresolved prerequisite PR #{parent}'
                     deps.append(dependency)
                     continue
-                required = captured_head if self.landed(captured_head) else prior.head
+                required = captured_head if self.landed(captured_head, number) else prior.head
                 if not self.ancestor(required, node.head):
                     self.problems[number] = f'PR #{parent} changed; its current head is absent from this PR'
                 deps.append(Dependency(parent, required))
@@ -425,7 +441,7 @@ class Graph:
             if number in visited:
                 return
             for dep in self.dependencies.get(number, ()):
-                if not self.landed(dep.head_sha):
+                if not self.landed(dep.head_sha, number):
                     visit(dep.number, path + [number])
             visited.add(number)
         for number in self.dependencies:
@@ -456,13 +472,14 @@ class Graph:
         node = self.nodes[number]
         reason = self.problems.get(number)
         if not reason and not node.ready:
-            reason = 'prerequisite is draft, rejected, withdrawn, or closed without its head in master'
+            reason = 'prerequisite is draft, rejected, withdrawn, or closed without its head in ' + self.target(number)[0]
         if not reason:
             for dep in self.dependencies[number]:
-                if self.landed(dep.head_sha):
+                if self.landed(dep.head_sha, number):
                     continue
                 prior = self.nodes.get(dep.number)
-                if prior is None or dep.number in path or not self.eligible(dep.number, path + (number,)):
+                if (prior is None or dep.number in path or self.target(dep.number)[0] != self.target(number)[0]
+                        or not self.eligible(dep.number, path + (number,))):
                     reason = f'blocked by prerequisite PR #{dep.number}'
                     break
         if reason:
@@ -472,17 +489,28 @@ class Graph:
         self._eligibility[number] = True
         return True
 
-    def select(self, *, priority=True):
+    def select(self, *, priority=True, target_ref=None, priority_only=False):
         ready = [n for n in sorted(self.dependencies) if self.nodes[n].ready
-                 and not self.landed(self.nodes[n].head) and self.eligible(n)]
-        seeds = [n for n in ready if self.nodes[n].priority] if priority else []
+                 and not self.ancestor(self.nodes[n].head, self.target(n)[1]) and self.eligible(n)
+                 and (self.available_targets is None or self.target(n)[0] in self.available_targets)]
+        if target_ref is not None:
+            ready = [n for n in ready if self.target(n)[0] == target_ref]
+        elif self.targets:
+            immediate = [n for n in ready if self.nodes[n].immediate and self.target(n)[0] == self.base_branch]
+            campaigns = [n for n in ready if self.target(n)[0] != self.base_branch]
+            chosen = self.base_branch if immediate or priority_only or not campaigns else self.target(campaigns[0])[0]
+            ready = [n for n in ready if self.target(n)[0] == chosen]
+        if priority_only and not any(self.nodes[n].priority for n in ready):
+            return []
+        campaign_lane = bool(ready and self.target(ready[0])[0] != self.base_branch)
+        seeds = [n for n in ready if self.nodes[n].priority] if priority and not campaign_lane else []
         seeds = seeds or ready
         ordered = []
         def include(number):
             if number in ordered:
                 return
             for dep in self.dependencies[number]:
-                if not self.landed(dep.head_sha):
+                if not self.landed(dep.head_sha, number):
                     include(dep.number)
             ordered.append(number)
         for number in seeds:
@@ -500,11 +528,11 @@ class Graph:
                 continue
             deps = {d.number: d for d in self.dependencies[pull.number]}
             for dep in pull.dependencies:
-                if not self.landed(dep.head_sha) and (dep.number not in deps or deps[dep.number].head_sha != dep.head_sha):
+                if not self.landed(dep.head_sha, pull.number) and (dep.number not in deps or deps[dep.number].head_sha != dep.head_sha):
                     blocked[pull.number] = f'captured prerequisite PR #{dep.number} changed'
                 deps.setdefault(dep.number, dep)
             for dep in deps.values():
-                if self.landed(dep.head_sha):
+                if self.landed(dep.head_sha, pull.number):
                     continue
                 included = selected.get(dep.number)
                 if included is None or included.head_sha != dep.head_sha:
@@ -514,7 +542,7 @@ class Graph:
             changed = False
             for pull in sources:
                 for dep in self.dependencies.get(pull.number, ()):
-                    if pull.number not in blocked and dep.number in blocked and not self.landed(dep.head_sha):
+                    if pull.number not in blocked and dep.number in blocked and not self.landed(dep.head_sha, pull.number):
                         blocked[pull.number] = f'blocked by prerequisite PR #{dep.number}'
                         changed = True
         return blocked
