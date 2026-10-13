@@ -45,6 +45,7 @@ class CampaignTests(unittest.TestCase):
         mock.patch.object(engine, 'LOCK_PATH', Path(self.temp.name) / 'stabilize.lock').start()
         mock.patch.object(monitor, 'CHANNEL_PATH', Path(self.temp.name) / 'channel').start()
         self.gh = mock.patch.object(monitor, 'run_gh', return_value='[]').start()
+        self.master = mock.patch.object(automerge, 'current_master_sha', return_value=A).start()
         self.ancestry = mock.patch.object(engine, 'ancestor', side_effect=lambda a, b: a == b or (a, b) in {(A, B), (A, C), (B, C)}).start()
         mock.patch.object(monitor, 'slack_send', return_value=(True, '123.456')).start()
         mock.patch.object(monitor, 'load_slack_transport', return_value=monitor.SlackTransport('chat', token='test', channel='C1')).start()
@@ -1016,6 +1017,159 @@ class CampaignTests(unittest.TestCase):
             self.assertNotIn(f'`{B[:12]}`', message)
             self.assertTrue(engine.slack_commit(A) in message or engine.slack_commit(B) in message)
         self.assertEqual(engine.get(c.id)['pause_reason'], f'Checks deferred at {B[:7]}')
+
+    def test_zero_fix_push_gate_lands_without_pr_and_advances(self):
+        c = self.campaign()
+        self.master.return_value = C  # Historical anchor is behind, not equal to, master.
+        with mock.patch.object(engine, 'ensure_ref') as create_ref:
+            self.assertTrue(engine.open_gate(self.conn, c))
+        create_ref.assert_not_called()
+        self.gh.assert_not_called()
+        gate = self.conn.execute('SELECT * FROM stabilize_gate_merges').fetchone()
+        self.assertEqual((gate['stage'], gate['state'], gate['pr_number']), ('push', 'merged', None))
+        self.assertEqual(self.current().stage, 'hourly')
+        self.assertEqual(engine.get(c.id)['gate_merges'][0]['pr_number'], None)
+        message = self.conn.execute("SELECT text FROM stabilize_messages WHERE checkpoint LIKE 'gate-in-master:%'").fetchone()[0]
+        self.assertEqual(message, f'push gate needs no PR: {engine.slack_commit(A)} is already in master.')
+        engine.observe_gates(self.conn, self.current())
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM stabilize_messages WHERE checkpoint LIKE 'gate-in-master:%'").fetchone()[0], 1)
+
+    def test_live_pending_zero_fix_gate_recovers_and_dispatches_hourly_next_tick(self):
+        c = self.campaign()
+        self.master.return_value = C
+        self.gate(c, tip=A, number=None)
+        now = monitor.utc_now()
+        with self.conn:
+            self.conn.execute("UPDATE stabilize_gate_merges SET state='pending'")
+            self.conn.execute('INSERT INTO stabilize_gate_intents(campaign_id,stage,intent_at) VALUES (?,?,?)', (c.id, 'push', now))
+        passing = run(1, conclusion='success')
+        with mock.patch.object(automerge, 'collect_failure_report_for_run', return_value=report(successful=True)):
+            engine.ingest_run(self.conn, c, 'push', passing)
+        self.gh.reset_mock()
+        with mock.patch.object(engine, 'ref_sha', return_value=A), \
+             mock.patch.object(engine, 'branch_runs', side_effect=lambda c, stage: [passing] if stage == 'push' else []), \
+             mock.patch.object(engine, 'ensure_ref') as refs:
+            engine.once(self.conn)
+            engine.once(self.conn)
+        refs.assert_not_called()  # Existing snapshot is left in place, not deleted or rewritten.
+        self.assertEqual(self.current().stage, 'hourly')
+        gate = self.conn.execute('SELECT * FROM stabilize_gate_merges').fetchone()
+        self.assertEqual((gate['state'], gate['pr_number']), ('merged', None))
+        self.assertEqual(self.conn.execute('SELECT intent_at FROM stabilize_gate_intents').fetchone()[0], now)
+        writes = [call.args[0] for call in self.gh.call_args_list]
+        self.assertFalse(any(args[:2] == ['pr', 'create'] for args in writes))
+        dispatches = self.conn.execute('SELECT stage,attempt FROM stabilize_dispatches').fetchall()
+        self.assertEqual([(r['stage'],r['attempt']) for r in dispatches], [('hourly',1)])
+
+    def test_nightly_zero_fix_gate_completes_without_pr(self):
+        c = self.campaign(stage='nightly')
+        with mock.patch.object(engine, 'pull_requests', return_value=[{'number': 99}]), \
+             mock.patch.object(engine, 'ensure_ref') as refs:
+            self.assertTrue(engine.open_gate(self.conn, c))
+        refs.assert_not_called()
+        self.assertEqual(self.current().status, 'completed')
+        self.assertIsNotNone(engine.get(c.id)['finished_at'])
+        gate = self.conn.execute('SELECT * FROM stabilize_gate_merges').fetchone()
+        self.assertEqual((gate['state'], gate['pr_number']), ('merged', None))
+        completion = self.conn.execute("SELECT text FROM stabilize_messages WHERE checkpoint='completed:0'").fetchone()[0]
+        self.assertIn('#99', completion)
+        self.assertIn('nightly gate', completion)
+        self.gh.assert_not_called()
+
+    def test_absorbed_gate_with_existing_pr_lands_without_closed_or_rejected_pause(self):
+        c = self.campaign(sha=B, stage='hourly')
+        self.gate(c)
+        self.master.return_value = C
+        # Inclusion is sufficient even if PR bookkeeping is closed or unavailable.
+        with mock.patch.object(engine, 'gh', side_effect=AssertionError('PR view not needed for a proven landing')):
+            engine.observe_gates(self.conn, c)
+        self.assertEqual((self.current().status, self.current().stage), ('running', 'hourly'))
+        gate = self.conn.execute('SELECT * FROM stabilize_gate_merges').fetchone()
+        self.assertEqual((gate['state'], gate['pr_number']), ('merged', 40))
+        self.assertIsNone(engine.get(c.id)['pause_reason'])
+        notice = self.conn.execute("SELECT text FROM stabilize_messages WHERE checkpoint LIKE 'gate-in-master:%'").fetchone()[0]
+        self.assertIn('Gate PR #40 is no longer needed', notice)
+
+    def test_closed_gate_pr_rechecks_master_advanced_during_read(self):
+        c = self.campaign(sha=B)
+        self.gate(c)
+        self.master.side_effect = [A, C]
+        self.gh.return_value = json.dumps({'state': 'CLOSED', 'labels': [], 'headRefOid': B})
+        engine.observe_gates(self.conn, c)
+        self.assertEqual((self.current().status, self.current().stage), ('running', 'hourly'))
+        self.assertEqual(self.conn.execute('SELECT state FROM stabilize_gate_merges').fetchone()[0], 'merged')
+
+    def test_already_in_master_gate_closes_included_landed_issues_with_null_pr_fence(self):
+        c = self.campaign(sha=B)
+        self.issue(c, status='landed')
+        with self.conn:
+            self.conn.execute('INSERT INTO stabilize_fix_commits VALUES (?,?,?)', (c.id, 7, B))
+        self.master.return_value = C
+        self.assertTrue(engine.open_gate(self.conn, c))
+        close = self.conn.execute("SELECT payload FROM stabilize_writes WHERE kind='close'").fetchone()
+        payload = json.loads(close[0])
+        self.assertIsNone(payload['gate_pr_number'])
+        self.assertIn('no gate PR was needed', payload['comment'])
+        with mock.patch.object(engine, 'api', return_value=[]) as api:
+            engine.deliver_writes(self.conn)
+        self.assertEqual(self.issue_state(), 'closed')
+        self.assertTrue(any('state=closed' in call.args for call in api.call_args_list))
+
+    def test_ancestry_unavailable_defers_gate_without_publication_or_advancement(self):
+        c = self.campaign(sha=B)
+        self.master.return_value = C
+        self.ancestry.side_effect = git_ancestry.Deferred('secret unprintable details')
+        with mock.patch.object(monitor, 'log') as log, mock.patch.object(engine, 'ensure_ref') as refs:
+            self.assertFalse(engine.open_gate(self.conn, c))
+        self.assertEqual(self.current().stage, 'push')
+        self.assertEqual(self.conn.execute('SELECT state FROM stabilize_gate_merges').fetchone()[0], 'pending')
+        refs.assert_not_called()
+        self.gh.assert_not_called()
+        self.assertTrue(any('deferred: Deferred' in call.args[0] for call in log.call_args_list))
+        self.assertFalse(any('secret' in call.args[0] for call in log.call_args_list))
+
+    def test_unavailable_master_read_defers_pending_gate_reconciliation(self):
+        c = self.campaign()
+        self.gate(c, tip=A, number=None)
+        with self.conn:
+            self.conn.execute("UPDATE stabilize_gate_merges SET state='pending'")
+        self.master.side_effect = monitor.CommandError('secret auth details')
+        with mock.patch.object(monitor, 'log') as log:
+            engine.observe_gates(self.conn, c)
+        self.assertEqual(self.current().stage, 'push')
+        self.assertEqual(self.conn.execute('SELECT state FROM stabilize_gate_merges').fetchone()[0], 'pending')
+        self.assertFalse(any('secret' in call.args[0] for call in log.call_args_list))
+
+    def test_gate_publication_error_logs_exception_class_without_message_body(self):
+        c = self.campaign(sha=B)
+        def external(args, **kwargs):
+            if args[:2] == ['pr', 'list']:
+                return '[]'
+            if args[:2] == ['pr', 'create']:
+                raise monitor.CommandError('secret PR message/token')
+            return ''
+        self.gh.side_effect = external
+        with mock.patch.object(engine, 'ref_sha', return_value=B), \
+             mock.patch.object(engine, 'ensure_ref', return_value=True), mock.patch.object(monitor, 'log') as log:
+            self.assertFalse(engine.open_gate(self.conn, c))
+        self.assertTrue(any('publication failed: CommandError' in call.args[0] for call in log.call_args_list))
+        self.assertFalse(any('secret' in call.args[0] for call in log.call_args_list))
+        self.assertEqual(self.current().stage, 'push')
+
+    def test_master_absorbs_tip_while_gate_publication_fails(self):
+        c = self.campaign(sha=B)
+        self.master.side_effect = [A, C]
+        def external(args, **kwargs):
+            if args[:2] == ['pr', 'list']:
+                return '[]'
+            if args[:2] == ['pr', 'create']:
+                raise monitor.CommandError('No commits between branches')
+            return ''
+        self.gh.side_effect = external
+        with mock.patch.object(engine, 'ref_sha', return_value=B), mock.patch.object(engine, 'ensure_ref', return_value=True):
+            self.assertTrue(engine.open_gate(self.conn, c))
+        self.assertEqual(self.current().stage, 'hourly')
+        self.assertEqual(self.conn.execute('SELECT state FROM stabilize_gate_merges').fetchone()[0], 'merged')
 
 
 if __name__ == '__main__':
