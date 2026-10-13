@@ -422,6 +422,12 @@ main {
   gap: 18px;
   margin-top: 13px;
 }
+.campaign-lane {
+  display: grid;
+  grid-template-columns: 1.14fr 1.14fr 0.85fr;
+  gap: 18px;
+  margin-top: 18px;
+}
 .pipeline-card {
   position: relative;
   min-width: 0;

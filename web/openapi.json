@@ -1588,6 +1588,17 @@
       },
       "Pipeline": {
         "properties": {
+          "campaign": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BatchSummary"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Batch in the release-branch lane, which runs alongside the master lane."
+          },
           "primary": {
             "anyOf": [
               {

@@ -241,6 +241,8 @@ class Stats(BaseModel):
 class Pipeline(BaseModel):
     primary: BatchSummary | None = None
     speculative: BatchSummary | None = None
+    campaign: BatchSummary | None = Field(
+        default=None, description='Batch in the release-branch lane, which runs alongside the master lane.')
 
 
 class Kpis(BaseModel):

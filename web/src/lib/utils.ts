@@ -10,6 +10,11 @@ const pluralRules = new Intl.PluralRules("en");
 export function plural(count: number, one: string, many = `${one}s`) {
   return `${count.toLocaleString("en")} ${pluralRules.select(count) === "one" ? one : many}`;
 }
+/** Release-branch refs are generated IDs; show them as "release branch" and keep the ref for hover text. */
+export function targetLabel(ref: string | null | undefined) {
+  if (!ref || ref === "master") return "master";
+  return ref.startsWith("stabilize/") ? "release branch" : ref;
+}
 export function duration(seconds: number | null | undefined) {
   if (seconds == null || !Number.isFinite(seconds)) return "—";
   const total = Math.max(0, Math.round(seconds));
