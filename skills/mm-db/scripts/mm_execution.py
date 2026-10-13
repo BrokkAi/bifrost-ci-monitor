@@ -14,7 +14,7 @@ import urllib.request
 
 import mm_attest_capture
 
-ATTEST_VERSION = "0.1.1"
+ATTEST_VERSION = "0.1.2"
 
 
 def git(cwd, *args):
@@ -139,7 +139,7 @@ def execute(argv, cwd, output, *, client=None, state=None, script=None, stdout=N
         if attest_output is not None:
             try:
                 summary = json.loads((Path(attest_output) / "summary.json").read_text())
-                if (summary["format_version"] != 1 or summary["head"] != head
+                if (summary["format_version"] not in (1, 2) or summary["head"] != head
                         or summary["tree"] != tree or summary["exit_code"] != receipt["exit_code"]):
                     raise ValueError("Attest summary does not match this execution")
                 receipt["attest"] = {k: summary[k] for k in (

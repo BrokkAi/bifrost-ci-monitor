@@ -714,7 +714,11 @@ flags/profile/environment remain authoritative. Unsupported calls or failed
 preflight run natively; report failures after execution never rerun tests or
 replace the native exit status. Multiple calls retain bounded `attest_runs` and
 capture diagnostics; legacy singular `attest` summaries remain readable. Suite
-labels do not establish equivalence: source and exact execution contracts do.
+labels do not establish equivalence: Attest compares source, test identity and
+adapter-defined build variants. Its single compatibility policy records environment
+and tool versions as diagnostics; environment-certification jobs use native runners.
+Format 2 adds the variant; format 1 summaries remain readable. Consumers retain
+summaries and leave compatibility decisions to Attest.
 Automatic capture never skips tests, changes assessments or authorizes a merge.
 `automerge_executions` retains command/arguments, committed head/tree, safe build
 settings and host metadata, start/end times, duration, exit status, source changes,

@@ -18,7 +18,7 @@ def collect(receipt, root):
             if path.stat().st_size > 48 * 1024:
                 raise ValueError("oversized summary")
             summary = json.loads(path.read_text())
-            if (not isinstance(summary, dict) or summary.get("format_version") != 1
+            if (not isinstance(summary, dict) or summary.get("format_version") not in (1, 2)
                     or summary.get("mode") != "shadow"
                     or not re.fullmatch(r"[0-9a-f]{32}", str(summary.get("run_id", "")))
                     or any(not re.fullmatch(r"[0-9a-f]{40}", str(summary.get(k, ""))) for k in ("head", "tree"))

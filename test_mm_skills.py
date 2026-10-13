@@ -301,7 +301,7 @@ tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).s
 for i in range(2):
     folder = output / str(i)
     folder.mkdir()
-    summary = dict(format_version=1, run_id=str(i)*32, head=head, tree=tree,
+    summary = dict(format_version=i+1, run_id=str(i)*32, head=head, tree=tree,
         mode="shadow", suite="future-test-system", exit_code=0, published=True,
         result=str(folder/"result.json"), object="s3://bucket/result",
         metrics={"executed": 1, "failed": 0, "potential_reuse": 0}, warnings=["not retained"])
@@ -404,7 +404,7 @@ class StateTests(unittest.TestCase):
         self.assertEqual(self.state()["revision"], terminal["revision"])
 
     def test_multiple_attest_summaries_are_validated_snapshotted_and_immutable(self):
-        summary = dict(format_version=1, run_id="a"*32, head=HEAD_ONE, tree="c"*40,
+        summary = dict(format_version=2, run_id="a"*32, head=HEAD_ONE, tree="c"*40,
                        mode="shadow", suite="native-test-system", exit_code=0, published=True,
                        result="/logs/result.json", object="s3://bucket/result", metrics={"executed": 2})
         receipt = self.execution(attest_runs=[summary],
@@ -419,6 +419,8 @@ class StateTests(unittest.TestCase):
             self.call("execution", receipt=dict(receipt, attest_runs=[]))
         with self.assertRaisesRegex(ValueError, "invalid automatic"):
             self.call("execution", receipt=self.execution(identifier="b"*32, attest_runs=[dict(summary, mode="reuse")]))
+        with self.assertRaisesRegex(ValueError, "invalid automatic"):
+            self.call("execution", receipt=self.execution(identifier="c"*32, attest_runs=[dict(summary, format_version=3)]))
 
     def test_execution_start_finish_and_late_start_preserve_completed_evidence(self):
         complete = self.execution()

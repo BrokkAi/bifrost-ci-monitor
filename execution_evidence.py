@@ -61,7 +61,7 @@ def validate(value):
             raise ValueError("execution output must reference retained log paths")
     attest = value.get("attest")
     if attest is not None:
-        if (not isinstance(attest, dict) or attest.get("format_version") != 1
+        if (not isinstance(attest, dict) or attest.get("format_version") not in (1, 2)
                 or not isinstance(attest.get("run_id"), str)
                 or not re.fullmatch(r"[0-9a-f]{32}", attest["run_id"])
                 or attest.get("mode") not in {"shadow", "reuse", "force"}
@@ -73,7 +73,7 @@ def validate(value):
     if not isinstance(runs, list) or len(runs) > 16:
         raise ValueError("invalid automatic Attest summaries")
     for run in runs:
-        if (not isinstance(run, dict) or run.get("format_version") != 1
+        if (not isinstance(run, dict) or run.get("format_version") not in (1, 2)
                 or not re.fullmatch(r"[0-9a-f]{32}", str(run.get("run_id", "")))
                 or not re.fullmatch(r"[0-9a-f]{40}", str(run.get("head", "")))
                 or not re.fullmatch(r"[0-9a-f]{40}", str(run.get("tree", "")))
