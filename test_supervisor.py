@@ -63,6 +63,37 @@ class SupervisorTests(unittest.TestCase):
         with conn:
             conn.execute('UPDATE automerge_batches SET prompt_delivered=1 WHERE batch_id=?', (row['batch_id'],))
 
+    def test_campaign_selection_captures_campaign_tip_and_forces_async(self):
+        target = 'stabilize/test'
+        source = a.PullRequest(50, 'fix', HEAD_ONE, 'url', base_ref=target, target_ref=target)
+        self.select.return_value = [source]
+        remote = self.patch(a, 'remote_branch_sha', return_value=BASE_SHA)
+        self.patch(a, 'current_master_sha', side_effect=AssertionError('master capture'))
+        self.patch(a, '_ancestry_cache', return_value=mock.Mock(behind=mock.Mock(return_value=1)))
+        self.patch(a, 'CI_MODE', 'sync')
+        self.patch(a, 'process_batch')
+        self.assertEqual(supervisor.run(a, self.conn, self.transport), 0)
+        row = a.active_batch(self.conn)
+        self.assertEqual(row['target_ref'], target)
+        self.assertEqual(row['base_sha'], BASE_SHA)
+        self.assertEqual(row['ci_mode'], 'async')
+        remote.assert_called_with(target)
+
+    def test_campaign_primary_waits_and_has_no_successor_action(self):
+        identifier = self.batch()
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET target_ref='stabilize/test' WHERE batch_id=?", (identifier,))
+        row = self.row(identifier)
+        value = {'id': 'checkpoint', 'head': HEAD_ONE, 'tree': HEAD_ONE,
+                 'source_revision': speculation.source_revision(a, row)}
+        with self.conn:
+            self.conn.execute('UPDATE automerge_batches SET candidate_json=? WHERE batch_id=?', (json.dumps(value), identifier))
+        options = supervisor.plan(a, self.conn, priority_checked=True, queue_checked=False,
+                                  maintenance_done=False, reconciled=set())
+        self.assertNotIn('select_primary', [entry[2] for entry in options])
+        self.assertNotIn('select_successor', [entry[2] for entry in options])
+        self.assertIn('advance_batch', [entry[2] for entry in options])
+
     def test_guidance_and_primary_progress_precede_lookahead_selection(self):
         identifier = self.batch(checkpoint=True)
         with self.conn:

@@ -41,6 +41,8 @@ def ensure_schema(conn, ensure_column):
 def source_revision(a, row, *, base=None):
     inputs = [row["base_sha"] if base is None else base,
               [p.as_json() for p in a.row_pulls(row)], a._excluded_source_heads(row)]
+    if a.batch_target(row) != a.BASE_BRANCH:
+        inputs.append(a.batch_target(row))
     generation = get(row, "attempt_generation", 0)
     if generation:
         inputs.append(generation)  # Generation zero retains legacy evidence digests.
@@ -130,18 +132,20 @@ Read mm-db state: if predecessor is present, your captured base is its pinned ca
 def selection(a, conn, parent):
     # Discovery and dependency retargeting use actual master. Only this second,
     # read-only view treats the unlanded checkpoint as a selection base.
+    if a.batch_target(parent) != a.BASE_BRANCH:
+        return []
     actual = a.dependency_graph(conn)
     checkpoint = candidate(a, parent)
     occupied = reserved(a, conn)
-    nodes = {n: replace(node, ready=False) if n in occupied else node for n, node in actual.nodes.items()}
+    nodes = {n: replace(node, ready=False) if n in occupied or actual.target(n)[0] != a.BASE_BRANCH else node for n, node in actual.nodes.items()}
     graph = a.pr_dependencies.Graph(nodes, actual.histories, checkpoint["head"],
         a.compare_commit_ancestry, conn=conn, base_branch=a.BASE_BRANCH,
-        persist_comparisons=True).discover()
+        persist_comparisons=True, gates=actual.gates).discover()
     return [a.dependency_pull(graph, n) for n in graph.select() if n not in occupied]
 
 
 def launch_child(a, conn, parent):
-    if (not a.SPECULATIVE_LOOKAHEAD or is_speculative(parent)
+    if (a.batch_target(parent) != a.BASE_BRANCH or not a.SPECULATIVE_LOOKAHEAD or is_speculative(parent)
             or not candidate(a, parent) or child(conn, parent["batch_id"])):
         return
     pulls = selection(a, conn, parent)

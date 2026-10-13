@@ -8,6 +8,7 @@ import issue_fixer as fixer
 import automerge
 import monitor
 import local_findings
+import stabilize_state
 
 
 def issue(number=12, *, assignees=(), progress=False):
@@ -58,6 +59,223 @@ class IssueFixerTests(TestCase):
         with self.conn:
             self.conn.execute("UPDATE issue_repairs SET status='completed',cleanup_done=1,repair_pr_number=30 WHERE id=?", (job["id"],))
         return job
+
+    def campaign(self, members):
+        with self.conn:
+            self.conn.execute("INSERT INTO stabilize_campaigns "
+                              "(id,branch,anchor_sha,tip_sha,stage,status,created_at,updated_at) "
+                              "VALUES ('campaign','stabilize/campaign',?,?, 'hourly','running','now','now')",
+                              ('c' * 40, 'd' * 40))
+            self.conn.executemany("INSERT INTO stabilize_issues "
+                                  "(campaign_id,issue_number,stage,state,source,round,added_at,updated_at) "
+                                  "VALUES ('campaign',?,?,?,'seed',0,'now','now')", members)
+
+    def campaign_job(self, number=12, *, retry=None):
+        def github(endpoint, **kwargs):
+            if endpoint == 'commits/stabilize%2Fcampaign':
+                return {'sha': 'e' * 40}
+            self.assertNotEqual(endpoint, 'commits/master')
+            return []
+        with mock.patch.object(fixer, 'api', side_effect=github):
+            return fixer.create_job(self.conn, issue(number), retry, 'bad test' if retry else None,
+                                    f'campaign:{number}:{retry["head"]["sha"] if retry else "initial"}',
+                                    [], 'b' * 40)
+
+    def test_campaign_priority_precedes_rejected_master_repairs_and_orders_by_stage(self):
+        self.owned_pr()
+        self.campaign([(90, 'nightly', 'open'), (60, 'hourly', 'open'),
+                       (80, 'push', 'open'), (70, 'push', 'open')])
+        pending = [issue(n) for n in [90, 60, 80, 70, 1, 12]]
+        with mock.patch.object(fixer, 'api', return_value=[rejection()]):
+            for expected in [70, 80, 60, 90, 12, 1]:
+                selected = fixer.select_work(self.conn, pending, [pr(rejected=True)])
+                self.assertEqual(selected[0]['number'], expected)
+                pending = [i for i in pending if i['number'] != expected]
+
+    def test_triage_linked_campaign_issues_have_priority_before_membership_is_recorded(self):
+        self.campaign([(90, 'nightly', 'open')])
+        with self.conn:
+            for number, stage in [(80, 'hourly'), (70, 'push')]:
+                self.conn.execute("INSERT INTO stabilize_failures "
+                                  "(campaign_id,stage,workflow,job_name,identity_kind,identity,"
+                                  "first_seen_sha,first_seen_run_id,first_seen_run_url,first_seen_at,"
+                                  "last_seen_sha,last_seen_run_id,last_seen_run_url,last_seen_at,"
+                                  "linked_issue_url,updated_at) "
+                                  "VALUES ('campaign',?,'CI','linux','test',?,'first',1,'url','then',"
+                                  "'last',2,'url','now',?,'now')",
+                                  (stage, f'failure-{number}', issue(number)['html_url']))
+        pending = [issue(n) for n in [1, 90, 80, 70]]
+        for expected in [70, 80, 90, 1]:
+            selected = fixer.select_work(self.conn, pending, [])
+            self.assertEqual(selected[0]['number'], expected)
+            pending = [i for i in pending if i['number'] != expected]
+        job = self.campaign_job(70)
+        self.assertEqual(job['target_branch'], 'stabilize/campaign')
+
+    def test_campaign_ready_and_landed_issues_are_not_admitted_even_with_new_evidence(self):
+        self.campaign([(12, 'push', 'pr_ready'), (13, 'hourly', 'landed')])
+        with mock.patch.object(fixer, 'create_job') as admission, \
+             mock.patch.object(fixer, 'cleanup'), \
+             mock.patch.object(fixer, 'api', side_effect=lambda endpoint, **kw:
+                               [dict(issue(12), body='new evidence'), issue(13)]
+                               if endpoint.startswith('issues?') else []):
+            fixer.tick(self.conn, self.transport)
+        admission.assert_not_called()
+
+    def test_inactive_campaign_issue_states_follow_master_behavior(self):
+        self.campaign([(12, 'push', 'escalated'), (13, 'hourly', 'closed'),
+                       (14, 'nightly', 'dropped')])
+        for number in [12, 13, 14]:
+            self.assertEqual(fixer.select_work(self.conn, [issue(number)], [])[0]['number'], number)
+            self.assertIsNone(self.job(number)['target_branch'])
+
+    def test_campaign_owned_exact_head_rejection_is_admitted_when_pr_ready(self):
+        self.campaign([(12, 'push', 'open')])
+        job = self.campaign_job()
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='completed',cleanup_done=1,"
+                              "repair_pr_number=30 WHERE id=?", (job['id'],))
+            self.conn.execute("UPDATE stabilize_issues SET state='pr_ready'")
+        repair = dict(pr(rejected=True), base={'ref': 'stabilize/campaign'})
+        with mock.patch.object(fixer, 'api', return_value=[rejection()]):
+            selected = fixer.select_work(self.conn, [issue(12, assignees=[fixer.ASSIGNEE], progress=True)], [repair])
+        self.assertEqual(selected[1]['number'], 30)
+        retry = self.campaign_job(retry=repair)
+        self.assertEqual(retry['target_branch'], 'stabilize/campaign')
+        self.assertEqual(retry['base_sha'], repair['head']['sha'])
+        self.assertIn('Merge current origin/stabilize/campaign', retry['prompt'])
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='completed',cleanup_done=1")
+            self.conn.execute("UPDATE stabilize_issues SET state='landed'")
+        with mock.patch.object(fixer, 'api') as api:
+            self.assertIsNone(fixer.select_work(self.conn, [issue()], [repair]))
+        api.assert_not_called()
+
+    def test_campaign_job_uses_fresh_target_tip_and_keeps_target_after_campaign_ends(self):
+        self.campaign([(12, 'push', 'open')])
+        job = self.campaign_job()
+        self.assertEqual(job['target_branch'], 'stabilize/campaign')
+        self.assertEqual(job['base_sha'], 'e' * 40)
+        for text in ['MERGE origin/stabilize/campaign', 'PR against stabilize/campaign',
+                     '--base stabilize/campaign', 'target stabilize/campaign',
+                     'Never merge master', 'Fixes #12', 'CI-Repair-Issue: 12']:
+            self.assertIn(text, job['prompt'])
+        self.assertNotIn('origin/master', job['prompt'])
+        with self.conn:
+            self.conn.execute("UPDATE stabilize_campaigns SET status='completed'")
+        sent = []
+        def mj(args, **kwargs):
+            if args[0] == 'sessions':
+                return '{"sessions":[]}'
+            sent.append(args)
+            self.assertEqual(Path(args[args.index('--prompt-file') + 1]).read_text(), job['prompt'])
+            return '{"session_id":"session"}'
+        with mock.patch.object(monitor, 'require_mj_success', side_effect=mj), \
+             mock.patch.object(fixer, 'api', return_value=issue()):
+            fixer.launch(self.conn, job)
+        self.assertEqual(sent[0][sent[0].index('--at') + 1], 'e' * 40)
+        self.assertEqual(sent[0][sent[0].index('--branch') + 1], job['branch'])
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='completed',cleanup_done=1,repair_pr_number=30")
+        retry = self.campaign_job(retry=pr(rejected=True))
+        self.assertEqual(retry['target_branch'], 'stabilize/campaign')
+        context = json.loads(retry['prompt'].split('## Issue dossier\n', 1)[1])
+        self.assertEqual(context['stabilize_campaign']['branch'], 'stabilize/campaign')
+
+    def test_completed_master_work_does_not_hide_new_campaign_work(self):
+        job = self.job()
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='completed',cleanup_done=1")
+        self.campaign([(12, 'push', 'open')])
+        selected = fixer.select_work(self.conn, [issue()], [])
+        self.assertIsNotNone(selected)
+        self.assertNotEqual(selected[3], job['work_key'])
+
+    def test_master_rejection_retry_retains_master_target_when_issue_joins_campaign(self):
+        self.owned_pr()
+        self.campaign([(12, 'push', 'open')])
+        retry = self.campaign_job(retry=pr(rejected=True))
+        self.assertIsNone(retry['target_branch'])
+        self.assertIn('MERGE origin/master', retry['prompt'])
+        self.assertNotIn('--base master', retry['prompt'])
+        self.assertNotIn('target master', retry['prompt'])
+
+    def test_tick_reads_campaign_prs_and_fresh_campaign_tip_without_reading_master(self):
+        self.campaign([(12, 'push', 'open')])
+        repair = dict(pr(), base={'ref': 'stabilize/campaign'})
+        calls = []
+        def github(endpoint, **kwargs):
+            calls.append(endpoint)
+            if endpoint.startswith('issues?'):
+                return [issue()]
+            if endpoint.startswith('pulls?'):
+                self.assertNotIn('base=master', endpoint)
+                return [repair]
+            if endpoint == 'commits/stabilize%2Fcampaign':
+                return {'sha': 'e' * 40}
+            self.assertNotEqual(endpoint, 'commits/master')
+            return []
+        with mock.patch.object(fixer, 'api', side_effect=github), \
+             mock.patch.object(fixer, 'process_job'), mock.patch.object(fixer, 'cleanup'):
+            fixer.tick(self.conn, self.transport)
+        saved = self.conn.execute('SELECT * FROM issue_repairs').fetchone()
+        self.assertEqual(saved['target_branch'], 'stabilize/campaign')
+        self.assertEqual(saved['base_sha'], 'e' * 40)
+        context = json.loads(saved['prompt'].split('## Issue dossier\n', 1)[1])
+        self.assertEqual(context['open_pr_inventory'][0]['number'], repair['number'])
+        self.assertEqual(context['open_pr_inventory'][0]['base_branch'], 'stabilize/campaign')
+
+    def test_tick_discovers_owned_campaign_rejection_after_campaign_ends(self):
+        self.campaign([(12, 'push', 'open')])
+        job = self.campaign_job()
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='completed',cleanup_done=1,"
+                              "outcome_sent=1,repair_pr_number=30 WHERE id=?", (job['id'],))
+            self.conn.execute("UPDATE stabilize_campaigns SET status='completed'")
+        repair = dict(pr(rejected=True), base={'ref': 'stabilize/campaign'})
+        def github(endpoint, **kwargs):
+            if endpoint.startswith('issues?'):
+                return [issue(assignees=[fixer.ASSIGNEE], progress=True)]
+            if endpoint.startswith('pulls?'):
+                self.assertNotIn('base=master', endpoint)
+                return [repair]
+            if endpoint.startswith('issues/30/comments'):
+                return [rejection()]
+            self.assertFalse(endpoint.startswith('commits/'))
+            return []
+        with mock.patch.object(fixer, 'api', side_effect=github), \
+             mock.patch.object(fixer, 'process_job'), mock.patch.object(fixer, 'cleanup'):
+            fixer.tick(self.conn, self.transport)
+        saved = self.conn.execute("SELECT * FROM issue_repairs WHERE retry_pr_number=30").fetchone()
+        self.assertEqual(saved['target_branch'], 'stabilize/campaign')
+
+    def test_failed_campaign_tip_read_does_not_starve_master_admission(self):
+        self.campaign([(12, 'push', 'open')])
+        def github(endpoint, **kwargs):
+            if endpoint.startswith('issues?'):
+                return [issue(12), issue(1)]
+            if endpoint == 'commits/stabilize%2Fcampaign':
+                raise monitor.CommandError('campaign tip unavailable')
+            if endpoint == 'commits/master':
+                return {'sha': 'b' * 40}
+            return []
+        with mock.patch.object(fixer, 'api', side_effect=github), \
+             mock.patch.object(fixer, 'process_job') as process, mock.patch.object(fixer, 'cleanup'), \
+             mock.patch.object(monitor, 'log'):
+            with self.assertRaisesRegex(monitor.CommandError, 'campaign tip unavailable'):
+                fixer.tick(self.conn, self.transport)
+        saved = self.conn.execute('SELECT * FROM issue_repairs').fetchone()
+        self.assertEqual(saved['issue_number'], 1)
+        self.assertIsNone(saved['target_branch'])
+        self.assertEqual(process.call_args.args[2]['issue_number'], 1)
+
+    def test_existing_database_additively_migrates_target_branch(self):
+        job = self.job()
+        self.conn.execute('ALTER TABLE issue_repairs DROP COLUMN target_branch')
+        fixer.ensure_schema(self.conn)
+        migrated = self.conn.execute('SELECT * FROM issue_repairs WHERE id=?', (job['id'],)).fetchone()
+        self.assertIsNone(migrated['target_branch'])
+        self.assertEqual(migrated['prompt'], job['prompt'])
 
     def test_new_work_requires_no_assignee_and_no_progress_label(self):
         self.assertIsNone(fixer.select_work(self.conn, [issue(1, assignees=["dave"]), issue(2, progress=True),

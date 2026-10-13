@@ -126,6 +126,227 @@ class DependencyTests(TestCase):
         self.git('checkout', '-q', 'master')
         self.git('merge', '--no-ff', '-qm', 'integration', head)
 
+    def campaign(self, *, status='running', state='pr_ready', tip=None):
+        tip = tip or self.base
+        self.git('branch', 'stabilize/test', tip)
+        with self.conn:
+            self.conn.execute("INSERT INTO stabilize_campaigns "
+                              "(id,branch,anchor_sha,tip_sha,status,created_at,updated_at) "
+                              "VALUES ('test','stabilize/test',?,?,?,?,?)",
+                              (self.base, tip, status, 'now', 'now'))
+            self.conn.execute("INSERT INTO stabilize_issues "
+                              "(campaign_id,issue_number,stage,source,round,state,added_at,updated_at) "
+                              "VALUES ('test',900,'push','test',0,?,'now','now')", (state,))
+        self.patch(automerge, 'remote_branch_sha', side_effect=lambda branch: self.git('rev-parse', branch))
+
+    def test_campaign_closed_gate_holds_selection_without_dependency_notice(self):
+        self.campaign(state='open')
+        self.add_pr(50, 'campaign-fix', self.base, base='stabilize/test')
+        self.assertEqual([p.number for p in self.selected()], [30, 20, 10, 40])
+        self.assertEqual(automerge.DEPENDENCY_BLOCKS, [])
+        automerge.report_dependency_blocks(self.conn, None)
+        self.assertEqual(self.writes, [])
+        with self.conn:
+            self.conn.execute("UPDATE stabilize_issues SET state='pr_ready'")
+        selected = self.selected()
+        self.assertEqual([p.number for p in selected], [50])
+        self.assertEqual(automerge.pulls_target(self.conn, selected), 'stabilize/test')
+
+    def test_campaign_priority_is_above_high_below_immediate_and_never_preempts(self):
+        self.campaign()
+        self.add_pr(50, 'campaign-fix', self.base, base='stabilize/test')
+        self.items[40]['labels'] = [{'name': 'mergemarshall:high'}]
+        self.assertEqual([p.number for p in self.selected()], [50])
+        self.items[40]['labels'] = [{'name': 'mergemarshall:immediate'}]
+        self.assertEqual([p.number for p in self.selected()], [40])
+        self.items[50]['labels'] = [{'name': 'mergemarshall:immediate'}]
+        priority = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True)
+        self.assertEqual([p.number for p in priority], [40])
+        self.items[40]['labels'] = []
+        selected = self.selected()
+        batch = automerge.create_batch(self.conn, [automerge.dependency_pull(
+            automerge.dependency_graph(self.conn), 40)], self.base)
+        row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
+        self.assertIsNone(automerge._priority_preemption_target(row, selected))
+
+    def test_campaign_lane_includes_all_ready_heads_regardless_of_priority_labels(self):
+        self.campaign()
+        self.add_pr(50, 'campaign-first', self.base, base='stabilize/test')
+        self.add_pr(51, 'campaign-second', self.base, base='stabilize/test')
+        self.items[50]['labels'] = [{'name': 'mergemarshall:high'}]
+        self.assertEqual([p.number for p in self.selected()], [50, 51])
+        batch = automerge.create_batch(self.conn, self.selected(), self.base)
+        self.add_pr(52, 'campaign-third', self.base, base='stabilize/test')
+        row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
+        self.assertTrue(automerge._request_rebuild(self.conn, row, automerge.row_pulls(row), 'expand', only_if_expanded=True))
+        row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
+        self.assertEqual([p.number for p in automerge.row_pulls(row)], [50, 51, 52])
+
+    def test_finished_campaign_is_quiet_and_visible_as_an_exclusion(self):
+        self.campaign(status='aborted')
+        self.add_pr(50, 'campaign-fix', self.base, base='stabilize/test')
+        self.assertNotIn(50, [p.number for p in self.selected()])
+        self.assertEqual(automerge.DEPENDENCY_BLOCKS, [])
+        self.assertEqual(automerge.CAMPAIGN_EXCLUSIONS[0]['number'], 50)
+        automerge.report_dependency_blocks(self.conn, None)
+        self.assertEqual(self.writes, [])
+        self.assertIsNone(self.conn.execute('SELECT blocked_reason FROM automerge_pr_inventory '
+                                            'WHERE number=50').fetchone()[0])
+
+    def test_campaign_dependencies_use_campaign_tip_and_keep_single_target(self):
+        self.campaign(tip=self.x)
+        self.items[30].update(state='closed', merged_at='now')
+        self.items[30]['base']['ref'] = 'stabilize/test'
+        self.add_pr(50, 'campaign-fix', self.x, base='stabilize/test')
+        self.add_pr(51, 'campaign-stack', self.items[50]['head']['sha'], base='campaign-fix')
+        selected = self.selected()
+        self.assertEqual([p.number for p in selected], [50])
+        self.assertTrue(all(p.target_ref == 'stabilize/test' for p in selected))
+        self.assertNotIn(30, {d.number for p in selected for d in p.dependencies})
+        with self.assertRaisesRegex(ValueError, 'one landing target'):
+            automerge.create_batch(self.conn, selected + [automerge.PullRequest(99, 'master', self.w, 'url')], self.x)
+
+    def test_gate_snapshot_satisfies_captured_merged_campaign_fix(self):
+        self.campaign(tip=self.x)
+        self.items[30].update(state='closed', merged_at='now')
+        self.items[30]['base']['ref'] = 'stabilize/test'
+        # Observe the closed fix and preserve a captured relationship from an
+        # earlier discovery before the campaign merge was recorded.
+        pr_dependencies.save_observation(self.conn, 30, self.x, self.items[30], [self.x], False)
+        self.add_pr(60, 'gate', self.x)
+        self.git('branch', 'stabilize-gate/test/push', self.x)
+        self.items[60]['head']['ref'] = 'stabilize-gate/test/push'
+        self.items[60]['head']['sha'] = self.x
+        self.items[60]['labels'] = [{'name': 'mergemarshall:high'}]
+        with self.conn:
+            self.conn.execute("INSERT INTO stabilize_gate_merges VALUES "
+                              "('test','push',?,'stabilize-gate/test/push',60,'open','now','now')", (self.x,))
+            self.conn.execute('INSERT INTO automerge_pr_dependencies VALUES (60,?,30,?)', (self.x, self.x))
+        selected = self.selected()
+        self.assertEqual([p.number for p in selected], [60])
+        self.assertEqual(selected[0].dependencies, ())
+        self.assertEqual(automerge.check_source_dependencies(selected, self.conn)[1], {})
+        # A campaign fix based on the snapshot must remain a campaign PR, never
+        # a stacked child of the gate PR targeting master.
+        self.add_pr(50, 'campaign-next', self.x, base='stabilize/test')
+        selected = self.selected()
+        self.assertEqual([p.number for p in selected], [50])
+        self.assertNotIn(60, {d.number for d in selected[0].dependencies})
+
+    def test_campaign_expansion_respects_gate_and_target(self):
+        self.campaign()
+        self.add_pr(50, 'campaign-first', self.base, base='stabilize/test')
+        selected = self.selected()
+        batch = automerge.create_batch(self.conn, selected, self.base)
+        self.add_pr(51, 'campaign-second', self.base, base='stabilize/test')
+        with self.conn:
+            self.conn.execute("UPDATE stabilize_issues SET state='open'")
+        row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
+        self.assertFalse(automerge._request_rebuild(self.conn, row, selected, 'expand', only_if_expanded=True))
+        with self.conn:
+            self.conn.execute("UPDATE stabilize_issues SET state='pr_ready'")
+        self.assertTrue(automerge._request_rebuild(self.conn, row, selected, 'expand', only_if_expanded=True))
+        row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
+        self.assertEqual([p.number for p in automerge.row_pulls(row)], [50, 51])
+        self.assertEqual(row['target_ref'], 'stabilize/test')
+
+    def gate_repair_fixture(self):
+        self.items.clear()
+        rejected = self.add_pr(50, 'repair', self.base, base='stabilize/test')
+        repaired = self.commit('repair-fixed', 'fixed')
+        self.campaign()
+        self.git('checkout', '-q', 'stabilize/test')
+        self.git('merge', '--no-ff', '-qm', 'land campaign repair', repaired)
+        landed = self.git('rev-parse', 'HEAD')
+        self.git('branch', 'gate', landed)
+        self.items[50]['head']['sha'] = repaired
+        self.items[50].update(state='closed', merged=True, merged_at='now', merge_commit_sha=landed)
+        self.items[60] = dict(number=60, title='gate', state='open', draft=False,
+                             head={'sha': landed, 'ref': 'gate', 'repo': {'full_name': automerge.REPO_NAME}},
+                             base={'ref': 'master', 'repo': {'full_name': automerge.REPO_NAME}}, labels=[])
+        with self.conn:
+            self.conn.execute('UPDATE stabilize_campaigns SET tip_sha=?', (landed,))
+            self.conn.execute("INSERT INTO stabilize_gate_merges VALUES "
+                              "('test','push',?,'gate',60,'open','now','now')", (landed,))
+            automerge.enqueue_github_write(self.conn, 'rejected', 'reject_head', 50, rejected,
+                                          {'reason': 'broken old head', 'evidence': 'old regression'})
+        pr_dependencies.save_observation(self.conn, 50, repaired, self.items[50], [rejected, repaired], False)
+        pr_dependencies.save_observation(self.conn, 60, landed, self.items[60], [landed], True)
+        source = automerge.PullRequest(60, 'gate', landed, 'url')
+        batch = automerge.create_batch(self.conn, [source], self.base)
+        row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
+        return row, rejected, repaired, landed
+
+    def test_gate_rejected_ancestor_is_allowed_after_same_pr_repair_lands_in_campaign(self):
+        row, _, _, landed = self.gate_repair_fixture()
+        with mock.patch.object(automerge, 'gh_json', side_effect=self.read) as read:
+            self.assertTrue(automerge.verify_source_ancestry(row, landed, conn=self.conn)[0])
+        read.assert_called_once_with(['api', f'repos/{automerge.REPO_NAME}/pulls/50'])
+        self.assertEqual(self.writes, [])
+
+    def test_gate_rejected_ancestor_without_landed_descendant_is_refused(self):
+        row, rejected, _, landed = self.gate_repair_fixture()
+        self.items[50].update(state='open', merged=False, merged_at=None)
+        allowed, reason = automerge.verify_source_ancestry(row, landed, conn=self.conn)
+        self.assertFalse(allowed)
+        self.assertIn('rejected prerequisite PR #50', reason)
+        # A merged PR at exactly the rejected head is not a later repair.
+        self.items[50].update(state='closed', merged=True, merged_at='now')
+        self.items[50]['head']['sha'] = rejected
+        self.assertFalse(automerge.verify_source_ancestry(row, landed, conn=self.conn)[0])
+
+    def test_non_gate_with_same_repaired_campaign_history_keeps_rejection_fence(self):
+        row, _, _, landed = self.gate_repair_fixture()
+        self.items[60]['head']['ref'] = 'ordinary'
+        pr_dependencies.save_observation(self.conn, 60, landed, self.items[60], [landed], True)
+        with mock.patch.object(automerge, 'gh_json', side_effect=AssertionError('non-gate repair read')):
+            self.assertFalse(automerge.verify_source_ancestry(row, landed, conn=self.conn)[0])
+
+    def test_gate_repair_must_land_to_its_campaign_and_be_in_immutable_tip(self):
+        row, rejected, repaired, landed = self.gate_repair_fixture()
+        self.items[50]['base']['ref'] = 'master'
+        self.assertFalse(automerge.verify_source_ancestry(row, landed, conn=self.conn)[0])
+        self.items[50]['base']['ref'] = 'stabilize/test'
+        with self.conn:
+            self.conn.execute('UPDATE stabilize_gate_merges SET tip_sha=?', (rejected,))
+        self.assertFalse(automerge.verify_source_ancestry(row, landed, conn=self.conn)[0])
+        with self.conn:
+            self.conn.execute('UPDATE stabilize_gate_merges SET tip_sha=?', (landed,))
+        self.items[50]['head']['sha'] = self.w  # Not a descendant of the rejected head.
+        self.assertFalse(automerge.verify_source_ancestry(row, landed, conn=self.conn)[0])
+        self.items[50]['head']['sha'] = repaired
+        self.items[50]['merge_commit_sha'] = self.base  # This merge did not contain the repair.
+        self.assertFalse(automerge.verify_source_ancestry(row, landed, conn=self.conn)[0])
+
+    def test_gate_repair_does_not_authorize_non_gate_source_in_same_batch(self):
+        row, _, _, landed = self.gate_repair_fixture()
+        sources = automerge.row_pulls(row) + [automerge.PullRequest(61, 'ordinary', landed, 'url')]
+        batch = automerge.create_batch(self.conn, sources, self.base)
+        row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
+        self.assertFalse(automerge.verify_source_ancestry(row, landed, conn=self.conn)[0])
+
+    def test_gate_repair_unavailable_reads_defer_without_using_cached_merge_metadata(self):
+        row, rejected, repaired, landed = self.gate_repair_fixture()
+        with (mock.patch.object(automerge, 'gh_json', side_effect=git_ancestry.Deferred('repair read pending')),
+              self.assertRaises(git_ancestry.Deferred)):
+            automerge.verify_source_ancestry(row, landed, conn=self.conn)
+        def ancestor(a, b):
+            if (a, b) == (rejected, repaired):
+                raise git_ancestry.Deferred('repair ancestry pending')
+            return self.ancestor(a, b)
+        with (mock.patch.object(automerge, 'compare_commit_ancestry', side_effect=ancestor),
+              self.assertRaises(git_ancestry.Deferred)):
+            automerge.verify_source_ancestry(row, landed, conn=self.conn)
+        self.items[50]['merge_commit_sha'] = None
+        with self.assertRaises(automerge.AutomergeError):
+            automerge.verify_source_ancestry(row, landed, conn=self.conn)
+
+    def test_gate_repair_operator_path_resolves_source_branch_without_inventory(self):
+        row, _, _, landed = self.gate_repair_fixture()
+        with self.conn:
+            self.conn.execute('DELETE FROM automerge_pr_inventory WHERE number=60')
+        self.assertTrue(automerge.verify_source_ancestry(row, landed, conn=self.conn)[0])
+
     def test_dependency_batch_orders_prerequisites_before_lower_numbered_descendants(self):
         selected = self.selected()
         self.assertEqual([p.number for p in selected], [30, 20, 10, 40])

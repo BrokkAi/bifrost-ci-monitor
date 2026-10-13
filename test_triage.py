@@ -1,16 +1,19 @@
 """Triage lifecycle tests with real SQLite and fake external services."""
 import copy
 import json
+import sqlite3
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 from unittest import TestCase, mock
+from urllib.parse import unquote
 
 import monitor
 import triage
 import automerge
 import local_findings
 import issue_fixer
+import stabilize_state
 
 
 class FakeGitHub:
@@ -19,11 +22,21 @@ class FakeGitHub:
         self.comments = {}
         self.calls = []
         self.lose_response_to = None
+        self.labels = {}
 
     def __call__(self, endpoint, *, method="GET", payload=None, pages=False):
         self.calls.append((method, endpoint, copy.deepcopy(payload)))
         parts = endpoint.split("?")[0].split("/")
-        if len(parts) == 1 and method == "GET":
+        if parts[0] == 'labels':
+            if method == 'POST':
+                self.labels[payload['name']] = dict(payload)
+                result = self.labels[payload['name']]
+            else:
+                name = unquote(parts[1])
+                if name not in self.labels:
+                    raise monitor.CommandError('HTTP 404: label not found')
+                result = self.labels[name]
+        elif len(parts) == 1 and method == "GET":
             result = list(self.issues.values())
         elif len(parts) == 1 and method == "POST":
             number = max(self.issues, default=100) + 1
@@ -95,6 +108,229 @@ class TriageTests(TestCase):
             return local_findings.record(self.conn, 'batch', 'merge-session', kind, 'a' * 40,
                                          'local_policy_test', 'eatmydata cargo nextest run local_policy_test',
                                          'expected exit 2, got 1; settings and log /tmp/base.log', '2026-01-02')
+
+    def add_branch_failure(self, campaign_id='campaign', sha='a' * 40):
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO stabilize_campaigns "
+                "(id,branch,anchor_sha,tip_sha,status,created_at,updated_at) "
+                "VALUES (?,?,?,?,'running','2026-01-01','2026-01-01')",
+                (campaign_id, 'stabilize/' + campaign_id, 'c' * 40, sha))
+            self.conn.execute(
+                "INSERT INTO stabilize_failures "
+                "(campaign_id,stage,workflow,job_name,identity_kind,identity,"
+                "first_seen_sha,first_seen_run_id,first_seen_run_url,first_seen_at,"
+                "last_seen_sha,last_seen_run_id,last_seen_run_url,last_seen_at,updated_at) "
+                "VALUES (?,'push','CI','linux','step','Cargo nextest',"
+                "?,2,'https://github.test/run/2','2026-01-01',"
+                "?,2,'https://github.test/run/2','2026-01-02','2026-01-02')",
+                (campaign_id, 'c' * 40, sha))
+
+    def test_branch_observation_reaches_issue_with_label_and_campaign_context(self):
+        self.add_branch_failure()
+        self.make_job()
+        prompt = triage.build_prompt(self.job())
+        self.assertIn('stabilize branch `stabilize/campaign` cut from master at `' + 'c' * 40, prompt)
+        self.assertIn('observed SHA `' + 'a' * 40, prompt)
+        self.assertIn('matching master-only issue', prompt)
+        triage.publish(self.conn, self.job())
+        self.reopen()
+        triage.publish(self.conn, self.job())
+        issue = self.github.issues[101]
+        self.assertEqual({label['name'] for label in issue['labels']},
+                         {'buildfailure', stabilize_state.LABEL})
+        self.assertIn('Stabilize branch `stabilize/campaign` cut from master at `' + 'c' * 40, issue['body'])
+        self.assertIn('(`' + 'a' * 40 + '`)', issue['body'])
+        self.assertIn('Red since ' + 'c' * 40 + ' (2026-01-01, https://github.test/run/2)', issue['body'])
+        row = self.conn.execute('SELECT * FROM stabilize_failures').fetchone()
+        self.assertEqual(row['status'], 'open')
+        self.assertEqual(row['triage_outcome'], 'product')
+        self.assertEqual(row['linked_issue_url'], f'https://github.com/{monitor.REPO_NAME}/issues/101')
+        self.assertEqual(stabilize_state.campaign_issue(self.conn, 101, row['linked_issue_url'])[0].id, 'campaign')
+        self.assertEqual(triage.pending(self.conn), [])
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM known_failures').fetchone()[0], 0)
+        self.assertEqual(sum(method == 'POST' and endpoint == 'labels'
+                             for method, endpoint, _ in self.github.calls), 1)
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM triage_product_announcements').fetchone()[0], 1)
+
+    def reuse_master_issue(self, *, closed):
+        self.add_failure()
+        self.make_job()
+        triage.publish(self.conn, self.job())
+        issue = self.github.issues[101]
+        if closed:
+            issue['state'] = 'closed'
+        self.add_branch_failure()
+        self.make_job(existing=101, job_id='branch')
+        triage.publish(self.conn, self.job('branch'))
+        self.assertEqual(set(self.github.issues), {101})
+        self.assertEqual(issue['state'], 'open')
+        self.assertIn({'name': stabilize_state.LABEL}, issue['labels'])
+        self.assertEqual(len(self.github.comments[101]), 1)
+        self.assertIn('Red since ' + 'c' * 40 + ' (2026-01-01, https://github.test/run/2)',
+                      self.github.comments[101][0]['body'])
+        url = f'https://github.com/{monitor.REPO_NAME}/issues/101'
+        self.assertEqual(self.conn.execute('SELECT linked_issue_url FROM stabilize_failures').fetchone()[0], url)
+        self.assertEqual(self.conn.execute('SELECT triage_issue_url FROM known_failures').fetchone()[0], url)
+        self.assertEqual(sum(method == 'POST' and endpoint == 'issues'
+                             for method, endpoint, _ in self.github.calls), 1)
+
+    def test_branch_cause_reuses_open_master_issue(self):
+        self.reuse_master_issue(closed=False)
+
+    def test_branch_cause_reopens_closed_master_issue(self):
+        self.reuse_master_issue(closed=True)
+
+    def test_master_and_branch_same_cause_publish_one_issue(self):
+        self.add_failure()
+        self.add_branch_failure()
+        self.make_job()
+        triage.publish(self.conn, self.job())
+        self.assertEqual(len(self.github.issues), 1)
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM triage_observations').fetchone()[0], 2)
+        self.assertEqual(self.conn.execute('SELECT triage_outcome FROM known_failures').fetchone()[0], 'product')
+        self.assertEqual(self.conn.execute('SELECT triage_outcome FROM stabilize_failures').fetchone()[0], 'product')
+
+    def test_campaign_fingerprints_do_not_collide_with_master_or_other_campaigns(self):
+        self.add_failure()
+        self.add_branch_failure()
+        self.add_branch_failure(campaign_id='another')
+        rows = triage.pending(self.conn)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(len({row['fingerprint'] for row in rows}), 3)
+        for observation in rows:
+            self.assertIsNotNone(triage.current_observation(self.conn, observation))
+        with self.conn:
+            self.conn.execute("UPDATE stabilize_failures SET last_seen_sha=? WHERE campaign_id='campaign'", ('b' * 40,))
+        for observation in rows:
+            if observation.get('stabilize_campaign_id') == 'campaign':
+                self.assertIsNone(triage.current_observation(self.conn, observation))
+            else:
+                self.assertIsNotNone(triage.current_observation(self.conn, observation))
+
+    def test_branch_classification_is_atomic_with_handled_publication(self):
+        self.add_branch_failure()
+        self.make_job()
+        original = stabilize_state.classify
+        reader = sqlite3.connect(self.path)
+        self.addCleanup(reader.close)
+
+        def failing_classify(conn, *args):
+            self.assertTrue(conn.in_transaction)
+            self.assertEqual(conn.execute('SELECT count(*) FROM triage_observations').fetchone()[0], 1)
+            self.assertEqual(conn.execute('SELECT issue_number FROM triage_publications').fetchone()[0], 101)
+            original(conn, *args)
+            self.assertEqual(reader.execute('SELECT count(*) FROM triage_observations').fetchone()[0], 0)
+            self.assertIsNone(reader.execute('SELECT linked_issue_url FROM stabilize_failures').fetchone()[0])
+            raise RuntimeError('classification interrupted')
+
+        with mock.patch.object(stabilize_state, 'classify', side_effect=failing_classify):
+            with self.assertRaisesRegex(RuntimeError, 'classification interrupted'):
+                triage.publish(self.conn, self.job())
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM triage_observations').fetchone()[0], 0)
+        self.assertIsNone(self.conn.execute('SELECT triage_outcome FROM stabilize_failures').fetchone()[0])
+        self.reopen()
+        triage.publish(self.conn, self.job())
+        self.assertEqual(len(self.github.issues), 1)
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM triage_observations').fetchone()[0], 1)
+        self.assertEqual(self.conn.execute('SELECT triage_outcome FROM stabilize_failures').fetchone()[0], 'product')
+
+    def test_branch_resolution_classifies_without_retiring_branch_or_master(self):
+        self.add_branch_failure()
+        self.make_job(resolved=True)
+        self.add_failure()
+        triage.publish(self.conn, self.job())
+        self.assertEqual(self.github.calls, [])
+        self.assertEqual(self.conn.execute('SELECT status,triage_outcome FROM stabilize_failures').fetchone()[:],
+                         ('open', 'resolved'))
+        self.assertEqual(self.conn.execute('SELECT status,triage_outcome FROM known_failures').fetchone()[:],
+                         ('open', None))
+        self.assertEqual(len(triage.pending(self.conn)), 1)
+        with self.conn:
+            self.conn.execute('UPDATE stabilize_failures SET last_seen_run_id=3')
+        self.assertEqual(len(triage.pending(self.conn)), 2)
+
+    def test_branch_resolution_cannot_classify_newer_run(self):
+        self.add_branch_failure()
+        self.make_job(resolved=True)
+        with self.conn:
+            self.conn.execute('UPDATE stabilize_failures SET last_seen_run_id=3')
+        triage.publish(self.conn, self.job())
+        self.assertIsNone(self.conn.execute('SELECT triage_outcome FROM stabilize_failures').fetchone()[0])
+        self.assertEqual(len(triage.pending(self.conn)), 1)
+
+    def test_changed_branch_observation_during_publication_is_not_classified(self):
+        self.add_branch_failure()
+        self.make_job()
+        original = triage.publish_issue
+
+        def changed(*args):
+            url = original(*args)
+            with self.conn:
+                self.conn.execute("UPDATE stabilize_failures SET last_seen_sha=?,diagnosis='new diagnosis'",
+                                  ('b' * 40,))
+            return url
+
+        with mock.patch.object(triage, 'publish_issue', side_effect=changed):
+            triage.publish(self.conn, self.job())
+        row = self.conn.execute('SELECT * FROM stabilize_failures').fetchone()
+        self.assertEqual(row['diagnosis'], 'new diagnosis')
+        self.assertIsNone(row['triage_outcome'])
+        self.assertIsNone(row['linked_issue_url'])
+        self.assertEqual(len(triage.pending(self.conn)), 1)
+
+    def test_lost_branch_issue_create_is_recovered_with_label_and_link(self):
+        self.add_branch_failure()
+        self.make_job()
+        self.github.lose_response_to = ('POST', 'issues')
+        with self.assertRaisesRegex(RuntimeError, 'response lost'):
+            triage.publish(self.conn, self.job())
+        self.reopen()
+        self.assertEqual(triage.pending(self.conn), [])
+        triage.publish(self.conn, self.job())
+        self.assertEqual(len(self.github.issues), 1)
+        self.assertIn({'name': stabilize_state.LABEL}, self.github.issues[101]['labels'])
+        row = self.conn.execute('SELECT * FROM stabilize_failures').fetchone()
+        self.assertEqual(row['triage_outcome'], 'product')
+        self.assertEqual(row['linked_issue_url'], f'https://github.com/{monitor.REPO_NAME}/issues/101')
+        self.assertEqual(sum(method == 'POST' and endpoint == 'labels'
+                             for method, endpoint, _ in self.github.calls), 1)
+
+    def test_existing_stabilize_label_is_preserved(self):
+        self.add_branch_failure()
+        self.github.labels[stabilize_state.LABEL] = dict(name=stabilize_state.LABEL, color='abcdef')
+        self.make_job()
+        triage.publish(self.conn, self.job())
+        self.assertEqual(self.github.labels[stabilize_state.LABEL]['color'], 'abcdef')
+        self.assertFalse(any(method == 'POST' and endpoint == 'labels'
+                             for method, endpoint, _ in self.github.calls))
+
+    def test_branch_infrastructure_uses_existing_incident_thread(self):
+        self.add_failure()
+        self.infrastructure_job(job_id='master')
+        triage.publish(self.conn, self.job('master'))
+        self.add_branch_failure()
+        self.infrastructure_job(job_id='branch')
+        triage.publish(self.conn, self.job('branch'))
+        self.assertEqual(self.github.calls, [])
+        self.assertEqual(self.slack.call_count, 3)
+        self.assertEqual(self.slack.call_args.kwargs['thread_ts'], 'notice')
+        self.assertIn('https://github.test/run/2', self.slack.call_args.args[1])
+        self.assertEqual(self.conn.execute('SELECT status,triage_outcome FROM stabilize_failures').fetchone()[:],
+                         ('open', 'infrastructure'))
+        self.assertEqual(triage.pending(self.conn), [])
+
+    def test_master_red_since_is_rendered_in_issue_and_reused_issue_comment(self):
+        self.add_failure()
+        self.make_job()
+        triage.publish(self.conn, self.job())
+        red_since = 'Red since ' + 'a' * 40 + ' (2026-01-01, https://github.test/run/1)'
+        self.assertIn(red_since, self.github.issues[101]['body'])
+        with self.conn:
+            self.conn.execute('UPDATE known_failures SET last_seen_sha=?', ('b' * 40,))
+        self.make_job(existing=101, job_id='again')
+        triage.publish(self.conn, self.job('again'))
+        self.assertIn(red_since, self.github.comments[101][0]['body'])
 
     def test_local_finding_reaches_deduplicated_issue_and_fixer_dossier(self):
         finding = self.add_local_finding()

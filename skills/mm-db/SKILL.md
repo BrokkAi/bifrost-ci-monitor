@@ -161,3 +161,14 @@ notes (`ready --notes-file FILE` or mm-autopr's `--notes-file`). The report is
 informational; supervisor processing does not depend on a final message or
 `mj wait` completion. An unavailable service is an error; do not substitute a
 local database for the shared state.
+
+Only when `mm-db state` names a stabilize campaign branch in `target_ref`, apply
+these campaign instructions: use the captured `base_sha` for assembly,
+comparisons and updates; publish against that campaign branch; never merge master
+into the batch; incorporate only campaign base updates requested by the supervisor.
+Integration batches use local validation in async mode. The supervisor may land a
+single up-to-date campaign PR directly under the same async policy as master;
+campaign stage suites then validate the new branch tip. Campaign gate snapshots
+may omit prerequisites already satisfied by merged campaign fixes, which the
+supervisor verifies before selection. Verdict, exact-head and freshness gates
+still apply to the campaign landing branch.

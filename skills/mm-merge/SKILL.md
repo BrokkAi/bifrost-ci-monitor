@@ -53,3 +53,14 @@ encounters conflicts, resolve/commit them and reassess affected checks.
 If the tree is unchanged, register the resulting head without withdrawing the
 old checkpoint so the next speculative batch can retain its work. Otherwise
 withdraw the checkpoint before further edits and register a replacement.
+
+Only when `mm-db state` names a stabilize campaign branch in `target_ref`, apply
+these campaign instructions: use the captured `base_sha` for assembly,
+comparisons and updates; publish against that campaign branch; never merge master
+into the batch; incorporate only campaign base updates requested by the supervisor.
+Integration batches use local validation in async mode. The supervisor may land a
+single up-to-date campaign PR directly under the same async policy as master;
+campaign stage suites then validate the new branch tip. Campaign gate snapshots
+may omit prerequisites already satisfied by merged campaign fixes, which the
+supervisor verifies before selection. Verdict, exact-head and freshness gates
+still apply to the campaign landing branch.

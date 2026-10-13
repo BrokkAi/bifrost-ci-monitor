@@ -12,6 +12,7 @@ import automerge as a
 import mm_service as service
 import monitor
 import speculation as s
+import pr_dependencies
 from test_automerge import make_db, pull, row_for, BASE_SHA, HEAD_ONE, HEAD_TWO, HEAD_THREE
 from test_mm_skills import GitFixture, merge, db
 
@@ -69,6 +70,30 @@ class StopWorkTests(unittest.TestCase):
 
 
 class StateTests(unittest.TestCase):
+    def test_campaign_parent_never_selects_or_launches_a_successor(self):
+        row = dict(self.row(self.parent), target_ref='stabilize/test')
+        with (mock.patch.object(a, 'dependency_graph', side_effect=AssertionError('discovery')),
+              mock.patch.object(a, 'create_batch', side_effect=AssertionError('launch'))):
+            self.assertEqual(s.selection(a, self.conn, row), [])
+            s.launch_child(a, self.conn, row)
+
+    def test_master_successor_excludes_campaign_target(self):
+        with self.conn:
+            pr_dependencies.ensure_schema(self.conn)
+        master = pr_dependencies.Node(90, HEAD_ONE, 'master', 'ordinary', a.REPO_NAME, a.REPO_NAME,
+                                      {'state': 'open'}, True)
+        campaign = pr_dependencies.Node(91, HEAD_TWO, 'stabilize/test', 'fix', a.REPO_NAME, a.REPO_NAME,
+                                        {'state': 'open'}, True)
+        actual = pr_dependencies.Graph({90: master, 91: campaign}, {90: [HEAD_ONE], 91: [HEAD_TWO]},
+                                      BASE_SHA, lambda x, y: x == y,
+                                      targets={90: ('master', BASE_SHA), 91: ('stabilize/test', BASE_SHA)})
+        with (mock.patch.object(a, 'dependency_graph', return_value=actual),
+              mock.patch.object(a, 'compare_commit_ancestry', side_effect=lambda x, y: x == y),
+              mock.patch.object(s, 'reserved', return_value=set())):
+            selected = s.selection(a, self.conn, self.row(self.parent))
+        self.assertEqual([p.number for p in selected], [90])
+        self.assertTrue(all(p.target_ref == 'master' for p in selected))
+
     def setUp(self):
         self.conn = make_db(ci_mode='async', integration_pr_number=None)
         self.addCleanup(self.conn.close)

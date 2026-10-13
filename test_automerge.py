@@ -3812,6 +3812,7 @@ class LaunchAndLifecycleTests(TestCase):
         with (
             mock.patch.object(automerge, "detect_batch_outcomes", return_value=outcome),
             mock.patch.object(monitor, "slack_send", return_value=(True, None)) as send,
+            mock.patch.object(automerge, "request_suspend"),
         ):
             automerge.finish_batch(
                 conn, monitor.SlackTransport("webhook", webhook="x"), row_for(conn),
@@ -4126,6 +4127,113 @@ class MissingFailedJobLogTests(TestCase):
         ).fetchone()
         self.assertEqual(processed["run_id"], 555)
         conn.close()
+
+
+class CampaignTargetTests(TestCase):
+    target = 'stabilize/test'
+
+    def campaign_pull(self):
+        return automerge.PullRequest(7, 'campaign fix', HEAD_ONE, 'url',
+                                     base_ref=self.target, target_ref=self.target)
+
+    def test_batch_target_is_additive_and_forces_async(self):
+        conn = make_db(pulls=[self.campaign_pull()], ci_mode='sync')
+        self.addCleanup(conn.close)
+        self.assertEqual(row_for(conn)['target_ref'], self.target)
+        self.assertEqual(row_for(conn)['ci_mode'], 'async')
+        self.assertEqual(automerge.batch_target({'target_ref': None}), 'master')
+        self.assertEqual(automerge.batch_target({}), 'master')
+
+    def test_connect_db_migrates_legacy_rows_with_null_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(automerge, 'DB_PATH', Path(directory) / 'legacy.db'):
+                conn = automerge.connect_db()
+                automerge.create_batch(conn, [pull()], BASE_SHA, batch_id='legacy', ci_mode='sync')
+                with conn:
+                    conn.execute('ALTER TABLE automerge_batches DROP COLUMN target_ref')
+                conn.close()
+                conn = automerge.connect_db()
+                try:
+                    row = row_for(conn, 'legacy')
+                    self.assertIsNone(row['target_ref'])
+                    self.assertEqual(automerge.batch_target(row), 'master')
+                    self.assertEqual(automerge._batch_ci_mode(row), 'sync')
+                    self.assertEqual(row['base_sha'], BASE_SHA)
+                finally:
+                    conn.close()
+
+    def test_campaign_prompt_names_target_and_forbids_master_update(self):
+        prompt = automerge.build_prompt('test', [self.campaign_pull()], BASE_SHA,
+                                        ci_mode='sync', target_ref=self.target)
+        self.assertIn('exact stabilize/test commit ' + BASE_SHA, prompt)
+        self.assertIn('Never merge master into a stabilize batch', prompt)
+        self.assertIn('checks stabilize/test freshness', prompt)
+
+    def test_campaign_direct_selection_and_checks_use_target_tip(self):
+        conn = make_db()
+        self.addCleanup(conn.close)
+        cache = mock.Mock()
+        cache.behind.return_value = 0
+        source = self.campaign_pull()
+        view = {'state': 'OPEN', 'headRefOid': HEAD_ONE, 'baseRefName': self.target, 'isDraft': False}
+        with (mock.patch.object(automerge, '_ancestry_cache', return_value=cache),
+              mock.patch.object(automerge, 'remote_branch_sha', return_value=BASE_SHA) as remote,
+              mock.patch.object(automerge, 'current_master_sha', side_effect=AssertionError('master read')),
+              mock.patch.object(automerge, 'direct_pull_request_view', return_value=view),
+              mock.patch.object(automerge, 'check_source_dependencies', return_value=([source], {}))):
+            batch = automerge.create_selected_batch(conn, [source], BASE_SHA, ci_mode='sync')
+            row = row_for(conn, batch)
+            self.assertEqual(row['kind'], 'direct')
+            self.assertEqual(row['ci_mode'], 'async')
+            self.assertEqual(automerge._direct_premerge_check(source, conn=conn, batch_id=batch)[0], 'ready')
+        self.assertTrue(all(call.args == (self.target,) for call in remote.call_args_list))
+        cache.behind.assert_called_with(HEAD_ONE, BASE_SHA)
+
+    def test_campaign_landing_keeps_verdict_and_match_head_and_uses_target(self):
+        conn = make_db(phase='merging', pulls=[self.campaign_pull()], ci_mode='sync')
+        self.addCleanup(conn.close)
+        view = {'state': 'OPEN', 'isDraft': False, 'baseRefName': self.target,
+                'headRefOid': HEAD_ONE, 'baseRefOid': BASE_SHA}
+        with (mock.patch.object(automerge, 'integration_pr_view', side_effect=[view, {'state': 'MERGED'}]),
+              mock.patch.object(automerge, 'remote_branch_sha', return_value=BASE_SHA) as remote,
+              mock.patch.object(automerge, 'current_master_sha', side_effect=AssertionError('master read')),
+              mock.patch.object(automerge, 'check_pr_verification', side_effect=AssertionError('sync CI read')),
+              mock.patch.object(automerge, '_record_trusted_rejection_markers', return_value=False),
+              mock.patch.object(automerge, '_recheck_sources', return_value=([self.campaign_pull()], [])),
+              mock.patch.object(automerge, 'verify_source_ancestry', return_value=(True, 'ok')) as ancestry,
+              mock.patch.object(automerge, '_try_post_verdict_status', return_value=True) as status,
+              mock.patch.object(automerge, 'run_gh') as gh,
+              mock.patch.object(automerge, '_complete_landed_batch') as complete):
+            automerge._merge_integration(conn, None, row_for(conn))
+        remote.assert_called_once_with(self.target)
+        ancestry.assert_called_once()
+        self.assertEqual(ancestry.call_args.kwargs['base_sha'], BASE_SHA)
+        self.assertEqual(status.call_args.args[3:5], (HEAD_ONE, 'success'))
+        self.assertEqual(gh.call_args.args[0][-2:], ['--match-head-commit', HEAD_ONE])
+        complete.assert_called_once()
+
+    def test_campaign_freshness_queues_campaign_update(self):
+        conn = make_db(phase='merging', pulls=[self.campaign_pull()])
+        self.addCleanup(conn.close)
+        view = {'state': 'OPEN', 'isDraft': False, 'baseRefName': self.target,
+                'headRefOid': HEAD_ONE, 'baseRefOid': HEAD_TWO}
+        with (mock.patch.object(automerge, 'integration_pr_view', return_value=view),
+              mock.patch.object(automerge, 'remote_branch_sha', return_value=HEAD_TWO) as remote,
+              mock.patch.object(automerge, 'current_master_sha', side_effect=AssertionError('master read')),
+              mock.patch.object(automerge, '_queue_master_update') as update):
+            automerge._merge_integration(conn, None, row_for(conn))
+        remote.assert_called_once_with(self.target)
+        self.assertEqual(update.call_args.args[3:5], (HEAD_TWO, HEAD_ONE))
+
+    def test_campaign_slack_heading_and_first_reply_name_branch(self):
+        conn = make_db(pulls=[self.campaign_pull()])
+        self.addCleanup(conn.close)
+        with conn:
+            conn.execute('UPDATE automerge_batches SET start_notification_sent=0,start_pr_list_sent=0')
+        with mock.patch.object(monitor, 'slack_send', return_value=(True, 'thread')) as send:
+            automerge.send_start_notification(conn, monitor.SlackTransport('chat', token='x', channel='x'), row_for(conn))
+        self.assertIn(monitor.slack_project_prefix() + ' stabilize batch:', send.call_args_list[0].args[1])
+        self.assertIn('Campaign branch: `stabilize/test`', send.call_args_list[1].args[1])
 
 
 if __name__ == "__main__":

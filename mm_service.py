@@ -60,7 +60,7 @@ def state(conn, batch_id):
     if row is None or row["kind"] != "batch":
         raise ValueError("unknown integration batch")
     result = {"batch_id": batch_id, "branch": row["branch"], "base_sha": row["base_sha"],
-              "ci_mode": row["ci_mode"], "status": row["status"], "phase": row["phase"],
+              "target_ref": automerge.batch_target(row), "ci_mode": automerge._batch_ci_mode(row), "status": row["status"], "phase": row["phase"],
               "sources": [p.as_json() for p in automerge.row_pulls(row)],
               "excluded": automerge._excluded_source_heads(row)}
     result["source_revision"] = speculation.source_revision(automerge, row)
@@ -137,6 +137,8 @@ def gh_api(endpoint, *, method="GET", payload=None):
 def integration_metadata(current, head, notes):
     title = "Merge batch: " + " ".join(f"#{p['number']}" for p in current["sources"])
     body = f"MergeMarshall batch `{current['batch_id']}`\n\nBase: `{current['base_sha']}`\n\nIncluded source heads:\n"
+    if current.get("target_ref", automerge.BASE_BRANCH) != automerge.BASE_BRANCH:
+        body = f"Landing target: `{current['target_ref']}`\n\n" + body
     body += "\n".join(f"- #{p['number']} `{p['head_sha']}`: {p['title']}" for p in current["sources"])
     body += "\n\nRemoved source heads:\n" + ("\n".join(
         f"- #{p['number']} `{p['head_sha']}` ({p['kind']})" for p in current["excluded"]) or "None.")
@@ -152,6 +154,7 @@ def integration_metadata(current, head, notes):
 
 def reconcile_publication(current, head, notes):
     branch = current["branch"]
+    target = current.get("target_ref") or automerge.BASE_BRANCH
     if automerge.remote_branch_sha(branch) != head:
         raise ValueError("remote batch head does not match recorded tested head")
     pulls = gh_api("pulls?state=open&head=" + quote(automerge.GH_OWNER + ":" + branch, safe=""))
@@ -160,13 +163,13 @@ def reconcile_publication(current, head, notes):
     metadata = integration_metadata(current, head, notes)
     if pulls:
         pr = pulls[0]
-        if pr["base"]["ref"] != automerge.BASE_BRANCH or pr.get("draft"):
-            raise ValueError("existing integration PR must be ready and based on master")
+        if pr["base"]["ref"] != target or pr.get("draft"):
+            raise ValueError("existing integration PR must be ready and based on the batch target")
     else:
         try:
             pr = gh_api("pulls", method="POST", payload={"title": metadata["title"],
                                                         "body": metadata["body"],
-                                                        "base": automerge.BASE_BRANCH, "head": branch})
+                                                        "base": target, "head": branch})
         except automerge.monitor.CommandError:
             # Recover creation accepted before an ambiguous response. Never create a second PR.
             pulls = gh_api("pulls?state=open&head=" + quote(automerge.GH_OWNER + ":" + branch, safe=""))
@@ -174,7 +177,8 @@ def reconcile_publication(current, head, notes):
                 raise
             pr = pulls[0]
     pr = gh_api(f"pulls/{pr['number']}")
-    if pr["head"]["sha"] != head or pr["head"]["ref"] != branch or pr["state"] != "open":
+    if (pr["head"]["sha"] != head or pr["head"]["ref"] != branch or pr["state"] != "open"
+            or pr["base"]["ref"] != target or pr.get("draft")):
         raise ValueError("published integration PR head/state does not match")
     return {"number": pr["number"], "url": pr["html_url"], "head": head}
 

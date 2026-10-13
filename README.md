@@ -133,7 +133,8 @@ After configuration, delivery failures are logged without stopping supervision.
 | Merger state and lock | `~/.local/state/bifrost-ci-automerge` | `BIFROST_CI_AUTOMERGE_STATE` |
 | Slack configuration | `~/.config/bifrost-ci-monitor` | `BIFROST_CI_CONFIG_DIR` |
 
-Triage's lock lives in `bifrost-ci-triage` beside the fixer's state directory.
+Triage's lock lives in `bifrost-ci-triage` beside the fixer's state directory;
+the stabilize engine's lock lives in `bifrost-ci-stabilize` beside it.
 Keep databases, tokens, logs, and session data out of Git.
 
 Initialize and inspect the jobs, then install the schedules with `crontab -e`.
@@ -146,6 +147,7 @@ python3 monitor.py --init-db
 python3 monitor.py --check
 python3 triage.py --check
 python3 automerge.py --check
+python3 stabilize.py check
 crontab -l
 ```
 
@@ -332,6 +334,42 @@ failure verdict, and leaves the branch for inspection. It rejects no source
 PRs. Established exact-head rejections remain recorded and their delivery is
 retried; other source heads become eligible again. Aborting a predecessor also
 aborts its speculative successor. For a direct attempt, the source PR stays open.
+
+### Stabilize a branch
+
+A stabilize campaign cuts `stabilize/<id>` from one master commit, runs push CI,
+then hourly, then nightly on it, and lets triage, the fixer and the merger fix it
+until every stage is green at one tip. Each passed stage opens a
+`mergemarshall:high` PR from a snapshot of that tip to master. Progress goes to
+one Slack thread. Only one campaign can be live.
+
+```sh
+python3 stabilize.py start --ref master --requested-by <github-login>
+python3 stabilize.py status --json
+python3 stabilize.py check
+python3 stabilize.py abort <campaign-id>
+python3 stabilize.py resume <campaign-id> --requested-by <github-login>
+```
+
+`start` without `--ref` uses the newest master commit with a completed push CI
+run. `status` and `check` only read SQLite. `abort` keeps the branches and PRs
+for inspection. A paused campaign names its reason in `status` and in its
+thread; common reasons are escalated issues, a dispatched run that could not be
+found, repeated infrastructure failures and the round limit.
+
+Dispatching the suites needs the MergeMarshall App to have `actions: write`.
+Without it, the first dispatch pauses the campaign with "GitHub App lacks
+actions: write". After an administrator grants the permission, run
+`resume`; the next tick retries the refused dispatch. `resume` never replays a
+dispatch whose result was ambiguous, and it keeps the round and
+infrastructure limits.
+
+The engine needs its own cron entry. It relies on the crontab's existing
+`PATH`, `HOME`, `XDG_RUNTIME_DIR` and `BIFROST_GH_BIN` lines:
+
+```
+*/5 * * * * /usr/bin/python3 /home/ubuntu/Projects/bifrost-ci-monitor/stabilize.py once 2>&1 | /usr/bin/logger -t bifrost-ci-stabilize
+```
 
 ### Common stalls
 

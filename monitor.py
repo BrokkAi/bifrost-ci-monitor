@@ -23,7 +23,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from contextlib import closing
+from contextlib import closing, nullcontext
 from pathlib import Path
 from typing import Any, Callable
 
@@ -676,12 +676,12 @@ def _failure_datetime(value: str | None) -> dt.datetime | None:
 
 
 def _known_failure_runs(
-    workflow: str, event: str | None, *, limit: int = 100
+    workflow: str, event: str | None, *, limit: int = 100, branch: str = BRANCH
 ) -> list[dict[str, Any]]:
     limit = max(1, min(int(limit), 100))
     args = [
         "run", "list", "--repo", REPO_NAME, "--workflow", workflow,
-        "--branch", BRANCH, "--status", "completed", "--limit", str(limit),
+        "--branch", branch, "--status", "completed", "--limit", str(limit),
         "--json",
         "databaseId,headSha,status,conclusion,url,workflowName,createdAt,updatedAt,headBranch,event",
     ]
@@ -919,10 +919,23 @@ def _failure_absence_proves_recovery(row, detail, successful_steps, *, incomplet
 
 
 def _process_known_failure_run(
-    conn: sqlite3.Connection, workflow: str, item: dict[str, Any]
-) -> None:
+    conn: sqlite3.Connection, workflow: str, item: dict[str, Any],
+    *, campaign_id: str | None = None, stage: str | None = None, report=None,
+):
+    """Apply the shared parser and recovery proofs to master or a campaign ledger.
+
+    Campaign callers own run receipts; returning the report avoids parsing twice.
+    Table names are selected internally, never supplied by callers.
+    """
     from automerge import collect_failure_report_for_run
 
+    table = "stabilize_failures" if campaign_id is not None else "known_failures"
+    if campaign_id is not None and stage not in ("push", "hourly", "nightly"):
+        raise ValueError("campaign ingestion requires a valid stage")
+    prefix_columns = "campaign_id,stage," if campaign_id is not None else ""
+    prefix_values = (campaign_id, stage) if campaign_id is not None else ()
+    scope = "campaign_id=? AND " if campaign_id is not None else ""
+    scope_values = (campaign_id,) if campaign_id is not None else ()
     run_id = int(item["databaseId"])
     sha = str(item.get("headSha") or "")
     url = str(item.get("url") or "")
@@ -930,7 +943,7 @@ def _process_known_failure_run(
     if conclusion in {"cancelled", "canceled"}:
         identities: list[dict[str, str]] = []
     else:
-        report = collect_failure_report_for_run(run_id)
+        report = report if report is not None else collect_failure_report_for_run(run_id)
         identities = []
         for key, detail in report.details.items():
             job_name = normalize_ci_job_name(key.split("/", 1)[-1])
@@ -953,32 +966,32 @@ def _process_known_failure_run(
             (entry["job"], entry["kind"], entry["identity"]): entry
             for entry in identities
         }
-        with conn:
+        with (conn if campaign_id is None else nullcontext()):
             for entry in identities:
                 conn.execute(
-                    "INSERT INTO known_failures(workflow,job_name,identity_kind,identity,"
+                    f"INSERT INTO {table}({prefix_columns}workflow,job_name,identity_kind,identity,"
                     "first_seen_sha,first_seen_run_id,first_seen_run_url,first_seen_at,"
                     "last_seen_sha,last_seen_run_id,last_seen_run_url,last_seen_at,"
                     "last_seen_failed_steps_json,status,updated_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?) "
-                    "ON CONFLICT(workflow,job_name,identity_kind,identity) DO UPDATE SET "
+                    f"VALUES ({'?,' * len(prefix_values)}?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?) "
+                    f"ON CONFLICT({'campaign_id,' if campaign_id is not None else ''}workflow,job_name,identity_kind,identity) DO UPDATE SET "
                     "last_seen_sha=excluded.last_seen_sha,last_seen_run_id=excluded.last_seen_run_id,"
                     "last_seen_run_url=excluded.last_seen_run_url,last_seen_at=excluded.last_seen_at,"
                     "last_seen_failed_steps_json=excluded.last_seen_failed_steps_json,"
-                    "diagnosis=CASE WHEN known_failures.status='fixed' OR (known_failures.triage_outcome='infrastructure' "
-                    "AND (known_failures.last_seen_sha<>excluded.last_seen_sha "
-                    "OR known_failures.last_seen_failed_steps_json<>excluded.last_seen_failed_steps_json)) "
-                    "THEN NULL ELSE known_failures.diagnosis END,"
-                    "diagnosis_source=CASE WHEN known_failures.status='fixed' OR (known_failures.triage_outcome='infrastructure' "
-                    "AND (known_failures.last_seen_sha<>excluded.last_seen_sha "
-                    "OR known_failures.last_seen_failed_steps_json<>excluded.last_seen_failed_steps_json)) "
-                    "THEN NULL ELSE known_failures.diagnosis_source END,"
-                    "triage_outcome=CASE WHEN known_failures.status='fixed' "
-                    "OR known_failures.last_seen_sha<>excluded.last_seen_sha "
-                    "OR known_failures.last_seen_failed_steps_json<>excluded.last_seen_failed_steps_json "
-                    "THEN NULL ELSE known_failures.triage_outcome END,"
+                    f"diagnosis=CASE WHEN {table}.status='fixed' OR ({table}.triage_outcome='infrastructure' "
+                    f"AND ({table}.last_seen_sha<>excluded.last_seen_sha "
+                    f"OR {table}.last_seen_failed_steps_json<>excluded.last_seen_failed_steps_json)) "
+                    f"THEN NULL ELSE {table}.diagnosis END,"
+                    f"diagnosis_source=CASE WHEN {table}.status='fixed' OR ({table}.triage_outcome='infrastructure' "
+                    f"AND ({table}.last_seen_sha<>excluded.last_seen_sha "
+                    f"OR {table}.last_seen_failed_steps_json<>excluded.last_seen_failed_steps_json)) "
+                    f"THEN NULL ELSE {table}.diagnosis_source END,"
+                    f"triage_outcome=CASE WHEN {table}.status='fixed' "
+                    f"OR {table}.last_seen_sha<>excluded.last_seen_sha "
+                    f"OR {table}.last_seen_failed_steps_json<>excluded.last_seen_failed_steps_json "
+                    f"THEN NULL ELSE {table}.triage_outcome END,"
                     "status='open',fixed_at=NULL,fixed_by_sha=NULL,updated_at=excluded.updated_at",
-                    (workflow, entry["job"], entry["kind"], entry["identity"],
+                    (*prefix_values, workflow, entry["job"], entry["kind"], entry["identity"],
                      sha, run_id, url, now, sha, run_id, url, now,
                      json.dumps(entry["steps"]), now),
                 )
@@ -1008,11 +1021,13 @@ def _process_known_failure_run(
                 for key, steps in report.successful_steps.items()
             }
             for job_name in seen_jobs:
+                if campaign_id is not None and job_name in incomplete_jobs:
+                    continue
                 succeeded = job_name in successful_jobs
                 existing = conn.execute(
-                    "SELECT job_name,identity_kind,identity,last_seen_failed_steps_json FROM known_failures "
-                    "WHERE workflow=? AND job_name=? AND status='open'",
-                    (workflow, job_name),
+                    f"SELECT job_name,identity_kind,identity,last_seen_failed_steps_json FROM {table} "
+                    f"WHERE {scope}workflow=? AND job_name=? AND status='open'",
+                    (*scope_values, workflow, job_name),
                 ).fetchall()
                 for row in existing:
                     key = (job_name, row["identity_kind"], row["identity"])
@@ -1022,11 +1037,13 @@ def _process_known_failure_run(
                         incomplete=job_name in incomplete_jobs,
                     )):
                         conn.execute(
-                            "UPDATE known_failures SET status='fixed',fixed_at=?,fixed_by_sha=?,updated_at=? "
-                            "WHERE workflow=? AND job_name=? AND identity_kind=? AND identity=?",
-                            (now, sha, now, workflow, job_name,
+                            f"UPDATE {table} SET status='fixed',fixed_at=?,fixed_by_sha=?,updated_at=? "
+                            f"WHERE {scope}workflow=? AND job_name=? AND identity_kind=? AND identity=?",
+                            (now, sha, now, *scope_values, workflow, job_name,
                              row["identity_kind"], row["identity"]),
                         )
+    if campaign_id is not None:
+        return report
     with conn:
         conn.execute(
             "INSERT OR IGNORE INTO known_failure_runs(workflow,run_id,sha,url,conclusion,"
