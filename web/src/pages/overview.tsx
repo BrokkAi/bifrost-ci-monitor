@@ -45,34 +45,46 @@ import {
   ExternalLink,
 } from "@/components/common";
 import { duration, durationFromMinutes, display, sentenceCase } from "@/lib/utils";
+const SLOTS = {
+  primary: {
+    label: "01 / Primary batch",
+    emptyTitle: "No active batch",
+    emptyText: "The next eligible work will appear here.",
+  },
+  speculative: {
+    label: "02 / Speculative successor",
+    emptyTitle: "No speculative batch",
+    emptyText:
+      "One starts when the primary batch registers a tested candidate and eligible PRs are waiting.",
+  },
+} as const;
+
 export function PipelineCard({
   batch,
+  slot,
 }: {
   batch: BatchSummary | null | undefined;
+  slot: keyof typeof SLOTS;
 }) {
   const detail = useBatch(batch?.batch_id ?? "");
   const checkpoint = detail.data?.state.candidate as
     | { head?: string }
     | null
     | undefined;
+  const { label, emptyTitle, emptyText } = SLOTS[slot];
   if (!batch)
     return (
       <Card className="pipeline-card">
-        <EmptyState title="No active batch">
-          The next eligible work will appear here.
-        </EmptyState>
+        <span className="pipeline-role">{label}</span>
+        <EmptyState title={emptyTitle}>{emptyText}</EmptyState>
       </Card>
     );
   return (
     <Card
-      className={`pipeline-card ${batch.role === "primary" ? "pipeline-primary" : ""}`}
+      className={`pipeline-card ${slot === "primary" ? "pipeline-primary" : ""}`}
     >
       <div className="flex items-center justify-between gap-2">
-        <span className="pipeline-role">
-          {batch.role === "primary"
-            ? "01 / Primary batch"
-            : "02 / Speculative successor"}
-        </span>
+        <span className="pipeline-role">{label}</span>
         <BatchStatus batch={batch} />
       </div>
       <Link
@@ -247,8 +259,8 @@ export function OverviewPage() {
         <SectionLink to="/queue">View queue</SectionLink>
       </div>
       <div className="pipeline-grid">
-        <PipelineCard batch={d.pipeline.primary} />
-        <PipelineCard batch={d.pipeline.speculative} />
+        <PipelineCard slot="primary" batch={d.pipeline.primary} />
+        <PipelineCard slot="speculative" batch={d.pipeline.speculative} />
         <Card className="pipeline-card">
           <div className="pipeline-role">03 / Pull request queue</div>
           <Link to="/queue" className="pipeline-title flex items-center gap-2">
