@@ -30,7 +30,7 @@ import {
   EmptyState,
 } from "@/components/common";
 import { StatusBadge } from "@/components/status";
-import { display, sentenceCase } from "@/lib/utils";
+import { display, plural, sentenceCase } from "@/lib/utils";
 const ledgerColumns: ColumnDef<KnownFailure>[] = [
   {
     accessorKey: "identity",
@@ -125,7 +125,7 @@ export function LedgerPage() {
         action={
           <StatusBadge
             value={observations.length ? "blocked" : "landed"}
-            label={`${observations.length} observations${q.hasNextPage ? " loaded" : ""}`}
+            label={`${plural(observations.length, "observation")}${q.hasNextPage ? " loaded" : ""}`}
             className="mt-3"
           />
         }
@@ -213,8 +213,8 @@ export function AgentsPage() {
             <h2 className="section-title mb-3">Issue repairs</h2>
             {repairPage.active_count > repairPage.active.length && (
               <div className="info-banner mb-3">
-                Showing {repairPage.active.length} of {repairPage.active_count}{" "}
-                active repairs.
+                Showing {repairPage.active.length} of{" "}
+                {plural(repairPage.active_count, "active repair")}.
               </div>
             )}
             <div className="space-y-3">
@@ -336,7 +336,7 @@ export function AgentsPage() {
                       />
                     </div>
                     <p className="text-[10px] text-muted-foreground mt-3">
-                      {t.observation_count} observations{" "}
+                      {plural(t.observation_count, "observation")}{" "}
                       <span className="mx-1">·</span> {t.id}
                     </p>
                     <div className="grid grid-cols-2 gap-4 border-t pt-4 mt-4">
@@ -614,7 +614,7 @@ export function QueryPage() {
               <CardTitle>Results</CardTitle>
               {result && (
                 <span className="text-[10px] text-muted-foreground">
-                  {result.rows.length} rows{result.truncated && " · truncated"}
+                  {plural(result.rows.length, "row")}{result.truncated && " · truncated"}
                 </span>
               )}
             </CardHeader>

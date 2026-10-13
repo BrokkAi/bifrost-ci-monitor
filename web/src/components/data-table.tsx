@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { plural } from "@/lib/utils";
 import {
   flexRender,
   getCoreRowModel,
@@ -120,7 +121,7 @@ export function DataTable<T>({
       {table.getFilteredRowModel().rows.length > pageSize && (
         <div className="flex items-center justify-between border-t px-5 py-3 text-xs text-muted-foreground">
           <span>
-            {table.getFilteredRowModel().rows.length} entries · Page{" "}
+            {plural(table.getFilteredRowModel().rows.length, "entry", "entries")} · Page{" "}
             {table.getState().pagination.pageIndex + 1} of{" "}
             {table.getPageCount()}
           </span>

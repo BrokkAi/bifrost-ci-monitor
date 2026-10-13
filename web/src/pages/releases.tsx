@@ -49,7 +49,7 @@ import {
   RelativeTime,
   EmptyState,
 } from "@/components/common";
-import { sentenceCase } from "@/lib/utils";
+import { plural, sentenceCase } from "@/lib/utils";
 import { StatusBadge, normalizeStatus } from "@/components/status";
 function useReleaseRetry(error: Error | null) {
   const [now, setNow] = useState(() => Date.now());
@@ -84,7 +84,7 @@ function ReleaseActionError({
             : error.message}{" "}
         {busy &&
           (seconds > 0
-            ? `Try again in ${seconds} second${seconds === 1 ? "" : "s"}.`
+            ? `Try again in ${plural(seconds, "second")}.`
             : "Try again.")}
       </span>
     </div>

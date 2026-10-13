@@ -22,7 +22,7 @@ import {
 } from "@/components/common";
 import { DataTable } from "@/components/data-table";
 import { StatusBadge, StatusIcon, BatchStatus } from "@/components/status";
-import { display, duration, sentenceCase } from "@/lib/utils";
+import { display, duration, plural, sentenceCase } from "@/lib/utils";
 import { batchCheckpoints } from "@/lib/batch-progress";
 const columns: ColumnDef<PullRef>[] = [
   {
@@ -54,7 +54,7 @@ function attestSummary(value: Execution["attest"]) {
   const passed = metrics.passed ?? metrics.tests_passed;
   const total = metrics.total ?? metrics.tests_total;
   if (typeof passed !== "number" || typeof total !== "number") return null;
-  return `${passed} / ${total} tests passed${typeof metrics.reused === "number" && metrics.reused > 0 ? ` · ${metrics.reused} reused` : ""}`;
+  return `${passed} / ${plural(total, "test")} passed${typeof metrics.reused === "number" && metrics.reused > 0 ? ` · ${metrics.reused} reused` : ""}`;
 }
 const executions: ColumnDef<Execution>[] = [
   {
@@ -134,7 +134,7 @@ export function BatchPage() {
         title={`Batch ${b.batch_id.replace("batch-", "")}`}
         description={
           <>
-            {b.sources.length} source pull requests. Started{" "}
+            {plural(b.sources.length, "source pull request")}. Started{" "}
             <RelativeTime value={b.created_at} />.
             {b.target_ref !== "master" && (
               <span className="block mt-1 break-all">
@@ -253,7 +253,7 @@ export function BatchPage() {
                 <CardTitle>Execution evidence</CardTitle>
                 <p className="section-caption">
                   Commands, results and tested commits. Loaded{" "}
-                  {b.executions.length} of {b.execution_count} executions.
+                  {b.executions.length} of {plural(b.execution_count, "execution")}.
                 </p>
               </div>
               <Terminal size={15} className="text-muted-foreground" />
@@ -375,8 +375,7 @@ export function BatchPage() {
               <div>
                 <CardTitle>Publication & delivery</CardTitle>
                 <p className="section-caption">
-                  Loaded {b.outbox.length} of {b.outbox_count} write
-                  {b.outbox_count === 1 ? "" : "s"}
+                  Loaded {b.outbox.length} of {plural(b.outbox_count, "write")}
                 </p>
               </div>
             </CardHeader>
