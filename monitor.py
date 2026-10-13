@@ -23,7 +23,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
@@ -1224,6 +1224,83 @@ def refresh_known_failure_link_states(conn: sqlite3.Connection) -> None:
                              (state, url))
 
 
+_HEARTBEAT_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS entrypoint_heartbeats (
+        entry_point TEXT PRIMARY KEY,
+        last_started_at TEXT,
+        last_finished_at TEXT,
+        last_outcome TEXT,
+        last_error TEXT,
+        last_skipped_at TEXT
+    )
+"""
+
+
+def record_heartbeat(conn, entry_point, event, outcome=None, error=None, *, db_path=None):
+    """Best-effort tick receipt; exception messages are deliberately never stored.
+
+    With no connection, use a short-lived connection (also for busy-lock receipts).
+    Never commit a caller's pending transaction. Error text is restricted to an
+    exception class or a fixed exit-code diagnostic, since arbitrary messages
+    may contain credentials, prompts or connection data.
+    """
+    owned = None
+    try:
+        if event not in {'started', 'finished', 'skipped'}:
+            raise ValueError('invalid heartbeat event')
+        if outcome not in {None, 'ok', 'error'}:
+            raise ValueError('invalid heartbeat outcome')
+        if conn is None:
+            path = Path(db_path) if db_path is not None else DB_PATH
+            owned = conn = sqlite3.connect(path, timeout=2.0)
+        if conn.in_transaction:
+            raise RuntimeError('heartbeat requires its own transaction')
+        if isinstance(error, BaseException):
+            detail = type(error).__name__
+        elif isinstance(error, int):
+            detail = f'Entry point returned exit code {error}'
+        elif error is not None:
+            detail = 'Error details omitted'
+        else:
+            detail = None
+        with conn:
+            conn.execute(_HEARTBEAT_SCHEMA)
+            conn.execute('INSERT OR IGNORE INTO entrypoint_heartbeats(entry_point) VALUES (?)',
+                         (entry_point,))
+            if event == 'finished':
+                conn.execute('UPDATE entrypoint_heartbeats SET last_finished_at=?,last_outcome=?,last_error=? '
+                             'WHERE entry_point=?', (utc_now(), outcome, detail[:500] if detail else None, entry_point))
+            else:
+                column = 'last_started_at' if event == 'started' else 'last_skipped_at'
+                conn.execute(f'UPDATE entrypoint_heartbeats SET {column}=? WHERE entry_point=?',
+                             (utc_now(), entry_point))
+    except Exception as exc:
+        try:
+            log(f'heartbeat recording failed: {type(exc).__name__}')
+        except Exception:
+            pass
+    finally:
+        if owned is not None:
+            try:
+                owned.close()
+            except Exception:
+                pass
+
+
+@contextmanager
+def heartbeat_tick(entry_point, *, db_path=None):
+    """Bracket only a cron tick after its lock is held, preserving exceptions."""
+    result = {'outcome': 'ok', 'error': None}
+    record_heartbeat(None, entry_point, 'started', db_path=db_path)
+    try:
+        yield result
+    except BaseException as exc:
+        result.update(outcome='error', error=exc)
+        raise
+    finally:
+        record_heartbeat(None, entry_point, 'finished', db_path=db_path, **result)
+
+
 def connect_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=10)
@@ -1231,6 +1308,7 @@ def connect_db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 10000")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute(_HEARTBEAT_SCHEMA)
     migrate_invocations(conn)
     conn.executescript(
         """
@@ -3769,38 +3847,45 @@ def row_session_id(conn: sqlite3.Connection, run_id: int) -> str:
 
 def run_monitor() -> int:
     """Poll issue-scoped repairs; legacy run invocations remain historical records."""
-    import issue_fixer
-
-    global GH_AUTH_FAILURE_HANDLER
     STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     with LOCK_PATH.open("a+", encoding="utf-8") as lock_handle:
         try:
             fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            record_heartbeat(None, "monitor", "skipped")
             return 0
-        transport = load_slack_transport()
-        conn = connect_db()
-        previous = GH_AUTH_FAILURE_HANDLER
-        GH_AUTH_FAILURE_HANDLER = lambda exc: notify_github_auth_blocked(conn, transport, exc)
+        with heartbeat_tick("monitor") as heartbeat:
+            return _run_monitor_tick(heartbeat)
+
+
+def _run_monitor_tick(heartbeat) -> int:
+    import issue_fixer
+
+    global GH_AUTH_FAILURE_HANDLER
+    transport = load_slack_transport()
+    conn = connect_db()
+    previous = GH_AUTH_FAILURE_HANDLER
+    GH_AUTH_FAILURE_HANDLER = lambda exc: notify_github_auth_blocked(conn, transport, exc)
+    try:
+        if not ensure_runtime_binaries(conn, transport) or not ensure_github_auth(conn, transport):
+            heartbeat.update(outcome="error", error=3)
+            return 3
+        # Do not overlap a legacy repair that an operator has not retired.
+        if conn.execute("SELECT 1 FROM invocations WHERE status IN "
+                        "('claimed','launching','running','pr_detection_pending') LIMIT 1").fetchone():
+            log("issue fixer waiting for a legacy repair invocation to finish")
+            return 0
+        update_known_failures(conn, transport)
+        issue_fixer.tick(conn, transport)
         try:
-            if not ensure_runtime_binaries(conn, transport) or not ensure_github_auth(conn, transport):
-                return 3
-            # Do not overlap a legacy repair that an operator has not retired.
-            if conn.execute("SELECT 1 FROM invocations WHERE status IN "
-                            "('claimed','launching','running','pr_detection_pending') LIMIT 1").fetchone():
-                log("issue fixer waiting for a legacy repair invocation to finish")
-                return 0
-            update_known_failures(conn, transport)
-            issue_fixer.tick(conn, transport)
-            try:
-                import attest_ci
-                attest_ci.tick(conn)
-            except (OSError, ValueError, RuntimeError, CommandError, subprocess.TimeoutExpired) as exc:
-                log(f"Attest CI evidence import deferred: {type(exc).__name__}")
-            return 0
-        finally:
-            GH_AUTH_FAILURE_HANDLER = previous
-            conn.close()
+            import attest_ci
+            attest_ci.tick(conn)
+        except (OSError, ValueError, RuntimeError, CommandError, subprocess.TimeoutExpired) as exc:
+            log(f"Attest CI evidence import deferred: {type(exc).__name__}")
+        return 0
+    finally:
+        GH_AUTH_FAILURE_HANDLER = previous
+        conn.close()
 
 
 def check_only() -> int:

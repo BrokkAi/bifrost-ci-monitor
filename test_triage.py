@@ -1155,3 +1155,89 @@ class GitHubCommandTests(TestCase):
             self.assertEqual(triage.gh_api("issues?state=all", pages=True), [{"number": 1}, {"number": 2}])
         self.assertIn("--paginate", gh.call_args.args[0])
         self.assertIn("--slurp", gh.call_args.args[0])
+
+
+class TriageHeartbeatTests(TestCase):
+    setUp = TriageTests.setUp
+    patch = TriageTests.patch
+
+    def test_cron_success_exception_and_busy_lock(self):
+        import contextlib
+        def row():
+            return dict(self.conn.execute('SELECT * FROM entrypoint_heartbeats').fetchone())
+        with (mock.patch('sys.argv', ['triage.py']),
+              mock.patch.object(triage, 'lock', side_effect=lambda _: contextlib.nullcontext(True)) as lock,
+              mock.patch.object(triage, 'tick') as tick,
+              mock.patch.object(monitor, 'record_heartbeat', wraps=monitor.record_heartbeat) as record):
+            triage.main()
+            self.assertEqual([c.args[2] for c in record.call_args_list], ['started', 'finished'])
+            self.assertEqual(row()['entry_point'], 'triage')
+            self.assertEqual(row()['last_outcome'], 'ok')
+            failure = RuntimeError('secret')
+            tick.side_effect = failure
+            with self.assertRaises(RuntimeError) as caught:
+                triage.main()
+            self.assertIs(caught.exception, failure)
+            self.assertEqual(row()['last_outcome'], 'error')
+            previous = row()
+            lock.side_effect = lambda _: contextlib.nullcontext(False)
+            triage.main()
+            current = row()
+            self.assertTrue(current.pop('last_skipped_at'))
+            previous.pop('last_skipped_at')
+            self.assertEqual(current, previous)
+
+    def test_actual_check_keeps_original_lock_and_schema_path_without_heartbeat(self):
+        from contextlib import nullcontext, redirect_stdout
+        from io import StringIO
+        events = []
+        original_schema = triage.ensure_schema
+        def lock(path):
+            events.append(('lock', path))
+            return nullcontext(True)
+        def migrate(conn):
+            events.append(('schema', None))
+            original_schema(conn)
+        with (mock.patch('sys.argv', ['triage.py', '--check']),
+              mock.patch.object(triage, 'lock', side_effect=lock),
+              mock.patch.object(monitor, 'connect_db', wraps=monitor.connect_db) as connect,
+              mock.patch.object(triage, 'ensure_schema', side_effect=migrate),
+              mock.patch.object(monitor, 'record_heartbeat') as record,
+              redirect_stdout(StringIO()) as output):
+            triage.main()
+            self.assertEqual(json.loads(output.getvalue())['jobs'], [])
+            connect.assert_called_once_with()
+            self.assertEqual(events, [('lock', triage.LOCK_PATH), ('schema', None)])
+            record.assert_not_called()
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM entrypoint_heartbeats').fetchone()[0], 0)
+
+    def test_operator_commands_do_not_record_heartbeats(self):
+        import contextlib
+        for args in [['--check'], ['--reconcile-resolved'], ['--retry-launch', 'missing']]:
+            with self.subTest(args=args), mock.patch('sys.argv', ['triage.py', *args]), \
+                    mock.patch.object(triage, 'lock', return_value=contextlib.nullcontext(True)), \
+                    mock.patch.object(triage, '_main_locked'), \
+                    mock.patch.object(monitor, 'record_heartbeat') as record:
+                triage.main()
+                record.assert_not_called()
+
+    def test_publication_fixer_lock_deferral_does_not_mark_tick_skipped(self):
+        import contextlib
+        TriageTests.add_failure(self)
+        TriageTests.make_job(self)
+        paths = []
+        def locks(path):
+            paths.append(path)
+            return contextlib.nullcontext(path == triage.LOCK_PATH)
+        def tick(conn):
+            triage.publish(conn, conn.execute('SELECT * FROM triage_jobs').fetchone())
+        with (mock.patch('sys.argv', ['triage.py']),
+              mock.patch.object(triage, 'lock', side_effect=locks),
+              mock.patch.object(triage, 'tick', side_effect=tick)):
+            triage.main()
+        self.assertEqual(paths, [triage.LOCK_PATH, monitor.LOCK_PATH])
+        row = self.conn.execute('SELECT * FROM entrypoint_heartbeats').fetchone()
+        self.assertEqual(row['last_outcome'], 'ok')
+        self.assertIsNone(row['last_skipped_at'])
+        self.assertEqual(self.conn.execute('SELECT status FROM triage_jobs').fetchone()[0], 'publishing')
+        self.assertEqual(self.github.calls, [])

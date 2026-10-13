@@ -93,10 +93,8 @@ def plan(a, conn, *, priority_checked, queue_checked, maintenance_done, reconcil
     return sorted(actions)
 
 
-def idle_summary(a, conn, transport):
-    if transport.kind != 'chat':
-        a.log('idle PR summary needs the threaded Slack chat transport')
-        return
+def queue_groups(a, conn) -> dict[str, list[tuple[int, str, str, str | None]]]:
+    """Categorize cached open PRs using read-only queries, in Slack order."""
     groups = {'dependency blocked': [], 'rejected': [], 'draft': [], 'otherwise ineligible': []}
     rejected = {(r['number'], r['head_sha']) for r in conn.execute(
         "SELECT number,head_sha FROM automerge_github_outbox WHERE kind='reject_head' AND cancelled_at IS NULL")}
@@ -113,6 +111,14 @@ def idle_summary(a, conn, transport):
         else:
             group = 'otherwise ineligible'
         groups[group].append((row['number'], row['head_sha'], item.get('title', ''), row['blocked_reason']))
+    return groups
+
+
+def idle_summary(a, conn, transport):
+    if transport.kind != 'chat':
+        a.log('idle PR summary needs the threaded Slack chat transport')
+        return
+    groups = queue_groups(a, conn)
     identifier = digest(groups)
     saved = conn.execute('SELECT * FROM automerge_queue_summaries WHERE summary_id=?', (identifier,)).fetchone()
     if saved and saved['completed_at']:

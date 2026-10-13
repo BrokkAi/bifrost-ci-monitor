@@ -238,5 +238,56 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(self.send.call_args.args[2], 'thread')
 
 
+class QueueGroupsTests(unittest.TestCase):
+    setUp = SupervisorTests.setUp
+    patch = SupervisorTests.patch
+
+    def test_groups_are_read_only_and_idle_message_bytes_are_unchanged(self):
+        import sqlite3
+        entries = [(8, False, None, 'ordinary'), (2, False, 'needs <base>', 'blocked & title'),
+                   (4, True, 'draft reason', 'draft'), (3, False, 'rejection reason', 'rejected'),
+                   (5, True, None, 'draft second')]
+        for number, draft, reason, title in entries:
+            item = {'state': 'open', 'draft': draft, 'title': title, 'labels': []}
+            with self.conn:
+                self.conn.execute('INSERT INTO automerge_pr_inventory '
+                                  '(number,head_sha,data_json,blocked_reason) VALUES (?,?,?,?)',
+                                  (number, HEAD_ONE, json.dumps(item), reason))
+        with self.conn:
+            a.enqueue_github_write(self.conn, '__queue__', 'reject_head', 3, HEAD_ONE, {})
+            for number, item in [(9, {'state': 'closed'}),
+                                 (10, {'state': 'open', 'labels': [{'name': a.INTEGRATION_LABEL}]})]:
+                self.conn.execute('INSERT INTO automerge_pr_inventory (number,head_sha,data_json) VALUES (?,?,?)',
+                                  (number, HEAD_ONE, json.dumps(item)))
+        expected = {
+            'dependency blocked': [(2, HEAD_ONE, 'blocked & title', 'needs <base>')],
+            'rejected': [(3, HEAD_ONE, 'rejected', 'rejection reason')],
+            'draft': [(4, HEAD_ONE, 'draft', 'draft reason'), (5, HEAD_ONE, 'draft second', None)],
+            'otherwise ineligible': [(8, HEAD_ONE, 'ordinary', None)],
+        }
+        with sqlite3.connect(f'file:{a.DB_PATH}?mode=ro', uri=True) as readonly:
+            readonly.row_factory = sqlite3.Row
+            readonly.execute('PRAGMA query_only=1')
+            before = readonly.total_changes
+            self.assertEqual(supervisor.queue_groups(a, readonly), expected)
+            self.assertEqual(readonly.total_changes, before)
+        self.send.assert_not_called()
+        supervisor.idle_summary(a, self.conn, self.transport)
+        messages = [call.args[1] for call in self.send.call_args_list[1:]]
+        self.assertEqual(messages, [
+            'No eligible PRs to start. 5 open PRs: 1 dependency blocked, 1 rejected, 2 draft, 1 otherwise ineligible.',
+            '*Dependency blocked*\n• <https://github.com/BrokkAi/bifrost-dev/pull/2|#2> blocked &amp; title — needs &lt;base&gt;',
+            '*Rejected*\n• <https://github.com/BrokkAi/bifrost-dev/pull/3|#3> rejected — rejection reason',
+            '*Draft*\n• <https://github.com/BrokkAi/bifrost-dev/pull/4|#4> draft — draft reason\n• <https://github.com/BrokkAi/bifrost-dev/pull/5|#5> draft second',
+            '*Otherwise ineligible*\n• <https://github.com/BrokkAi/bifrost-dev/pull/8|#8> ordinary',
+        ])
+        saved = self.conn.execute('SELECT * FROM automerge_queue_summaries').fetchone()
+        self.assertEqual(saved['summary_id'], supervisor.digest(expected))
+        self.assertEqual(saved['messages_json'], json.dumps(messages))
+        count = self.send.call_count
+        supervisor.idle_summary(a, self.conn, self.transport)
+        self.assertEqual(self.send.call_count, count)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -2530,3 +2530,150 @@ class KnownFailureLedgerTests(unittest.TestCase):
             self.assertTrue(monitor.update_known_failures(self.conn, self.transport, force=True))
         count = self.conn.execute("SELECT COUNT(*) FROM known_failure_errors").fetchone()[0]
         self.assertEqual(count, 0)
+
+
+class HeartbeatTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        for name, value in [('DB_PATH', root / 'activity.db'), ('STATE_DIR', root),
+                            ('LOCK_PATH', root / 'monitor.lock')]:
+            patcher = mock.patch.object(monitor, name, value)
+            self.addCleanup(patcher.stop)
+            patcher.start()
+
+    def row(self):
+        with sqlite3.connect(monitor.DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            return conn.execute('SELECT * FROM entrypoint_heartbeats WHERE entry_point="monitor"').fetchone()
+
+    def test_receipts_preserve_fields_and_clear_old_error(self):
+        conn = monitor.connect_db()
+        self.addCleanup(conn.close)
+        monitor.record_heartbeat(conn, 'monitor', 'started')
+        monitor.record_heartbeat(conn, 'monitor', 'finished', 'error',
+                                 RuntimeError('token=private prompt=private'))
+        monitor.record_heartbeat(conn, 'monitor', 'skipped')
+        row = self.row()
+        self.assertTrue(row['last_started_at'])
+        self.assertTrue(row['last_finished_at'])
+        self.assertTrue(row['last_skipped_at'])
+        self.assertEqual(row['last_outcome'], 'error')
+        self.assertEqual(row['last_error'], 'RuntimeError')
+        monitor.record_heartbeat(conn, 'monitor', 'finished', 'ok')
+        self.assertIsNone(self.row()['last_error'])
+
+
+    def test_broken_database_and_logging_never_raise(self):
+        conn = sqlite3.connect(':memory:')
+        conn.close()
+        with mock.patch.object(monitor, 'log', side_effect=RuntimeError('broken logger')):
+            monitor.record_heartbeat(conn, 'monitor', 'started')
+            monitor.record_heartbeat(None, 'monitor', 'started', db_path=monitor.STATE_DIR)
+
+    def test_pending_transaction_is_not_committed_or_rolled_back(self):
+        conn = sqlite3.connect(':memory:')
+        self.addCleanup(conn.close)
+        conn.execute('CREATE TABLE pending(value)')
+        conn.execute('INSERT INTO pending VALUES (1)')
+        monitor.record_heartbeat(conn, 'monitor', 'started')
+        self.assertTrue(conn.in_transaction)
+        self.assertEqual(conn.execute('SELECT value FROM pending').fetchone()[0], 1)
+        conn.rollback()
+        self.assertEqual(conn.execute('SELECT count(*) FROM pending').fetchone()[0], 0)
+
+    def test_cron_success_error_return_exception_and_busy_lock(self):
+        import issue_fixer
+        import attest_ci
+        with (mock.patch.object(monitor, 'load_slack_transport'),
+              mock.patch.object(monitor, 'ensure_runtime_binaries', return_value=True) as runtime,
+              mock.patch.object(monitor, 'ensure_github_auth', return_value=True),
+              mock.patch.object(monitor, 'update_known_failures'),
+              mock.patch.object(issue_fixer, 'tick') as tick,
+              mock.patch.object(attest_ci, 'tick'),
+              mock.patch.object(monitor, 'record_heartbeat', wraps=monitor.record_heartbeat) as record):
+            self.assertEqual(monitor.run_monitor(), 0)
+            self.assertEqual([c.args[2] for c in record.call_args_list], ['started', 'finished'])
+            self.assertEqual(self.row()['last_outcome'], 'ok')
+            runtime.return_value = False
+            self.assertEqual(monitor.run_monitor(), 3)
+            self.assertEqual(self.row()['last_error'], 'Entry point returned exit code 3')
+            runtime.return_value = True
+            failure = RuntimeError('secret')
+            tick.side_effect = failure
+            with self.assertRaises(RuntimeError) as caught:
+                monitor.run_monitor()
+            self.assertIs(caught.exception, failure)
+            row = dict(self.row())
+            self.assertEqual(row['last_outcome'], 'error')
+            with mock.patch.object(monitor.fcntl, 'flock', side_effect=BlockingIOError):
+                self.assertEqual(monitor.run_monitor(), 0)
+            skipped = dict(self.row())
+            self.assertTrue(skipped.pop('last_skipped_at'))
+            row.pop('last_skipped_at')
+            self.assertEqual(skipped, row)
+
+    def test_startup_exception_is_recorded_before_transport_or_schema_load(self):
+        failure = RuntimeError('private connection data')
+        with mock.patch.object(monitor, 'load_slack_transport', side_effect=failure):
+            with self.assertRaises(RuntimeError) as caught:
+                monitor.run_monitor()
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(self.row()['last_outcome'], 'error')
+        self.assertEqual(self.row()['last_error'], 'RuntimeError')
+
+    def test_error_details_are_bounded_and_arbitrary_strings_are_omitted(self):
+        large_error = type('E' * 700, (Exception,), {})('private')
+        monitor.record_heartbeat(None, 'monitor', 'finished', 'error', large_error)
+        self.assertEqual(len(self.row()['last_error']), 500)
+        monitor.record_heartbeat(None, 'monitor', 'finished', 'error', '{"token":"private"}')
+        self.assertEqual(self.row()['last_error'], 'Error details omitted')
+
+    def test_actual_check_keeps_original_database_path_without_heartbeat(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        result = SimpleNamespace(state='idle', head_sha='a' * 40, run=None)
+        with (mock.patch.object(monitor, 'load_slack_transport'),
+              mock.patch.object(monitor, 'ensure_runtime_binaries', return_value=True),
+              mock.patch.object(monitor, 'ensure_github_auth', return_value=True),
+              mock.patch.object(monitor, 'poll_ci', return_value=result),
+              mock.patch.object(monitor, 'connect_db', wraps=monitor.connect_db) as connect,
+              mock.patch.object(monitor, 'record_heartbeat') as record,
+              redirect_stdout(StringIO())):
+            self.assertEqual(monitor.check_only(), 0)
+            connect.assert_called_once_with()
+            record.assert_not_called()
+        self.assertTrue(monitor.DB_PATH.exists())
+        with sqlite3.connect(monitor.DB_PATH) as conn:
+            self.assertEqual(conn.execute('SELECT count(*) FROM entrypoint_heartbeats').fetchone()[0], 0)
+
+    def test_heartbeat_preserves_permissions_and_uses_two_second_timeout(self):
+        with sqlite3.connect(monitor.DB_PATH):
+            pass
+        monitor.DB_PATH.chmod(0o640)
+        with (mock.patch.object(Path, 'chmod') as chmod,
+              mock.patch.object(Path, 'mkdir') as mkdir,
+              mock.patch.object(monitor.sqlite3, 'connect', wraps=sqlite3.connect) as connect):
+            monitor.record_heartbeat(None, 'monitor', 'started')
+            connect.assert_called_once_with(monitor.DB_PATH, timeout=2.0)
+            chmod.assert_not_called()
+            mkdir.assert_not_called()
+        self.assertEqual(monitor.DB_PATH.stat().st_mode & 0o777, 0o640)
+        self.assertTrue(self.row()['last_started_at'])
+
+    def test_heartbeat_does_not_create_missing_parent_directory(self):
+        missing = monitor.STATE_DIR / 'missing' / 'activity.db'
+        with mock.patch.object(monitor, 'log') as log:
+            monitor.record_heartbeat(None, 'monitor', 'started', db_path=missing)
+            log.assert_called_once_with('heartbeat recording failed: OperationalError')
+        self.assertFalse(missing.parent.exists())
+
+    def test_check_dispatch_never_records_heartbeat(self):
+        args = SimpleNamespace(configure_slack=False, configure_bot=False, test_slack=False,
+                               check=True, init_db=False)
+        with (mock.patch.object(monitor, 'parse_args', return_value=args),
+              mock.patch.object(monitor, 'check_only', return_value=0),
+              mock.patch.object(monitor, 'record_heartbeat') as record):
+            self.assertEqual(monitor.main(), 0)
+            record.assert_not_called()

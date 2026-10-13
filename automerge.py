@@ -1090,6 +1090,7 @@ def connect_db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 10000")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute(monitor._HEARTBEAT_SCHEMA)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS automerge_batches (
@@ -6099,10 +6100,22 @@ def run_land_now(number: int) -> int:
 
 
 def run_automerge() -> int:
-    global OBSERVATION_DEADLINE, ANCESTRY_CACHE, ANCESTRY_CONNECTION, SUPERVISOR_RUNNING
     lock_handle = acquire_lock()
     if lock_handle is None:
+        monitor.record_heartbeat(None, "merger", "skipped", db_path=DB_PATH)
         return 0
+    try:
+        with monitor.heartbeat_tick("merger", db_path=DB_PATH) as heartbeat:
+            result = _run_automerge_tick()
+            if result:
+                heartbeat.update(outcome="error", error=result)
+            return result
+    finally:
+        lock_handle.close()
+
+
+def _run_automerge_tick() -> int:
+    global OBSERVATION_DEADLINE, ANCESTRY_CACHE, ANCESTRY_CONNECTION, SUPERVISOR_RUNNING
     monitor.reset_github_auth_cache()
     OBSERVATION_DEADLINE = time.monotonic() + TURN_TICK_SECONDS
     budget_token = read_budget.deadline.set(OBSERVATION_DEADLINE)
@@ -6132,7 +6145,6 @@ def run_automerge() -> int:
         OBSERVATION_DEADLINE = None
         SUPERVISOR_RUNNING = False
         read_budget.deadline.reset(budget_token)
-        lock_handle.close()
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -800,29 +800,38 @@ def main() -> None:
     parser.add_argument("--retry-launch", metavar="JOB", help="explicitly retry an ambiguous launch after confirming no matching session exists")
     parser.add_argument("--reconcile-resolved", action="store_true", help="retire unchanged resolved observations from completed reports and refresh the index without launching a session")
     args = parser.parse_args()
+    cron_tick = not (args.check or args.retry_launch or args.reconcile_resolved)
     with lock(LOCK_PATH) as acquired:
         if not acquired:
+            if cron_tick:
+                monitor.record_heartbeat(None, "triage", "skipped")
             return
-        with contextlib.closing(monitor.connect_db()) as conn:
-            ensure_schema(conn)
-            if args.check:
-                jobs = [dict(row) for row in conn.execute(
-                    "SELECT id,status,session_id,created_at,finished_at,last_error FROM triage_jobs ORDER BY created_at DESC LIMIT 10")]
-                print(json.dumps({"jobs": jobs, "pending_observations": len(pending(conn)),
-                                  "model": MODEL, "cpus": CPUS, "memory_gib": MEMORY_GIB}, indent=2))
-                return
-            if args.reconcile_resolved:
-                count = reconcile_resolved(conn)
-                monitor._sync_known_failure_issue(conn)
-                print(json.dumps({"retired_observations": count}))
-                return
-            if args.retry_launch:
-                job = conn.execute("SELECT * FROM triage_jobs WHERE id=?", (args.retry_launch,)).fetchone()
-                if job is None or job["status"] != "launching" or lookup_session(job):
-                    raise ValueError("retry requires a launching job with no matching mj session")
-                with conn:
-                    conn.execute("UPDATE triage_jobs SET status='queued',last_error=NULL WHERE id=?", (job["id"],))
-            tick(conn)
+        heartbeat = monitor.heartbeat_tick("triage") if cron_tick else contextlib.nullcontext()
+        with heartbeat:
+            _main_locked(args)
+
+
+def _main_locked(args):
+    with contextlib.closing(monitor.connect_db()) as conn:
+        ensure_schema(conn)
+        if args.check:
+            jobs = [dict(row) for row in conn.execute(
+                "SELECT id,status,session_id,created_at,finished_at,last_error FROM triage_jobs ORDER BY created_at DESC LIMIT 10")]
+            print(json.dumps({"jobs": jobs, "pending_observations": len(pending(conn)),
+                              "model": MODEL, "cpus": CPUS, "memory_gib": MEMORY_GIB}, indent=2))
+            return
+        if args.reconcile_resolved:
+            count = reconcile_resolved(conn)
+            monitor._sync_known_failure_issue(conn)
+            print(json.dumps({"retired_observations": count}))
+            return
+        if args.retry_launch:
+            job = conn.execute("SELECT * FROM triage_jobs WHERE id=?", (args.retry_launch,)).fetchone()
+            if job is None or job["status"] != "launching" or lookup_session(job):
+                raise ValueError("retry requires a launching job with no matching mj session")
+            with conn:
+                conn.execute("UPDATE triage_jobs SET status='queued',last_error=NULL WHERE id=?", (job["id"],))
+        tick(conn)
 
 
 if __name__ == "__main__":

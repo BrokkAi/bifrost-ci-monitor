@@ -4128,6 +4128,71 @@ class MissingFailedJobLogTests(TestCase):
         conn.close()
 
 
+
+class EntrypointHeartbeatTests(TestCase):
+    def test_merger_tick_records_success_nonzero_exception_and_skip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'activity.db'
+            def row():
+                with sqlite3.connect(path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    return dict(conn.execute('SELECT * FROM entrypoint_heartbeats').fetchone())
+            with (mock.patch.object(automerge, 'DB_PATH', path),
+                  mock.patch.object(automerge, 'acquire_lock', return_value=mock.Mock()) as lock,
+                  mock.patch.object(monitor, 'load_slack_transport'),
+                  mock.patch.object(automerge, 'ensure_runtime_binaries', return_value=True),
+                  mock.patch.object(automerge, 'ensure_github_auth', return_value=True),
+                  mock.patch.object(automerge.supervisor, 'run', return_value=0) as tick,
+                  mock.patch.object(monitor, 'record_heartbeat', wraps=monitor.record_heartbeat) as record):
+                self.assertEqual(automerge.run_automerge(), 0)
+                self.assertEqual([c.args[2] for c in record.call_args_list], ['started', 'finished'])
+                self.assertEqual(row()['entry_point'], 'merger')
+                self.assertEqual(row()['last_outcome'], 'ok')
+                tick.return_value = 3
+                self.assertEqual(automerge.run_automerge(), 3)
+                self.assertEqual(row()['last_error'], 'Entry point returned exit code 3')
+                failure = RuntimeError('secret')
+                tick.side_effect = failure
+                with self.assertRaises(RuntimeError) as caught:
+                    automerge.run_automerge()
+                self.assertIs(caught.exception, failure)
+                self.assertEqual(row()['last_outcome'], 'error')
+                previous = row()
+                lock.return_value = None
+                self.assertEqual(automerge.run_automerge(), 0)
+                current = row()
+                self.assertTrue(current.pop('last_skipped_at'))
+                previous.pop('last_skipped_at')
+                self.assertEqual(current, previous)
+
+    def test_startup_transport_error_return_is_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'activity.db'
+            with (mock.patch.object(automerge, 'DB_PATH', path),
+                  mock.patch.object(automerge, 'acquire_lock', return_value=mock.Mock()),
+                  mock.patch.object(monitor, 'load_slack_transport', side_effect=ValueError('secret'))):
+                self.assertEqual(automerge.run_automerge(), 2)
+            with sqlite3.connect(path) as conn:
+                self.assertEqual(conn.execute('SELECT last_outcome,last_error FROM entrypoint_heartbeats').fetchone(),
+                                 ('error', 'Entry point returned exit code 2'))
+
+    def test_operator_dispatch_never_records_heartbeat(self):
+        for args, target in [(['--check'], 'check_only'), (['--abort-batch', 'batch'], 'run_abort_batch'),
+                             (['--land-now', '17'], 'run_land_now')]:
+            with self.subTest(args=args), mock.patch.object(automerge, target, return_value=0), \
+                    mock.patch.object(monitor, 'record_heartbeat') as record:
+                self.assertEqual(automerge.main(args), 0)
+                record.assert_not_called()
+
+    def test_separate_merger_schema_has_heartbeat_table(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(automerge, 'DB_PATH', Path(directory) / 'activity.db'):
+            conn = automerge.connect_db()
+            try:
+                self.assertEqual(len(conn.execute('PRAGMA table_info(entrypoint_heartbeats)').fetchall()), 6)
+            finally:
+                conn.close()
+
 if __name__ == "__main__":
     import unittest
 
