@@ -69,6 +69,22 @@ def validate(value):
                 or not isinstance(attest.get("metrics"), dict)
                 or any(not isinstance(attest.get(k), str) for k in ("result", "object", "suite"))):
             raise ValueError("invalid Attest execution summary")
+    runs = value.get("attest_runs", [])
+    if not isinstance(runs, list) or len(runs) > 16:
+        raise ValueError("invalid automatic Attest summaries")
+    for run in runs:
+        if (not isinstance(run, dict) or run.get("format_version") != 1
+                or not re.fullmatch(r"[0-9a-f]{32}", str(run.get("run_id", "")))
+                or not re.fullmatch(r"[0-9a-f]{40}", str(run.get("head", "")))
+                or not re.fullmatch(r"[0-9a-f]{40}", str(run.get("tree", "")))
+                or run.get("mode") != "shadow" or type(run.get("exit_code")) is not int
+                or type(run.get("published")) is not bool or not isinstance(run.get("metrics"), dict)
+                or any(not isinstance(run.get(k), str) for k in ("result", "object", "suite"))):
+            raise ValueError("invalid automatic Attest summary")
+    capture = value.get("attest_capture")
+    if capture is not None and (not isinstance(capture, dict) or set(capture) != {"recorded", "unavailable", "native_fallbacks", "omitted"}
+            or any(type(v) is not int or v < 0 for v in capture.values())):
+        raise ValueError("invalid automatic Attest capture status")
     return value
 
 
@@ -82,7 +98,7 @@ def record(conn, batch_id, session_id, value):
             return old
         # A late retry of the start cannot overwrite a completed result.
         result_fields = {"status", "finished_at", "duration_seconds", "exit_code", "head_after",
-                         "tree_after", "tracked_source_changed", "stdout", "stderr", "error", "attest"}
+                         "tree_after", "tracked_source_changed", "stdout", "stderr", "error", "attest", "attest_runs", "attest_capture"}
         identity = lambda v: {k: item for k, item in v.items() if k not in result_fields}
         if (identity(old) != identity(value)
                 or any(old[name]["path"] != value[name]["path"] for name in ("stdout", "stderr"))):
@@ -149,6 +165,15 @@ def render(assessment, *, limit=12000):
                  f"stdout {run['stdout']['path']}; stderr {run['stderr']['path']}")
         if run.get("reuse_reason"):
             entry += "\n  Reuse: " + run["reuse_reason"]
+        for captured in run.get("attest_runs", []):
+            m = captured["metrics"]
+            entry += (f"\n  Attest {captured['suite']}: head {captured['head']}, exit {captured['exit_code']}; "
+                      f"{m.get('executed', 0)} executed, {m.get('failed', 0)} failures, "
+                      f"{m.get('potential_reuse', 0)} potential reuse; {captured['result']}")
+        capture = run.get("attest_capture")
+        if capture and (capture["unavailable"] or capture["native_fallbacks"] or capture["omitted"]):
+            entry += (f"\n  Attest capture: {capture['unavailable']} unavailable, "
+                      f"{capture['native_fallbacks']} native fallbacks, {capture['omitted']} summaries omitted.")
         if run.get("attest"):
             a = run["attest"]
             m = a["metrics"]

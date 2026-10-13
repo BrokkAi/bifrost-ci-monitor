@@ -510,9 +510,15 @@ See [LICENSE](LICENSE).
 
 ## Attest shadow test evidence
 
-Attest is a separate Go project at `../attest`. Merge agents use
-`mm-db attest SUITE --filter EXPR` for matching nextest suites when
-`attest.toml` is available. This currently executes all selected tests in shadow
+Attest is a separate Go project at `../attest`. With `attest.toml` available,
+ordinary `mm-db run` commands and configured `mm-compare` checks invoke
+`attest exec -- COMMAND`, which automatically captures supported native test
+calls, including calls inside scripts. Agents do not need to choose a suite.
+Runner interception and parsing belong to standalone Attest; Merge Marshall
+only links compact results to its execution receipts and supplies storage.
+Nextest is the first adapter; other test systems use the same interface.
+The explicit `mm-db attest SUITE --filter EXPR` command remains available.
+This currently executes all selected tests in shadow
 mode; normal assessment and landing policies still apply. Command receipts
 retain the compact summary and a pointer to the detailed result.
 

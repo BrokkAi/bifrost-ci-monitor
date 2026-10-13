@@ -109,6 +109,11 @@ def render_report(state):
                      f"stdout {run['stdout']['path']}; stderr {run['stderr']['path']}")
         if run.get("reuse_reason"):
             lines.append("Reuse: " + run["reuse_reason"])
+        for capture in run.get("attest_runs", []):
+            metrics = capture["metrics"]
+            lines.append(f"Attest {capture['suite']} at {capture['head']}: exit {capture['exit_code']}; "
+                         f"{metrics.get('executed', 0)} executed, "
+                         f"{metrics.get('potential_reuse', 0)} potential reuse; {capture['result']}")
     publication = state.get("publication")
     if publication:
         if publication["head"] != evidence["head"]:

@@ -12,6 +12,10 @@ import time
 import uuid
 import urllib.request
 
+import mm_attest_capture
+
+ATTEST_VERSION = "0.1.1"
+
 
 def git(cwd, *args):
     return subprocess.run(["git", "-C", str(cwd), *args], text=True,
@@ -80,11 +84,40 @@ def execute(argv, cwd, output, *, client=None, state=None, script=None, stdout=N
     save(receipt_path, receipt)
     print(f"Execution {receipt['id']}: stdout {stdout}; stderr {stderr}", file=sys.stderr, flush=True)
     try_upload(client, receipt_path)
+    capture_root = None
+    executed_argv = argv
+    if client is not None and attest_output is None:
+        try:
+            root = Path(git(cwd, "rev-parse", "--show-toplevel"))
+            if (root / "attest.toml").is_file():
+                common = Path(git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+                binary = ensure_attest(client, common)
+                capture_root = output / "attest-runs"
+                executed_argv = [binary, "exec", "--config", str(root / "attest.toml"),
+                                 "--output", str(capture_root), "--"] + argv
+                process_env = dict(os.environ if process_env is None else process_env,
+                    ATTEST_HTTP_URL=client.connection["url"].rstrip("/")
+                        + "/batch/" + client.connection["batch_id"] + "/attest",
+                    ATTEST_HTTP_TOKEN=client.connection["token"])
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            print("Automatic Attest capture unavailable; native check and command evidence retained.", file=sys.stderr)
+            receipt["attest_capture"] = {"recorded": 0, "unavailable": 1, "native_fallbacks": 0, "omitted": 0}
     started = time.monotonic()
     try:
         with stdout.open("wb") as out, stderr.open("wb") as err:
-            receipt["exit_code"] = subprocess.run(argv, cwd=cwd, stdout=out, stderr=err,
-                                                 env=process_env).returncode
+            try:
+                receipt["exit_code"] = subprocess.run(executed_argv, cwd=cwd, stdout=out, stderr=err,
+                                                     env=process_env).returncode
+            except OSError:
+                if executed_argv == argv:
+                    raise
+                # Failure to start the observer has not executed any test work.
+                receipt["attest_capture"] = {"recorded": 0, "unavailable": 1,
+                                            "native_fallbacks": 0, "omitted": 0}
+                capture_root = None
+                print("Attest could not start; executing the original command.", file=sys.stderr)
+                receipt["exit_code"] = subprocess.run(argv, cwd=cwd, stdout=out, stderr=err,
+                                                     env=process_env).returncode
         receipt["status"] = "interrupted" if receipt["exit_code"] < 0 else "completed"
     except KeyboardInterrupt:
         receipt.update(status="interrupted", exit_code=-2)
@@ -113,6 +146,11 @@ def execute(argv, cwd, output, *, client=None, state=None, script=None, stdout=N
                     "format_version", "run_id", "result", "object", "published", "suite", "mode", "metrics")}
             except (OSError, ValueError, KeyError):
                 print("Attest summary unavailable; command evidence retained.", file=sys.stderr)
+        if capture_root is not None:
+            try:
+                mm_attest_capture.collect(receipt, capture_root)
+            except (OSError, ValueError):
+                print("Automatic Attest summaries unavailable; native command evidence retained.", file=sys.stderr)
         save(receipt_path, receipt)
         try_upload(client, receipt_path)
     return receipt
@@ -142,15 +180,23 @@ def run_attest(client, suite, *, filterset=None, config="attest.toml"):
 def ensure_attest(client, common):
     configured = os.environ.get("ATTEST_BIN")
     if configured:
+        checked = subprocess.run([configured, "version"], capture_output=True, text=True, timeout=10)
+        if checked.returncode or checked.stdout.strip() != ATTEST_VERSION:
+            raise ValueError("configured Attest binary has an unsupported version")
         return configured
     installed = shutil.which("attest")
     if installed:
-        return installed
-    target = common / "mm-tools" / "attest-0.1.0"
+        try:
+            checked = subprocess.run([installed, "version"], capture_output=True, text=True, timeout=10)
+            if checked.returncode == 0 and checked.stdout.strip() == ATTEST_VERSION:
+                return installed
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    target = common / "mm-tools" / ("attest-" + ATTEST_VERSION)
     if target.is_file():
         try:
             checked = subprocess.run([str(target), "version"], capture_output=True, text=True, timeout=10)
-            if checked.returncode == 0 and checked.stdout.strip() == "0.1.0":
+            if checked.returncode == 0 and checked.stdout.strip() == ATTEST_VERSION:
                 return str(target)
         except (OSError, subprocess.TimeoutExpired):
             pass
@@ -173,7 +219,7 @@ def ensure_attest(client, common):
                 raise ValueError("incomplete Attest binary download")
         temporary.chmod(0o700)
         checked = subprocess.run([str(temporary), "version"], capture_output=True, text=True, timeout=10)
-        if checked.returncode or checked.stdout.strip() != "0.1.0":
+        if checked.returncode or checked.stdout.strip() != ATTEST_VERSION:
             raise ValueError("downloaded Attest binary has an unsupported version")
         temporary.replace(target)
     finally:

@@ -704,6 +704,18 @@ command registry is implemented.
 
 Run selected local builds/tests through `mm-db run -- COMMAND...` or
 `mm-db run --script FILE`; configured `mm-compare` records both sides automatically.
+When the tested checkout has `attest.toml`, the wrapper invokes standalone
+`attest exec -- COMMAND` in shadow mode. Attest owns child-scoped runner
+interception, adapter registration, native argument parsing and per-test results;
+Merge Marshall only supplies authenticated storage and retains compact summaries
+in the command receipt. Nextest is the first adapter, not a language boundary.
+Native calls inside scripts are captured without agent suite selection. Actual
+flags/profile/environment remain authoritative. Unsupported calls or failed
+preflight run natively; report failures after execution never rerun tests or
+replace the native exit status. Multiple calls retain bounded `attest_runs` and
+capture diagnostics; legacy singular `attest` summaries remain readable. Suite
+labels do not establish equivalence: source and exact execution contracts do.
+Automatic capture never skips tests, changes assessments or authorizes a merge.
 `automerge_executions` retains command/arguments, committed head/tree, safe build
 settings and host metadata, start/end times, duration, exit status, source changes,
 output paths, source revision and attempt generation. The helper retains output,
