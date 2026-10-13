@@ -53,6 +53,7 @@ function pull(i: number): PullRef {
 export const primary: BatchSummary = {
   batch_id: "batch-8f21c9",
   kind: "batch",
+  target_ref: "master",
   lane: "queue",
   role: "primary",
   status: "running",
@@ -93,6 +94,7 @@ export const recent = Array.from(
   (_, i): BatchSummary => ({
     ...primary,
     batch_id: `batch-${["7a3b92", "24e581", "d529a0", "18cb43", "9d7231", "fab712", "b41273"][i]}`,
+    target_ref: i === 0 ? "stabilize/stable-20261012" : "master",
     status: i === 3 ? "failed" : "completed",
     phase: "terminal",
     terminal_status: [
@@ -389,11 +391,15 @@ export const stats: Stats = {
 export const campaigns: Campaign[] = [
   {
     id: "stable-20261012",
-    status: "running",
+    branch: "stabilize/stable-20261012",
+    anchor_sha: sha(871422),
+    requested_ref: "master",
+    start_error: null,
+    status: "paused",
     stage: "hourly",
     round: 2,
     tip_sha: sha(871423),
-    pause_reason: null,
+    pause_reason: "GitHub App lacks actions: write",
     requested_by: "jonathan",
     updated_at: date(3),
     created_at: date(180),
@@ -428,24 +434,27 @@ export const campaigns: Campaign[] = [
     ],
     latest_runs: {
       push: {
-        run_id: 89127401,
+        sha: sha(871422),
         url: "https://github.com/BrokkAi/bifrost-dev/actions/runs/89127401",
-        status: "completed",
         conclusion: "success",
       },
       hourly: {
-        run_id: 89128244,
+        sha: sha(871423),
         url: "https://github.com/BrokkAi/bifrost-dev/actions/runs/89128244",
-        status: "in_progress",
-        conclusion: null,
+        conclusion: "failure",
       },
+      nightly: null,
     },
   },
   ...Array.from(
     { length: 3 },
     (_, i): Campaign => ({
       id: `stable-2026100${9 - i * 2}`,
-      status: i === 2 ? "aborted" : "complete",
+      branch: `stabilize/stable-2026100${9 - i * 2}`,
+      anchor_sha: sha(871200 - i * 34),
+      requested_ref: "master",
+      start_error: null,
+      status: i === 2 ? "aborted" : "completed",
       stage: i === 2 ? "nightly" : "complete",
       round: 2 + i,
       tip_sha: sha(871218 - i * 34),
@@ -463,15 +472,17 @@ export const campaigns: Campaign[] = [
   ),
 ];
 const health: Endpoints["/health"] = {
-  entry_points: (["merger", "monitor", "triage"] as const).map((name, i) => ({
-    name,
-    last_started_at: date(i === 2 ? 23 : 3),
-    last_finished_at: date(i === 2 ? 21 : 2),
-    last_outcome: "completed",
-    last_error: null,
-    last_skipped_at: null,
-    state: i === 2 ? "stale" : "ok",
-  })),
+  entry_points: (["merger", "monitor", "triage", "stabilize"] as const).map(
+    (name, i) => ({
+      name,
+      last_started_at: date(i === 2 ? 23 : 3),
+      last_finished_at: date(i === 2 ? 21 : 2),
+      last_outcome: "completed",
+      last_error: null,
+      last_skipped_at: null,
+      state: i === 2 ? "stale" : "ok",
+    }),
+  ),
   skill_service: { reachable: true, version: "1.0" },
   db: { path_ok: true },
 };

@@ -13,6 +13,7 @@ import {
   PackageOpen,
   ShieldCheck,
   OctagonX,
+  Play,
   X,
 } from "lucide-react";
 import type { ColumnDef } from "@tanstack/react-table";
@@ -23,6 +24,7 @@ import {
   createRelease,
   isMock,
   resolveRelease,
+  resumeRelease,
   useApi,
 } from "@/api/client";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -49,21 +51,44 @@ import {
 } from "@/components/common";
 import { sentenceCase } from "@/lib/utils";
 import { StatusBadge, normalizeStatus } from "@/components/status";
-function stageRun(
-  value: unknown,
-): { url: string | null; run_id: string; conclusion: string | null } | null {
-  if (!value || typeof value !== "object") return null;
-  const r = value as Record<string, unknown>;
-  return {
-    url:
-      typeof r.url === "string"
-        ? r.url
-        : typeof r.html_url === "string"
-          ? r.html_url
-          : null,
-    run_id: String(r.run_id ?? r.id ?? "—"),
-    conclusion: typeof r.conclusion === "string" ? r.conclusion : null,
-  };
+function useReleaseRetry(error: Error | null) {
+  const [now, setNow] = useState(() => Date.now());
+  const deadline = error instanceof ApiError ? error.retryAt : undefined;
+  useEffect(() => {
+    if (!deadline) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [deadline]);
+  return deadline
+    ? Math.max(0, Math.ceil((deadline - Math.max(now, Date.now())) / 1000))
+    : 0;
+}
+function ReleaseActionError({
+  error,
+  seconds,
+}: {
+  error: Error;
+  seconds: number;
+}) {
+  const busy = error instanceof ApiError && error.code === "release_busy";
+  const unavailable =
+    error instanceof ApiError && error.code === "release_machinery_unavailable";
+  return (
+    <div role="alert" className="info-banner mt-4">
+      <Info size={14} className="shrink-0" />
+      <span>
+        {busy
+          ? "The release engine is busy."
+          : unavailable
+            ? "Release machinery is not available on this host."
+            : error.message}{" "}
+        {busy &&
+          (seconds > 0
+            ? `Try again in ${seconds} second${seconds === 1 ? "" : "s"}.`
+            : "Try again.")}
+      </span>
+    </div>
+  );
 }
 const liveStatuses = ["starting", "running", "paused"];
 const stages = [
@@ -82,7 +107,7 @@ const columns: ColumnDef<Campaign>[] = [
           {row.original.id}
         </ExternalLink>
         <p className="text-[9px] text-muted-foreground mt-1">
-          {row.original.branch_url?.split("/tree/")[1] ?? "Stabilize branch"}
+          {row.original.branch}
         </p>
       </div>
     ),
@@ -94,8 +119,8 @@ const columns: ColumnDef<Campaign>[] = [
       <StatusBadge
         value={row.original.status}
         label={
-          row.original.status === "complete"
-            ? "Complete"
+          row.original.status === "completed"
+            ? "Completed"
             : row.original.status === "aborted"
               ? "Aborted"
               : undefined
@@ -134,6 +159,17 @@ function LiveCampaign({
       client.invalidateQueries({ queryKey: ["release-anchor"] });
     },
   });
+  const resume = useMutation({
+    mutationFn: () => resumeRelease(campaign.id),
+    onSuccess: () => {
+      client.invalidateQueries({ queryKey: ["/releases"] });
+      client.invalidateQueries({ queryKey: ["release-anchor"] });
+    },
+  });
+  const abortSeconds = useReleaseRetry(abort.error);
+  const resumeSeconds = useReleaseRetry(resume.error);
+  const actionPending = abort.isPending || resume.isPending;
+  const retrySeconds = Math.max(abortSeconds, resumeSeconds);
   const currentIndex = stages.findIndex((s) => s.key === campaign.stage);
   return (
     <Card>
@@ -158,9 +194,36 @@ function LiveCampaign({
         />
       </CardHeader>
       <CardContent>
+        {campaign.status === "paused" && campaign.pause_reason && (
+          <div role="status" className="info-banner mb-4">
+            <Info size={16} className="shrink-0" />
+            <span>
+              <strong className="font-medium text-foreground">
+                Campaign paused.
+              </strong>{" "}
+              {campaign.pause_reason}
+            </span>
+          </div>
+        )}
+        {campaign.status === "starting" && campaign.start_error && (
+          <div role="alert" className="info-banner mb-4">
+            <Info size={16} className="shrink-0" />
+            <div>
+              <strong className="font-medium text-foreground">
+                Branch write failed.
+              </strong>{" "}
+              {campaign.start_error}
+              <p className="mt-1">
+                The cron tick retries the branch write within about five
+                minutes.
+              </p>
+            </div>
+          </div>
+        )}
         <div className="stage-pipeline mt-4">
           {stages.map((s, i) => {
-            const run = stageRun(campaign.latest_runs?.[s.key]);
+            const run =
+              s.key === "complete" ? null : campaign.latest_runs?.[s.key];
             const done = i < currentIndex;
             return (
               <div
@@ -174,11 +237,13 @@ function LiveCampaign({
                 <div className="mt-1.5 font-normal text-[9px] min-h-4">
                   {run ? (
                     <ExternalLink href={run.url}>
-                      {done ? "Passed" : (run.conclusion ?? "Running")} #
-                      {String(run.run_id).slice(-4)}
+                      {run.conclusion
+                        ? sentenceCase(run.conclusion)
+                        : "No conclusion"}{" "}
+                      · {run.sha.slice(0, 7)}
                     </ExternalLink>
                   ) : i === 3 ? (
-                    campaign.status === "complete" ? (
+                    campaign.status === "completed" ? (
                       "Complete"
                     ) : (
                       "Not complete"
@@ -192,21 +257,21 @@ function LiveCampaign({
           })}
         </div>
         <div className="flex flex-wrap items-center justify-between gap-4 border-t pt-4">
-          <div className="flex items-center gap-6">
+          <div className="flex flex-wrap items-center gap-6 min-w-0">
             <div>
               <div className="metadata-label">Current tip</div>
               <Sha value={campaign.tip_sha} />
             </div>
             <div>
               <div className="metadata-label">Branch</div>
-              <div className="text-[10px]">
+              <div className="text-[10px] break-all">
                 <ExternalLink href={campaign.branch_url}>
-                  {campaign.branch_url?.split("/tree/")[1] ?? campaign.id}
+                  {campaign.branch}
                 </ExternalLink>
               </div>
             </div>
           </div>
-          <div className="flex gap-2 items-center">
+          <div className="flex flex-wrap gap-2 items-center">
             {campaign.slack_thread_url && (
               <ExternalLink
                 href={campaign.slack_thread_url}
@@ -215,13 +280,52 @@ function LiveCampaign({
                 Slack thread
               </ExternalLink>
             )}
+            {canRelease && campaign.status === "paused" && (
+              <AlertDialogRoot>
+                <AlertDialogTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={actionPending || retrySeconds > 0}
+                  >
+                    <Play size={14} />
+                    {resume.isPending ? "Resuming…" : "Resume"}
+                  </Button>
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogTitle className="font-semibold">
+                    Resume this stabilization campaign?
+                  </AlertDialogTitle>
+                  <AlertDialogDescription className="text-sm text-muted-foreground leading-relaxed">
+                    Campaign {campaign.id} will retry its current CI stage.
+                    Check that the pause reason has been resolved before
+                    resuming.
+                  </AlertDialogDescription>
+                  <div className="flex justify-end gap-2">
+                    <AlertDialogCancel asChild>
+                      <Button variant="outline">Keep paused</Button>
+                    </AlertDialogCancel>
+                    <AlertDialogAction asChild>
+                      <Button
+                        onClick={() => {
+                          abort.reset();
+                          resume.mutate();
+                        }}
+                      >
+                        Resume campaign
+                      </Button>
+                    </AlertDialogAction>
+                  </div>
+                </AlertDialogContent>
+              </AlertDialogRoot>
+            )}
             {canRelease && (
               <AlertDialogRoot>
                 <AlertDialogTrigger asChild>
                   <Button
                     variant="destructive"
                     size="sm"
-                    disabled={abort.isPending}
+                    disabled={actionPending || retrySeconds > 0}
                   >
                     <OctagonX size={14} />
                     {abort.isPending ? "Aborting…" : "Abort campaign"}
@@ -243,7 +347,10 @@ function LiveCampaign({
                     <AlertDialogAction asChild>
                       <Button
                         variant="destructive"
-                        onClick={() => abort.mutate()}
+                        onClick={() => {
+                          resume.reset();
+                          abort.mutate();
+                        }}
                       >
                         Abort campaign
                       </Button>
@@ -254,21 +361,30 @@ function LiveCampaign({
             )}
           </div>
         </div>
-        {campaign.pause_reason && (
-          <div className="info-banner mt-4">
-            <Info size={14} />
-            <span>
-              <strong className="font-medium text-foreground">
-                Campaign paused.
-              </strong>{" "}
-              {campaign.pause_reason}
+        <div className="flex flex-wrap gap-x-6 gap-y-3 mt-4 text-[10px] text-muted-foreground">
+          <div>
+            Anchor: <Sha value={campaign.anchor_sha} />
+          </div>
+          <div>
+            Requested by:{" "}
+            <span className="text-foreground">
+              {campaign.requested_by ?? "Unknown"}
             </span>
           </div>
-        )}
-        {abort.isError && (
-          <div role="alert" className="info-banner mt-4">
-            {abort.error.message}
+          {campaign.requested_ref && (
+            <div className="break-all">
+              Requested ref: {campaign.requested_ref}
+            </div>
+          )}
+          <div>
+            Updated <RelativeTime value={campaign.updated_at} />
           </div>
+        </div>
+        {abort.isError && (
+          <ReleaseActionError error={abort.error} seconds={abortSeconds} />
+        )}
+        {resume.isError && (
+          <ReleaseActionError error={resume.error} seconds={resumeSeconds} />
         )}
         <div className="grid md:grid-cols-2 gap-5 mt-6">
           <div>
@@ -389,10 +505,12 @@ export function ReleasesPage() {
       client.invalidateQueries({ queryKey: ["release-anchor"] });
     },
   });
+  const createSeconds = useReleaseRetry(create.error);
   const campaign = history.data?.find((c) => liveStatuses.includes(c.status));
   const canRelease = me.data?.can_release ?? false;
   const unavailable =
-    history.error instanceof ApiError && history.error.status === 503;
+    history.error instanceof ApiError &&
+    history.error.code === "release_machinery_unavailable";
   const liveId =
     campaign?.id ??
     (anchor.data ? anchor.data.live_campaign_id : resolution?.live_campaign_id);
@@ -478,7 +596,13 @@ export function ReleasesPage() {
                   setCommitish(e.target.value);
                   setResolution(null);
                   resolve.reset();
-                  create.reset();
+                  if (
+                    !(
+                      create.error instanceof ApiError &&
+                      create.error.code === "release_busy"
+                    )
+                  )
+                    create.reset();
                 }}
                 placeholder="master or a full commit SHA"
                 disabled={unavailable || create.isPending}
@@ -557,6 +681,7 @@ export function ReleasesPage() {
                 disabled={
                   Boolean(disabledReason) ||
                   create.isPending ||
+                  createSeconds > 0 ||
                   resolve.isPending ||
                   history.isPending ||
                   anchor.isPending
@@ -580,10 +705,15 @@ export function ReleasesPage() {
                 </p>
               )}
               {create.isError && (
-                <div role="alert" className="info-banner mt-4">
-                  {create.error.message} The same request identity will be used
-                  if you retry.
-                </div>
+                <>
+                  <ReleaseActionError
+                    error={create.error}
+                    seconds={createSeconds}
+                  />
+                  <p className="text-[10px] text-muted-foreground mt-2">
+                    Retrying uses the same request identity.
+                  </p>
+                </>
               )}
               {create.isSuccess && (
                 <div role="status" className="info-banner mt-4">

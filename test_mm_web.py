@@ -31,6 +31,8 @@ import automerge
 import issue_fixer
 import monitor
 import triage
+import stabilize
+import stabilize_state
 
 ROOT = Path(__file__).resolve().parent
 SHA = 'a' * 40
@@ -48,7 +50,9 @@ class WebTests(unittest.TestCase):
         for obj, name, value in [(monitor, 'DB_PATH', self.root / 'activity.db'),
                                   (automerge, 'DB_PATH', self.root / 'activity.db'),
                                   (monitor, 'STATE_DIR', self.root / 'state'),
-                                  (monitor, 'CONFIG_DIR', self.root / 'config')]:
+                                  (monitor, 'CONFIG_DIR', self.root / 'config'),
+                                  (monitor, 'CHANNEL_PATH', self.root / 'channel'),
+                                  (stabilize, 'LOCK_PATH', self.root / 'stabilize.lock')]:
             patch = mock.patch.object(obj, name, value)
             patch.start()
             self.addCleanup(patch.stop)
@@ -73,6 +77,7 @@ class WebTests(unittest.TestCase):
             conn = automerge.connect_db()
         issue_fixer.ensure_schema(conn)
         triage.ensure_schema(conn)
+        stabilize.ensure_schema(conn)
         # Concurrent heartbeat extraction is additive; fallback allows this
         # suite to validate the specified contract before that work is ready.
         conn.execute('''CREATE TABLE IF NOT EXISTS entrypoint_heartbeats (
@@ -180,6 +185,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.post('/sql', {'sql': 'SELECT 1'}).status_code, 200)
         self.assertEqual(self.post('/releases', {'sha': SHA, 'idempotency_key': 'x'}).status_code, 403)
         self.assertEqual(self.post('/releases/campaign/abort', {}).status_code, 403)
+        self.assertEqual(self.post('/releases/campaign/resume', {}).status_code, 403)
         self.github_user.assert_not_called()
         self.permission.assert_not_called()
         self.headers = {'Authorization': 'Bearer ' + value[:-1] + ('a' if value[-1] != 'a' else 'b')}
@@ -350,7 +356,7 @@ class WebTests(unittest.TestCase):
         conn.commit()
         conn.close()
         states = {v['name']: v['state'] for v in self.get('/health').json()['entry_points']}
-        self.assertEqual(states, {'merger': 'stale', 'monitor': 'failing', 'triage': 'ok'})
+        self.assertEqual(states, {'merger': 'stale', 'monitor': 'failing', 'triage': 'ok', 'stabilize': 'unknown'})
         with mock.patch.object(monitor, 'DB_PATH', self.root / 'missing.db'):
             result = self.get('/health')
             self.assertFalse(result.json()['db']['path_ok'])
@@ -368,64 +374,71 @@ class WebTests(unittest.TestCase):
                 self.assertEqual(result.status_code, 503)
                 self.assertEqual(result.json()['error']['code'], 'release_machinery_unavailable')
                 self.assertEqual(self.post('/releases/id/abort', {}).status_code, 503)
+                self.assertEqual(self.post('/releases/id/resume', {}).status_code, 503)
 
-    def test_release_adapter(self):
+    def test_release_adapter_real_engine(self):
         self.permission.return_value = 'maintain'
-        value = {'campaign_id': 'campaign', 'status': 'running', 'stage': 'push', 'tip_sha': SHA,
-                 'round': 1, 'token': SECRET, 'unknown_future_key': 'preserved'}
-        stub = types.ModuleType('stabilize')
-        stub.resolve = mock.Mock(return_value={'sha': SHA, 'subject': 'Anchor', 'committed_at': self.created,
-            'on_master': True, 'push_ci': {'run_id': 1, 'url': 'https://github.com/run/1', 'conclusion': 'success'}, 'live_campaign_id': None})
-        stub.create = mock.Mock(return_value=value)
-        stub.list_campaigns = mock.Mock(return_value=[value])
-        stub.get = mock.Mock(return_value=value)
-        stub.abort = mock.Mock(return_value={**value, 'status': 'aborted'})
-        with mock.patch.dict(sys.modules, {'stabilize': stub}):
-            self.assertEqual(self.get('/releases/resolve').json()['sha'], SHA)
+        with mock.patch.object(stabilize, 'ensure_ref', return_value=True), mock.patch.object(stabilize, 'deliver_slack'):
             result = self.post('/releases', {'sha': SHA, 'idempotency_key': 'key', 'requested_by': 'attacker'})
             self.assertEqual(result.status_code, 200, result.text)
-            stub.create.assert_called_once_with(sha=SHA, requested_by='fixture-user', idempotency_key='key')
-            self.assertNotIn('token', result.json())
-            self.assertNotIn('unknown_future_key', result.json())
-            self.assertEqual(self.get('/releases').json()[0]['id'], 'campaign')
-            self.assertEqual(self.get('/releases/campaign').json()['id'], 'campaign')
-            self.assertEqual(self.post('/releases/campaign/abort', {}).json()['status'], 'aborted')
-            stub.abort.assert_called_once_with('campaign', requested_by='fixture-user')
-            stub.get.return_value = None
+            campaign = result.json()
+            identifier = campaign['id']
+            self.assertEqual(campaign['requested_by'], 'fixture-user')
+            self.assertEqual(campaign['status'], 'running')
+            self.assertEqual(campaign['anchor_sha'], SHA)
+            self.assertEqual(campaign['branch'], 'stabilize/' + identifier)
+            self.assertEqual(campaign['latest_runs'], {'push': None, 'hourly': None, 'nightly': None})
+            self.assertIsNone(campaign['start_error'])
+            self.assertNotIn('idempotency_key', campaign)
+            self.assertEqual(self.get('/releases').json()[0]['id'], identifier)
+            self.assertEqual(self.get('/releases/' + identifier).json()['id'], identifier)
+            with closing(sqlite3.connect(monitor.DB_PATH)) as conn, conn:
+                conn.execute("UPDATE stabilize_campaigns SET status='paused',pause_reason='actions permission denied' WHERE id=?", (identifier,))
+            self.assertEqual(self.get('/releases/' + identifier).json()['pause_reason'], 'actions permission denied')
+            resumed = self.post('/releases/' + identifier + '/resume', {'requested_by': 'attacker'})
+            self.assertEqual(resumed.status_code, 200, resumed.text)
+            self.assertEqual(resumed.json()['status'], 'running')
+            self.assertIsNone(resumed.json()['pause_reason'])
+            with closing(sqlite3.connect(monitor.DB_PATH)) as conn:
+                message = conn.execute("SELECT text FROM stabilize_messages WHERE campaign_id=? AND checkpoint LIKE 'resumed:%'", (identifier,)).fetchone()[0]
+            self.assertIn('fixture-user', message)
+            self.assertNotIn('attacker', message)
+            self.assertEqual(self.post('/releases/' + identifier + '/abort', {}).json()['status'], 'aborted')
             self.assertEqual(self.get('/releases/missing').status_code, 404)
-            stub.create.side_effect = type('CampaignAlreadyLive', (RuntimeError,), {})()
-            self.assertEqual(self.post('/releases', {'sha': SHA, 'idempotency_key': 'other'}).status_code, 409)
-            stub.resolve.side_effect = ValueError('private provider detail: ' + SECRET)
-            result = self.get('/releases/resolve?commitish=unknown')
-            self.assertEqual(result.status_code, 400)
-            self.assertNotIn(SECRET, result.text)
 
-    def test_stabilize_exception_mapping(self):
+    def test_stabilize_exception_mapping_real_engine(self):
         self.permission.return_value = 'maintain'
-        class StabilizeError(RuntimeError):
-            pass
-        class InvalidRef(StabilizeError, ValueError):
-            pass
-        class CampaignNotFound(StabilizeError, LookupError):
-            pass
-        class CampaignAlreadyLive(StabilizeError):
-            campaign_id = 'existing-campaign'
-        stub = types.ModuleType('stabilize')
-        for cls in [StabilizeError, InvalidRef, CampaignNotFound, CampaignAlreadyLive]:
-            setattr(stub, cls.__name__, cls)
-        stub.create = mock.Mock(side_effect=CampaignAlreadyLive())
-        stub.abort = mock.Mock(side_effect=CampaignNotFound())
-        stub.resolve = mock.Mock(side_effect=InvalidRef())
-        stub.get = mock.Mock(side_effect=StabilizeError('provider says {"token": "' + SECRET + '"}'))
-        with mock.patch.dict(sys.modules, {'stabilize': stub}):
+        with mock.patch.object(stabilize, 'ensure_ref', return_value=True), mock.patch.object(stabilize, 'deliver_slack'):
+            first = self.post('/releases', {'sha': SHA, 'idempotency_key': 'first'}).json()
             result = self.post('/releases', {'sha': SHA, 'idempotency_key': 'another'})
             self.assertEqual(result.status_code, 409)
-            self.assertEqual(result.json()['error']['campaign_id'], 'existing-campaign')
+            self.assertEqual(result.json()['error']['campaign_id'], first['id'])
             self.assertEqual(self.post('/releases/missing/abort', {}).status_code, 404)
-            self.assertEqual(self.get('/releases/resolve?commitish=bad').status_code, 400)
-            result = self.get('/releases/campaign')
+            self.assertEqual(self.post('/releases/missing/resume', {}).status_code, 404)
+            with mock.patch.object(monitor, 'run_gh', side_effect=monitor.CommandError('HTTP 404 Not Found')):
+                self.assertEqual(self.get('/releases/resolve?commitish=bad').status_code, 400)
+            self.post('/releases/' + first['id'] + '/abort', {})
+            result = self.post('/releases/' + first['id'] + '/resume', {})
+            self.assertEqual(result.status_code, 502)
+            with mock.patch.object(stabilize, 'resume_campaign', side_effect=stabilize.StabilizeError('provider says {"token": "' + SECRET + '"}')):
+                result = self.post('/releases/' + first['id'] + '/resume', {})
             self.assertEqual(result.status_code, 502)
             self.assertNotIn(SECRET, result.text)
+
+    def test_release_busy_header_and_resume_permission(self):
+        with mock.patch.object(stabilize, 'lock', side_effect=stabilize.LockTimeout('busy')) as lock:
+            self.assertEqual(self.post('/releases/missing/resume', {}).status_code, 403)
+            lock.assert_not_called()
+            for level in ['maintain', 'admin']:
+                self.permission.return_value = level
+                for path, payload in [('/releases', {'sha': SHA, 'idempotency_key': 'retry'}),
+                                      ('/releases/missing/abort', {}), ('/releases/missing/resume', {})]:
+                    with self.subTest(level=level, path=path):
+                        result = self.post(path, payload)
+                        self.assertEqual(result.status_code, 503)
+                        self.assertEqual(result.json()['error']['code'], 'release_busy')
+                        self.assertIn('retry', result.json()['error']['message'])
+                        self.assertEqual(result.headers['Retry-After'], '5')
 
     def test_spa_fallback_rejects_escaping_index_symlink(self):
         self.session_cookie()
@@ -676,6 +689,191 @@ class ReadRegressionTests(unittest.TestCase):
         repair_reads = [q for q in queries if 'FROM "issue_repairs"' in q]
         self.assertTrue(repair_reads)
         self.assertTrue(all('LIMIT' in q for q in repair_reads))
+
+
+@unittest.skipIf(OPTIONAL_IMPORT_ERROR is not None, OPTIONAL_IMPORT_ERROR or '')
+class RealReleaseTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = WebTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        patch = mock.patch.object(stabilize, 'deliver_slack')
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def write(self, sql, params=()):
+        with closing(sqlite3.connect(monitor.DB_PATH)) as conn, conn:
+            conn.execute('PRAGMA synchronous=OFF')
+            conn.execute(sql, params)
+
+    def create(self, key='request'):
+        with mock.patch.object(stabilize, 'ensure_ref', return_value=True):
+            return releases.create(SHA, 'fixture-user', key)
+
+    def test_real_create_idempotency_read_abort_and_resume(self):
+        first = self.create()
+        self.assertEqual(first.status, 'running')
+        self.assertEqual(first.requested_by, 'fixture-user')
+        self.assertEqual(self.create().model_dump(), first.model_dump())
+        self.assertEqual(releases.get(first.id).id, first.id)
+        self.assertEqual(releases.list_campaigns()[0].id, first.id)
+        with self.assertRaises(db.ApiError) as caught:
+            self.create('second')
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(caught.exception.detail['campaign_id'], first.id)
+        self.write("UPDATE stabilize_campaigns SET status='paused',pause_reason='permission denied' WHERE id=?", (first.id,))
+        resumed = releases.resume(first.id, 'authenticated-maintainer')
+        self.assertEqual(resumed.status, 'running')
+        self.assertIsNone(resumed.pause_reason)
+        with closing(sqlite3.connect(monitor.DB_PATH)) as conn:
+            message = conn.execute("SELECT text FROM stabilize_messages WHERE campaign_id=? AND checkpoint LIKE 'resumed:%'", (first.id,)).fetchone()[0]
+        self.assertIn('authenticated-maintainer', message)
+        self.assertEqual(releases.abort(first.id, 'fixture-user').status, 'aborted')
+        for operation in [lambda: releases.get('missing'), lambda: releases.abort('missing', 'fixture-user'),
+                          lambda: releases.resume('missing', 'fixture-user')]:
+            with self.assertRaises(db.ApiError) as caught:
+                operation()
+            self.assertEqual(caught.exception.status_code, 404)
+
+    def test_real_view_run_keys_urls_completion_and_start_error(self):
+        created = self.create()
+        self.write("UPDATE stabilize_campaigns SET thread_ts='123.456',requested_ref='tag',status='completed',stage='complete',finished_at=updated_at WHERE id=?", (created.id,))
+        monitor.CHANNEL_PATH.write_text('C123')
+        self.write("INSERT INTO stabilize_issues(campaign_id,issue_number,stage,source,round,state,pr_number,pr_head_sha,added_at,updated_at) VALUES (?,555,'push','observed',1,'pr_ready',888,?,?,?)", (created.id, HEAD, self.fixture.created, self.fixture.finished))
+        self.write("INSERT INTO stabilize_gate_merges VALUES (?,'push',?,'stabilize-gate/snapshot',999,'merged',?,?)", (created.id, SHA, self.fixture.created, self.fixture.finished))
+        for number, stage in [(1, 'push'), (2, 'hourly')]:
+            self.write('INSERT INTO stabilize_runs(campaign_id,stage,run_id,tip_sha,conclusion,green,incomplete,processed_at,url) VALUES (?,?,?,?,?,1,0,?,?)',
+                       (created.id, stage, number, SHA, 'success', self.fixture.finished, f'https://github.com/run/{number}'))
+        self.write('UPDATE stabilize_runtime SET ref_error=? WHERE campaign_id=?', ('start failed ' + 'd' * 64, created.id))
+        result = releases.get(created.id)
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(result.stage, 'complete')
+        self.assertEqual(result.requested_ref, 'tag')
+        self.assertEqual(result.issues[0].number, 555)
+        self.assertEqual(result.gate_merges[0].pr_number, 999)
+        self.assertEqual(result.latest_runs['push'].model_dump(), {'sha': SHA, 'url': 'https://github.com/run/1', 'conclusion': 'success'})
+        self.assertEqual(result.latest_runs['hourly'].sha, SHA)
+        self.assertIsNone(result.latest_runs['nightly'])
+        self.assertEqual(result.branch_url, f'https://github.com/{monitor.REPO_NAME}/tree/{created.branch}')
+        self.assertEqual(result.slack_thread_url, 'https://app.slack.com/archives/C123/p123456')
+        self.assertNotIn('d' * 64, result.start_error)
+        self.assertIsNotNone(result.created_at)
+        self.assertIsNotNone(result.updated_at)
+        self.assertIsNotNone(result.finished_at)
+        self.assertEqual(releases.list_campaigns()[0].model_dump(), result.model_dump())
+        with mock.patch.object(stabilize, 'ensure_ref', side_effect=monitor.CommandError('Bearer ghp_fixture_error')):
+            starting = releases.create(SHA, 'fixture-user', 'ambiguous')
+        self.assertEqual(starting.status, 'starting')
+        self.assertIsNone(starting.tip_sha)
+        self.assertNotIn('ghp_fixture_error', starting.start_error)
+
+    def test_real_read_paths_are_readonly_and_only_resolve_uses_github(self):
+        created = self.create()
+        before = monitor.DB_PATH.read_bytes()
+        statements, opened = [], []
+        real_connect = sqlite3.connect
+        def ro_connect(path, *args, **kwargs):
+            self.assertTrue(str(path).endswith('?mode=ro'))
+            self.assertTrue(kwargs.get('uri'))
+            conn = real_connect(path, *args, **kwargs)
+            conn.set_trace_callback(statements.append)
+            read_actions = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION}
+            conn.set_authorizer(lambda action, *args: sqlite3.SQLITE_OK if action in read_actions else sqlite3.SQLITE_DENY)
+            opened.append(conn)
+            return conn
+        try:
+            with mock.patch.object(sqlite3, 'connect', side_effect=ro_connect), \
+                 mock.patch.object(monitor, 'connect_db', side_effect=AssertionError('migration prohibited')), \
+                 mock.patch.object(stabilize, 'ensure_schema', side_effect=AssertionError('migration prohibited')):
+                self.assertEqual(releases.get(created.id).id, created.id)
+                self.assertEqual(releases.list_campaigns()[0].id, created.id)
+            def gh_read(args, **kwargs):
+                self.assertNotIn('--method', args)
+                if args[0] == 'api':
+                    if 'compare/' in args[1]:
+                        return json.dumps({'status': 'ahead'})
+                    return json.dumps({'sha': HEAD if args[1].endswith('/master') else SHA,
+                                       'commit': {'message': 'Anchor subject\nDetails', 'committer': {'date': self.fixture.created}}})
+                return json.dumps([{'databaseId': 1, 'headSha': SHA, 'headBranch': monitor.BRANCH,
+                                   'event': 'push', 'status': 'completed', 'conclusion': 'success', 'url': 'https://github.com/run/1'}])
+            with mock.patch.object(sqlite3, 'connect', side_effect=ro_connect), \
+                 mock.patch.object(monitor, 'connect_db', side_effect=AssertionError('migration prohibited')), \
+                 mock.patch.object(stabilize, 'ensure_schema', side_effect=AssertionError('migration prohibited')), \
+                 mock.patch.object(monitor, 'run_gh', side_effect=gh_read), mock.patch.object(monitor, 'git_cache', side_effect=AssertionError('cache writes prohibited')):
+                resolution = releases.resolve('tag')
+            self.assertEqual(resolution.sha, SHA)
+            self.assertEqual(resolution.subject, 'Anchor subject')
+            self.assertTrue(resolution.on_master)
+            self.assertEqual(resolution.push_ci.run_id, 1)
+            self.assertEqual(resolution.live_campaign_id, created.id)
+            self.assertTrue(statements)
+            self.assertEqual(monitor.DB_PATH.read_bytes(), before)
+            with mock.patch.object(monitor, 'run_gh', side_effect=monitor.CommandError('HTTP 404 Not Found')):
+                with self.assertRaises(db.ApiError) as caught:
+                    releases.resolve('unknown')
+            self.assertEqual(caught.exception.status_code, 400)
+        finally:
+            for conn in opened:
+                conn.close()
+        for external in self.fixture.external:
+            external.assert_not_called()
+
+    def test_real_locktimeout_mapping_for_all_mutations(self):
+        # Real engine methods and real LockTimeout; force the lock seam to avoid a 120-second wait.
+        for action in [lambda: releases.create(SHA, 'fixture-user', 'key'),
+                       lambda: releases.abort('missing', 'fixture-user'), lambda: releases.resume('missing', 'fixture-user')]:
+            with mock.patch.object(stabilize, 'lock', side_effect=stabilize.LockTimeout('busy')), \
+                 mock.patch.object(monitor, 'connect_db') as connect, self.assertRaises(db.ApiError) as caught:
+                action()
+            connect.assert_not_called()
+            self.assertEqual(caught.exception.status_code, 503)
+            self.assertEqual(caught.exception.detail['code'], 'release_busy')
+            self.assertIn('retry', caught.exception.detail['message'])
+            self.assertEqual(caught.exception.headers, {'Retry-After': '5'})
+
+    def test_real_allowlist_and_batch_targets_and_stabilize_health(self):
+        self.write("UPDATE automerge_batches SET target_ref='stabilize/example' WHERE batch_id='primary'")
+        generator = db.connection()
+        conn = next(generator)
+        try:
+            summaries = {item.batch_id: item for item in data.batches(conn).items}
+            self.assertEqual(summaries['primary'].target_ref, 'stabilize/example')
+            self.assertEqual(summaries['direct'].target_ref, 'master')
+            self.assertEqual(data.detail(conn, 'primary').target_ref, 'stabilize/example')
+            health = {entry.name: entry for entry in data.health(conn).entry_points}
+            self.assertEqual(health['stabilize'].state, 'unknown')
+            tables = {table.name: {c.name for c in table.columns} for table in db.schema(conn).tables}
+            self.assertIn('target_ref', tables['automerge_batches'])
+            self.assertIn('pr_head_sha', tables['stabilize_issues'])
+            self.assertIn('last_seen_run_url', tables['stabilize_failures'])
+            self.assertIn('gate_branch', tables['stabilize_gate_merges'])
+            self.assertNotIn('pause_reason', tables['stabilize_campaigns'])
+            self.assertNotIn('requested_by', tables['stabilize_campaigns'])
+            self.assertNotIn('verdict_status_description', tables['automerge_batches'])
+            self.assertNotIn('diagnosis', tables['stabilize_failures'])
+            private = {'stabilize_runtime', 'stabilize_dispatches', 'stabilize_runs', 'stabilize_issue_identities',
+                       'stabilize_fix_commits', 'stabilize_messages', 'stabilize_writes', 'stabilize_gate_intents'}
+            self.assertFalse(private & tables.keys())
+            for table in ['stabilize_campaigns', 'stabilize_issues', 'stabilize_gate_merges', 'stabilize_failures']:
+                actual = {r['name'] for r in conn.execute(f'PRAGMA table_info({table})')}
+                self.assertTrue(tables[table] <= actual)
+        finally:
+            generator.close()
+        self.write("INSERT INTO entrypoint_heartbeats(entry_point,last_finished_at,last_outcome) VALUES ('stabilize',?,'ok')", (self.fixture.finished,))
+        generator = db.connection()
+        conn = next(generator)
+        try:
+            self.assertEqual(next(e for e in data.health(conn).entry_points if e.name == 'stabilize').state, 'ok')
+        finally:
+            generator.close()
+        self.write('ALTER TABLE automerge_batches DROP COLUMN target_ref')
+        generator = db.connection()
+        conn = next(generator)
+        try:
+            self.assertTrue(all(batch.target_ref == 'master' for batch in data.batches(conn).items))
+        finally:
+            generator.close()
+
 
 
 

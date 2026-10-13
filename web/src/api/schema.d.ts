@@ -226,6 +226,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/releases/{id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Release Resume */
+        post: operations["release_resume_api_v1_releases__id__resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/repairs": {
         parameters: {
             query?: never;
@@ -399,6 +416,11 @@ export interface components {
             status: string;
             /** Supervisor Actions */
             supervisor_actions: components["schemas"]["SupervisorAction"][];
+            /**
+             * Target Ref
+             * @default master
+             */
+            target_ref: string;
             /** Terminal Status */
             terminal_status?: string | null;
         };
@@ -449,6 +471,11 @@ export interface components {
             sources: components["schemas"]["PullRef"][];
             /** Status */
             status: string;
+            /**
+             * Target Ref
+             * @default master
+             */
+            target_ref: string;
             /** Terminal Status */
             terminal_status?: string | null;
         };
@@ -461,6 +488,10 @@ export interface components {
         };
         /** Campaign */
         Campaign: {
+            /** Anchor Sha */
+            anchor_sha: string;
+            /** Branch */
+            branch: string;
             /** Branch Url */
             branch_url?: string | null;
             /** Created At */
@@ -475,12 +506,14 @@ export interface components {
             issues?: components["schemas"]["CampaignIssue"][];
             /** Latest Runs */
             latest_runs?: {
-                [key: string]: unknown;
+                [key: string]: components["schemas"]["CampaignRun"] | null;
             };
             /** Pause Reason */
             pause_reason?: string | null;
             /** Requested By */
             requested_by?: string | null;
+            /** Requested Ref */
+            requested_ref?: string | null;
             /**
              * Round
              * @default 0
@@ -488,10 +521,20 @@ export interface components {
             round: number;
             /** Slack Thread Url */
             slack_thread_url?: string | null;
-            /** Stage */
-            stage: string;
-            /** Status */
-            status: string;
+            /**
+             * Stage
+             * @enum {string}
+             */
+            stage: "push" | "hourly" | "nightly" | "complete";
+            /** Start Error */
+            start_error?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "starting" | "running" | "paused" | "completed" | "aborted";
+            /** Thread Ts */
+            thread_ts?: string | null;
             /** Tip Sha */
             tip_sha?: string | null;
             /** Updated At */
@@ -509,6 +552,15 @@ export interface components {
             stage?: string | null;
             /** State */
             state?: string | null;
+        };
+        /** CampaignRun */
+        CampaignRun: {
+            /** Conclusion */
+            conclusion?: string | null;
+            /** Sha */
+            sha: string;
+            /** Url */
+            url?: string | null;
         };
         /** CreateRelease */
         CreateRelease: {
@@ -553,7 +605,7 @@ export interface components {
              * Name
              * @enum {string}
              */
-            name: "merger" | "monitor" | "triage";
+            name: "merger" | "monitor" | "triage" | "stabilize";
             /**
              * State
              * @enum {string}
@@ -2141,6 +2193,8 @@ export interface operations {
             /** @description Service Unavailable */
             503: {
                 headers: {
+                    /** @description Seconds to wait before retrying a busy release action */
+                    "Retry-After"?: number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -2450,6 +2504,113 @@ export interface operations {
             /** @description Service Unavailable */
             503: {
                 headers: {
+                    /** @description Seconds to wait before retrying a busy release action */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    release_resume_api_v1_releases__id__resume_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Campaign"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Request Timeout */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Unprocessable Content */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Too Many Requests */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Bad Gateway */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before retrying a busy release action */
+                    "Retry-After"?: number;
                     [name: string]: unknown;
                 };
                 content: {

@@ -85,6 +85,11 @@ export function PipelineCard({
       <div className="pipeline-subtitle">
         Phase: {batch.phase} <span className="mx-1">·</span> {batch.batch_id}
       </div>
+      {batch.target_ref !== "master" && (
+        <div className="text-[10px] text-muted-foreground mt-2 break-all">
+          Target: {batch.target_ref}
+        </div>
+      )}
       <div className="pipeline-meta">
         <div>
           <div className="metadata-label">Candidate head</div>
@@ -504,6 +509,11 @@ export function OverviewPage() {
                     <span className="mx-1">·</span>{" "}
                     {minutes(batch.duration_seconds)}
                   </div>
+                  {batch.target_ref !== "master" && (
+                    <div className="mt-1 text-[9px] text-muted-foreground break-all">
+                      Target: {batch.target_ref}
+                    </div>
+                  )}
                 </div>
                 <OutcomeBadge outcome={batch.outcome} />
                 <ArrowUpRight size={13} className="text-muted-foreground" />

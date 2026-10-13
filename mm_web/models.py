@@ -56,6 +56,7 @@ class BatchSummary(BaseModel):
     terminal_status: str | None = None
     outcome: Outcome
     ci_mode: str
+    target_ref: str = 'master'
     created_at: str
     finished_at: str | None = None
     duration_seconds: float
@@ -196,7 +197,7 @@ class Repairs(BaseModel):
 
 
 class EntryPointHealth(BaseModel):
-    name: Literal['merger', 'monitor', 'triage']
+    name: Literal['merger', 'monitor', 'triage', 'stabilize']
     last_started_at: str | None = None
     last_finished_at: str | None = None
     last_outcome: str | None = None
@@ -349,21 +350,32 @@ class GateMerge(BaseModel):
     state: str | None = None
 
 
+class CampaignRun(BaseModel):
+    sha: str
+    url: str | None = None
+    conclusion: str | None = None
+
+
 class Campaign(BaseModel):
     model_config = ConfigDict(extra='ignore')
     id: str
-    status: str
-    stage: str
+    branch: str
+    anchor_sha: str
+    status: Literal['starting', 'running', 'paused', 'completed', 'aborted']
+    stage: Literal['push', 'hourly', 'nightly', 'complete']
     round: int = 0
     tip_sha: str | None = None
+    requested_ref: str | None = None
     requested_by: str | None = None
     updated_at: str | None = None
     created_at: str | None = None
     finished_at: str | None = None
+    thread_ts: str | None = None
     pause_reason: str | None = None
+    start_error: str | None = None
     issues: list[CampaignIssue] = Field(default_factory=list)
     gate_merges: list[GateMerge] = Field(default_factory=list)
-    latest_runs: dict[str, Any] = Field(default_factory=dict)
+    latest_runs: dict[Literal['push', 'hourly', 'nightly'], CampaignRun | None] = Field(default_factory=dict)
     branch_url: str | None = None
     slack_thread_url: str | None = None
 

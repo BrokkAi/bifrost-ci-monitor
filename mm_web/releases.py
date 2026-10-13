@@ -8,11 +8,6 @@ from mm_web.models import Campaign, Resolution
 from mm_web.security import scrub
 
 
-def is_error(module, exc, name):
-    cls = getattr(module, name, None)
-    return isinstance(exc, cls) if isinstance(cls, type) else type(exc).__name__ == name
-
-
 def call(name, *args, **kwargs):
     try:
         module = importlib.import_module('stabilize')
@@ -21,22 +16,23 @@ def call(name, *args, **kwargs):
     try:
         return getattr(module, name)(*args, **kwargs)
     except Exception as exc:
-        if is_error(module, exc, 'CampaignAlreadyLive'):
+        if isinstance(exc, module.LockTimeout):
+            raise ApiError(503, 'release_busy', 'Release service is busy; retry this request in 5 seconds.',
+                           headers={'Retry-After': '5'}) from None
+        if isinstance(exc, module.CampaignAlreadyLive):
             raise ApiError(409, 'release_conflict', 'A release campaign is already live',
                            campaign_id=scrub(getattr(exc, 'campaign_id', None))) from None
-        if is_error(module, exc, 'CampaignNotFound'):
+        if isinstance(exc, module.CampaignNotFound):
             raise ApiError(404, 'release_not_found', 'Release campaign was not found') from None
-        if is_error(module, exc, 'InvalidRef') or isinstance(exc, ValueError):
+        if isinstance(exc, module.InvalidRef) or isinstance(exc, ValueError):
             raise ApiError(400, 'invalid_release', 'Release request is invalid') from None
-        if is_error(module, exc, 'StabilizeError'):
+        if isinstance(exc, module.StabilizeError):
             raise ApiError(502, 'release_failed', scrub(str(exc))[:1000]) from None
         raise ApiError(503, 'release_machinery_unavailable', 'Release machinery is unavailable') from None
 
 
 def campaign(value):
     value = projections.campaign(value)
-    value['id'] = value.get('id', value.get('campaign_id'))
-    value['tip_sha'] = value.get('tip_sha', value.get('sha'))
     return Campaign.model_validate(value)
 
 
@@ -65,3 +61,8 @@ def list_campaigns(limit=50):
 
 def abort(campaign_id, login):
     return campaign(call('abort', campaign_id, requested_by=login))
+
+
+
+def resume(campaign_id, login):
+    return campaign(call('resume', campaign_id, requested_by=login))

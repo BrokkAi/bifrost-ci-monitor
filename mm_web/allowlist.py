@@ -11,7 +11,7 @@ def columns(value):
 
 
 COLUMNS = {
-    'automerge_batches': columns('agent_configuration attempt_generation base_ci_run_id base_ci_source base_sha baseline_dispatch_after_run_id baseline_dispatch_grace_until baseline_dispatch_intent_at baseline_dispatch_requested_at baseline_dispatch_sha batch_id ci_head_sha ci_mode ci_not_worse ci_result_conclusion ci_result_head_sha ci_result_run_id ci_round created_at expansion_count finished_at github_write_retry_after github_write_retry_attempts integration_merge_commit_sha integration_pr_number integration_pr_url kind launch_attempted launch_attempted_at outcome_posted phase predecessor_id priority report_after_seq retry_rescan_pending role_promoted session_id source speculative_thread_ts start_notification_role start_notification_sent start_pr_list_sent status suspend_pending suspend_verify_failures terminal_status thread_ts turn_started_at verdict_status_description verdict_status_sha verdict_status_state'),
+    'automerge_batches': columns('agent_configuration attempt_generation base_ci_run_id base_ci_source base_sha baseline_dispatch_after_run_id baseline_dispatch_grace_until baseline_dispatch_intent_at baseline_dispatch_requested_at baseline_dispatch_sha batch_id ci_head_sha ci_mode ci_not_worse ci_result_conclusion ci_result_head_sha ci_result_run_id ci_round created_at expansion_count finished_at github_write_retry_after github_write_retry_attempts integration_merge_commit_sha integration_pr_number integration_pr_url kind launch_attempted launch_attempted_at outcome_posted phase predecessor_id priority report_after_seq retry_rescan_pending role_promoted session_id source speculative_thread_ts start_notification_role start_notification_sent start_pr_list_sent status target_ref suspend_pending suspend_verify_failures terminal_status thread_ts turn_started_at verdict_status_sha verdict_status_state'),
     'automerge_github_outbox': columns('alerted_at attempts batch_id cancelled_at created_at delivered_at head_sha intent_id kind next_attempt_at number'),
     'automerge_pr_inventory': columns('head_sha number'),
     'automerge_pr_dependencies': columns('head_sha number prerequisite_head prerequisite_number'),
@@ -41,10 +41,12 @@ COLUMNS = {
     'blocked_notifications': columns('created_at slack_notification_attempted workflow_run_id'),
     'relayed_messages': columns('seq stable_id workflow_run_id'),
     'escalation_gate': columns('escalated issue_url last_reported_run_id opened_at sha signature thread_ts'),
-    'stabilize_campaigns': columns('anchor_sha base_sha branch_url campaign_id created_at finished_at id idempotency_key round slack_thread_url stage status thread_ts tip_sha updated_at'),
-    'stabilize_issues': columns('campaign_id created_at issue_number number pr_number source stage state updated_at'),
-    'stabilize_gate_merges': columns('campaign_id created_at merged_at pr_number stage state tip_sha updated_at'),
-    'stabilize_failures': columns('campaign_id created_at identity_kind issue_number resolved_at run_id stage status tip_sha updated_at'),
+    # Actual contract tables from stabilize_state.ensure_schema. Ref names are
+    # identifiers; diagnoses/pause prose and the engine's opaque internals stay hidden.
+    'stabilize_campaigns': columns('id branch idempotency_key anchor_sha tip_sha stage status round thread_ts created_at updated_at finished_at'),
+    'stabilize_issues': columns('campaign_id issue_number stage source round state pr_number pr_head_sha added_at updated_at'),
+    'stabilize_gate_merges': columns('campaign_id stage tip_sha gate_branch pr_number state created_at updated_at'),
+    'stabilize_failures': columns('campaign_id stage identity_kind first_seen_sha first_seen_run_id first_seen_run_url first_seen_at last_seen_sha last_seen_run_id last_seen_run_url last_seen_at status fixed_at fixed_by_sha triage_outcome linked_issue_url linked_issue_state updated_at'),
     'sqlite_master': columns('rootpage type'),
     'sqlite_schema': columns('rootpage type'),
 

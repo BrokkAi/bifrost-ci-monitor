@@ -18,6 +18,8 @@ Limit = Annotated[int, Query(ge=1, le=500)]
 User = Annotated[m.Me, Depends(auth.identity)]
 Maintainer = Annotated[m.Me, Depends(auth.require_release)]
 Connection = Annotated[sqlite3.Connection | None, Depends(db.connection)]
+RELEASE_BUSY = {503: {'model': m.ErrorResponse, 'headers': {'Retry-After': {
+    'description': 'Seconds to wait before retrying a busy release action', 'schema': {'type': 'integer'}}}}}
 ERRORS = {code: {'model': m.ErrorResponse} for code in [400, 401, 403, 404, 408, 422, 429, 502, 503]}
 
 
@@ -29,7 +31,7 @@ def create_app():
     @app.exception_handler(HTTPException)
     async def http_error(request, exc):
         detail = exc.detail if isinstance(exc, ApiError) else {'code': 'request_failed', 'message': 'Request failed'}
-        return JSONResponse(status_code=exc.status_code, content={'error': detail})
+        return JSONResponse(status_code=exc.status_code, content={'error': detail}, headers=exc.headers)
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request, exc):
@@ -99,7 +101,7 @@ def create_app():
     def resolve(user: User, commitish: str | None = None):
         return releases.resolve(commitish)
 
-    @api.post('/releases', response_model=m.Campaign, tags=['releases'], responses={409: {'model': m.ErrorResponse}})
+    @api.post('/releases', response_model=m.Campaign, tags=['releases'], responses={409: {'model': m.ErrorResponse}, **RELEASE_BUSY})
     def create_release(body: m.CreateRelease, user: Maintainer):
         return releases.create(body.sha, user.login, body.idempotency_key)
 
@@ -111,9 +113,13 @@ def create_app():
     def release_detail(id: str, user: User):
         return releases.get(id)
 
-    @api.post('/releases/{id}/abort', response_model=m.Campaign, tags=['releases'])
+    @api.post('/releases/{id}/abort', response_model=m.Campaign, tags=['releases'], responses=RELEASE_BUSY)
     def release_abort(id: str, user: Maintainer):
         return releases.abort(id, user.login)
+
+    @api.post('/releases/{id}/resume', response_model=m.Campaign, tags=['releases'], responses=RELEASE_BUSY)
+    def release_resume(id: str, user: Maintainer):
+        return releases.resume(id, user.login)
 
     @api.get('/openapi.json', response_model=dict, include_in_schema=False)
     def openapi(user: User):

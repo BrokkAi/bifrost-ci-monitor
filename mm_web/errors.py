@@ -3,11 +3,11 @@ from fastapi import HTTPException
 
 
 class ApiError(HTTPException):
-    def __init__(self, status: int, code: str, message: str, *, campaign_id=None):
+    def __init__(self, status: int, code: str, message: str, *, campaign_id=None, headers=None):
         detail = {'code': code, 'message': message}
         if campaign_id is not None:
             detail['campaign_id'] = campaign_id
-        super().__init__(status, detail=detail)
+        super().__init__(status, detail=detail, headers=headers)
 
 
 class SafeErrorMiddleware:

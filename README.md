@@ -38,7 +38,8 @@ through pull requests.
 Install Python 3.11 or later, Node.js 18 or later, Git, GitHub CLI (`gh`), Mjolnir (`mj`), Podman,
 and SQLite's CLI for inspection/backups. The cron programs and the skill
 service use only the standard library; the merger uses host Node.js to run
-Bifrost's CI impact classifier. The web dashboard (below) also needs `uv`.
+Bifrost's CI impact classifier. The web dashboard (below) also needs `uv` and
+`npm` to install its dependencies and build its UI.
 Configure Mjolnir's `CI` workspace, `bifrost` bundle, and the `podman` and
 `bedrock-podman` targets before enabling cron. Batches starting with one source PR
 use DeepSeek Flash (`deepseek-flash`) on `podman`, with subagents disabled.

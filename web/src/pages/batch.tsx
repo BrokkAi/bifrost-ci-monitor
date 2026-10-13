@@ -136,6 +136,11 @@ export function BatchPage() {
           <>
             {b.sources.length} source pull requests. Started{" "}
             <RelativeTime value={b.created_at} />.
+            {b.target_ref !== "master" && (
+              <span className="block mt-1 break-all">
+                Target: {b.target_ref}
+              </span>
+            )}
           </>
         }
         action={

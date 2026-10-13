@@ -185,6 +185,11 @@
             "title": "Supervisor Actions",
             "type": "array"
           },
+          "target_ref": {
+            "default": "master",
+            "title": "Target Ref",
+            "type": "string"
+          },
           "terminal_status": {
             "anyOf": [
               {
@@ -348,6 +353,11 @@
             "title": "Status",
             "type": "string"
           },
+          "target_ref": {
+            "default": "master",
+            "title": "Target Ref",
+            "type": "string"
+          },
           "terminal_status": {
             "anyOf": [
               {
@@ -407,6 +417,14 @@
       },
       "Campaign": {
         "properties": {
+          "anchor_sha": {
+            "title": "Anchor Sha",
+            "type": "string"
+          },
+          "branch": {
+            "title": "Branch",
+            "type": "string"
+          },
           "branch_url": {
             "anyOf": [
               {
@@ -459,7 +477,23 @@
             "type": "array"
           },
           "latest_runs": {
-            "additionalProperties": true,
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/CampaignRun"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "propertyNames": {
+              "enum": [
+                "push",
+                "hourly",
+                "nightly"
+              ]
+            },
             "title": "Latest Runs",
             "type": "object"
           },
@@ -485,6 +519,17 @@
             ],
             "title": "Requested By"
           },
+          "requested_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Ref"
+          },
           "round": {
             "default": 0,
             "title": "Round",
@@ -502,12 +547,47 @@
             "title": "Slack Thread Url"
           },
           "stage": {
+            "enum": [
+              "push",
+              "hourly",
+              "nightly",
+              "complete"
+            ],
             "title": "Stage",
             "type": "string"
           },
+          "start_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Error"
+          },
           "status": {
+            "enum": [
+              "starting",
+              "running",
+              "paused",
+              "completed",
+              "aborted"
+            ],
             "title": "Status",
             "type": "string"
+          },
+          "thread_ts": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thread Ts"
           },
           "tip_sha": {
             "anyOf": [
@@ -534,6 +614,8 @@
         },
         "required": [
           "id",
+          "branch",
+          "anchor_sha",
           "status",
           "stage"
         ],
@@ -595,6 +677,41 @@
           "number"
         ],
         "title": "CampaignIssue",
+        "type": "object"
+      },
+      "CampaignRun": {
+        "properties": {
+          "conclusion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conclusion"
+          },
+          "sha": {
+            "title": "Sha",
+            "type": "string"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "required": [
+          "sha"
+        ],
+        "title": "CampaignRun",
         "type": "object"
       },
       "CreateRelease": {
@@ -736,7 +853,8 @@
             "enum": [
               "merger",
               "monitor",
-              "triage"
+              "triage",
+              "stabilize"
             ],
             "title": "Name",
             "type": "string"
@@ -3689,7 +3807,15 @@
                 }
               }
             },
-            "description": "Service Unavailable"
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying a busy release action",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -4077,7 +4203,15 @@
                 }
               }
             },
-            "description": "Service Unavailable"
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying a busy release action",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -4086,6 +4220,141 @@
           }
         ],
         "summary": "Release Abort",
+        "tags": [
+          "releases"
+        ]
+      }
+    },
+    "/api/v1/releases/{id}/resume": {
+      "post": {
+        "operationId": "release_resume_api_v1_releases__id__resume_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "title": "Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Campaign"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Timeout"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Content"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying a busy release action",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Release Resume",
         "tags": [
           "releases"
         ]

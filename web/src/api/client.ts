@@ -23,9 +23,17 @@ export class ApiError extends Error {
     message: string,
     public status: number,
     public code?: string,
+    public retryAt?: number,
   ) {
     super(message);
   }
+}
+function retryAfterDeadline(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Date.now() + Math.max(0, seconds) * 1000;
+  const deadline = Date.parse(value);
+  return Number.isFinite(deadline) ? deadline : undefined;
 }
 export const api = createClient<paths>({
   baseUrl: "",
@@ -51,6 +59,7 @@ function unwrap<T>(result: {
         `The request could not be completed (${result.response.status}).`,
       result.response.status,
       error?.error?.code,
+      retryAfterDeadline(result.response.headers.get("Retry-After")),
     );
   }
   if (result.data === undefined)
@@ -230,6 +239,7 @@ export async function resolveRelease(commitish?: string): Promise<Resolution> {
       throw new ApiError(
         "Release machinery is not available on this host yet.",
         503,
+        "release_machinery_unavailable",
       );
     return mockResolution(commitish);
   }
@@ -256,6 +266,17 @@ export async function createRelease(
     const campaign: Campaign = {
       ...campaigns[0],
       id: "stable-new",
+      branch: "stabilize/stable-new",
+      branch_url:
+        "https://github.com/BrokkAi/bifrost-dev/tree/stabilize/stable-new",
+      anchor_sha: sha,
+      requested_ref: sha,
+      requested_by: "jonathan",
+      start_error: null,
+      pause_reason: null,
+      round: 0,
+      updated_at: new Date().toISOString(),
+      slack_thread_url: null,
       status: "starting",
       stage: "push",
       tip_sha: sha,
@@ -281,10 +302,27 @@ export async function abortRelease(id: string): Promise<Campaign> {
     const campaign = campaigns.find((c) => c.id === id)!;
     campaign.status = "aborted";
     campaign.finished_at = new Date().toISOString();
+    campaign.updated_at = campaign.finished_at;
     return campaign;
   }
   return unwrap(
     await api.POST("/api/v1/releases/{id}/abort", {
+      params: { path: { id } },
+      headers: { "Content-Type": "application/json" },
+      body: undefined,
+    }),
+  );
+}
+export async function resumeRelease(id: string): Promise<Campaign> {
+  if (isMock) {
+    const campaign = campaigns.find((c) => c.id === id)!;
+    campaign.status = "running";
+    campaign.pause_reason = null;
+    campaign.updated_at = new Date().toISOString();
+    return campaign;
+  }
+  return unwrap(
+    await api.POST("/api/v1/releases/{id}/resume", {
       params: { path: { id } },
       headers: { "Content-Type": "application/json" },
       body: undefined,

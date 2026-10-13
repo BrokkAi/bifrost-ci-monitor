@@ -22,9 +22,16 @@ REPAIR_ACTIVE = "(status IN ('selected','launching','running','finishing') OR (s
 DETAIL_LIMIT = 200
 ACTIVE_LIMIT = 500
 BATCH_COLUMNS = '''batch_id,kind,source,status,phase,terminal_status,base_sha,ci_mode,
-    created_at,finished_at,pull_requests_json,active_pull_requests_json,excluded_source_heads_json,
+    created_at,finished_at,target_ref,pull_requests_json,active_pull_requests_json,excluded_source_heads_json,
     integration_pr_number,ci_head_sha,session_id,predecessor_id,role_promoted,attempt_generation,
     abort_reason,agent_configuration'''
+
+
+def batch_columns(conn):
+    if not db.has_table(conn, 'automerge_batches'):
+        return BATCH_COLUMNS
+    present = {column[1] for column in conn.execute('PRAGMA table_info(automerge_batches)')}
+    return BATCH_COLUMNS if 'target_ref' in present else BATCH_COLUMNS.replace('target_ref,', 'NULL AS target_ref,')
 
 
 def aggregate(conn, table, expression, where='1', params=()):
@@ -87,7 +94,7 @@ def summary(row):
         lane=row.get('source') if row.get('source') in {'queue', 'priority', 'operator'} else 'queue',
         role='speculative' if speculation.is_speculative(row) else 'primary',
         status=row['status'], phase=row['phase'], terminal_status=row.get('terminal_status'), outcome=category(row),
-        ci_mode=row['ci_mode'], created_at=timestamp(row['created_at']), finished_at=timestamp(row.get('finished_at')),
+        ci_mode=row['ci_mode'], target_ref=automerge.batch_target(row), created_at=timestamp(row['created_at']), finished_at=timestamp(row.get('finished_at')),
         duration_seconds=max(0, (finished - started).total_seconds()), sources=sources, excluded=excluded,
         integration_pr=pull({'number': integration, 'head_sha': row.get('ci_head_sha')}) if integration else None,
         session_id=row.get('session_id'), predecessor_id=row.get('predecessor_id'),
@@ -105,7 +112,7 @@ def batches(conn, state='all', kind=None, limit=50, before=None):
         predicates.append('kind=?')
         params.append(kind)
     rows, cursor = page_rows(conn, 'automerge_batches', pagination.BATCH, limit, before,
-        where=' AND '.join(predicates) or '1', params=tuple(params), columns=BATCH_COLUMNS)
+        where=' AND '.join(predicates) or '1', params=tuple(params), columns=batch_columns(conn))
     return m.BatchesPage(items=[summary(r) for r in rows], next_cursor=cursor)
 
 
@@ -156,7 +163,7 @@ def queue(conn):
     if db.has_table(conn, 'automerge_pr_inventory') and db.has_table(conn, 'automerge_github_outbox'):
         raw = supervisor.queue_groups(automerge, conn)
         inventory = {r['number']: json.loads(r['data_json']) for r in db.rows(conn, 'automerge_pr_inventory')}
-        live = {p.number: r['batch_id'] for r in db.rows(conn, 'automerge_batches', where=LIVE_WHERE, limit=ACTIVE_LIMIT, columns=BATCH_COLUMNS)
+        live = {p.number: r['batch_id'] for r in db.rows(conn, 'automerge_batches', where=LIVE_WHERE, limit=ACTIVE_LIMIT, columns=batch_columns(conn))
                 for p in automerge.row_pulls(r)}
         for label, entries in raw.items():
             for number, head, title, reason in entries:
@@ -217,7 +224,7 @@ def skill_health():
 def health(conn):
     heartbeat = {r['entry_point']: normalize(r) for r in db.rows(conn, 'entrypoint_heartbeats')} if conn else {}
     entries = []
-    for name in ['merger', 'monitor', 'triage']:
+    for name in ['merger', 'monitor', 'triage', 'stabilize']:
         value = heartbeat.get(name, {})
         if not value.get('last_finished_at'):
             state = 'unknown'
@@ -238,7 +245,7 @@ def stats(conn, days=30):
     finish = start + timedelta(days=days)
     for row in db.rows(conn, 'automerge_batches', where='finished_at>=? AND finished_at<?',
         params=(datetime.combine(start, datetime.min.time(), timezone.utc).isoformat(),
-                datetime.combine(finish, datetime.min.time(), timezone.utc).isoformat()), columns=BATCH_COLUMNS):
+                datetime.combine(finish, datetime.min.time(), timezone.utc).isoformat()), columns=batch_columns(conn)):
         date = parsed(row['finished_at']).date()
         if date not in days_data:
             continue
@@ -293,7 +300,7 @@ def overview(conn):
     if db.has_table(conn, 'automerge_pr_inventory') and db.has_table(conn, 'automerge_github_outbox'):
         raw = supervisor.queue_groups(automerge, conn)
         live_numbers = {p.number for r in db.rows(conn, 'automerge_batches', where=LIVE_WHERE, limit=ACTIVE_LIMIT,
-                                                columns=BATCH_COLUMNS) for p in automerge.row_pulls(r)}
+                                                columns=batch_columns(conn)) for p in automerge.row_pulls(r)}
         otherwise = raw.get('otherwise ineligible', [])
         included = sum(item[0] in live_numbers for item in otherwise)
         queue_counts = m.QueueCounts(in_batch=included, waiting=len(otherwise)-included,

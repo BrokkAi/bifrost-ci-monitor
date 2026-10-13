@@ -43,7 +43,7 @@ def attest(value):
 
 
 def batch_state(value):
-    result = fields(value, 'batch_id branch base_sha ci_mode status phase source_revision attempt_generation role revision')
+    result = fields(value, 'batch_id branch base_sha target_ref ci_mode status phase source_revision attempt_generation role revision')
     result['sources'] = [fields(p, PULL) for p in value.get('sources', [])]
     result['excluded'] = [fields(p, 'number head_sha kind') for p in value.get('excluded', [])]
     result['candidate'] = fields(value.get('candidate'), CANDIDATE)
@@ -66,10 +66,11 @@ def failover(value):
 
 
 def campaign(value):
-    result = fields(value, 'id campaign_id status stage round tip_sha sha requested_by created_at updated_at finished_at pause_reason branch_url slack_thread_url')
+    result = fields(value, 'id branch anchor_sha tip_sha requested_ref requested_by status stage round thread_ts '
+                    'created_at updated_at finished_at pause_reason start_error branch_url slack_thread_url')
     result['issues'] = [fields(p, 'number stage source state pr_number') for p in value.get('issues', [])]
-    result['gate_merges'] = [fields(p, 'stage tip_sha gate_branch pr_number state') for p in value.get('gate_merges', value.get('gates', []))]
-    runs = value.get('latest_runs', value.get('runs', {}))
-    result['latest_runs'] = {stage: fields(runs[stage], RUN) for stage in ['push', 'hourly', 'nightly']
+    result['gate_merges'] = [fields(p, 'stage tip_sha gate_branch pr_number state') for p in value.get('gate_merges', [])]
+    runs = value.get('latest_runs', {})
+    result['latest_runs'] = {stage: fields(runs[stage], 'sha url conclusion') for stage in ['push', 'hourly', 'nightly']
                              if isinstance(runs, dict) and stage in runs}
     return result
