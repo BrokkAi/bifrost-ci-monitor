@@ -715,9 +715,13 @@ preflight run natively; report failures after execution never rerun tests or
 replace the native exit status. Multiple calls retain bounded `attest_runs` and
 capture diagnostics; legacy singular `attest` summaries remain readable. Suite
 labels do not establish equivalence: Attest compares source, test identity and
-adapter-defined build variants. Its single compatibility policy records environment
-and tool versions as diagnostics; environment-certification jobs use native runners.
-Format 2 adds the variant; format 1 summaries remain readable. Consumers retain
+adapter-defined build variants and declared runtime test inputs. Its single
+compatibility policy records platform and tool versions as diagnostics;
+environment-certification jobs use native runners. Format 3 adds required runtime
+inputs gathered from project-wide env_inputs declarations. Native capture preserves
+actual inherited values, including script overrides, without imposing suite defaults.
+Formats 1/2 remain readable but cannot supply passes without recorded runtime inputs.
+Consumers accept summary formats 1/2/3, request CLI 0.1.3, retain
 summaries and leave compatibility decisions to Attest.
 Automatic capture never skips tests, changes assessments or authorizes a merge.
 `automerge_executions` retains command/arguments, committed head/tree, safe build
