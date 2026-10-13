@@ -293,7 +293,8 @@ export async function createRelease(
   return unwrap(
     await api.POST("/api/v1/releases", {
       body: { sha, idempotency_key: key },
-      signal: AbortSignal.timeout(130000),
+      // Lock wait (up to 120 s) plus the campaign's first inline tick.
+      signal: AbortSignal.timeout(240000),
     }),
   );
 }

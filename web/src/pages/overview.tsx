@@ -44,42 +44,54 @@ import {
   EmptyState,
   ExternalLink,
 } from "@/components/common";
-import { duration, durationFromMinutes, display, sentenceCase } from "@/lib/utils";
+import { duration, durationFromMinutes, display, plural, sentenceCase } from "@/lib/utils";
+const SLOTS = {
+  primary: {
+    label: "01 / Primary batch",
+    emptyTitle: "No active batch",
+    emptyText: "The next eligible work will appear here.",
+  },
+  speculative: {
+    label: "02 / Speculative successor",
+    emptyTitle: "No speculative batch",
+    emptyText:
+      "One starts when the primary batch registers a tested candidate and eligible PRs are waiting.",
+  },
+} as const;
+
 export function PipelineCard({
   batch,
+  slot,
 }: {
   batch: BatchSummary | null | undefined;
+  slot: keyof typeof SLOTS;
 }) {
   const detail = useBatch(batch?.batch_id ?? "");
   const checkpoint = detail.data?.state.candidate as
     | { head?: string }
     | null
     | undefined;
+  const { label, emptyTitle, emptyText } = SLOTS[slot];
   if (!batch)
     return (
       <Card className="pipeline-card">
-        <EmptyState title="No active batch">
-          The next eligible work will appear here.
-        </EmptyState>
+        <span className="pipeline-role">{label}</span>
+        <EmptyState title={emptyTitle}>{emptyText}</EmptyState>
       </Card>
     );
   return (
     <Card
-      className={`pipeline-card ${batch.role === "primary" ? "pipeline-primary" : ""}`}
+      className={`pipeline-card ${slot === "primary" ? "pipeline-primary" : ""}`}
     >
       <div className="flex items-center justify-between gap-2">
-        <span className="pipeline-role">
-          {batch.role === "primary"
-            ? "01 / Primary batch"
-            : "02 / Speculative successor"}
-        </span>
+        <span className="pipeline-role">{label}</span>
         <BatchStatus batch={batch} />
       </div>
       <Link
         to={`/batches/${batch.batch_id}`}
         className="pipeline-title flex items-center gap-2"
       >
-        {batch.sources.length} pull requests
+        {plural(batch.sources.length, "pull request")}
         <ArrowUpRight size={15} className="text-muted-foreground" />
       </Link>
       <div className="pipeline-subtitle">
@@ -136,14 +148,14 @@ export function overviewStatus(data: Overview) {
   function state(batch: BatchSummary, role: string) {
     const id = batch.batch_id.replace(/^batch-/, "");
     if (batch.phase === "building" || batch.phase === "fixing")
-      return `${role} ${id} is ${batch.phase} ${batch.sources.length} PR${batch.sources.length === 1 ? "" : "s"}.`;
+      return `${role} ${id} is ${batch.phase} ${plural(batch.sources.length, "PR")}.`;
     if (batch.phase === "waiting_parent")
       return `${role} ${id} is waiting for ${batch.predecessor_id ? `batch ${batch.predecessor_id.replace(/^batch-/, "")}` : "its predecessor"}.`;
     if (batch.phase === "waiting_ci" || batch.phase === "direct_waiting_ci")
-      return `${role} ${id} is waiting for CI on ${batch.sources.length} PR${batch.sources.length === 1 ? "" : "s"}.`;
+      return `${role} ${id} is waiting for CI on ${plural(batch.sources.length, "PR")}.`;
     if (batch.phase === "merging" || batch.phase === "direct_merging")
-      return `${role} ${id} is merging ${batch.sources.length} PR${batch.sources.length === 1 ? "" : "s"}.`;
-    return `${role} ${id} has ${batch.sources.length} PR${batch.sources.length === 1 ? "" : "s"}; phase: ${batch.phase}.`;
+      return `${role} ${id} is merging ${plural(batch.sources.length, "PR")}.`;
+    return `${role} ${id} has ${plural(batch.sources.length, "PR")}; phase: ${batch.phase}.`;
   }
   const parts = [
     primary ? state(primary, "Batch") : "No primary batch is active.",
@@ -151,11 +163,11 @@ export function overviewStatus(data: Overview) {
   if (successor) parts.push(state(successor, "Speculative batch"));
   if (data.outbox.failing)
     parts.push(
-      `${data.outbox.failing} GitHub write${data.outbox.failing === 1 ? " is" : "s are"} failing.`,
+      `${plural(data.outbox.failing, "GitHub write is", "GitHub writes are")} failing.`,
     );
   else if (data.outbox.pending)
     parts.push(
-      `${data.outbox.pending} GitHub write${data.outbox.pending === 1 ? " is" : "s are"} pending.`,
+      `${plural(data.outbox.pending, "GitHub write is", "GitHub writes are")} pending.`,
     );
   for (const entry of data.health.entry_points.filter(
     (entry) => entry.state === "stale" || entry.state === "failing",
@@ -201,7 +213,7 @@ export function OverviewPage() {
     {
       label: "Pending writes",
       value: d.kpis.pending_outbox_writes,
-      footnote: `${d.outbox.failing} delivery needs attention`,
+      footnote: `${plural(d.outbox.failing, "delivery needs", "deliveries need")} attention`,
       icon: Send,
     },
     {
@@ -247,8 +259,8 @@ export function OverviewPage() {
         <SectionLink to="/queue">View queue</SectionLink>
       </div>
       <div className="pipeline-grid">
-        <PipelineCard batch={d.pipeline.primary} />
-        <PipelineCard batch={d.pipeline.speculative} />
+        <PipelineCard slot="primary" batch={d.pipeline.primary} />
+        <PipelineCard slot="speculative" batch={d.pipeline.speculative} />
         <Card className="pipeline-card">
           <div className="pipeline-role">03 / Pull request queue</div>
           <Link to="/queue" className="pipeline-title flex items-center gap-2">
@@ -494,8 +506,7 @@ export function OverviewPage() {
               >
                 <div>
                   <div className="font-medium">
-                    {batch.sources.length} pull request
-                    {batch.sources.length !== 1 ? "s" : ""}
+                    {plural(batch.sources.length, "pull request")}
                     <span className="ml-2 text-[10px] text-muted-foreground font-normal">
                       {batch.batch_id}
                     </span>
@@ -568,7 +579,7 @@ export function OverviewPage() {
               <Bot size={14} />
               <div>
                 <h3>
-                  {d.repairs.recovering + d.triage.recovering} session
+                  {plural(d.repairs.recovering + d.triage.recovering, "session")}{" "}
                   recovering
                 </h3>
                 <p>Session recovery is in progress.</p>
@@ -584,7 +595,7 @@ export function OverviewPage() {
               <ShieldAlert size={14} />
               <div>
                 <h3>
-                  {d.queue.dependency_blocked} pull requests awaiting
+                  {plural(d.queue.dependency_blocked, "pull request")} awaiting
                   prerequisites
                 </h3>
                 <p>Exact captured heads must land before their dependents.</p>

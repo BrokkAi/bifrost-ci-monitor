@@ -497,7 +497,15 @@ export const fixtures: Endpoints = {
   "/overview": {
     generated_at: date(),
     health,
-    pipeline: { primary, speculative },
+    pipeline: {
+      primary,
+      // `?speculative=none` previews the empty successor slot.
+      speculative:
+        typeof window !== "undefined" &&
+        new URLSearchParams(window.location.search).get("speculative") === "none"
+          ? null
+          : speculative,
+    },
     queue: {
       in_batch: 9,
       waiting: 13,

@@ -5,6 +5,11 @@ export function cn(...inputs: ClassValue[]) {
 }
 export const display = (s: string | null | undefined) =>
   s ? s.replaceAll("_", " ").replaceAll("-", " ") : "—";
+const pluralRules = new Intl.PluralRules("en");
+/** "1 pull request", "2 pull requests"; pass `many` for irregular forms or verb agreement. */
+export function plural(count: number, one: string, many = `${one}s`) {
+  return `${count.toLocaleString("en")} ${pluralRules.select(count) === "one" ? one : many}`;
+}
 export function duration(seconds: number | null | undefined) {
   if (seconds == null || !Number.isFinite(seconds)) return "—";
   const total = Math.max(0, Math.round(seconds));

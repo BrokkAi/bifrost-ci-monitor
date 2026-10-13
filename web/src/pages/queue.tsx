@@ -1,4 +1,5 @@
 import { useSearchParams, Link } from "react-router-dom";
+import { plural } from "@/lib/utils";
 import { Info, GitPullRequest, Flag } from "lucide-react";
 import type { ColumnDef } from "@tanstack/react-table";
 import type { QueueItem } from "@/api/types";
@@ -134,7 +135,7 @@ export function QueuePage() {
         action={
           <div className="flex items-center gap-2 text-xs text-muted-foreground mt-3">
             <GitPullRequest size={14} />
-            {rows.length} open pull requests
+            {plural(rows.length, "open pull request")}
           </div>
         }
       />
