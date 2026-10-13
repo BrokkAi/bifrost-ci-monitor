@@ -4,6 +4,7 @@ import {
   Activity,
   ArrowUpRight,
   Bot,
+  BarChart3,
   ChevronDown,
   Database,
   FlaskConical,
@@ -32,6 +33,7 @@ import {
 import { RelativeTime } from "./components/common";
 import { absoluteTime, sentenceCase } from "./lib/utils";
 import { StatusBadge } from "./components/status";
+import { StatsPage } from "./pages/stats";
 import { OverviewPage } from "./pages/overview";
 import { BatchPage } from "./pages/batch";
 import { QueuePage } from "./pages/queue";
@@ -44,6 +46,7 @@ import {
 import { ReleasesPage } from "./pages/releases";
 const navigation = [
   { label: "Overview", to: "/", icon: LayoutDashboard },
+  { label: "Stats", to: "/stats", icon: BarChart3 },
   { label: "Pull request queue", to: "/queue", icon: GitPullRequest },
   { label: "CI failures", to: "/ledger", icon: FlaskConical },
   { label: "Agents", to: "/agents", icon: Bot },
@@ -272,6 +275,7 @@ export default function App() {
         <main id="main-content">
           <Routes>
             <Route path="/" element={<OverviewPage />} />
+            <Route path="/stats" element={<StatsPage />} />
             <Route path="/batches/:id" element={<BatchPage />} />
             <Route path="/queue" element={<QueuePage />} />
             <Route path="/ledger" element={<LedgerPage />} />

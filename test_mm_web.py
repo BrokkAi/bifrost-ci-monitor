@@ -649,19 +649,66 @@ class ReadRegressionTests(unittest.TestCase):
         self.write("UPDATE automerge_batches SET terminal_status='aborted' WHERE batch_id IN ('primary','speculative')")
         self.assertEqual(data.stats(self.conn, days=1).days[0].batches_failed, 0)
 
-    def test_campaign_lane_is_separate_from_master_pipeline_and_kpis(self):
-        before = data.overview(self.conn)
-        self.assertIsNone(before.pipeline.campaign)
+    def test_release_lane_summarizes_campaign_and_master_kpis_exclude_it(self):
+        live = models.Campaign(id='c1', branch='stabilize/test', anchor_sha=SHA, status='running', stage='hourly',
+                               round=2, issues=[{'number': 1, 'stage': 'hourly', 'source': 'ledger', 'state': 'open'},
+                                                {'number': 2, 'stage': 'push', 'source': 'ledger', 'state': 'closed'}],
+                               latest_runs={'hourly': {'sha': SHA, 'url': 'https://github.com/run/9',
+                                                       'conclusion': 'failure'}})
+        done = live.model_copy(update={'id': 'old', 'status': 'completed'})
+        with mock.patch.object(releases, 'list_campaigns', return_value=[done]):
+            before = data.overview(self.conn)
+        self.assertIsNone(before.pipeline.release)
         self.assertEqual(before.kpis.landed_today, 1)
         self.write("UPDATE automerge_batches SET target_ref='stabilize/test' WHERE batch_id='landed'")
         self.write("UPDATE automerge_batches SET status='running',phase='building',terminal_status=NULL,"
                    "finished_at=NULL,target_ref='stabilize/test' WHERE batch_id='direct'")
-        after = data.overview(self.conn)
-        self.assertEqual(after.pipeline.campaign.batch_id, 'direct')
-        self.assertEqual(after.pipeline.campaign.target_ref, 'stabilize/test')
+        with mock.patch.object(releases, 'list_campaigns', return_value=[live, done]):
+            after = data.overview(self.conn)
+        lane = after.pipeline.release
+        self.assertEqual((lane.campaign_id, lane.stage, lane.round, lane.open_issues), ('c1', 'hourly', 2, 1))
+        self.assertEqual(lane.current_run.conclusion, 'failure')
+        self.assertEqual(lane.batch.batch_id, 'direct')
+        self.assertEqual((lane.merged_batches, lane.merged_prs), (1, 1))
         self.assertEqual(after.pipeline.primary.batch_id, 'primary')
         self.assertEqual(after.kpis.landed_today, 0)
         self.assertEqual(data.stats(self.conn, days=1).days[0].batches_completed, 0)
+        with mock.patch.object(releases, 'list_campaigns',
+                               side_effect=db.ApiError(503, 'release_machinery_unavailable', 'x')):
+            self.assertIsNone(data.overview(self.conn).pipeline.release)
+
+    def test_ci_attention_lists_only_failures_nobody_is_working_on(self):
+        self.write('DELETE FROM known_failures')
+        self.write('DELETE FROM issue_repairs')
+        current = datetime.now(timezone.utc)
+        for repair, issue, status, outcome in [('r1', 4613, 'completed', 'escalated'), ('r2', 4805, 'completed', 'resolved'),
+                                               ('r3', 5049, 'completed', 'submitted'), ('r4', 700, 'running', None)]:
+            self.write("""INSERT INTO issue_repairs(id,work_key,issue_number,issue_url,title,branch,base_sha,status,
+                created_at,prompt,cleanup_done,report_json) VALUES (?,?,?,'https://github.com/issue','fixture','b',?,?,?,
+                'private',1,?)""", (repair, repair, issue, SHA, status, current.isoformat(),
+                                   json.dumps({'outcome': outcome}) if outcome else None))
+        def failure(identity, issue, first_hours, last_hours, outcome='product', job='tests'):
+            first = (current - timedelta(hours=first_hours)).isoformat()
+            last = (current - timedelta(hours=last_hours)).isoformat()
+            url = f'https://github.com/BrokkAi/bifrost-dev/issues/{issue}' if issue else None
+            self.write("""INSERT INTO known_failures(workflow,job_name,identity_kind,identity,first_seen_sha,
+                first_seen_run_id,first_seen_run_url,first_seen_at,last_seen_sha,last_seen_run_id,last_seen_run_url,
+                last_seen_at,status,updated_at,triage_outcome,triage_issue_url) VALUES ('CI',?,'test',?,?,1,
+                'https://github.com/run/1',?,?,2,'https://github.com/run/2',?,'open',?,?,?)""",
+                       (job, identity, SHA, first, HEAD, last, last, outcome, url))
+        failure('escalated-a', 4613, 30, 1, job='linux')
+        failure('escalated-b', 4613, 30, 3, job='windows')
+        failure('fixed-long-ago', 4805, 120, 96)
+        failure('fixed-recently', 5049, 30, 1)
+        failure('being-repaired', 700, 30, 1)
+        failure('runner-lost', None, 30, 1, outcome='infrastructure')
+        failure('no-issue-old', None, 5, 1)
+        failure('no-issue-new', None, 0.5, 0.5)
+        items = data.ci_attention(self.conn)
+        self.assertEqual([(i.reason, i.issue_number, i.failures) for i in items],
+                         [('escalated', 4613, 2), ('no_repair', None, 1), ('fix_unconfirmed', 4805, 1)])
+        self.assertEqual(items[0].summary, 'CI · linux and 1 more')
+        self.assertEqual(data.overview(self.conn).ci_attention, items)
 
     def test_spa_index_containment_without_testclient(self):
         from starlette.requests import Request

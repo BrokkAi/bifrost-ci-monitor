@@ -1,6 +1,68 @@
 {
   "components": {
     "schemas": {
+      "AttentionFailure": {
+        "description": "Open product CI failures that no agent is working on, grouped by issue.",
+        "properties": {
+          "failures": {
+            "title": "Failures",
+            "type": "integer"
+          },
+          "issue_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issue Number"
+          },
+          "issue_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issue Url"
+          },
+          "last_seen_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Seen At"
+          },
+          "reason": {
+            "enum": [
+              "escalated",
+              "fix_unconfirmed",
+              "no_repair"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "failures",
+          "summary"
+        ],
+        "title": "AttentionFailure",
+        "type": "object"
+      },
       "BatchDetail": {
         "properties": {
           "abort_reason": {
@@ -733,6 +795,34 @@
           "idempotency_key"
         ],
         "title": "CreateRelease",
+        "type": "object"
+      },
+      "CurrentRun": {
+        "properties": {
+          "conclusion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conclusion"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "title": "CurrentRun",
         "type": "object"
       },
       "DailyStats": {
@@ -1535,6 +1625,13 @@
       },
       "Overview": {
         "properties": {
+          "ci_attention": {
+            "items": {
+              "$ref": "#/components/schemas/AttentionFailure"
+            },
+            "title": "Ci Attention",
+            "type": "array"
+          },
           "generated_at": {
             "title": "Generated At",
             "type": "string"
@@ -1588,7 +1685,7 @@
       },
       "Pipeline": {
         "properties": {
-          "campaign": {
+          "primary": {
             "anyOf": [
               {
                 "$ref": "#/components/schemas/BatchSummary"
@@ -1596,13 +1693,12 @@
               {
                 "type": "null"
               }
-            ],
-            "description": "Batch in the release-branch lane, which runs alongside the master lane."
+            ]
           },
-          "primary": {
+          "release": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/BatchSummary"
+                "$ref": "#/components/schemas/ReleaseLane"
               },
               {
                 "type": "null"
@@ -1870,6 +1966,135 @@
           "url"
         ],
         "title": "QueueItem",
+        "type": "object"
+      },
+      "ReleaseLane": {
+        "description": "Summary of the live stabilize campaign and its merges into the release branch.",
+        "properties": {
+          "anchor_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anchor Sha"
+          },
+          "batch": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BatchSummary"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Running batch merging fixes into the release branch."
+          },
+          "campaign_id": {
+            "title": "Campaign Id",
+            "type": "string"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "current_run": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CurrentRun"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Latest CI run of the current stage at the tip."
+          },
+          "merged_batches": {
+            "default": 0,
+            "title": "Merged Batches",
+            "type": "integer"
+          },
+          "merged_prs": {
+            "default": 0,
+            "title": "Merged Prs",
+            "type": "integer"
+          },
+          "open_issues": {
+            "default": 0,
+            "title": "Open Issues",
+            "type": "integer"
+          },
+          "pause_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pause Reason"
+          },
+          "round": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Round"
+          },
+          "stage": {
+            "enum": [
+              "push",
+              "hourly",
+              "nightly",
+              "complete"
+            ],
+            "title": "Stage",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "starting",
+              "running",
+              "paused",
+              "completed",
+              "aborted"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "tip_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tip Sha"
+          }
+        },
+        "required": [
+          "campaign_id",
+          "status",
+          "stage"
+        ],
+        "title": "ReleaseLane",
         "type": "object"
       },
       "Repair": {

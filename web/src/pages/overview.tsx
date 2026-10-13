@@ -1,10 +1,7 @@
 import { Link } from "react-router-dom";
 import {
-  ArrowRight,
   ArrowUpRight,
   Clock3,
-  GitMerge,
-  GitPullRequest,
   Layers3,
   Radio,
   ShieldAlert,
@@ -13,26 +10,15 @@ import {
   TriangleAlert,
   FlaskConical,
 } from "lucide-react";
-import {
-  BarChart,
-  Bar,
-  CartesianGrid,
-  XAxis,
-  YAxis,
-  LineChart,
-  Line,
-  ReferenceDot,
-} from "recharts";
 import { useApi, useBatch, useHistory } from "@/api/client";
-import type { BatchSummary, Overview } from "@/api/types";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import type {
+  AttentionFailure,
+  BatchSummary,
+  Overview,
+  ReleaseLane,
+} from "@/api/types";
+import { Card, CardHeader, CardTitle } from "@/components/ui/card";
 import { HistoryFooter } from "@/components/history-footer";
-import { Button } from "@/components/ui/button";
-import {
-  ChartContainer,
-  ChartTooltip,
-  ChartTooltipContent,
-} from "@/components/ui/chart";
 import { OutcomeBadge, BatchStatus, StatusBadge } from "@/components/status";
 import {
   PageHeading,
@@ -44,17 +30,18 @@ import {
   EmptyState,
   ExternalLink,
 } from "@/components/common";
-import { duration, durationFromMinutes, display, plural, sentenceCase, targetLabel } from "@/lib/utils";
+import {
+  duration,
+  display,
+  plural,
+  sentenceCase,
+  targetLabel,
+} from "@/lib/utils";
 const SLOTS = {
   primary: {
     label: "01 / Primary batch",
     emptyTitle: "No active batch",
     emptyText: "The next eligible work will appear here.",
-  },
-  campaign: {
-    label: "Release branch batch",
-    emptyTitle: "No release branch batch",
-    emptyText: "Runs alongside the master lane while a stabilize campaign needs fixes merged.",
   },
   speculative: {
     label: "02 / Speculative successor",
@@ -73,9 +60,7 @@ export function PipelineCard({
 }) {
   const detail = useBatch(batch?.batch_id ?? "");
   const checkpoint = detail.data?.state.candidate as
-    | { head?: string }
-    | null
-    | undefined;
+    { head?: string } | null | undefined;
   const { label, emptyTitle, emptyText } = SLOTS[slot];
   if (!batch)
     return (
@@ -100,7 +85,8 @@ export function PipelineCard({
         <ArrowUpRight size={15} className="text-muted-foreground" />
       </Link>
       <div className="pipeline-subtitle">
-        Phase: {batch.phase} <span className="mx-1">·</span> {batch.batch_id}
+        Phase: {batchPhase(batch.phase)} <span className="mx-1">·</span>{" "}
+        {batch.batch_id}
       </div>
       {batch.target_ref !== "master" && (
         <div
@@ -169,8 +155,14 @@ export function overviewStatus(data: Overview) {
     primary ? state(primary, "Batch") : "No primary batch is active.",
   ];
   if (successor) parts.push(state(successor, "Speculative batch"));
-  if (data.pipeline.campaign)
-    parts.push(state(data.pipeline.campaign, "Release branch batch"));
+  if (data.pipeline.release) {
+    const release = data.pipeline.release;
+    parts.push(
+      release.status === "paused"
+        ? "The release branch campaign is paused."
+        : `The release branch campaign is ${release.status}; stage: ${release.stage}.`,
+    );
+  }
   if (data.outbox.failing)
     parts.push(
       `${plural(data.outbox.failing, "GitHub write is", "GitHub writes are")} failing.`,
@@ -185,9 +177,154 @@ export function overviewStatus(data: Overview) {
     parts.push(`${sentenceCase(entry.name)} heartbeat is ${entry.state}.`);
   return parts.join(" ");
 }
+function batchPhase(phase: string) {
+  if (phase === "waiting_parent") return "Waiting for predecessor";
+  if (phase === "waiting_ci" || phase === "direct_waiting_ci")
+    return "Waiting for CI";
+  return sentenceCase(phase);
+}
+
+const RELEASE_STAGES = ["push", "hourly", "nightly", "complete"] as const;
+
+function ReleaseCard({ release }: { release: ReleaseLane | null }) {
+  if (!release)
+    return (
+      <Card className="pipeline-card release-card">
+        <div className="pipeline-role">03 / Release branch</div>
+        <EmptyState title="No release branch campaign">
+          <Link to="/releases" className="external-link">
+            Start a release branch campaign <ArrowUpRight size={12} />
+          </Link>
+        </EmptyState>
+      </Card>
+    );
+  const current = RELEASE_STAGES.indexOf(release.stage);
+  return (
+    <Card className="pipeline-card release-card">
+      <div className="flex items-center justify-between gap-2">
+        <span className="pipeline-role">03 / Release branch</span>
+        <StatusBadge
+          value={release.status}
+          label={sentenceCase(release.status)}
+        />
+      </div>
+      <h3 className="pipeline-title">
+        Release branch from{" "}
+        {release.anchor_sha?.slice(0, 7) ?? "an unknown commit"}
+      </h3>
+      {release.status === "paused" && (
+        <div role="status" className="release-pause">
+          <ShieldAlert size={14} />
+          <span>{release.pause_reason ?? "The campaign is paused."}</span>
+        </div>
+      )}
+      <ol className="release-stages" aria-label="Release stages">
+        {RELEASE_STAGES.map((stage, index) => (
+          <li
+            key={stage}
+            aria-current={stage === release.stage ? "step" : undefined}
+            className={
+              index === current ? "current" : index < current ? "done" : ""
+            }
+          >
+            <span className="release-stage-dot" aria-hidden="true" />
+            {sentenceCase(stage)}
+          </li>
+        ))}
+      </ol>
+      <div className="pipeline-meta release-meta">
+        <div>
+          <div className="metadata-label">Round</div>
+          <div className="metadata-value">{release.round ?? "—"}</div>
+        </div>
+        <div>
+          <div className="metadata-label">Latest {release.stage} run</div>
+          <div className="metadata-value">
+            {release.current_run ? (
+              <ExternalLink href={release.current_run.url}>
+                <StatusBadge
+                  value={release.current_run.conclusion ?? "running"}
+                  label={sentenceCase(
+                    release.current_run.conclusion ?? "running",
+                  )}
+                  className="health-status"
+                />
+              </ExternalLink>
+            ) : (
+              "No run yet"
+            )}
+          </div>
+        </div>
+      </div>
+      <div className="release-counts">
+        <span>{plural(release.open_issues, "open issue")}</span>
+        <span>{plural(release.merged_prs, "PR")} merged into the branch</span>
+      </div>
+      {release.batch && (
+        <Link
+          to={`/batches/${release.batch.batch_id}`}
+          className="release-batch"
+        >
+          <span>
+            Merging {plural(release.batch.sources.length, "PR")} into the branch ·{" "}
+            {batchPhase(release.batch.phase).toLowerCase()}
+          </span>
+          <ArrowUpRight size={12} />
+        </Link>
+      )}
+      <div className="pipeline-footer">
+        <SectionLink to="/releases">View release</SectionLink>
+      </div>
+    </Card>
+  );
+}
+
+function AttentionSummary({ item }: { item: AttentionFailure }) {
+  const checks = plural(item.failures, "failing check");
+  if (item.reason === "escalated")
+    return (
+      <>
+        {item.issue_number != null
+          ? `Issue #${item.issue_number}`
+          : "CI failures"}{" "}
+        escalated to a person: {checks}
+        {item.last_seen_at && (
+          <>
+            , last seen <RelativeTime value={item.last_seen_at} />
+          </>
+        )}
+      </>
+    );
+  if (item.reason === "fix_unconfirmed") {
+    const since = item.last_seen_at
+      ? new Date(item.last_seen_at).toLocaleDateString("en", {
+          month: "short",
+          day: "numeric",
+        })
+      : null;
+    return (
+      <>
+        {item.issue_number != null
+          ? `Issue #${item.issue_number} is closed, but its`
+          : "A closed issue's"}{" "}
+        {item.failures === 1 ? "failing check has" : "failing checks have"} not
+        passed{since ? ` since ${since}` : " since it was closed"}
+      </>
+    );
+  }
+  return item.issue_number != null ? (
+    <>
+      Issue #{item.issue_number}: {checks} with no repair in progress
+    </>
+  ) : (
+    <>
+      {checks} {item.failures === 1 ? "has" : "have"} no issue or repair
+    </>
+  );
+}
+
 export function OverviewPage() {
   const overview = useApi("/overview");
-  const stats = useApi("/stats", "days=30");
   const history = useHistory("/batches", "state=recent&limit=5");
   if (overview.isPending) return <Loading />;
   if (overview.isError)
@@ -195,47 +332,15 @@ export function OverviewPage() {
       <ErrorState error={overview.error} retry={() => overview.refetch()} />
     );
   const d = overview.data;
-  const kpis = [
-    {
-      label: "Landed today",
-      value: d.kpis.landed_today,
-      footnote: "Pull requests on master",
-      icon: GitMerge,
-    },
-    {
-      label: "Landed · 7 days",
-      value: d.kpis.landed_7_days,
-      footnote: "Across integration batches",
-      icon: GitPullRequest,
-    },
-    {
-      label: "Median duration",
-      value: durationFromMinutes(d.kpis.median_batch_minutes_7_days),
-      footnote: "Completed batches · 7 days",
-      icon: Clock3,
-    },
-    {
-      label: "Open CI failures",
-      value: d.kpis.open_ci_failures,
-      footnote: "In the shared failure ledger",
-      icon: FlaskConical,
-    },
-    {
-      label: "Pending writes",
-      value: d.kpis.pending_outbox_writes,
-      footnote: `${plural(d.outbox.failing, "delivery needs", "deliveries need")} attention`,
-      icon: Send,
-    },
-    {
-      label: "Active repairs",
-      value: d.kpis.active_repairs,
-      footnote: `Of ${d.repairs.concurrency_limit} available slots`,
-      icon: Bot,
-    },
-  ];
-  const days = stats.data?.days ?? [];
   const recentBatches =
     history.data?.pages.flatMap((page) => page.items) ?? d.recent.slice(0, 5);
+  const ciAttention = d.ci_attention ?? [];
+  const hasAttention =
+    ciAttention.length > 0 ||
+    d.outbox.failing > 0 ||
+    d.health.entry_points.some((e) => e.state !== "ok") ||
+    d.repairs.recovering + d.triage.recovering > 0 ||
+    d.queue.dependency_blocked > 0;
   return (
     <>
       <PageHeading
@@ -250,303 +355,171 @@ export function OverviewPage() {
           </div>
         }
       />
-      <div className="kpi-grid">
-        {kpis.map((k) => (
-          <Card key={k.label} className="kpi">
-            <div className="kpi-label">
-              {k.label}
-              <k.icon size={12} strokeWidth={1.5} />
-            </div>
-            <div className="kpi-value">{k.value}</div>
-            <div className="kpi-footnote">{k.footnote}</div>
-          </Card>
-        ))}
-      </div>
-      <div className="flex justify-between items-center">
-        <div>
-          <h2 className="section-title">Merge pipeline</h2>
-        </div>
-        <SectionLink to="/queue">View queue</SectionLink>
-      </div>
-      <div className="pipeline-grid">
-        <PipelineCard slot="primary" batch={d.pipeline.primary} />
-        <PipelineCard slot="speculative" batch={d.pipeline.speculative} />
-        <Card className="pipeline-card">
-          <div className="pipeline-role">03 / Pull request queue</div>
-          <Link to="/queue" className="pipeline-title flex items-center gap-2">
-            {Object.values(d.queue).reduce((a, b) => a + b, 0)} open
-            <ArrowUpRight size={15} className="text-muted-foreground" />
-          </Link>
-          <div className="pipeline-subtitle">
-            Cached inventory · all readiness groups
-          </div>
-          <div className="mt-3">
-            {(
-              [
-                { key: "waiting", label: "Waiting", status: "waiting" },
-                {
-                  key: "dependency_blocked",
-                  label: "Dependency blocked",
-                  status: "blocked",
-                },
-                {
-                  key: "rejected",
-                  label: "Rejected heads",
-                  status: "rejected",
-                },
-                { key: "draft", label: "Draft", status: "waiting" },
-              ] as const
-            ).map((g) => (
-              <Link
-                key={g.key}
-                to={`/queue?group=${g.key}`}
-                className="queue-summary-row"
-              >
-                <span className="flex items-center gap-1.5">
-                  <StatusBadge
-                    value={g.status}
-                    label={g.label}
-                    className="health-status"
-                  />
-                </span>
-                <strong>{d.queue[g.key]}</strong>
-              </Link>
-            ))}
-          </div>
-          <div className="pipeline-footer">
-            <span className="text-muted-foreground">
-              {d.queue.in_batch} already in a batch
-            </span>
-            <ArrowRight size={13} className="text-muted-foreground" />
-          </div>
-        </Card>
-      </div>
-      {d.pipeline.campaign && (
-        <div className="campaign-lane">
-          <PipelineCard slot="campaign" batch={d.pipeline.campaign} />
-        </div>
-      )}
-      <div
-        className={`chart-grid ${stats.isFetching && !stats.isPending ? "opacity-65" : ""}`}
-      >
-        <Card>
-          <CardHeader>
+      <div className="overview-summary-grid">
+        <Card className="overview-summary-card">
+          <CardHeader className="shrink-0">
             <div>
-              <CardTitle>Pull requests landed</CardTitle>
+              <CardTitle id="attention-heading">Needs attention</CardTitle>
               <p className="section-caption">
-                Pull requests landed per day · last 30 days
+                CI failures and supervisor updates
               </p>
             </div>
-            <GitMerge size={15} className="text-muted-foreground" />
+            <TriangleAlert size={15} className="text-muted-foreground" />
           </CardHeader>
-          <CardContent>
-            {stats.isError ? (
-              <div className="py-12 text-xs text-muted-foreground">
-                Daily statistics are unavailable.
-              </div>
-            ) : (
-              <ChartContainer
-                config={{
-                  landed_prs: {
-                    label: "Pull requests",
-                    color: "var(--series-1)",
-                  },
-                }}
-              >
-                <BarChart
-                  data={days}
-                  accessibilityLayer
-                  margin={{ top: 10, left: -26, right: 0, bottom: 0 }}
-                  barSize={12}
-                >
-                  <CartesianGrid vertical={false} />
-                  <XAxis
-                    dataKey="date"
-                    tickLine={false}
-                    axisLine={false}
-                    tickMargin={10}
-                    minTickGap={37}
-                    tickFormatter={(s) =>
-                      new Date(`${s}T00:00:00`).toLocaleDateString("en", {
-                        month: "short",
-                        day: "numeric",
-                      })
-                    }
-                  />
-                  <YAxis
-                    tickLine={false}
-                    axisLine={false}
-                    allowDecimals={false}
-                  />
-                  <ChartTooltip
-                    shared={false}
-                    cursor={false}
-                    content={<ChartTooltipContent />}
-                  />
-                  <Bar
-                    isAnimationActive={false}
-                    dataKey="landed_prs"
-                    fill="var(--color-landed_prs)"
-                    radius={[3, 3, 0, 0]}
-                  />
-                </BarChart>
-              </ChartContainer>
-            )}
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <div>
-              <CardTitle>Batch duration</CardTitle>
-              <p className="section-caption">Daily median duration · minutes</p>
-            </div>
-            <Clock3 size={15} className="text-muted-foreground" />
-          </CardHeader>
-          <CardContent>
-            <ChartContainer
-              config={{
-                median_batch_minutes: {
-                  label: "Median",
-                  color: "var(--series-1)",
-                },
-              }}
-            >
-              <LineChart
-                data={days}
-                accessibilityLayer
-                margin={{ top: 10, left: -26, right: 25, bottom: 0 }}
-              >
-                <CartesianGrid vertical={false} />
-                <XAxis
-                  dataKey="date"
-                  tickLine={false}
-                  axisLine={false}
-                  tickMargin={10}
-                  minTickGap={42}
-                  tickFormatter={(s) =>
-                    new Date(`${s}T00:00:00`).toLocaleDateString("en", {
-                      month: "short",
-                      day: "numeric",
-                    })
-                  }
-                />
-                <YAxis
-                  tickLine={false}
-                  axisLine={false}
-                  domain={[0, "auto"]}
-                  tickFormatter={(n) => String(n)}
-                />
-                <ChartTooltip
-                  cursor={{ strokeWidth: 1 }}
-                  content={
-                    <ChartTooltipContent
-                      valueFormatter={(v) => durationFromMinutes(Number(v))}
-                    />
-                  }
-                />
-                <Line
-                  isAnimationActive={false}
-                  dataKey="median_batch_minutes"
-                  type="linear"
-                  stroke="var(--color-median_batch_minutes)"
-                  strokeWidth={2}
-                  dot={false}
-                  activeDot={{ r: 4, strokeWidth: 2, stroke: "var(--card)" }}
-                  connectNulls={false}
-                />
-                {days.length > 0 &&
-                  days[days.length - 1].median_batch_minutes != null && (
-                    <ReferenceDot
-                      x={days[days.length - 1].date}
-                      y={days[days.length - 1].median_batch_minutes!}
-                      r={4}
-                      fill="var(--series-1)"
-                      stroke="var(--card)"
-                      strokeWidth={2}
-                      label={{
-                        value: durationFromMinutes(days[days.length - 1].median_batch_minutes),
-                        position: "top",
-                        fill: "var(--foreground)",
-                        fontSize: 10,
-                      }}
-                    />
+          <div
+            className="overview-card-scroll"
+            role="region"
+            aria-labelledby="attention-heading"
+            tabIndex={0}
+          >
+            {ciAttention.map((item, index) => {
+              const content = (
+                <>
+                  <FlaskConical size={14} />
+                  <div>
+                    <h3>
+                      <AttentionSummary item={item} />
+                    </h3>
+                    <p>{item.summary}</p>
+                  </div>
+                  {item.issue_url && (
+                    <ArrowUpRight size={12} className="ml-auto" />
                   )}
-              </LineChart>
-            </ChartContainer>
-          </CardContent>
-        </Card>
-      </div>
-      <details className="mt-3 text-[10px] text-muted-foreground">
-        <summary className="cursor-pointer">
-          View daily statistics as a table
-        </summary>
-        <Card className="mt-3 max-h-60 overflow-auto">
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>Date</th>
-                <th>Landed PRs</th>
-                <th>Median duration</th>
-              </tr>
-            </thead>
-            <tbody>
-              {days.map((day) => (
-                <tr key={day.date}>
-                  <td>{day.date}</td>
-                  <td>{day.landed_prs}</td>
-                  <td>{durationFromMinutes(day.median_batch_minutes)}</td>
-                </tr>
+                </>
+              );
+              return item.issue_url ? (
+                <a
+                  key={`${item.reason}-${item.issue_number}-${index}`}
+                  href={item.issue_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="attention-item"
+                >
+                  {content}
+                </a>
+              ) : (
+                <div key={`${item.reason}-${index}`} className="attention-item">
+                  {content}
+                </div>
+              );
+            })}
+            {d.outbox.failing > 0 && (
+              <Link to="/outbox" className="attention-item">
+                <Send size={14} />
+                <div>
+                  <h3>
+                    {d.outbox.failing} GitHub write
+                    {d.outbox.failing === 1 ? "" : "s"} retrying
+                  </h3>
+                </div>
+                <ArrowUpRight size={12} className="ml-auto" />
+              </Link>
+            )}
+            {d.health.entry_points
+              .filter((e) => e.state !== "ok")
+              .map((e) => (
+                <div key={e.name} className="attention-item">
+                  <Clock3 size={14} />
+                  <div>
+                    <h3>
+                      {sentenceCase(e.name)} heartbeat is {e.state}
+                    </h3>
+                    <p>
+                      Last completed <RelativeTime value={e.last_finished_at} />
+                      . {e.last_error}
+                    </p>
+                  </div>
+                </div>
               ))}
-            </tbody>
-          </table>
+            {d.repairs.recovering + d.triage.recovering > 0 && (
+              <Link to="/agents" className="attention-item">
+                <Bot size={14} />
+                <div>
+                  <h3>
+                    {plural(
+                      d.repairs.recovering + d.triage.recovering,
+                      "session",
+                    )}{" "}
+                    recovering
+                  </h3>
+                  <p>Session recovery is in progress.</p>
+                </div>
+                <ArrowUpRight size={12} className="ml-auto" />
+              </Link>
+            )}
+            {d.queue.dependency_blocked > 0 && (
+              <Link
+                to="/queue?group=dependency_blocked"
+                className="attention-item"
+              >
+                <ShieldAlert size={14} />
+                <div>
+                  <h3>
+                    {plural(d.queue.dependency_blocked, "pull request")}{" "}
+                    awaiting prerequisites
+                  </h3>
+                  <p>Exact captured heads must land before their dependents.</p>
+                </div>
+                <ArrowUpRight size={12} className="ml-auto" />
+              </Link>
+            )}
+            {!hasAttention && <EmptyState title="Nothing needs attention" />}
+          </div>
         </Card>
-      </details>
-      <div className="lower-grid">
-        <Card>
-          <CardHeader>
+        <Card className="overview-summary-card">
+          <CardHeader className="shrink-0">
             <div>
-              <CardTitle>Recent outcomes</CardTitle>
-              <p className="section-caption">Completed batches</p>
+              <CardTitle id="outcomes-heading">Recent outcomes</CardTitle>
+              <p className="section-caption">
+                Landed, failed and other finished batches
+              </p>
             </div>
             <span className="text-[10px] text-muted-foreground">
               {recentBatches.length} shown
             </span>
           </CardHeader>
-          {recentBatches.length ? (
-            recentBatches.map((batch) => (
-              <Link
-                to={`/batches/${batch.batch_id}`}
-                key={batch.batch_id}
-                className="recent-row"
-              >
-                <div>
-                  <div className="font-medium">
-                    {plural(batch.sources.length, "pull request")}
-                    <span className="ml-2 text-[10px] text-muted-foreground font-normal">
-                      {batch.batch_id}
-                    </span>
-                  </div>
-                  <div className="mt-1 text-[9px] text-muted-foreground">
-                    <RelativeTime value={batch.finished_at} />{" "}
-                    <span className="mx-1">·</span>{" "}
-                    {duration(batch.duration_seconds)}
-                  </div>
-                  {batch.target_ref !== "master" && (
-                    <div
-                      className="mt-1 text-[9px] text-muted-foreground"
-                      title={batch.target_ref}
-                    >
-                      Target: {targetLabel(batch.target_ref)}
+          <div
+            className="overview-card-scroll"
+            role="region"
+            aria-labelledby="outcomes-heading"
+            tabIndex={0}
+          >
+            {recentBatches.length ? (
+              recentBatches.map((batch) => (
+                <Link
+                  to={`/batches/${batch.batch_id}`}
+                  key={batch.batch_id}
+                  className="recent-row"
+                >
+                  <div>
+                    <div className="font-medium">
+                      {plural(batch.sources.length, "pull request")}
+                      <span className="ml-2 text-[10px] text-muted-foreground font-normal">
+                        {batch.batch_id}
+                      </span>
                     </div>
-                  )}
-                </div>
-                <OutcomeBadge outcome={batch.outcome} />
-                <ArrowUpRight size={13} className="text-muted-foreground" />
-              </Link>
-            ))
-          ) : (
-            <EmptyState title="No recent batches" />
-          )}
+                    <div className="mt-1 text-[9px] text-muted-foreground">
+                      <RelativeTime value={batch.finished_at} />{" "}
+                      <span className="mx-1">·</span>{" "}
+                      {duration(batch.duration_seconds)}
+                    </div>
+                    {batch.target_ref !== "master" && (
+                      <div
+                        className="mt-1 text-[9px] text-muted-foreground"
+                        title={batch.target_ref}
+                      >
+                        Target: {targetLabel(batch.target_ref)}
+                      </div>
+                    )}
+                  </div>
+                  <OutcomeBadge outcome={batch.outcome} />
+                  <ArrowUpRight size={13} className="text-muted-foreground" />
+                </Link>
+              ))
+            ) : (
+              <EmptyState title="No recent batches" />
+            )}
+          </div>
           <HistoryFooter
             hasMore={Boolean(history.hasNextPage)}
             loading={history.isFetchingNextPage}
@@ -557,79 +530,14 @@ export function OverviewPage() {
             error={history.isError ? history.error : null}
           />
         </Card>
-        <Card>
-          <CardHeader>
-            <div>
-              <CardTitle>Needs attention</CardTitle>
-            </div>
-            <TriangleAlert size={15} className="text-muted-foreground" />
-          </CardHeader>
-          {d.outbox.failing > 0 && (
-            <Link to="/outbox" className="attention-item">
-              <Send size={14} />
-              <div>
-                <h3>
-                  {d.outbox.failing} GitHub write
-                  {d.outbox.failing === 1 ? "" : "s"} retrying
-                </h3>
-              </div>
-              <ArrowUpRight size={12} className="ml-auto" />
-            </Link>
-          )}
-          {d.health.entry_points
-            .filter((e) => e.state !== "ok")
-            .map((e) => (
-              <div key={e.name} className="attention-item">
-                <Clock3 size={14} />
-                <div>
-                  <h3>
-                    {sentenceCase(e.name)} heartbeat is {e.state}
-                  </h3>
-                  <p>
-                    Last completed <RelativeTime value={e.last_finished_at} />.{" "}
-                    {e.last_error}
-                  </p>
-                </div>
-              </div>
-            ))}
-          {d.repairs.recovering + d.triage.recovering > 0 && (
-            <Link to="/agents" className="attention-item">
-              <Bot size={14} />
-              <div>
-                <h3>
-                  {plural(d.repairs.recovering + d.triage.recovering, "session")}{" "}
-                  recovering
-                </h3>
-                <p>Session recovery is in progress.</p>
-              </div>
-              <ArrowUpRight size={12} className="ml-auto" />
-            </Link>
-          )}
-          {d.queue.dependency_blocked > 0 && (
-            <Link
-              to="/queue?group=dependency_blocked"
-              className="attention-item"
-            >
-              <ShieldAlert size={14} />
-              <div>
-                <h3>
-                  {plural(d.queue.dependency_blocked, "pull request")} awaiting
-                  prerequisites
-                </h3>
-                <p>Exact captured heads must land before their dependents.</p>
-              </div>
-              <ArrowUpRight size={12} className="ml-auto" />
-            </Link>
-          )}
-        </Card>
       </div>
-      <div className="mt-5 flex justify-end">
-        <Button variant="ghost" size="sm" asChild>
-          <Link to="/releases">
-            Prepare a stable release
-            <ArrowRight />
-          </Link>
-        </Button>
+      <div className="flex justify-between items-center mt-7">
+        <h2 className="section-title">Merge pipeline</h2>
+      </div>
+      <div className="pipeline-grid">
+        <PipelineCard slot="primary" batch={d.pipeline.primary} />
+        <PipelineCard slot="speculative" batch={d.pipeline.speculative} />
+        <ReleaseCard release={d.pipeline.release ?? null} />
       </div>
     </>
   );

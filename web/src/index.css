@@ -418,17 +418,13 @@ main {
 }
 .pipeline-grid {
   display: grid;
-  grid-template-columns: 1.14fr 1.14fr 0.85fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 18px;
   margin-top: 13px;
 }
-.campaign-lane {
-  display: grid;
-  grid-template-columns: 1.14fr 1.14fr 0.85fr;
-  gap: 18px;
-  margin-top: 18px;
-}
 .pipeline-card {
+  display: flex;
+  flex-direction: column;
   position: relative;
   min-width: 0;
   padding: 18px;
@@ -517,11 +513,117 @@ main {
 .chart {
   font-size: 10px;
 }
-.lower-grid {
+.overview-summary-grid {
   display: grid;
-  grid-template-columns: 1.35fr 1fr;
+  grid-template-columns: 1.15fr 1fr;
   gap: 18px;
-  margin-top: 20px;
+}
+.overview-summary-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: 269px;
+  overflow: hidden;
+}
+.overview-card-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+.overview-card-scroll:focus-visible {
+  outline: 2px solid var(--series-1);
+  outline-offset: -2px;
+}
+.pipeline-card .pipeline-footer {
+  margin-top: auto;
+}
+.pipeline-card:not(.release-card) .pipeline-meta {
+  margin-bottom: 17px;
+}
+.release-stages {
+  display: flex;
+  margin: 17px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.release-stages li {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  position: relative;
+  gap: 7px;
+  color: var(--muted-foreground);
+  font-size: 9px;
+}
+.release-stages li:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  top: 4px;
+  left: calc(50% + 9px);
+  right: calc(-50% + 9px);
+  height: 1px;
+  background: var(--border);
+}
+.release-stage-dot {
+  width: 9px;
+  height: 9px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--card);
+}
+.release-stages .current {
+  color: var(--foreground);
+  font-weight: 650;
+}
+.release-stages .current .release-stage-dot {
+  border-color: var(--series-1);
+  background: var(--series-1);
+  box-shadow: 0 0 0 3px var(--muted);
+}
+.release-stages .done .release-stage-dot {
+  border-color: var(--status-landed);
+  background: var(--status-landed);
+}
+.release-meta {
+  margin-top: 15px;
+}
+.release-counts {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 13px;
+  font-size: 11px;
+}
+.release-batch {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 12px 0 15px;
+  font-size: 10px;
+  color: var(--muted-foreground);
+}
+.release-batch:hover {
+  color: var(--foreground);
+}
+.release-pause {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--status-blocked) 40%, var(--border));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--status-blocked) 8%, var(--card));
+  font-size: 11px;
+  line-height: 1.5;
+}
+.release-pause svg {
+  color: var(--status-blocked);
+  flex-shrink: 0;
+  margin-top: 2px;
 }
 .recent-row {
   display: grid;
@@ -546,9 +648,16 @@ main {
   flex-shrink: 0;
   color: var(--muted-foreground);
 }
+.attention-item > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .attention-item h3 {
   font-size: 11px;
   font-weight: 550;
+}
+.attention-item:is(a):hover {
+  background: var(--muted);
 }
 .attention-item p {
   font-size: 10px;
@@ -773,7 +882,7 @@ main {
     display: none;
   }
   .chart-grid,
-  .lower-grid,
+  .overview-summary-grid,
   .detail-grid {
     grid-template-columns: 1fr;
   }

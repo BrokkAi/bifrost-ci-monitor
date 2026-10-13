@@ -349,6 +349,27 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * AttentionFailure
+         * @description Open product CI failures that no agent is working on, grouped by issue.
+         */
+        AttentionFailure: {
+            /** Failures */
+            failures: number;
+            /** Issue Number */
+            issue_number?: number | null;
+            /** Issue Url */
+            issue_url?: string | null;
+            /** Last Seen At */
+            last_seen_at?: string | null;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "escalated" | "fix_unconfirmed" | "no_repair";
+            /** Summary */
+            summary: string;
+        };
         /** BatchDetail */
         BatchDetail: {
             /** Abort Reason */
@@ -568,6 +589,13 @@ export interface components {
             idempotency_key: string;
             /** Sha */
             sha: string;
+        };
+        /** CurrentRun */
+        CurrentRun: {
+            /** Conclusion */
+            conclusion?: string | null;
+            /** Url */
+            url?: string | null;
         };
         /** DailyStats */
         DailyStats: {
@@ -832,6 +860,8 @@ export interface components {
         Outcome: "landed" | "rejected" | "failed" | "aborted" | "withdrawn" | "other";
         /** Overview */
         Overview: {
+            /** Ci Attention */
+            ci_attention?: components["schemas"]["AttentionFailure"][];
             /** Generated At */
             generated_at: string;
             health: components["schemas"]["Health"];
@@ -847,9 +877,8 @@ export interface components {
         };
         /** Pipeline */
         Pipeline: {
-            /** @description Batch in the release-branch lane, which runs alongside the master lane. */
-            campaign?: components["schemas"]["BatchSummary"] | null;
             primary?: components["schemas"]["BatchSummary"] | null;
+            release?: components["schemas"]["ReleaseLane"] | null;
             speculative?: components["schemas"]["BatchSummary"] | null;
         };
         /** PullRef */
@@ -951,6 +980,53 @@ export interface components {
             title: string;
             /** Url */
             url: string;
+        };
+        /**
+         * ReleaseLane
+         * @description Summary of the live stabilize campaign and its merges into the release branch.
+         */
+        ReleaseLane: {
+            /** Anchor Sha */
+            anchor_sha?: string | null;
+            /** @description Running batch merging fixes into the release branch. */
+            batch?: components["schemas"]["BatchSummary"] | null;
+            /** Campaign Id */
+            campaign_id: string;
+            /** Created At */
+            created_at?: string | null;
+            /** @description Latest CI run of the current stage at the tip. */
+            current_run?: components["schemas"]["CurrentRun"] | null;
+            /**
+             * Merged Batches
+             * @default 0
+             */
+            merged_batches: number;
+            /**
+             * Merged Prs
+             * @default 0
+             */
+            merged_prs: number;
+            /**
+             * Open Issues
+             * @default 0
+             */
+            open_issues: number;
+            /** Pause Reason */
+            pause_reason?: string | null;
+            /** Round */
+            round?: number | null;
+            /**
+             * Stage
+             * @enum {string}
+             */
+            stage: "push" | "hourly" | "nightly" | "complete";
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "starting" | "running" | "paused" | "completed" | "aborted";
+            /** Tip Sha */
+            tip_sha?: string | null;
         };
         /** Repair */
         Repair: {

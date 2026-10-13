@@ -278,12 +278,96 @@ def stats(conn, days=30):
         for date, value in days_data.items()])
 
 
+LIVE_CAMPAIGN = ('starting', 'running', 'paused')
+
+
+def release_lane(conn):
+    """The live stabilize campaign with its release-branch merges, or None."""
+    from mm_web import releases
+    try:
+        live = next((c for c in releases.list_campaigns(limit=5) if c.status in LIVE_CAMPAIGN), None)
+    except ApiError:
+        return None
+    if live is None:
+        return None
+    batch, merged_batches, merged_prs = None, 0, 0
+    if db.has_table(conn, 'automerge_batches') and master_lane(conn)[0] != '1':
+        running = automerge.active_campaign_batch(conn)
+        if running is not None and running['target_ref'] == live.branch:
+            batch = summary(dict(running))
+        merged_batches, merged_prs = conn.execute(
+            "SELECT count(*), coalesce(sum(json_array_length(coalesce(active_pull_requests_json,pull_requests_json))),0) "
+            "FROM automerge_batches WHERE target_ref=? AND terminal_status='merged'", (live.branch,)).fetchone()
+    run = live.latest_runs.get(live.stage) if live.stage != 'complete' else None
+    return m.ReleaseLane(campaign_id=live.id, status=live.status, stage=live.stage, round=live.round,
+        anchor_sha=live.anchor_sha, tip_sha=live.tip_sha, pause_reason=scrub(live.pause_reason),
+        created_at=live.created_at, open_issues=sum(issue.state == 'open' for issue in live.issues),
+        current_run=m.CurrentRun(conclusion=run.conclusion, url=run.url) if run else None,
+        batch=batch, merged_batches=merged_batches, merged_prs=merged_prs)
+
+
+ATTENTION_ORDER = {'escalated': 0, 'no_repair': 1, 'fix_unconfirmed': 2}
+FIXED_OUTCOMES = {'submitted', 'resolved'}
+HANDLED_OUTCOMES = {'infrastructure', 'claimed_elsewhere'}
+
+
+def ci_attention(conn):
+    """Open product failures no agent is working on.
+
+    Uses the fixer's own records, not the ledger's cached issue states, which can lag GitHub.
+    Infrastructure, active repairs and fixes still awaiting their next run are not attention items.
+    """
+    if not db.has_table(conn, 'known_failures'):
+        return []
+    current = now()
+    latest, active = {}, set()
+    if db.has_table(conn, 'issue_repairs'):
+        for row in conn.execute("SELECT issue_number, json_extract(report_json,'$.outcome') AS outcome "
+                                "FROM issue_repairs ORDER BY created_at"):
+            latest[row['issue_number']] = row['outcome']
+        active = {row[0] for row in conn.execute(f'SELECT issue_number FROM issue_repairs WHERE {REPAIR_ACTIVE}')}
+    groups = {}
+    for row in conn.execute("SELECT workflow, job_name, first_seen_at, last_seen_at, linked_pr_state, "
+                            "coalesce(triage_issue_url, linked_issue_url) AS issue_url FROM known_failures "
+                            "WHERE status='open' AND coalesce(triage_outcome,'') <> 'infrastructure'"):
+        issue_url = row['issue_url']
+        number = int(issue_url.rstrip('/').rsplit('/', 1)[-1]) if issue_url and issue_url.rstrip('/').rsplit('/', 1)[-1].isdigit() else None
+        outcome = latest.get(number)
+        if number in active or outcome in HANDLED_OUTCOMES:
+            continue
+        last_seen = parsed(row['last_seen_at']) if row['last_seen_at'] else None
+        if outcome == 'escalated':
+            reason = 'escalated'
+        elif outcome in FIXED_OUTCOMES or row['linked_pr_state'] == 'MERGED':
+            if last_seen is None or current - last_seen < timedelta(hours=48):
+                continue
+            reason = 'fix_unconfirmed'
+        else:
+            first_seen = parsed(row['first_seen_at']) if row['first_seen_at'] else None
+            if first_seen is not None and current - first_seen < timedelta(hours=2):
+                continue
+            reason = 'no_repair'
+        group = groups.setdefault((reason, number), {'issue_url': issue_url if number else None, 'failures': 0,
+                                                     'last_seen_at': None, 'jobs': []})
+        group['failures'] += 1
+        if row['last_seen_at'] and (group['last_seen_at'] is None or row['last_seen_at'] > group['last_seen_at']):
+            group['last_seen_at'] = row['last_seen_at']
+        job = f"{row['workflow']} · {row['job_name']}"
+        if job not in group['jobs']:
+            group['jobs'].append(job)
+    items = [m.AttentionFailure(reason=reason, issue_number=number, issue_url=group['issue_url'],
+                failures=group['failures'], last_seen_at=timestamp(group['last_seen_at']),
+                summary=scrub(group['jobs'][0] + (f" and {len(group['jobs']) - 1} more" if len(group['jobs']) > 1 else '')))
+             for (reason, number), group in groups.items()]
+    return sorted(items, key=lambda item: (ATTENTION_ORDER[item.reason], -(parsed(item.last_seen_at).timestamp()
+                                                                         if item.last_seen_at else 0)))
+
+
 def overview(conn):
     db.require(conn)
     has_batches = db.has_table(conn, 'automerge_batches')
     primary = automerge.active_batch(conn) if has_batches else None
     child = speculation.child(conn, primary['batch_id']) if primary is not None else None
-    campaign = automerge.active_campaign_batch(conn) if has_batches else None
     lane, lane_params = master_lane(conn)
     seven = datetime.combine(now().date() - timedelta(days=6), datetime.min.time(), timezone.utc).isoformat()
     tomorrow = datetime.combine(now().date() + timedelta(days=1), datetime.min.time(), timezone.utc).isoformat()
@@ -325,7 +409,7 @@ def overview(conn):
     return m.Overview(generated_at=now().isoformat(), health=health(conn),
         pipeline=m.Pipeline(primary=summary(dict(primary)) if primary is not None else None,
                             speculative=summary(dict(child)) if child is not None else None,
-                            campaign=summary(dict(campaign)) if campaign is not None else None),
+                            release=release_lane(conn)),
         queue=queue_counts,
         kpis=m.Kpis(landed_today=landed_today, landed_7_days=landed_seven,
             median_batch_minutes_7_days=median, open_ci_failures=failures,
@@ -334,4 +418,5 @@ def overview(conn):
         outbox=m.OutboxCounts(pending=pending, failing=failing),
         ledger=m.LedgerCounts(open=failures, product=product, infrastructure=infrastructure),
         triage=m.TriageSummary(active=investigations, recovering=triage_recovering),
-        repairs=m.RepairsSummary(active=active_repairs, recovering=repairs_recovering, concurrency_limit=concurrency))
+        repairs=m.RepairsSummary(active=active_repairs, recovering=repairs_recovering, concurrency_limit=concurrency),
+        ci_attention=ci_attention(conn))

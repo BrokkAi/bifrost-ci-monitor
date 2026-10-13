@@ -238,11 +238,42 @@ class Stats(BaseModel):
     days: list[DailyStats]
 
 
+class CurrentRun(BaseModel):
+    conclusion: str | None = None
+    url: str | None = None
+
+
+class ReleaseLane(BaseModel):
+    """Summary of the live stabilize campaign and its merges into the release branch."""
+    campaign_id: str
+    status: Literal['starting', 'running', 'paused', 'completed', 'aborted']
+    stage: Literal['push', 'hourly', 'nightly', 'complete']
+    round: int | None = None
+    anchor_sha: str | None = None
+    tip_sha: str | None = None
+    pause_reason: str | None = None
+    created_at: str | None = None
+    open_issues: int = 0
+    current_run: CurrentRun | None = Field(default=None, description="Latest CI run of the current stage at the tip.")
+    batch: BatchSummary | None = Field(default=None, description='Running batch merging fixes into the release branch.')
+    merged_batches: int = 0
+    merged_prs: int = 0
+
+
 class Pipeline(BaseModel):
     primary: BatchSummary | None = None
     speculative: BatchSummary | None = None
-    campaign: BatchSummary | None = Field(
-        default=None, description='Batch in the release-branch lane, which runs alongside the master lane.')
+    release: ReleaseLane | None = None
+
+
+class AttentionFailure(BaseModel):
+    """Open product CI failures that no agent is working on, grouped by issue."""
+    reason: Literal['escalated', 'fix_unconfirmed', 'no_repair']
+    issue_number: int | None = None
+    issue_url: str | None = None
+    failures: int
+    last_seen_at: str | None = None
+    summary: str
 
 
 class Kpis(BaseModel):
@@ -287,6 +318,7 @@ class Overview(BaseModel):
     ledger: LedgerCounts
     triage: TriageSummary
     repairs: RepairsSummary
+    ci_attention: list[AttentionFailure] = Field(default_factory=list)
 
 
 class SchemaColumn(BaseModel):

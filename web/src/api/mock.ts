@@ -8,6 +8,7 @@ import type {
   PullRef,
   Queue,
   Repair,
+  ReleaseLane,
   Resolution,
   Repairs,
   SqlResult,
@@ -471,6 +472,44 @@ export const campaigns: Campaign[] = [
     }),
   ),
 ];
+const preview = new URLSearchParams(
+  typeof window === "undefined" ? "" : window.location.search,
+);
+export const campaignBatch: BatchSummary = {
+  ...speculative,
+  batch_id: "batch-c71e0a",
+  role: "primary",
+  phase: "building",
+  target_ref: campaigns[0].branch,
+  predecessor_id: null,
+  integration_pr: null,
+};
+const releaseLane: ReleaseLane = {
+  campaign_id: campaigns[0].id,
+  status: preview.get("release") === "paused" ? "paused" : "running",
+  stage: "hourly",
+  round: 2,
+  anchor_sha: campaigns[0].anchor_sha,
+  tip_sha: campaigns[0].tip_sha,
+  pause_reason:
+    preview.get("release") === "paused"
+      ? "GitHub App lacks actions: write. Hourly CI cannot continue."
+      : null,
+  created_at: campaigns[0].created_at,
+  open_issues: 2,
+  current_run: {
+    conclusion: "failure",
+    url: "https://github.com/BrokkAi/bifrost-dev/actions/runs/89128244",
+  },
+  batch: campaignBatch,
+  merged_batches: 1,
+  merged_prs: 3,
+};
+// Keep release details consistent with the Overview preview.
+campaigns[0].status = releaseLane.status;
+campaigns[0].pause_reason = releaseLane.pause_reason;
+if (preview.get("release") === "none") campaigns.shift();
+
 const health: Endpoints["/health"] = {
   entry_points: (["merger", "monitor", "triage", "stabilize"] as const).map(
     (name, i) => ({
@@ -499,27 +538,51 @@ export const fixtures: Endpoints = {
     health,
     pipeline: {
       primary,
-      // `?campaign=1` previews a running release-branch batch.
-      campaign:
-        typeof window !== "undefined" &&
-        new URLSearchParams(window.location.search).get("campaign") === "1"
-          ? {
-              ...speculative,
-              batch_id: "batch-c71e0a",
-              role: "primary",
-              phase: "building",
-              target_ref: "stabilize/20261013-204031-a9e122e8",
-              predecessor_id: null,
-              integration_pr: null,
-            }
-          : null,
+      // The former `?campaign=1` preview remains supported by the default running lane.
+      release: preview.get("release") === "none" ? null : releaseLane,
       // `?speculative=none` previews the empty successor slot.
       speculative:
         typeof window !== "undefined" &&
-        new URLSearchParams(window.location.search).get("speculative") === "none"
+        new URLSearchParams(window.location.search).get("speculative") ===
+          "none"
           ? null
           : speculative,
     },
+    ci_attention: [
+      {
+        reason: "escalated",
+        issue_number: 4613,
+        issue_url: "https://github.com/BrokkAi/bifrost-dev/issues/4613",
+        failures: 2,
+        last_seen_at: date(180),
+        summary:
+          "Hourly CI · os matrix / rust (x86_64-pc-windows-msvc) and 1 more",
+      },
+      {
+        reason: "no_repair",
+        issue_number: 4806,
+        issue_url: "https://github.com/BrokkAi/bifrost-dev/issues/4806",
+        failures: 2,
+        last_seen_at: date(60),
+        summary: "Nightly CI · workspace / checkpoint recovery and 1 more",
+      },
+      {
+        reason: "no_repair",
+        issue_number: null,
+        issue_url: null,
+        failures: 2,
+        last_seen_at: date(90),
+        summary: "Push CI · agent / tool result ordering and 1 more",
+      },
+      {
+        reason: "fix_unconfirmed",
+        issue_number: 4805,
+        issue_url: "https://github.com/BrokkAi/bifrost-dev/issues/4805",
+        failures: 1,
+        last_seen_at: "2026-10-09T12:00:00Z",
+        summary: "Hourly CI · workspace / incremental indexing",
+      },
+    ],
     queue: {
       in_batch: 9,
       waiting: 13,
@@ -631,11 +694,14 @@ export const fixtures: Endpoints = {
       url: "https://github.com/BrokkAi/bifrost-dev/actions/runs/89127102",
       conclusion: "success",
     },
-    live_campaign_id: campaigns[0].id,
+    live_campaign_id:
+      campaigns.find((c) =>
+        ["starting", "running", "paused"].includes(c.status),
+      )?.id ?? null,
   },
 };
 export function mockBatch(id: string): BatchDetail {
-  const batch = [primary, speculative, ...recent].find(
+  const batch = [primary, speculative, campaignBatch, ...recent].find(
     (b) => b.batch_id === id,
   );
   if (!batch) throw new Error("Batch not found");
