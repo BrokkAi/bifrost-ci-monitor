@@ -117,7 +117,7 @@ with the snapshot. Every status has a fixed icon and label; chart colors are
 separate from status colors and were checked with the dataviz palette validator.
 
 `entrypoint_heartbeats` records started/finished/skipped for the `monitor`,
-`merger` and `triage` cron ticks through `monitor.record_heartbeat`, which is
+`merger`, `triage` and `stabilize` cron ticks through `monitor.record_heartbeat`, which is
 best-effort, never raises, stores only exception class names or exit codes, and
 is not written by operator commands such as `--check`.
 

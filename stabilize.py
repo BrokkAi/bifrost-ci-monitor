@@ -1123,13 +1123,15 @@ def main():
     else:
         with lock() as acquired:
             if not acquired:
+                monitor.record_heartbeat(None, 'stabilize', 'skipped')
                 monitor.log('Another stabilize command owns the lock; skipping')
                 return 0
-            conn = monitor.connect_db()
-            try:
-                once(conn)
-            finally:
-                conn.close()
+            with monitor.heartbeat_tick('stabilize'):
+                conn = monitor.connect_db()
+                try:
+                    once(conn)
+                finally:
+                    conn.close()
 
     return 0
 
