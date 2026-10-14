@@ -89,6 +89,17 @@ summary:focus-visible {
   outline: 2px solid var(--series-1);
   outline-offset: 3px;
 }
+#main-content {
+  -webkit-user-select: text;
+  user-select: text;
+}
+/* Content links and copyable identifiers should select instead of dragging. */
+#main-content a,
+#main-content .sha {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-user-drag: none;
+}
 .app-shell {
   display: flex;
   min-height: 100vh;

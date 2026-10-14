@@ -287,7 +287,7 @@ function AttentionSummary({ item }: { item: AttentionFailure }) {
         {item.issue_number != null
           ? `Issue #${item.issue_number}`
           : "CI failures"}{" "}
-        escalated to a person: {checks}
+        escalated: {checks}
         {item.last_seen_at && (
           <>
             , last seen <RelativeTime value={item.last_seen_at} />
@@ -296,19 +296,17 @@ function AttentionSummary({ item }: { item: AttentionFailure }) {
       </>
     );
   if (item.reason === "fix_unconfirmed") {
-    const since = item.last_seen_at
-      ? new Date(item.last_seen_at).toLocaleDateString("en", {
-          month: "short",
-          day: "numeric",
-        })
-      : null;
     return (
       <>
         {item.issue_number != null
-          ? `Issue #${item.issue_number} is closed, but its`
-          : "A closed issue's"}{" "}
-        {item.failures === 1 ? "failing check has" : "failing checks have"} not
-        passed{since ? ` since ${since}` : " since it was closed"}
+          ? `Issue #${item.issue_number}`
+          : "A reported fix"}{" "}
+        awaits CI confirmation: {plural(item.failures, "check")}
+        {item.last_seen_at && (
+          <>
+            , last failure <RelativeTime value={item.last_seen_at} />
+          </>
+        )}
       </>
     );
   }
@@ -394,6 +392,7 @@ export function OverviewPage() {
                   target="_blank"
                   rel="noreferrer"
                   className="attention-item"
+                  draggable={false}
                 >
                   {content}
                 </a>

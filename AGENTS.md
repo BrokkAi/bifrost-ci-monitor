@@ -121,6 +121,16 @@ separate from status colors and were checked with the dataviz palette validator.
 best-effort, never raises, stores only exception class names or exit codes, and
 is not written by operator commands such as `--check`.
 
+Overview Needs attention is a read-only projection of the shared ledger, latest
+fixer outcomes and active repairs, plus failed outbox deliveries, cron heartbeat
+health, recovering sessions and blocked PR dependencies. Its two-hour unhandled
+failure and 48-hour unconfirmed-fix filters are display heuristics, not proof of
+issue closure or recurrence. Missing CI confirmation never authorizes reopening
+a ticket; triage verifies a new failure's cause before reusing/reopening it.
+For completed master runs, explicit passing steps also retire matching ledger
+failures when their job was later cancelled. Missing/interrupted test output
+does not prove recovery. Campaign qualification retains its complete-job boundary.
+
 This repository's direct-master workflow does not authorize the supervised
 agents to push `bifrost-dev/master`. Those agents publish PRs; only the
 supervisor lands their tested heads through GitHub.

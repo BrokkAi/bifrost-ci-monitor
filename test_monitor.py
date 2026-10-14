@@ -2214,6 +2214,42 @@ class KnownFailureLedgerTests(unittest.TestCase):
         row = self.conn.execute("SELECT status FROM known_failures WHERE identity='pytest:test_old'").fetchone()
         self.assertEqual(row['status'], 'fixed')
 
+    def test_cancelled_job_retains_passed_step_without_clearing_interrupted_tests(self):
+        import automerge
+
+        key = 'Nightly CI/os matrix / rust (aarch64-pc-windows-msvc)'
+        for run_id, steps, tests in [(101, {'Cargo clippy'}, set()),
+                                    (102, {'Run tests'}, {'pytest:test_old'})]:
+            report = automerge.FailureReport(frozenset({key}), {
+                key: automerge.FailedJobDetails(frozenset(steps), frozenset(tests))
+            }, 'failure')
+            monitor._process_known_failure_run(self.conn, 'Nightly CI',
+                                              self.run_item(run_id, 'a' * 40), report=report)
+        jobs = {'workflowName': 'Nightly CI', 'jobs': [{
+            'name': 'os matrix / rust (aarch64-pc-windows-msvc)',
+            'databaseId': 123, 'status': 'completed', 'conclusion': 'cancelled',
+            'steps': [{'name': 'Cargo clippy', 'conclusion': 'success', 'status': 'completed'},
+                      {'name': 'Run tests', 'conclusion': 'cancelled', 'status': 'completed'}],
+        }]}
+        with (mock.patch.object(automerge, 'gh_json', return_value=jobs),
+              mock.patch.object(automerge, 'run_gh') as logs):
+            monitor._process_known_failure_run(self.conn, 'Nightly CI',
+                                              self.run_item(103, 'b' * 40))
+        logs.assert_not_called()
+        rows = {r['identity']: r for r in self.conn.execute('SELECT * FROM known_failures')}
+        self.assertEqual(rows['Cargo clippy']['status'], 'fixed')
+        self.assertEqual(rows['Cargo clippy']['fixed_by_sha'], 'b' * 40)
+        self.assertEqual(rows['pytest:test_old']['status'], 'open')
+        self.assertEqual(rows['pytest:test_old']['last_seen_run_id'], 102)
+        # A real recurrence reopens the ledger; missing confirmation alone does not.
+        recurrence = automerge.FailureReport(frozenset({key}), {
+            key: automerge.FailedJobDetails(frozenset({'Cargo clippy'}))
+        }, 'new failure')
+        monitor._process_known_failure_run(self.conn, 'Nightly CI',
+                                          self.run_item(104, 'c' * 40), report=recurrence)
+        self.assertEqual(self.conn.execute("SELECT status,last_seen_run_id FROM known_failures "
+                                          "WHERE identity='Cargo clippy'").fetchone()[:], ('open', 104))
+
     def test_infrastructure_classification_is_scoped_to_the_observation(self):
         import automerge
 

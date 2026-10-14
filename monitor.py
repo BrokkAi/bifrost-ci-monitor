@@ -1004,6 +1004,17 @@ def _process_known_failure_run(
                 if normalize_ci_job_name(key.split("/", 1)[-1]).casefold()
                 != "pr verification"
             }
+            if campaign_id is None:
+                # A job cancelled after Clippy (or another step) passed still
+                # proves recovery for that step. The parser retains these
+                # passes even though the job is neither failed nor successful.
+                # Campaign qualification retains its complete-job boundary.
+                seen_jobs.update(
+                    normalize_ci_job_name(key.split("/", 1)[-1])
+                    for key, steps in report.successful_steps.items() if steps
+                    and normalize_ci_job_name(key.split("/", 1)[-1]).casefold()
+                    != "pr verification"
+                )
             successful_jobs = {
                 normalize_ci_job_name(key.split("/", 1)[-1])
                 for key in report.successful_jobs
