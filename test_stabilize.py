@@ -707,6 +707,15 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(len(second_comments), 1)
         self.assertNotEqual(first_comments[0][-1], second_comments[0][-1])
 
+    def test_github_refusal_keeps_status_and_message_without_url(self):
+        live = monitor.CommandError(
+            'gh workflow run hourly.yml exited 1: could not create workflow dispatch event: HTTP 403: '
+            'Resource not accessible by integration '
+            '(https://api.github.com/repos/BrokkAi/bifrost-dev/actions/workflows/337188008/dispatches)')
+        self.assertEqual(engine.github_refusal(live), 'HTTP 403: Resource not accessible by integration')
+        self.assertEqual(engine.github_refusal(monitor.CommandError('insufficient permission')),
+                         'GitHub refused the request')
+
     def test_dispatch_permission_denial_pauses_once_and_explicit_resume_retries(self):
         c = self.campaign()
         dispatches = []
@@ -724,7 +733,9 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(len(dispatches), 1)
             paused = engine.get(c.id)
             self.assertEqual(paused['status'], 'paused')
-            self.assertIn('GitHub App lacks actions: write', paused['pause_reason'])
+            self.assertIn('push workflow_dispatch refused (attempt 1): HTTP 403: Resource not accessible by integration.',
+                          paused['pause_reason'])
+            self.assertIn('token_permissions', paused['pause_reason'])
             self.assertIn(f'resume {c.id}', paused['pause_reason'])
             notices = self.conn.execute("SELECT * FROM stabilize_messages WHERE checkpoint LIKE 'paused:%'").fetchall()
             self.assertEqual(len(notices), 1)

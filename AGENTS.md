@@ -1008,7 +1008,8 @@ an ambiguous dispatch; an undiscovered one pauses after the ten-minute grace.
 Cancelled runs, and runs classified as infrastructure or incomplete, are the
 only redispatches (infrastructure at most twice per tip). Eight rounds in one
 stage, or blockers that are only escalated issues, pause the campaign. A
-refused dispatch (HTTP 403; the App needs `actions: write`) pauses once and is
+refused dispatch (HTTP 403; the installation and the host mj `token_permissions`
+both need `actions: write`) pauses once with GitHub's status and message, and is
 retried only after `resume`, which never replays an ambiguous dispatch.
 
 Branch runs use the master ledger's parser and proof rules but write only
