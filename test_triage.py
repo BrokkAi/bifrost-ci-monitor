@@ -845,6 +845,36 @@ class TriageTests(TestCase):
             with self.subTest(outcome=outcome), self.assertRaises(ValueError):
                 triage.parse_report('triage-result: ' + json.dumps(invalid), observations)
 
+    def test_omitted_issue_target_is_corrected_before_creating_a_duplicate(self):
+        self.add_failure()
+        report = self.make_job()
+        del report['findings'][0]['issue']['existing_number']
+        self.github.issues[77] = dict(number=77, title='Existing cause', body='Tracked evidence',
+                                     state='open', labels=[{'name': 'buildfailure'}])
+        with self.conn:
+            self.conn.execute('UPDATE triage_jobs SET report_json=?', (json.dumps(report),))
+            self.conn.execute('UPDATE known_failures SET triage_issue_url=?',
+                              (f'https://github.com/{monitor.REPO_NAME}/issues/77',))
+        prompt = self.patch(monitor, 'send_session_message')
+        triage.publish(self.conn, self.job())
+        self.reopen()
+        triage.publish(self.conn, self.job())
+        prompt.assert_called_once()
+        self.assertIn('existing_number', prompt.call_args.args[1])
+        self.assertEqual(self.job()['status'], 'running')
+        self.assertEqual(self.github.calls, [])
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM triage_observations').fetchone()[0], 0)
+        # The same investigation can deliberately reuse the existing ticket.
+        report['findings'][0]['issue']['existing_number'] = 77
+        with self.conn:
+            self.conn.execute("UPDATE triage_jobs SET status='publishing',report_json=?",
+                              (json.dumps(report),))
+        triage.publish(self.conn, self.job())
+        self.assertEqual(set(self.github.issues), {77})
+        self.assertFalse(any(method == 'POST' and endpoint == 'issues'
+                             for method, endpoint, _ in self.github.calls))
+        self.assertEqual(self.conn.execute('SELECT issue_number FROM triage_publications').fetchone()[0], 77)
+
     def test_schema_migrates_existing_ledger_additively(self):
         self.add_failure()
         self.conn.execute("ALTER TABLE known_failures DROP COLUMN triage_issue_url")

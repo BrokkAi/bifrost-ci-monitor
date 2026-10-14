@@ -306,7 +306,9 @@ def parse_report(text: str, observations: list[dict]) -> dict:
             for name, limit in (("title", 240), ("body", 40000)):
                 if not isinstance(issue.get(name), str) or not 1 <= len(issue[name].strip()) <= limit:
                     raise ValueError(f"issue {name} must be nonempty and at most {limit} characters")
-            number = issue.get("existing_number")
+            if "existing_number" not in issue:
+                raise ValueError("issue needs existing_number: an existing issue number or explicit null for a new issue")
+            number = issue["existing_number"]
             if number is not None and (type(number) is not int or number <= 0):
                 raise ValueError("existing_number must be a positive integer or null")
     if seen != expected:

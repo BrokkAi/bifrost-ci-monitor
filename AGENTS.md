@@ -981,7 +981,12 @@ occupying the investigation slot or allowing duplicate investigation of its
 captured fingerprints. Accepted findings are checkpointed independently so a
 later finding's failed write does not republish earlier Slack messages. Failed
 Slack sends retry the cached text; an accepted send whose reply is lost can still
-produce a duplicate notice. Old in-flight reports lacking outcome must classify
+produce a duplicate notice. Product issue drafts must explicitly include
+`existing_number`: a positive issue number for reuse or null for a new issue.
+Omission is ambiguous and requests a same-session correction before any issue
+write, including for cached reports awaiting publication. Existing issue links
+remain investigation metadata; they do not prove that different failures share
+a cause. Old in-flight reports lacking outcome must classify
 their existing findings in a correction turn before any issue write, using their
 captured evidence rather than repeating investigation.
 Skip findings fixed/superseded during investigation. A resolved finding can
