@@ -949,6 +949,44 @@ class DependencyTests(TestCase):
         self.assertNotIn(20, graph.problems)
         self.assertNotIn(4788, {dep.number for dep in graph.dependencies[4785]})
 
+    def test_shared_supersession_is_verified_once_per_discovery_and_refreshed_next_time(self):
+        record = self.reviewed_pair()
+        for number in range(60, 72):
+            self.add_pr(number, f'dependent-{number}', record.replacement_head,
+                        base='replacement')
+        with (mock.patch.object(pr_dependencies, 'REVIEWED_SUPERSESSIONS', (record,)),
+              mock.patch.object(automerge, 'list_pull_comments',
+                                side_effect=lambda number: self.comments.get(number, [])) as reads):
+            graph = automerge.dependency_graph(self.conn)
+            self.assertTrue(all(graph.eligible(number) for number in range(60, 72)))
+            self.assertEqual(reads.call_args_list,
+                             [mock.call(record.retired_number), mock.call(record.replacement_number)])
+
+            # A subsequent discovery must see newly posted authenticated
+            # rejection evidence, even though every Git head is unchanged.
+            self.comments[record.retired_number] = [{
+                'user': {'login': automerge.TRUSTED_REJECTION_LOGIN},
+                'body': f'mergemarshall:rejected-head: {record.retired_head}\nnew rejection',
+            }]
+            reads.reset_mock()
+            graph = automerge.dependency_graph(self.conn)
+            self.assertTrue(all(not graph.eligible(number) for number in range(60, 72)))
+            self.assertTrue(graph.eligible(40))
+            reads.assert_called_once_with(record.retired_number)
+
+    def test_failed_supersession_read_defers_and_is_retried_by_next_discovery(self):
+        record = self.reviewed_pair()
+        with (mock.patch.object(pr_dependencies, 'REVIEWED_SUPERSESSIONS', (record,)),
+              mock.patch.object(automerge, 'list_pull_comments',
+                                side_effect=git_ancestry.Deferred('comments unavailable'))):
+            with self.assertRaisesRegex(git_ancestry.Deferred, 'comments unavailable'):
+                automerge.dependency_graph(self.conn)
+        with (mock.patch.object(pr_dependencies, 'REVIEWED_SUPERSESSIONS', (record,)),
+              mock.patch.object(automerge, 'list_pull_comments', return_value=[]) as reads):
+            graph = automerge.dependency_graph(self.conn)
+            self.assertTrue(graph.eligible(20))
+            self.assertEqual(reads.call_count, 2)
+
     def test_reviewed_supersession_keeps_captured_external_closure(self):
         record = self.reviewed_pair()
         graph = self.reviewed_graph(record)
@@ -1193,10 +1231,15 @@ class DependencyTests(TestCase):
             self.conn.execute('UPDATE automerge_batches SET candidate_json=? WHERE batch_id=?',
                               (json.dumps(checkpoint), identifier))
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (identifier,)).fetchone()
-        with mock.patch.object(pr_dependencies, 'REVIEWED_SUPERSESSIONS', (record,)):
+        with (mock.patch.object(pr_dependencies, 'REVIEWED_SUPERSESSIONS', (record,)),
+              mock.patch.object(automerge, 'list_pull_comments', return_value=[]) as reads):
             selected = speculation.selection(automerge, self.conn, row)
         self.assertEqual([p.number for p in selected], [record.replacement_number, 20])
         self.assertTrue(all(p.target_ref == 'master' for p in selected))
+        # The speculative view derives from this same discovery and shares
+        # its authenticated proof without another pair of comment requests.
+        self.assertEqual(reads.call_args_list,
+                         [mock.call(record.retired_number), mock.call(record.replacement_number)])
 
     def test_exclusion_cascades_without_rejecting_descendants(self):
         batch = automerge.create_batch(self.conn, self.selected(), self.base, batch_id='test-batch')

@@ -209,6 +209,11 @@ External prerequisites, ordinary cycles, rejected ancestors and normal review,
 tests and final exact-head landing gates remain authoritative. A changed
 replacement head needs a new reviewed source record. Once the retired head is
 actually in master, ordinary landed ancestry applies without supersession.
+Within one dependency discovery, authenticate each exact reviewed source record
+once and share the completed rejection proof across its descendant edges. The
+cache is local to that discovery; the next discovery rereads mutable metadata
+and comments. Failed/unavailable reads never populate it, and final landing
+checks retain their own fresh discovery.
 
 Each production comparison is committed immediately, including negative results
 and pinned speculative views; exceptions and incomplete fetches are never facts.

@@ -1054,12 +1054,23 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
             discover_bases(pending)
             targets, gates, available, exclusions = _graph_targets(
                 conn, nodes, actual_base, selection_target=target_scope)
+    verified_supersessions = {}
+
+    def verify_supersession(record, retired, replacement):
+        # Descendants share the same fresh PR metadata and rejection proof.
+        # Authenticate each exact record once in this discovery, rather than
+        # rereading its comments for every inherited edge. A later discovery
+        # starts empty; failed/unavailable reads never enter this cache.
+        if record not in verified_supersessions:
+            verified_supersessions[record] = _verify_supersession_rejections(
+                conn, retired, replacement, compare)
+        return verified_supersessions[record]
+
     graph = pr_dependencies.Graph(nodes, histories, actual_base, compare,
                                   conn=conn, base_branch=BASE_BRANCH, targets=targets, gates=gates,
                                   available_targets=available,
                                   supersessions=supersessions,
-                                  verify_supersession=lambda record, retired, replacement:
-                                      _verify_supersession_rejections(conn, retired, replacement, compare),
+                                  verify_supersession=verify_supersession,
                                   persist_comparisons=(not dry_run if persist_comparisons is None
                                                        else persist_comparisons)).discover(roots)
     graph.exclusions = exclusions
