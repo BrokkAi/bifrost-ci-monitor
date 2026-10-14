@@ -649,6 +649,18 @@ class ReadRegressionTests(unittest.TestCase):
         self.write("UPDATE automerge_batches SET terminal_status='aborted' WHERE batch_id IN ('primary','speculative')")
         self.assertEqual(data.stats(self.conn, days=1).days[0].batches_failed, 0)
 
+    def test_campaign_projects_stage_threads_without_raw_slack_ids(self):
+        value = {'id': 'c1', 'branch': 'stabilize/c1', 'anchor_sha': SHA, 'status': 'running', 'stage': 'hourly',
+                 'stage_threads': [
+                     {'stage': 'push', 'thread_ts': '1.1', 'slack_thread_url': 'https://app.slack.com/archives/C/p11',
+                      'root_text': 'private'},
+                     {'stage': 'hourly', 'thread_ts': None, 'slack_thread_url': None}]}
+        result = releases.campaign(value)
+        self.assertEqual([t.model_dump() for t in result.stage_threads],
+                         [{'stage': 'push', 'slack_thread_url': 'https://app.slack.com/archives/C/p11'},
+                          {'stage': 'hourly', 'slack_thread_url': None}])
+        self.assertEqual(releases.campaign({k: v for k, v in value.items() if k != 'stage_threads'}).stage_threads, [])
+
     def test_release_lane_summarizes_campaign_and_master_kpis_exclude_it(self):
         live = models.Campaign(id='c1', branch='stabilize/test', anchor_sha=SHA, status='running', stage='hourly',
                                round=2, issues=[{'number': 1, 'stage': 'hourly', 'source': 'ledger', 'state': 'open'},

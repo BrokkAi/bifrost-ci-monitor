@@ -70,6 +70,7 @@ def campaign(value):
                     'created_at updated_at finished_at pause_reason start_error branch_url slack_thread_url')
     result['issues'] = [fields(p, 'number stage source state pr_number') for p in value.get('issues', [])]
     result['gate_merges'] = [fields(p, 'stage tip_sha gate_branch pr_number state') for p in value.get('gate_merges', [])]
+    result['stage_threads'] = [fields(p, 'stage slack_thread_url') for p in value.get('stage_threads', [])]
     runs = value.get('latest_runs', {})
     result['latest_runs'] = {stage: fields(runs[stage], 'sha url conclusion') for stage in ['push', 'hourly', 'nightly']
                              if isinstance(runs, dict) and stage in runs}

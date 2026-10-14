@@ -384,6 +384,12 @@ class GateMerge(BaseModel):
     state: str | None = None
 
 
+class StageThread(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+    stage: Literal['push', 'hourly', 'nightly', 'complete']
+    slack_thread_url: str | None = Field(default=None, description='Null until Slack accepts the stage thread.')
+
+
 class CampaignRun(BaseModel):
     sha: str
     url: str | None = None
@@ -409,6 +415,8 @@ class Campaign(BaseModel):
     start_error: str | None = None
     issues: list[CampaignIssue] = Field(default_factory=list)
     gate_merges: list[GateMerge] = Field(default_factory=list)
+    stage_threads: list[StageThread] = Field(default_factory=list,
+        description='Each stage starts its own Slack thread; slack_thread_url points at the newest.')
     latest_runs: dict[Literal['push', 'hourly', 'nightly'], CampaignRun | None] = Field(default_factory=dict)
     branch_url: str | None = None
     slack_thread_url: str | None = None

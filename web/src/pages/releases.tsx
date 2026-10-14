@@ -177,6 +177,12 @@ function LiveCampaign({
   const actionPending = abort.isPending || resume.isPending;
   const retrySeconds = Math.max(abortSeconds, resumeSeconds);
   const currentIndex = stages.findIndex((s) => s.key === campaign.stage);
+  // Each stage has its own Slack thread; only accepted threads have a URL.
+  const stageThreads = new Map<string, string>(
+    (campaign.stage_threads ?? [])
+      .filter((t) => t.slack_thread_url)
+      .map((t) => [t.stage, t.slack_thread_url as string]),
+  );
   return (
     <Card>
       <CardHeader>
@@ -258,6 +264,13 @@ function LiveCampaign({
                     "Not started"
                   )}
                 </div>
+                {stageThreads.get(s.key) && (
+                  <div className="mt-1 font-normal text-[9px]">
+                    <ExternalLink href={stageThreads.get(s.key)}>
+                      Slack thread
+                    </ExternalLink>
+                  </div>
+                )}
               </div>
             );
           })}

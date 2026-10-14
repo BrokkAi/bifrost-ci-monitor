@@ -408,6 +408,10 @@ export const campaigns: Campaign[] = [
     branch_url:
       "https://github.com/BrokkAi/bifrost-dev/tree/stabilize/stable-20261012",
     slack_thread_url: "https://slack.com/app_redirect?channel=ci",
+    stage_threads: [
+      { stage: "push", slack_thread_url: "https://slack.com/app_redirect?channel=ci&push" },
+      { stage: "hourly", slack_thread_url: "https://slack.com/app_redirect?channel=ci" },
+    ],
     issues: [
       {
         number: 4690,

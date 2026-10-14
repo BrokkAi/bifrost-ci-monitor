@@ -547,6 +547,11 @@ export interface components {
              * @enum {string}
              */
             stage: "push" | "hourly" | "nightly" | "complete";
+            /**
+             * Stage Threads
+             * @description Each stage starts its own Slack thread; slack_thread_url points at the newest.
+             */
+            stage_threads?: components["schemas"]["StageThread"][];
             /** Start Error */
             start_error?: string | null;
             /**
@@ -1145,6 +1150,19 @@ export interface components {
             rows: unknown[][];
             /** Truncated */
             truncated: boolean;
+        };
+        /** StageThread */
+        StageThread: {
+            /**
+             * Slack Thread Url
+             * @description Null until Slack accepts the stage thread.
+             */
+            slack_thread_url?: string | null;
+            /**
+             * Stage
+             * @enum {string}
+             */
+            stage: "push" | "hourly" | "nightly" | "complete";
         };
         /** Stats */
         Stats: {

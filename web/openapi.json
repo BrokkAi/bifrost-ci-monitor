@@ -618,6 +618,14 @@
             "title": "Stage",
             "type": "string"
           },
+          "stage_threads": {
+            "description": "Each stage starts its own Slack thread; slack_thread_url points at the newest.",
+            "items": {
+              "$ref": "#/components/schemas/StageThread"
+            },
+            "title": "Stage Threads",
+            "type": "array"
+          },
           "start_error": {
             "anyOf": [
               {
@@ -2475,6 +2483,37 @@
           "truncated"
         ],
         "title": "SqlResult",
+        "type": "object"
+      },
+      "StageThread": {
+        "properties": {
+          "slack_thread_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null until Slack accepts the stage thread.",
+            "title": "Slack Thread Url"
+          },
+          "stage": {
+            "enum": [
+              "push",
+              "hourly",
+              "nightly",
+              "complete"
+            ],
+            "title": "Stage",
+            "type": "string"
+          }
+        },
+        "required": [
+          "stage"
+        ],
+        "title": "StageThread",
         "type": "object"
       },
       "Stats": {
