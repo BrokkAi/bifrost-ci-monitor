@@ -1039,7 +1039,7 @@ unavailable ancestry defers. Seeds keep their master provenance.
 
 Issue states are `open`, `pr_ready`, `landed`, `escalated`, `closed` and
 `dropped`. A PR whose current head has a trusted or recorded exact-head
-rejection keeps its issue `open`. An `open` campaign issue assigned to anyone
+rejection keeps its issue `open`. An `open` or `escalated` campaign issue assigned to anyone
 other than the fixer account (`issue_fixer.ASSIGNEE`; `mergemarshall[bot]` is
 ignored) gets one durable comment per campaign, issue and assignee set, asking
 for a PR against the campaign branch with `Fixes #N` and `CI-Repair-Issue: N`,

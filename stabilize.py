@@ -144,8 +144,9 @@ def assignee_guidance(conn, campaign_id):
     c = campaign(conn, campaign_id)
     if not c.live:
         return
-    for row in conn.execute("SELECT issue_number FROM stabilize_issues WHERE campaign_id=? AND state='open'",
-                            (c.id,)).fetchall():
+    # Escalated issues still need a human fix on the campaign branch, not on master.
+    for row in conn.execute("SELECT issue_number,state FROM stabilize_issues WHERE campaign_id=? "
+                            "AND state IN ('open','escalated')", (c.id,)).fetchall():
         number = row['issue_number']
         try:
             issue = gh(['issue', 'view', str(number), '--repo', monitor.REPO_NAME,
@@ -162,8 +163,11 @@ def assignee_guidance(conn, campaign_id):
         comment = (f"{mentions}: this issue is part of stabilize campaign `{c.branch}`. "
                    f"Please open your fix as a PR against `{c.branch}` (rather than master), "
                    f"with `Fixes #{number}` and `CI-Repair-Issue: {number}` in the PR body "
-                   "so the campaign can land it. If you are not working on it, you can "
-                   "unassign yourself and MergeMarshall's fixer will take it.")
+                   "so the campaign can land it. "
+                   + ("MergeMarshall's fixer escalated this issue, so the campaign needs your fix."
+                      if row['state'] == 'escalated' else
+                      "If you are not working on it, you can unassign yourself and "
+                      "MergeMarshall's fixer will take it."))
         queue_write(conn, c.id, checkpoint, 'assignee-guidance',
                     {'number': number, 'assignees': owners, 'comment': comment})
 
@@ -255,7 +259,7 @@ def deliver_writes(conn, *, campaign_id=None):
                                       (c.id, number)).fetchone()
                 issue = gh(['issue', 'view', str(number), '--repo', monitor.REPO_NAME,
                             '--json', 'state,assignees'])
-                if (not c.live or not member or member['state'] != 'open' or
+                if (not c.live or not member or member['state'] not in ('open', 'escalated') or
                         issue.get('state') != 'OPEN' or not payload['assignees'] or
                         human_assignees(issue) != payload['assignees']):
                     cancel_write(conn, row, 'Campaign, issue state or assignees changed')

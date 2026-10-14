@@ -150,13 +150,28 @@ class CampaignTests(unittest.TestCase):
         self.assertIsNotNone(self.guidance_writes()[0]['cancelled_at'])
         self.assertFalse(any('/comments' in str(call.args[0]) for call in self.gh.call_args_list))
 
+    def test_assignee_guidance_asks_escalation_owner_for_campaign_branch_pr(self):
+        c = self.campaign()
+        self.issue(c, status='escalated')
+        self.issue_reads(assignees=['DavidBakerEffendi'])
+        engine.assignee_guidance(self.conn, c.id)
+        rows = self.guidance_writes()
+        self.assertEqual(len(rows), 1)
+        comment = json.loads(rows[0]['payload'])['comment']
+        for text in ('@davidbakereffendi', '`stabilize/test`', 'Fixes #7', 'CI-Repair-Issue: 7', 'escalated this issue'):
+            self.assertIn(text, comment)
+        self.assertNotIn('unassign yourself', comment)
+        engine.deliver_writes(self.conn)
+        self.assertIsNone(self.guidance_writes()[0]['cancelled_at'])
+        self.assertTrue(any('/comments' in str(call.args[0]) for call in self.gh.call_args_list))
+
     def test_assignee_guidance_requires_live_open_member_and_github_issue(self):
         c = self.campaign()
         self.issue(c)
         self.issue_reads(assignees=['David'], status='CLOSED')
         engine.assignee_guidance(self.conn, c.id)
         self.issue_reads(assignees=['David'])
-        for status in ('pr_ready', 'landed', 'escalated', 'closed', 'dropped'):
+        for status in ('pr_ready', 'landed', 'closed', 'dropped'):
             with self.conn:
                 self.conn.execute('UPDATE stabilize_issues SET state=?', (status,))
             engine.assignee_guidance(self.conn, c.id)
