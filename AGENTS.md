@@ -990,7 +990,15 @@ produce a duplicate notice. Product issue drafts must explicitly include
 Omission is ambiguous and requests a same-session correction before any issue
 write, including for cached reports awaiting publication. Existing issue links
 remain investigation metadata; they do not prove that different failures share
-a cause. Old in-flight reports lacking outcome must classify
+a cause. Reopening a closed issue also requires `issue.verified_head` and
+diagnosis/evidence establishing that the cause remains at that current master
+or affected stabilize Git head. Fresh Git-protocol reads verify the head before
+commenting or reopening; missing/stale verification requests correction in the
+same investigation without consuming observations. Unavailable Git reads defer
+publication. Closure metadata alone never proves recovery, and historical
+baseline failures alone never justify reopening a repaired issue. Reconcile
+current source/CI facts and reuse existing evidence without repeating builds.
+Old in-flight reports lacking outcome must classify
 their existing findings in a correction turn before any issue write, using their
 captured evidence rather than repeating investigation.
 Skip findings fixed/superseded during investigation. A resolved finding can

@@ -83,6 +83,7 @@ class TriageTests(TestCase):
         triage.ensure_schema(self.conn)
         self.github = FakeGitHub()
         self.patch(triage, "gh_api", side_effect=self.github)
+        self.git_head = self.patch(triage.git_ancestry, 'remote_head', return_value='a' * 40)
 
     def patch(self, obj, name, *args, **kwargs):
         patcher = mock.patch.object(obj, name, *args, **kwargs)
@@ -162,7 +163,14 @@ class TriageTests(TestCase):
             issue['state'] = 'closed'
         self.add_branch_failure()
         self.make_job(existing=101, job_id='branch')
+        if closed:
+            report = json.loads(self.job('branch')['report_json'])
+            report['findings'][0]['issue']['verified_head'] = 'a' * 40
+            with self.conn:
+                self.conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=?', (json.dumps(report), 'branch'))
         triage.publish(self.conn, self.job('branch'))
+        if closed:
+            self.git_head.assert_called_once_with(monitor.REPO_NAME, 'stabilize/campaign', monitor.github_app_token)
         self.assertEqual(set(self.github.issues), {101})
         self.assertEqual(issue['state'], 'open')
         self.assertIn({'name': stabilize_state.LABEL}, issue['labels'])
@@ -180,6 +188,90 @@ class TriageTests(TestCase):
 
     def test_branch_cause_reopens_closed_master_issue(self):
         self.reuse_master_issue(closed=True)
+
+    def test_old_local_baseline_cannot_reopen_closed_issue_and_can_resolve_after_correction(self):
+        finding = self.add_local_finding()
+        self.make_job(existing=77)
+        self.github.issues[77] = dict(number=77, title='Fixed lint', body='Original body', state='closed', labels=[])
+        send = self.patch(monitor, 'send_session_message')
+        triage.publish(self.conn, self.job())
+        self.reopen()
+        triage.publish(self.conn, self.job())
+        send.assert_called_once()
+        self.assertIn('issue.verified_head', send.call_args.args[1])
+        self.assertEqual(self.job()['status'], 'running')
+        self.assertEqual(self.github.issues[77]['state'], 'closed')
+        self.assertFalse(any(method != 'GET' for method, _, _ in self.github.calls))
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM triage_observations').fetchone()[0], 0)
+        self.assertEqual(local_findings.observations(self.conn)[0]['local_finding_id'], finding['id'])
+        report = json.loads(self.job()['report_json'])
+        report['findings'][0].update(outcome='resolved', issue=None,
+                                    diagnosis='Landed fix removed the lint at current master',
+                                    evidence='Current source uses find; later exact-tree clippy passed')
+        with self.conn:
+            self.conn.execute("UPDATE triage_jobs SET status='publishing',report_json=? WHERE id='job'", (json.dumps(report),))
+        triage.publish(self.conn, self.job())
+        self.assertEqual(self.job()['status'], 'completed')
+        self.assertEqual(local_findings.observations(self.conn), [])
+        self.assertEqual(self.github.issues[77]['state'], 'closed')
+
+    def test_stale_reopening_head_requires_current_evidence_before_any_write(self):
+        self.add_failure()
+        report = self.make_job(existing=77)
+        report['findings'][0]['issue']['verified_head'] = 'a' * 40
+        self.github.issues[77] = dict(number=77, title='Recurring defect', body='Original body', state='closed', labels=[])
+        self.git_head.return_value = 'b' * 40
+        send = self.patch(monitor, 'send_session_message')
+        with self.conn:
+            self.conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=\'job\'', (json.dumps(report),))
+        triage.publish(self.conn, self.job())
+        self.reopen()
+        triage.publish(self.conn, self.job())
+        send.assert_called_once()
+        self.assertFalse(any(method != 'GET' for method, _, _ in self.github.calls))
+        report = json.loads(self.job()['report_json'])
+        self.assertNotIn('issue_body', report['findings'][0])
+        report['findings'][0]['issue']['verified_head'] = 'b' * 40
+        report['findings'][0]['evidence'] = 'The same cause remains in current bbbbbbbb source and CI'
+        with self.conn:
+            self.conn.execute("UPDATE triage_jobs SET status='publishing',report_json=? WHERE id='job'", (json.dumps(report),))
+        triage.publish(self.conn, self.job())
+        self.assertEqual(self.github.issues[77]['state'], 'open')
+        self.assertEqual(len(self.github.comments[77]), 1)
+        self.assertIn('Verified current Git head: `' + 'b' * 40, self.github.comments[77][0]['body'])
+        self.assertIn('same cause remains', self.github.comments[77][0]['body'])
+        self.assertEqual(self.job()['status'], 'completed')
+
+    def test_unavailable_git_does_not_authorize_reopening_or_consume_observation(self):
+        self.add_failure()
+        report = self.make_job(existing=77)
+        report['findings'][0]['issue']['verified_head'] = 'a' * 40
+        self.github.issues[77] = dict(number=77, title='Recurring defect', body='Original body', state='closed', labels=[])
+        self.git_head.side_effect = OSError('Git unavailable')
+        with self.conn:
+            self.conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=\'job\'', (json.dumps(report),))
+        with self.assertRaisesRegex(OSError, 'Git unavailable'):
+            triage.publish(self.conn, self.job())
+        self.assertEqual(self.job()['status'], 'publishing')
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM triage_observations').fetchone()[0], 0)
+        self.assertFalse(any(method != 'GET' for method, _, _ in self.github.calls))
+        self.git_head.side_effect = None
+        triage.publish(self.conn, self.job())
+        self.assertEqual(self.github.issues[77]['state'], 'open')
+
+    def test_local_campaign_baseline_verifies_its_batch_target(self):
+        self.add_local_finding()
+        with self.conn:
+            self.conn.execute('CREATE TABLE automerge_batches(batch_id TEXT PRIMARY KEY,target_ref TEXT)')
+            self.conn.execute("INSERT INTO automerge_batches VALUES ('batch','stabilize/campaign')")
+        report = self.make_job(existing=77)
+        report['findings'][0]['issue']['verified_head'] = 'a' * 40
+        self.github.issues[77] = dict(number=77, title='Campaign recurrence', body='Original body', state='closed', labels=[])
+        with self.conn:
+            self.conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=\'job\'', (json.dumps(report),))
+        triage.publish(self.conn, self.job())
+        self.git_head.assert_called_once_with(monitor.REPO_NAME, 'stabilize/campaign', monitor.github_app_token)
+        self.assertEqual(self.github.issues[77]['state'], 'open')
 
     def test_master_and_branch_same_cause_publish_one_issue(self):
         self.add_failure()
@@ -654,6 +746,7 @@ class TriageTests(TestCase):
         self.add_failure('Second failure')
         report = self.separate_product_findings()
         report['findings'][1]['issue']['existing_number'] = 77
+        report['findings'][1]['issue']['verified_head'] = 'a' * 40
         self.github.issues[77] = dict(number=77, title='Existing <defect> & regression | fix', body='Original body',
                                      state='closed', labels=[])
         with self.conn:
@@ -990,7 +1083,10 @@ class TriageTests(TestCase):
 
     def test_lost_existing_issue_comment_response_is_not_posted_twice(self):
         self.add_failure()
-        self.make_job(existing=77)
+        report = self.make_job(existing=77)
+        report['findings'][0]['issue']['verified_head'] = 'a' * 40
+        with self.conn:
+            self.conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=\'job\'', (json.dumps(report),))
         self.github.issues[77] = dict(number=77, title="Original title", body="Original body", state="closed", labels=[])
         self.github.lose_response_to = ("POST", "issues/77/comments")
         with self.assertRaises(RuntimeError):

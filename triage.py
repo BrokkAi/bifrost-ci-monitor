@@ -19,6 +19,7 @@ import monitor
 import local_findings
 import stabilize_state
 import agent_recovery
+import git_ancestry
 
 LOCK_PATH = monitor.STATE_DIR.parent / "bifrost-ci-triage" / "triage.lock"
 KEY = ("workflow", "job_name", "identity_kind", "identity")
@@ -245,6 +246,13 @@ run). For infrastructure, include any later recovery in the notice and still use
 outcome:infrastructure. A repair PR alone is not proof of recovery.
 Search open AND closed issues and the linked tickets before drafting product tickets.
 Reuse an existing issue only for the same cause; it will be reopened if closed.
+Before proposing to reopen a closed issue, verify that the cause remains present
+at the current Git head of master or the affected stabilize branch. Describe that
+verification in diagnosis/evidence and include issue.verified_head (the full SHA).
+Reuse applicable logs and source evidence; a historical failing baseline or a
+GitHub issue/PR link alone does not prove a current failure. If the repair landed
+and the cause is gone, report resolved instead. Publication checks the Git head
+again and requests correction if the evidence is stale; no new build is required.
 {branch_dedup}Never reuse the aggregate 'Known CI failures on master' issue. An observed product
 failure can need a ticket even when its root cause remains unknown.
 
@@ -311,6 +319,9 @@ def parse_report(text: str, observations: list[dict]) -> dict:
             number = issue["existing_number"]
             if number is not None and (type(number) is not int or number <= 0):
                 raise ValueError("existing_number must be a positive integer or null")
+            if 'verified_head' in issue and (not isinstance(issue['verified_head'], str)
+                    or not re.fullmatch(r'[0-9a-fA-F]{40}', issue['verified_head'])):
+                raise ValueError('issue verified_head must be a full Git commit SHA')
     if seen != expected:
         raise ValueError(f"missing failure_ids: {sorted(expected - seen)}")
     return report
@@ -364,8 +375,9 @@ def request_report_correction(conn, job, final, problem, *, turn_id=None) -> Non
         f"Your report needs correction: {problem}. Return the complete triage-result JSON "
         "with all original failure_ids. Each finding needs outcome product, infrastructure, "
         "or resolved. Product requires an issue object; the other outcomes require issue:null. "
-        "Use the evidence already collected to classify your findings; do not repeat the "
-        "investigation or write to GitHub/Slack. Infrastructure findings are channel notices, "
+        "Use the evidence already collected and reconcile any changed Git/CI facts requested "
+        "above; do not repeat the completed investigation or builds, or write to GitHub/Slack. "
+        "Infrastructure findings are channel notices, "
         "never product tickets, including when a later job has recovered.",
         request_id="triage-feedback-" + hashlib.sha256((job['id'] + digest).encode()).hexdigest()[:32])
     with conn:
@@ -489,8 +501,11 @@ def issue_body(job, index, finding, observations) -> str:
         return (f"- {row['workflow']} / {row['job_name']} / `{row['identity']}`: "
                 f"{ref}{row['last_seen_run_url']} (`{row['last_seen_sha']}`)\n"
                 f"  Red since {row['first_seen_sha']} ({row['first_seen_at']}, {row['first_seen_run_url']})")
+    verified = finding['issue'].get('verified_head')
+    verification = f'\n\nVerified current Git head: `{verified}`.' if verified else ''
     return (finding['issue']['body'] + '\n\n### Triage evidence\n\n' + finding['diagnosis']
             + '\n\n' + finding['evidence'] + '\n\n' + '\n'.join(source(row) for row in observations)
+            + verification
             + f"\n\nTriage session: `{job['session_id']}`.\n\n"
             + f"<!-- mergemarshall-triage:{job['id']}:{index} -->")
 
@@ -507,6 +522,39 @@ def ensure_stabilize_label() -> None:
     else:
         if not isinstance(label, dict) or label.get('name') != name:
             raise ValueError('GitHub returned invalid stabilize label')
+
+
+class ReopenReviewRequired(ValueError):
+    """The report needs current Git/test facts before changing a closed ticket."""
+
+
+def verify_reopening(conn, issue, finding, observations):
+    if issue['state'] == 'open':
+        return
+    refs = set()
+    for row in (dict(o) for o in observations):
+        ref = row['stabilize_branch'] if row.get('stabilize_campaign_id') else 'master'
+        if row.get('local_finding_id') and conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='automerge_batches'").fetchone():
+            batch = conn.execute('SELECT target_ref FROM automerge_batches WHERE batch_id=?',
+                                 (row['batch_id'],)).fetchone()
+            if batch and batch['target_ref']:
+                ref = batch['target_ref']
+        refs.add(ref)
+    refs = sorted(refs)
+    guidance = (f"Closed issue #{issue['number']} needs current-cause verification. "
+                f"Check current Git/CI facts on {', '.join(refs)}, describe why the same cause "
+                "still fails in diagnosis/evidence, and include issue.verified_head for that "
+                "full Git head; report resolved if the repair has removed the cause")
+    verified = finding['issue'].get('verified_head')
+    if not verified:
+        raise ReopenReviewRequired(guidance)
+    # A GitHub closure is metadata, not evidence that the cause is gone. The
+    # agent owns the diagnosis; Git owns freshness of its explicit verification.
+    heads = {git_ancestry.remote_head(monitor.REPO_NAME, ref, monitor.github_app_token)
+             for ref in refs}
+    if verified.lower() not in heads:
+        raise ReopenReviewRequired(guidance + '; the reported verified_head is no longer current')
 
 
 def publish_issue(conn, job, index, finding, observations) -> str:
@@ -542,6 +590,7 @@ def publish_issue(conn, job, index, finding, observations) -> str:
     aggregate = monitor._known_failure_state(conn, "issue_number")
     if "pull_request" in issue or str(number) == aggregate or issue["title"] == monitor.KNOWN_FAILURE_ISSUE_TITLE:
         raise ValueError(f"#{number} is not an individual failure issue")
+    verify_reopening(conn, issue, finding, observations)
     # Pin an existing ticket before commenting too, so a restart keeps the same
     # publication target even if another component changes a ledger link.
     with conn:
@@ -784,7 +833,13 @@ def publish(conn, job) -> None:
             active = [(o, row) for o, row in active if row is not None]
             if finding['outcome'] == 'infrastructure':
                 publish_infrastructure_slack(conn, job, report, finding)
-            url = publish_issue(conn, job, index, finding, [row for _, row in active]) if active and finding["issue"] else None
+            try:
+                url = publish_issue(conn, job, index, finding, [row for _, row in active]) if active and finding["issue"] else None
+            except ReopenReviewRequired as exc:
+                finding.pop('issue_body', None)
+                cache_report(conn, job, report)
+                request_report_correction(conn, job, json.dumps(report), exc)
+                return
             with conn:
                 conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=?', (json.dumps(report), job['id']))
                 if url:
