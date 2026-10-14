@@ -596,8 +596,15 @@ def ensure_dispatch(conn, c, stage, runs):
             conn.execute('UPDATE stabilize_dispatches SET error=?,permission_denied=? WHERE campaign_id=? AND stage=? AND tip_sha=? AND attempt=?',
                          (str(exc)[:1000], int(denied), c.id, stage, c.tip_sha, attempt))
             if denied:
-                pause(conn, c, f'GitHub App lacks actions: write for {stage} workflow_dispatch (attempt {attempt}). '
-                      f'Grant actions: write, then run stabilize.py resume {c.id}.')
+                pause(conn, c, f'{stage} workflow_dispatch refused (attempt {attempt}): {github_refusal(exc)}. '
+                      'The dispatch token likely lacks actions: write; check the App installation and the '
+                      f'host mj token_permissions, then run stabilize.py resume {c.id}.')
+
+
+def github_refusal(exc):
+    """GitHub's status and message from a gh failure, without URLs or other output."""
+    match = re.search(r'HTTP (\d{3}):?\s*([^(\n]+)', str(exc))
+    return f'HTTP {match[1]}: {match[2].strip()[:160]}' if match else 'GitHub refused the request'
 
 
 def pull_requests(branch, status='all'):

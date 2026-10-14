@@ -410,10 +410,12 @@ for inspection. A paused campaign names its reason in `status` and in its
 thread; common reasons are escalated issues, a dispatched run that could not be
 found, repeated infrastructure failures and the round limit.
 
-Dispatching the suites needs the MergeMarshall App to have `actions: write`.
-Without it, the first dispatch pauses the campaign with "GitHub App lacks
-actions: write". After an administrator grants the permission, run
-`resume`; the next tick retries the refused dispatch. `resume` never replays a
+Dispatching the suites needs `actions: write` on the MergeMarshall App
+installation and in the host's `mj` `[github.app.token_permissions]`, which
+narrows every host token. A refused dispatch pauses the campaign with GitHub's
+status and message, for example "hourly workflow_dispatch refused (attempt 1):
+HTTP 403: Resource not accessible by integration". After the permission is
+fixed, run `resume`; the next tick retries the refused dispatch. `resume` never replays a
 dispatch whose result was ambiguous, and it keeps the round and
 infrastructure limits.
 
