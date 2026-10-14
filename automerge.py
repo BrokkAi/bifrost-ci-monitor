@@ -1149,7 +1149,7 @@ def select_eligible_pull_requests(*, dry_run: bool = False,
     return pulls if not priority_only or any(p.priority for p in pulls) else []
 
 
-def report_dependency_blocks(conn, transport):
+def report_dependency_blocks(conn, transport, *, deliver=True):
     """Checkpoint informational GitHub notices from the just-refreshed inventory."""
     with conn:
         for observed in conn.execute("SELECT * FROM automerge_pr_inventory").fetchall():
@@ -1164,7 +1164,8 @@ def report_dependency_blocks(conn, transport):
             if bool(reason) != present:
                 conn.execute("UPDATE automerge_github_outbox SET delivered_at=NULL,next_attempt_at=NULL,attempts=0 "
                              "WHERE intent_id=? AND delivered_at IS NOT NULL", (intent_id,))
-    retry_github_outbox(conn, transport, kind="dependency_notice")
+    if deliver:
+        retry_github_outbox(conn, transport, kind="dependency_notice")
 
 
 def dependency_block_comment(number: int, reason: str) -> str:

@@ -190,6 +190,7 @@ def run(a, conn, transport):
     attempted = set()
     deferred = set()
     priority_checked = queue_checked = campaign_checked = maintenance_done = False
+    priority_dependencies_checked = False
     served = set()
     priority_pulls = []
     reconciled = set()
@@ -264,6 +265,10 @@ def run(a, conn, transport):
                 if any(a._priority_flags(a._labels(item))[0] for item in a.list_open_pull_requests()
                        if not a._is_integration_pull(item)):
                     priority_pulls = a.select_eligible_pull_requests(conn=conn, priority_only=True)
+                    # Checkpoint notices now, but keep their network delivery
+                    # after batch advancement in this poll.
+                    a.report_dependency_blocks(conn, transport, deliver=False)
+                    priority_dependencies_checked = True
                     campaign = a.active_campaign_batch(conn)
                     if campaign is not None:
                         priority_pulls = a.unreserved_pulls(priority_pulls, {p.number for p in a._active_sources(campaign)})
@@ -303,6 +308,8 @@ def run(a, conn, transport):
                 a.retry_pending_aborted_outcomes(conn, transport)
                 a.enqueue_active_membership_labels(conn)
                 a.retry_github_outbox(conn, transport)
+                if priority_dependencies_checked:
+                    a.retry_github_outbox(conn, transport, kind='dependency_notice')
                 monitor.update_known_failures(conn, transport)
                 a.check_pending_suspensions(conn, transport)
                 for completed in conn.execute("SELECT * FROM automerge_batches WHERE status='completed' "

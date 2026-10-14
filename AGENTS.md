@@ -249,6 +249,10 @@ within the poll budget, with no agent work deadline or idleness gate. Deferred
 reads retain their action without an error alert; other independent actions may
 proceed. Repeated observations are new polls of the same action, not repeated
 message writes. Maintenance and notification retries follow batch advancement.
+Priority dependency discovery checkpoints informational notices even while an
+existing batch has no candidate; delivery follows advancement through the same
+outbox and preserves retry backoff. Failed notice delivery never fences
+preemption or landing.
 An empty eligible queue with no active batch posts a categorized open-PR summary
 in the last primary thread (or a new idle thread); checkpoint accepted replies in
 `automerge_queue_summaries` and suppress unchanged snapshots. This needs Slack chat.

@@ -30,6 +30,8 @@ class SupervisorTests(unittest.TestCase):
         self.transport = monitor.SlackTransport('chat', token='unused', channel='unused')
         self.patch(a, 'list_open_pull_requests', return_value=[])
         self.select = self.patch(a, 'select_eligible_pull_requests', return_value=[])
+        self.report_blocks_impl = a.report_dependency_blocks
+        self.retry_outbox_impl = a.retry_github_outbox
         self.patch(a, 'report_dependency_blocks')
         self.alert = self.patch(a, 'notify_blocked_once')
         self.send = self.patch(monitor, 'slack_send', return_value=(True, 'thread'))
@@ -217,6 +219,59 @@ class SupervisorTests(unittest.TestCase):
         supervisor.run(a, self.conn, self.transport)
         self.assertEqual(observed, [campaign])
         self.assertNotIn(master, observed)
+
+    def test_blocked_priority_notice_does_not_wait_for_candidate_or_gate_advancement(self):
+        identifier = self.batch()  # No checkpoint, so no successor selection.
+        self.patch(a, 'list_open_pull_requests', return_value=[{
+            'number': 99, 'labels': [{'name': 'mergemarshall:immediate'}]}])
+
+        def discover(**kwargs):
+            self.assertTrue(kwargs['priority_only'])
+            with self.conn:
+                self.conn.execute('INSERT INTO automerge_pr_inventory '
+                                  '(number,head_sha,data_json,blocked_reason) VALUES (?,?,?,?) '
+                                  'ON CONFLICT(number) DO UPDATE SET blocked_reason=excluded.blocked_reason',
+                                  (99, HEAD_ONE, json.dumps({'number': 99, 'labels': []}),
+                                   'blocked by prerequisite PR #100'))
+            return []
+
+        self.select.side_effect = discover
+        self.patch(a, 'report_dependency_blocks', side_effect=self.report_blocks_impl)
+        self.patch(a, 'retry_github_outbox', side_effect=self.retry_outbox_impl)
+        order = []
+
+        def process(conn, transport, owner):
+            self.assertEqual(owner, identifier)
+            notice = conn.execute("SELECT * FROM automerge_github_outbox "
+                                  "WHERE kind='dependency_notice' AND number=99").fetchone()
+            self.assertIsNotNone(notice)
+            self.assertIsNone(notice['delivered_at'])
+            order.append('advance')
+
+        self.patch(a, 'process_batch', side_effect=process)
+
+        def deliver(row, *, conn):
+            if row['kind'] != 'dependency_notice':
+                return None
+            order.append('deliver')
+            raise monitor.CommandError('temporary GitHub outage')
+
+        delivery = self.patch(a, 'deliver_github_write', side_effect=deliver)
+        self.assertEqual(supervisor.run(a, self.conn, self.transport), 0)
+        self.assertEqual(order, ['advance', 'deliver'])
+        notice = self.conn.execute("SELECT * FROM automerge_github_outbox "
+                                   "WHERE kind='dependency_notice' AND number=99").fetchone()
+        self.assertEqual(notice['attempts'], 1)
+        self.assertIsNotNone(notice['next_attempt_at'])
+        self.assertIsNone(notice['delivered_at'])
+        self.alert.assert_not_called()
+        # A later poll preserves the one intent and its failed-delivery backoff.
+        self.assertEqual(supervisor.run(a, self.conn, self.transport), 0)
+        self.assertEqual(order, ['advance', 'deliver', 'advance'])
+        self.assertEqual(sum(call.args[0]['kind'] == 'dependency_notice'
+                             for call in delivery.call_args_list), 1)
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM automerge_github_outbox "
+                                          "WHERE kind='dependency_notice' AND number=99").fetchone()[0], 1)
 
     def test_check_shows_master_successor_and_campaign(self):
         primary, successor, campaign = self.three_batches()
