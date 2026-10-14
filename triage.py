@@ -551,7 +551,8 @@ def verify_reopening(conn, issue, finding, observations):
         raise ReopenReviewRequired(guidance)
     # A GitHub closure is metadata, not evidence that the cause is gone. The
     # agent owns the diagnosis; Git owns freshness of its explicit verification.
-    heads = {git_ancestry.remote_head(monitor.REPO_NAME, ref, monitor.github_app_token)
+    heads = {git_ancestry.remote_head(monitor.REPO_NAME, ref, monitor.github_app_token,
+                                    refresh_token=lambda: monitor.github_app_token(force_refresh=True))
              for ref in refs}
     if verified.lower() not in heads:
         raise ReopenReviewRequired(guidance + '; the reported verified_head is no longer current')

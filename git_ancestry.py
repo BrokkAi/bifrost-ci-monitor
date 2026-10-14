@@ -58,24 +58,67 @@ def repository_url(repository):
     return repository if repository.startswith('/') else 'https://github.com/' + repository + '.git'
 
 
-def remote_head(repository, branch, token):
+class RemoteReadError(OSError):
+    """Only a reviewed category leaves the Git process; never its stderr."""
+    def __init__(self, category):
+        self.category = category
+        super().__init__(f'remote Git branch could not be read ({category})')
+
+
+def remote_error_category(result):
+    detail = (result.stderr or '').casefold()
+    if any(marker in detail for marker in (
+            'authentication failed', 'invalid username or password',
+            'bad credentials', 'returned error: 401')):
+        return 'authentication'
+    if 'rate limit' in detail:
+        return 'rate_limit'
+    if any(marker in detail for marker in (
+            'repository not found', 'returned error: 403', 'returned error: 404',
+            'permission denied')):
+        return 'repository_access'
+    if any(marker in detail for marker in (
+            'could not resolve', 'failed to connect', 'connection', 'timed out',
+            'ssl', 'tls', 'returned error: 50')):
+        return 'transport'
+    if result.returncode == 2:
+        return 'missing_branch'
+    return 'invalid_response' if result.returncode == 0 else 'unknown'
+
+
+def remote_head(repository, branch, token, *, refresh_token=None):
     """A fresh Git-protocol read, including at final landing gates; no disk writes."""
     ref = 'refs/heads/' + branch
     if subprocess.run(['git', 'check-ref-format', ref], stdout=subprocess.DEVNULL,
                       stderr=subprocess.DEVNULL, check=False).returncode:
         raise ValueError('invalid branch ref')
-    try:
-        result = subprocess.run(['git', 'ls-remote', '--exit-code', '--refs',
-                                 repository_url(repository), ref], text=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                env=authenticated_env(token()), timeout=read_budget.timeout(30), check=False)
-    except subprocess.TimeoutExpired as exc:
-        if read_budget.expired():
-            raise Deferred('remote Git read is unfinished') from exc
-        raise OSError('remote Git read timed out') from exc
-    lines = result.stdout.splitlines()
-    if result.returncode or len(lines) != 1:
-        raise OSError('remote Git branch could not be read')
+    current_token = token()
+    # Renewal and the second probe share the original network-read window.
+    end = time.monotonic() + read_budget.timeout(30)
+    for attempt in range(2):
+        try:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired('remote Git read', 30)
+            result = subprocess.run(['git', 'ls-remote', '--exit-code', '--refs',
+                                     repository_url(repository), ref], text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    env=authenticated_env(current_token),
+                                    timeout=read_budget.timeout(remaining), check=False)
+        except subprocess.TimeoutExpired as exc:
+            if read_budget.expired():
+                raise Deferred('remote Git read is unfinished') from exc
+            raise OSError('remote Git read timed out') from exc
+        lines = result.stdout.splitlines()
+        if result.returncode == 0 and len(lines) == 1:
+            break
+        category = remote_error_category(result)
+        if attempt == 0 and category == 'authentication' and refresh_token is not None:
+            current_token = refresh_token()
+            continue
+        raise RemoteReadError(category)
+    if '\t' not in lines[0]:
+        raise ValueError('invalid remote Git branch response')
     sha, name = lines[0].split('\t', 1)
     if name != ref or not re.fullmatch(r'[0-9a-f]{40}', sha):
         raise ValueError('invalid remote Git branch response')

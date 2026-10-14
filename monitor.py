@@ -1696,7 +1696,8 @@ class PollResult:
 
 
 def remote_branch_sha(branch: str) -> str:
-    return git_ancestry.remote_head(REPO_NAME, branch, github_app_token)
+    return git_ancestry.remote_head(REPO_NAME, branch, github_app_token,
+                                   refresh_token=lambda: github_app_token(force_refresh=True))
 
 
 def git_cache(state_dir=None, repository=None, token=None, **kwargs):

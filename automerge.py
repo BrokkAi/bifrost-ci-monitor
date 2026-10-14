@@ -305,9 +305,11 @@ def run_gh(args: list[str], *, timeout: int = 60) -> str:
         raise
 
 
-def github_app_token() -> str | None:
+def github_app_token(*, force_refresh: bool = False) -> str | None:
     """Compatibility seam that delegates token policy to the shared monitor."""
     try:
+        if force_refresh:
+            return monitor.github_app_token(force_refresh=True)
         return monitor.github_app_token()
     except monitor.GitHubAuthError as exc:
         raise AutomergeError(str(exc), reason=exc.reason) from exc
@@ -1210,7 +1212,8 @@ def current_master_sha() -> str:
 
 
 def remote_branch_sha(branch: str) -> str:
-    return git_ancestry.remote_head(REPO_NAME, branch, github_app_token)
+    return git_ancestry.remote_head(REPO_NAME, branch, github_app_token,
+                                   refresh_token=lambda: github_app_token(force_refresh=True))
 
 
 def compare_pr_behind_by(head_sha: str) -> int:

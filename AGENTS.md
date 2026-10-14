@@ -231,6 +231,11 @@ Fetch branch and PR refs together with full history and filtered blobs; fetch
 detached historical tips in batches only when still missing. This bare cache uses
 `fetch`, never `pull`, and never changes agent checkouts. Read current master and
 published batch heads freshly with `ls-remote`, including final landing gates.
+Current-ref failures expose only sanitized categories (authentication, repository
+access, transport, rate limit, missing branch or invalid/unknown response), never
+Git stderr. Explicit authentication failure permits one renewal through the same
+App-token provider and a fresh probe within the original read budget. Other
+failures are not retried inline and never supply a stale head or negative fact.
 Cache immutable tree identities, behind counts, merge-base changed paths, and
 base-pinned classifier results across polls/batches. Changed-path reads include
 rename endpoints without loading file blobs; retrieve only the pinned classifier

@@ -170,7 +170,8 @@ class TriageTests(TestCase):
                 self.conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=?', (json.dumps(report), 'branch'))
         triage.publish(self.conn, self.job('branch'))
         if closed:
-            self.git_head.assert_called_once_with(monitor.REPO_NAME, 'stabilize/campaign', monitor.github_app_token)
+            self.git_head.assert_called_once_with(monitor.REPO_NAME, 'stabilize/campaign', monitor.github_app_token,
+                                                  refresh_token=mock.ANY)
         self.assertEqual(set(self.github.issues), {101})
         self.assertEqual(issue['state'], 'open')
         self.assertIn({'name': stabilize_state.LABEL}, issue['labels'])
@@ -270,7 +271,8 @@ class TriageTests(TestCase):
         with self.conn:
             self.conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=\'job\'', (json.dumps(report),))
         triage.publish(self.conn, self.job())
-        self.git_head.assert_called_once_with(monitor.REPO_NAME, 'stabilize/campaign', monitor.github_app_token)
+        self.git_head.assert_called_once_with(monitor.REPO_NAME, 'stabilize/campaign', monitor.github_app_token,
+                                              refresh_token=mock.ANY)
         self.assertEqual(self.github.issues[77]['state'], 'open')
 
     def test_master_and_branch_same_cause_publish_one_issue(self):

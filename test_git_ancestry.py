@@ -218,8 +218,96 @@ class GitReads(unittest.TestCase):
         result.returncode = 128
         result.stderr = 'private-test-token'
         with mock.patch.object(g.subprocess, 'run', side_effect=[mock.Mock(returncode=0), result]):
-            with self.assertRaisesRegex(OSError, '^remote Git branch could not be read$'):
+            with self.assertRaisesRegex(OSError, r'^remote Git branch could not be read \(unknown\)$'):
                 g.remote_head('owner/repo', 'master', lambda: 'private-test-token')
+
+    def test_remote_auth_failure_renews_once_and_reads_a_fresh_head(self):
+        rejected = subprocess.CompletedProcess([], 128, '', 'Authentication failed: private-old-token')
+        accepted = subprocess.CompletedProcess([], 0, self.base + '\trefs/heads/master\n', '')
+        refresh = mock.Mock(return_value='private-new-token')
+        with mock.patch.object(g.subprocess, 'run', side_effect=[mock.Mock(returncode=0), rejected, accepted]) as run:
+            self.assertEqual(g.remote_head('owner/repo', 'master', lambda: 'private-old-token',
+                                           refresh_token=refresh), self.base)
+        refresh.assert_called_once_with()
+        key = 'GIT_CONFIG_VALUE_1'
+        self.assertNotEqual(run.call_args_list[1].kwargs['env'][key], run.call_args_list[2].kwargs['env'][key])
+        self.assertNotIn('private-new-token', str(run.call_args.args))
+
+    def test_remote_failure_categories_withhold_secrets_and_retry_only_authentication(self):
+        cases = [('Authentication failed', 'authentication'),
+                 ('The requested URL returned error: 401', 'authentication'),
+                 ('API rate limit exceeded', 'rate_limit'),
+                 ('The requested URL returned error: 403', 'repository_access'),
+                 ('Repository not found', 'repository_access'),
+                 ('Could not resolve host', 'transport'),
+                 ('GnuTLS connection terminated', 'transport'),
+                 ('unexpected failure', 'unknown')]
+        for detail, category in cases:
+            with self.subTest(category=category, detail=detail):
+                rejected = subprocess.CompletedProcess([], 128, '', detail + ' private-test-token')
+                refresh = mock.Mock(return_value='fresh-test-token')
+                outcomes = [mock.Mock(returncode=0), rejected]
+                if category == 'authentication':
+                    outcomes.append(rejected)
+                with mock.patch.object(g.subprocess, 'run', side_effect=outcomes) as run:
+                    with self.assertRaises(g.RemoteReadError) as error:
+                        g.remote_head('owner/repo', 'master', lambda: 'private-test-token',
+                                      refresh_token=refresh)
+                self.assertEqual(error.exception.category, category)
+                self.assertNotIn('private-test-token', str(error.exception))
+                self.assertNotIn(detail, str(error.exception))
+                self.assertEqual(refresh.call_count, int(category == 'authentication'))
+                self.assertEqual(run.call_count, 3 if category == 'authentication' else 2)
+
+    def test_remote_missing_branch_and_malformed_response_never_renew_or_return_a_head(self):
+        for result, category in [(subprocess.CompletedProcess([], 2, '', ''), 'missing_branch'),
+                                 (subprocess.CompletedProcess([], 0, '', ''), 'invalid_response')]:
+            refresh = mock.Mock()
+            with mock.patch.object(g.subprocess, 'run', side_effect=[mock.Mock(returncode=0), result]):
+                with self.assertRaises(g.RemoteReadError) as error:
+                    g.remote_head('owner/repo', 'master', lambda: None, refresh_token=refresh)
+            self.assertEqual(error.exception.category, category)
+            refresh.assert_not_called()
+
+    def test_remote_auth_retry_shares_the_original_read_budget(self):
+        clock = {'at': 0}
+        def renew():
+            clock['at'] = 29
+            return 'fresh-test-token'
+        rejected = subprocess.CompletedProcess([], 128, '', 'Authentication failed')
+        accepted = subprocess.CompletedProcess([], 0, self.base + '\trefs/heads/master\n', '')
+        with (mock.patch.object(g.time, 'monotonic', side_effect=lambda: clock['at']),
+              mock.patch.object(g.subprocess, 'run', side_effect=[mock.Mock(returncode=0), rejected, accepted]) as run):
+            self.assertEqual(g.remote_head('owner/repo', 'master', lambda: 'old-test-token',
+                                           refresh_token=renew), self.base)
+        self.assertEqual(run.call_args_list[1].kwargs['timeout'], 30)
+        self.assertEqual(run.call_args_list[2].kwargs['timeout'], 1)
+
+    def test_remote_renewal_spending_the_read_budget_cannot_start_another_probe(self):
+        clock = {'at': 0}
+        def renew():
+            clock['at'] = 31
+            return 'fresh-test-token'
+        rejected = subprocess.CompletedProcess([], 128, '', 'Authentication failed')
+        with (mock.patch.object(g.time, 'monotonic', side_effect=lambda: clock['at']),
+              mock.patch.object(g.subprocess, 'run', side_effect=[mock.Mock(returncode=0), rejected]) as run):
+            with self.assertRaisesRegex(OSError, 'remote Git read timed out'):
+                g.remote_head('owner/repo', 'master', lambda: 'old-test-token', refresh_token=renew)
+        self.assertEqual(run.call_count, 2)
+
+    def test_remote_branch_callers_renew_through_the_same_required_app_provider(self):
+        def read(repository, branch, token, *, refresh_token):
+            self.assertEqual(repository, monitor.REPO_NAME)
+            self.assertEqual(branch, 'master')
+            self.assertEqual(token(), 'cached-test-token')
+            self.assertEqual(refresh_token(), 'fresh-test-token')
+            return self.base
+        for caller in [monitor.remote_branch_sha, a.remote_branch_sha]:
+            with (mock.patch.object(g, 'remote_head', side_effect=read),
+                  mock.patch.object(monitor, 'github_app_token',
+                                    side_effect=['cached-test-token', 'fresh-test-token']) as tokens):
+                self.assertEqual(caller('master'), self.base)
+                self.assertEqual(tokens.call_args_list, [mock.call(), mock.call(force_refresh=True)])
 
 
 if __name__ == '__main__':
