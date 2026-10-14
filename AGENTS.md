@@ -1034,7 +1034,11 @@ runs by branch, event, exact tip, intent time and run-ID floor. Never resubmit
 an ambiguous dispatch; an undiscovered one pauses after the ten-minute grace.
 Cancelled runs, and runs classified as infrastructure or incomplete, are the
 only redispatches (infrastructure at most twice per tip). Eight rounds in one
-stage, or blockers that are only escalated issues, pause the campaign. A
+stage, or blockers that are only escalated issues, pause the campaign. The
+escalated-only pause (`stabilize_runtime.pause_kind`, including legacy rows with
+that reason text) keeps refreshing issue states and resumes automatically once an
+issue at or before the current stage is `open` or `pr_ready`, with one linked thread
+reply; stage work waits for the next tick. Every other pause needs `resume`. A
 refused dispatch (HTTP 403; the installation and the host mj `token_permissions`
 both need `actions: write`) pauses once with GitHub's status and message, and is
 retried only after `resume`, which never replays an ambiguous dispatch.
@@ -1117,7 +1121,14 @@ Each campaign posts one Slack root, `<project prefix> stable release branch
 started from <linked 7-character anchor>.`, with no branch, campaign ID or full
 SHA at channel level. Its first thread reply, checkpointed once, links the
 branch and names the campaign ID and requester; the seeded-issue reply follows.
-Thread messages show commits as linked 7-character SHAs (`slack_commit`).
+Thread messages show commits as linked 7-character SHAs (`slack_commit`) and
+issue/PR numbers as links (`slack_number`). Each stage change (including a
+no-PR gate) starts a new channel-level stage thread, `<prefix> stable release
+branch from <anchor>: <stage> stage started (<previous> passed at <tip>).`,
+checkpointed in `stabilize_stage_threads`; its first reply links the previous
+thread. Later replies go to the newest thread, already-queued replies keep their
+pinned thread, and `stabilize_campaigns.thread_ts` moves only after Slack accepts
+the new root. `get` adds `stage_threads`.
 Delivery is durable and never gates the engine. `create` and `resume` run the
 campaign's first tick inline under the engine lock (`run_campaign_tick`, shared
 with cron): Slack root, seeding and dispatch happen before they return. That

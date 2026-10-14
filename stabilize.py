@@ -60,9 +60,18 @@ def ensure_schema(conn):
     CREATE TABLE IF NOT EXISTS stabilize_gate_intents (
         campaign_id TEXT NOT NULL, stage TEXT NOT NULL, intent_at TEXT,
         PRIMARY KEY(campaign_id,stage));
+    CREATE TABLE IF NOT EXISTS stabilize_stage_threads (
+        campaign_id TEXT NOT NULL, stage TEXT NOT NULL, thread_ts TEXT,
+        root_text TEXT NOT NULL, previous_stage TEXT, previous_thread_ts TEXT,
+        intro_pending INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL, PRIMARY KEY(campaign_id,stage));
     """)
     monitor.ensure_column(conn, 'stabilize_runtime', 'ref_error', 'TEXT')
     monitor.ensure_column(conn, 'stabilize_runtime', 'resume_count', 'INTEGER NOT NULL DEFAULT 0')
+    monitor.ensure_column(conn, 'stabilize_runtime', 'pause_kind', 'TEXT')
+    monitor.ensure_column(conn, 'stabilize_messages', 'thread_stage', 'TEXT')
+    monitor.ensure_column(conn, 'stabilize_messages', 'thread_ts', 'TEXT')
+    monitor.ensure_column(conn, 'stabilize_stage_threads', 'intro_pending', 'INTEGER NOT NULL DEFAULT 0')
     monitor.ensure_column(conn, 'stabilize_dispatches', 'permission_denied', 'INTEGER NOT NULL DEFAULT 0')
     monitor.ensure_column(conn, 'stabilize_dispatches', 'cancelled_at', 'TEXT')
     monitor.ensure_column(conn, 'stabilize_writes', 'cancelled_at', 'TEXT')
@@ -120,9 +129,10 @@ def notify(conn, campaign_id, checkpoint, text):
     limit = monitor.SLACK_MESSAGE_LIMIT - 100
     chunks = [text[i:i + limit] for i in range(0, len(text), limit)] or ['']
     with conn:
+        target = conn.execute('SELECT stage,thread_ts FROM stabilize_campaigns WHERE id=?', (campaign_id,)).fetchone()
         for index, chunk in enumerate(chunks):
-            conn.execute('INSERT OR IGNORE INTO stabilize_messages(campaign_id,checkpoint,text) '
-                         'VALUES (?,?,?)', (campaign_id, f'{checkpoint}:{index}', chunk))
+            conn.execute('INSERT OR IGNORE INTO stabilize_messages(campaign_id,checkpoint,text,thread_stage,thread_ts) '
+                         'VALUES (?,?,?,?,?)', (campaign_id, f'{checkpoint}:{index}', chunk, target['stage'], target['thread_ts']))
 
 
 def queue_write(conn, campaign_id, checkpoint, kind, payload):
@@ -285,6 +295,51 @@ def slack_commit(sha):
     return f'<https://github.com/{monitor.REPO_NAME}/commit/{sha}|{sha[:7]}>'
 
 
+def slack_number(number, kind='issue'):
+    path = 'pull' if kind == 'pr' else 'issues'
+    return f'<https://github.com/{monitor.REPO_NAME}/{path}/{number}|#{number}>'
+
+
+def slack_thread_url(thread_ts, channel=None):
+    if monitor.CHANNEL_PATH.exists():
+        channel = monitor.CHANNEL_PATH.read_text().strip()
+    if thread_ts and channel and re.fullmatch(r'[A-Z0-9]+', channel):
+        return f"https://app.slack.com/archives/{channel}/p{thread_ts.replace('.', '')}"
+    return None
+
+
+def remember_current_thread(conn, row):
+    """Adopt a legacy thread, never invent a historical stage promotion."""
+    conn.execute('INSERT OR IGNORE INTO stabilize_stage_threads(campaign_id,stage,thread_ts,root_text,intro_pending,created_at) '
+                 'VALUES (?,?,?,?,?,?)', (row['id'], row['stage'], row['thread_ts'],
+                 f"{monitor.slack_project_prefix()} stable release branch started from {slack_commit(row['anchor_sha'])}.",
+                 int(not row['thread_ts']), monitor.utc_now()))
+    # Pin legacy pending replies before a stage change clears the current thread.
+    conn.execute('UPDATE stabilize_messages SET thread_stage=?,thread_ts=COALESCE(thread_ts,?) '
+                 'WHERE campaign_id=? AND thread_stage IS NULL', (row['stage'], row['thread_ts'], row['id']))
+
+
+def stage_first_reply(conn, row, stage_thread, thread, transport):
+    previous = stage_thread['previous_stage']
+    if previous:
+        prior = conn.execute('SELECT thread_ts FROM stabilize_stage_threads WHERE campaign_id=? AND stage=?',
+                             (row['id'], previous)).fetchone()
+        previous_ts = stage_thread['previous_thread_ts'] or (prior['thread_ts'] if prior else None)
+        url = slack_thread_url(previous_ts, transport.channel)
+        if not url:
+            raise ValueError('Previous stage Slack permalink unavailable')
+        checkpoint = f'stage-started:{stage_thread["stage"]}:0'
+        introduction = f'Previous {previous} stage thread: <{url}|view thread>. '
+    else:
+        checkpoint = 'started:0'
+        introduction = ''
+    branch_url = f"https://github.com/{monitor.REPO_NAME}/tree/{urllib.parse.quote(row['branch'], safe='/')}"
+    text = (introduction + f"Branch: <{branch_url}|{row['branch']}>; campaign `{row['id']}`; "
+            f"requested by {row['requested_by'] or 'operator'}.")
+    conn.execute('INSERT OR IGNORE INTO stabilize_messages(campaign_id,checkpoint,text,thread_stage,thread_ts) '
+                 'VALUES (?,?,?,?,?)', (row['id'], checkpoint, text, stage_thread['stage'], thread))
+
+
 def deliver_slack(conn, transport=None, *, campaign_id=None):
     try:
         transport = transport or monitor.load_slack_transport()
@@ -296,29 +351,41 @@ def deliver_slack(conn, transport=None, *, campaign_id=None):
             query += ' WHERE id=?'
             args = (campaign_id,)
         for row in conn.execute(query + ' ORDER BY created_at', args).fetchall():
-            thread = row['thread_ts']
-            if not thread:
-                ok, thread = monitor.slack_send(transport,
-                    f"{monitor.slack_project_prefix()} stable release branch started from {slack_commit(row['anchor_sha'])}.")
-                if not ok or not thread:
-                    monitor.log(f"stabilize campaign {row['id']} Slack root deferred")
-                    continue
-                with conn:
-                    conn.execute('UPDATE stabilize_campaigns SET thread_ts=? WHERE id=?', (thread, row['id']))
-                    branch_url = f"https://github.com/{monitor.REPO_NAME}/tree/{urllib.parse.quote(row['branch'], safe='/')}"
-                    notify(conn, row['id'], 'started',
-                           f"Branch: <{branch_url}|{row['branch']}>; campaign `{row['id']}`; "
-                           f"requested by {row['requested_by'] or 'operator'}.")
-            for message in conn.execute('SELECT * FROM stabilize_messages WHERE campaign_id=? '
-                    "AND sent_at IS NULL ORDER BY CASE WHEN checkpoint='started:0' THEN 0 ELSE 1 END,sequence",
-                    (row['id'],)).fetchall():
-                ok, _ = monitor.slack_send(transport, message['text'], thread_ts=thread)
-                if not ok:
-                    monitor.log(f"stabilize campaign {row['id']} Slack reply deferred")
-                    break
-                with conn:
-                    conn.execute('UPDATE stabilize_messages SET sent_at=? WHERE sequence=?',
-                                 (monitor.utc_now(), message['sequence']))
+            with conn:
+                remember_current_thread(conn, row)
+            threads = conn.execute('SELECT * FROM stabilize_stage_threads WHERE campaign_id=? '
+                "ORDER BY CASE stage WHEN 'push' THEN 0 WHEN 'hourly' THEN 1 ELSE 2 END", (row['id'],)).fetchall()
+            for stage_thread in threads:
+                thread = stage_thread['thread_ts']
+                if not thread:
+                    previous = stage_thread['previous_stage']
+                    if previous and not conn.execute('SELECT thread_ts FROM stabilize_stage_threads WHERE campaign_id=? AND stage=?',
+                                                     (row['id'], previous)).fetchone()['thread_ts']:
+                        continue  # Wait for the previous root so the first reply can link it.
+                    ok, thread = monitor.slack_send(transport, stage_thread['root_text'])
+                    if not ok or not thread:
+                        monitor.log(f"stabilize campaign {row['id']} {stage_thread['stage']} Slack root deferred")
+                        continue
+                    with conn:
+                        conn.execute('UPDATE stabilize_stage_threads SET thread_ts=? WHERE campaign_id=? AND stage=?',
+                                     (thread, row['id'], stage_thread['stage']))
+                        conn.execute('UPDATE stabilize_campaigns SET thread_ts=? WHERE id=? AND stage=?',
+                                     (thread, row['id'], stage_thread['stage']))
+                if stage_thread['intro_pending']:
+                    with conn:
+                        stage_first_reply(conn, row, stage_thread, thread, transport)
+                        conn.execute('UPDATE stabilize_stage_threads SET intro_pending=0 WHERE campaign_id=? AND stage=?',
+                                     (row['id'], stage_thread['stage']))
+                for message in conn.execute('SELECT * FROM stabilize_messages WHERE campaign_id=? AND thread_stage=? '
+                        "AND sent_at IS NULL ORDER BY CASE WHEN checkpoint='started:0' OR checkpoint LIKE 'stage-started:%' THEN 0 ELSE 1 END,sequence",
+                        (row['id'], stage_thread['stage'])).fetchall():
+                    ok, _ = monitor.slack_send(transport, message['text'], thread_ts=message['thread_ts'] or thread)
+                    if not ok:
+                        monitor.log(f"stabilize campaign {row['id']} Slack reply deferred")
+                        break
+                    with conn:
+                        conn.execute('UPDATE stabilize_messages SET sent_at=?,thread_ts=COALESCE(thread_ts,?) WHERE sequence=?',
+                                     (monitor.utc_now(), thread, message['sequence']))
     except Exception as exc:
         monitor.log(f'stabilize Slack delivery deferred: {exc}')
 
@@ -450,7 +517,7 @@ def add_issue(conn, c, number, stage, source, rows):
                  json.dumps(dict(row))))
     queue_write(conn, c.id, f'issue-label:{number}', 'label', {'number': number, 'label': state.LABEL})
     if added and source == 'observed':
-        notify(conn, c.id, f'issue-added:{number}', f"Issue added: #{number} ({stage}, round {c.round}).")
+        notify(conn, c.id, f'issue-added:{number}', f"Issue added: {slack_number(number)} ({stage}, round {c.round}).")
 
 
 def seed_issues(conn, c):
@@ -481,7 +548,7 @@ def seed_issues(conn, c):
             'JOIN stabilize_issue_identities e ON e.campaign_id=i.campaign_id AND e.issue_number=i.issue_number '
             "WHERE i.campaign_id=? AND i.source='seeded' ORDER BY i.issue_number", (c.id,)):
         evidence = json.loads(row['evidence_json'])
-        lines.append(f"- #{row['issue_number']} [{row['stage']}]: {slack_commit(evidence['first_seen_sha'])} "
+        lines.append(f"- {slack_number(row['issue_number'])} [{row['stage']}]: {slack_commit(evidence['first_seen_sha'])} "
                      f"since {evidence['first_seen_at']} — {evidence['first_seen_run_url']}")
     notify(conn, c.id, 'seeded', '\n'.join(lines) if len(lines) > 1 else 'Seeded issues: none.')
     with conn:
@@ -507,11 +574,13 @@ def advance_start(conn, campaign_id):
         conn.execute('UPDATE stabilize_runtime SET stage_rounds=1,ref_error=NULL WHERE campaign_id=?', (c.id,))
 
 
-def pause(conn, c, reason, *, commit_sha=None):
+def pause(conn, c, reason, *, kind='operator', commit_sha=None):
     with conn:
         conn.execute("UPDATE stabilize_campaigns SET status='paused',pause_reason=?,updated_at=? WHERE id=?",
                      (reason, monitor.utc_now(), c.id))
+        conn.execute('UPDATE stabilize_runtime SET pause_kind=? WHERE campaign_id=?', (kind, c.id))
         slack_reason = reason.replace(commit_sha[:7], slack_commit(commit_sha)) if commit_sha else reason
+        slack_reason = re.sub(r'PR #(\d+)', lambda m: 'PR ' + slack_number(int(m[1]), 'pr'), slack_reason)
         notify(conn, c.id, 'paused:' + reason, f'Campaign paused: {slack_reason}')
 
 
@@ -604,7 +673,7 @@ def ensure_dispatch(conn, c, stage, runs):
         if not discovered:
             if _expired(intent['intent_at']):
                 pause(conn, c, f'{stage} dispatch at {c.tip_sha[:7]} has no discovered run after 10 minutes; reconcile before retry',
-                      commit_sha=c.tip_sha)
+                      kind='dispatch_undiscovered', commit_sha=c.tip_sha)
             return
         run_id = min(discovered, key=lambda r: r['databaseId'])['databaseId']
         with conn:
@@ -632,7 +701,7 @@ def ensure_dispatch(conn, c, stage, runs):
                 (c.id, stage, c.tip_sha)).fetchone()[0]
             if retries >= 2:
                 pause(conn, c, f'{stage} infrastructure/incomplete jobs persisted after two redispatches at {c.tip_sha[:7]}',
-                      commit_sha=c.tip_sha)
+                      kind='infrastructure', commit_sha=c.tip_sha)
                 return
         else:
             return
@@ -658,7 +727,7 @@ def ensure_dispatch(conn, c, stage, runs):
             if denied:
                 pause(conn, c, f'{stage} workflow_dispatch refused (attempt {attempt}): {github_refusal(exc)}. '
                       'The dispatch token likely lacks actions: write; check the App installation and the '
-                      f'host mj token_permissions, then run stabilize.py resume {c.id}.')
+                      f'host mj token_permissions, then run stabilize.py resume {c.id}.', kind='dispatch_refused')
 
 
 def github_refusal(exc):
@@ -746,8 +815,8 @@ def refresh_issues(conn, c):
                           monitor.utc_now(), c.id, row['issue_number']))
         if new != old:
             notify(conn, c.id, f'issue-state:{row["issue_number"]}:{c.round}:{new}',
-                   f"Issue #{row['issue_number']}: {new}.")
-    if state.merge_gate_open(conn, c.id):
+                   f"Issue {slack_number(row['issue_number'])}: {new}.")
+    if c.status == 'running' and state.merge_gate_open(conn, c.id):
         notify(conn, c.id, f'merge-gate:{c.round}:{c.stage}',
                f'Round {c.round}: fix merge gate open for {c.branch} ({c.stage}).')
 
@@ -780,8 +849,21 @@ def advance_gate_stage(conn, campaign_id, stage):
     """Opening/landing an older gate cannot advance the newer current stage."""
     index = state.STAGES.index(stage)
     if index + 1 < len(state.STAGES):
-        changed = conn.execute('UPDATE stabilize_campaigns SET stage=?,updated_at=? WHERE id=? AND stage=?',
-                               (state.STAGES[index + 1], monitor.utc_now(), campaign_id, stage)).rowcount
+        row = conn.execute('SELECT * FROM stabilize_campaigns WHERE id=?', (campaign_id,)).fetchone()
+        if row['stage'] != stage:
+            return
+        remember_current_thread(conn, row)
+        gate = conn.execute('SELECT tip_sha FROM stabilize_gate_merges WHERE campaign_id=? AND stage=?',
+                            (campaign_id, stage)).fetchone()
+        tip = gate['tip_sha'] if gate else row['tip_sha']
+        next_stage = state.STAGES[index + 1]
+        root = (f"{monitor.slack_project_prefix()} stable release branch from {slack_commit(row['anchor_sha'])}: "
+                f"{next_stage} stage started ({stage} passed at {slack_commit(tip)}).")
+        conn.execute('INSERT OR IGNORE INTO stabilize_stage_threads(campaign_id,stage,root_text,previous_stage,'
+                     'previous_thread_ts,intro_pending,created_at) VALUES (?,?,?,?,?,1,?)',
+                     (campaign_id, next_stage, root, stage, row['thread_ts'], monitor.utc_now()))
+        changed = conn.execute('UPDATE stabilize_campaigns SET stage=?,thread_ts=NULL,updated_at=? WHERE id=? AND stage=?',
+                               (next_stage, monitor.utc_now(), campaign_id, stage)).rowcount
         if changed:
             conn.execute('UPDATE stabilize_runtime SET stage_rounds=1 WHERE campaign_id=?', (campaign_id,))
 
@@ -824,10 +906,11 @@ def land_gate(conn, c, gate, *, already_in_master=False):
         if already_in_master:
             text = f"{gate['stage']} gate needs no PR: {slack_commit(gate['tip_sha'])} is already in master."
             if gate['pr_number'] is not None:
-                text += f" Gate PR #{gate['pr_number']} is no longer needed."
+                text += f" Gate PR {slack_number(gate['pr_number'], 'pr')} is no longer needed."
             notify(conn, c.id, f"gate-in-master:{gate['stage']}:{gate['tip_sha']}", text)
         else:
-            notify(conn, c.id, f"gate-merged:{gate['pr_number']}", f"{gate['stage']} gate PR #{gate['pr_number']} merged.")
+            notify(conn, c.id, f"gate-merged:{gate['pr_number']}",
+                   f"{gate['stage']} gate PR {slack_number(gate['pr_number'], 'pr')} merged.")
     if gate['stage'] == 'nightly':
         completion_notice(conn, c)
 
@@ -858,7 +941,7 @@ def open_gate(conn, c):
     existing_ref = ref_sha(branch)
     if existing_ref and existing_ref != gate['tip_sha']:
         if gate['pr_number'] is not None:
-            pause(conn, c, f"Immutable gate branch {branch} changed after publication")
+            pause(conn, c, f"Immutable gate branch {branch} changed after publication", kind='gate_ref_changed')
             return False
         intent_row = conn.execute('SELECT snapshot_attempt FROM stabilize_gate_intents WHERE campaign_id=? AND stage=?',
                                   (c.id, c.stage)).fetchone()
@@ -886,7 +969,7 @@ def open_gate(conn, c):
                                  (pr['number'], c.id, c.stage))
                 land_gate(conn, c, dict(gate, pr_number=pr['number']), already_in_master=True)
                 return True
-            pause(conn, c, f"Gate PR #{pr['number']} closed without merging")
+            pause(conn, c, f"Gate PR #{pr['number']} closed without merging", kind='gate_closed')
             return False
         if pr.get('isDraft'):
             monitor.run_gh(['pr', 'ready', str(pr['number']), '--repo', monitor.REPO_NAME])
@@ -917,7 +1000,7 @@ def open_gate(conn, c):
         conn.execute("UPDATE stabilize_gate_merges SET pr_number=?,state='open',updated_at=? WHERE campaign_id=? AND stage=?",
                      (number, monitor.utc_now(), c.id, c.stage))
     queue_write(conn, c.id, f'gate-label:{number}', 'label', {'number': number, 'label': 'mergemarshall:high'})
-    notify(conn, c.id, f'gate-open:{number}', f'{c.stage} gate PR opened: https://github.com/{monitor.REPO_NAME}/pull/{number}')
+    notify(conn, c.id, f'gate-open:{number}', f"{c.stage} gate PR opened: {slack_number(number, 'pr')}")
     if pr.get('state') == 'MERGED':
         land_gate(conn, c, dict(gate, pr_number=number))
     else:
@@ -941,7 +1024,7 @@ def observe_gates(conn, c):
         pr = gh(['pr', 'view', str(gate['pr_number']), '--repo', monitor.REPO_NAME, '--json', 'state,labels,headRefOid'])
         labels = {l['name'].casefold() for l in pr.get('labels', [])}
         if pr.get('headRefOid') and pr['headRefOid'] != gate['tip_sha']:
-            pause(conn, c, f"Gate PR #{gate['pr_number']} no longer has its immutable tested head")
+            pause(conn, c, f"Gate PR #{gate['pr_number']} no longer has its immutable tested head", kind='gate_head_changed')
             return
         if labels & {'mergemarshall:rejected', 'automerge-rejected'} or pr.get('state') == 'CLOSED':
             covered = gate_tip_in_master(gate)
@@ -950,7 +1033,8 @@ def observe_gates(conn, c):
             if covered:
                 land_gate(conn, c, gate, already_in_master=True)
                 continue
-            pause(conn, c, f"Gate PR #{gate['pr_number']} rejected or closed; inspect the merger's rejection evidence")
+            pause(conn, c, f"Gate PR #{gate['pr_number']} rejected or closed; inspect the merger's rejection evidence",
+                  kind='gate_rejected_or_closed')
             return
         if pr.get('state') != 'MERGED':
             continue
@@ -963,8 +1047,46 @@ def completion_notice(conn, c):
         return
     remaining = pull_requests(c.branch, 'open')
     text = 'Campaign complete: nightly gate merged. Remaining open branch PRs: '
-    text += ', '.join(p.get('url') or f"#{p['number']}" for p in remaining) or 'none'
+    text += ', '.join(slack_number(p['number'], 'pr') for p in remaining) or 'none'
     notify(conn, c.id, 'completed', text)
+
+
+def refresh_escalated_pause(conn, c):
+    """Refresh only issue states; eligible work releases this one pause kind."""
+    row = conn.execute('SELECT c.pause_reason,r.pause_kind FROM stabilize_campaigns c '
+                       'JOIN stabilize_runtime r ON r.campaign_id=c.id WHERE c.id=?', (c.id,)).fetchone()
+    kind = row['pause_kind']
+    if not kind and (row['pause_reason'] or '').startswith('Only escalated issues remain'):
+        kind = 'escalated_only'
+        with conn:
+            conn.execute('UPDATE stabilize_runtime SET pause_kind=? WHERE campaign_id=?', (kind, c.id))
+    if kind != 'escalated_only':
+        return
+    previous = {r['issue_number']: r['state'] for r in conn.execute(
+        'SELECT issue_number,state FROM stabilize_issues WHERE campaign_id=?', (c.id,))}
+    refresh_issues(conn, c)
+    required = state.STAGES[:state.STAGES.index(c.stage) + 1]
+    eligible = conn.execute('SELECT issue_number,state,pr_number FROM stabilize_issues WHERE campaign_id=? '
+                           'AND stage IN (' + ','.join('?' * len(required)) + ") AND state IN ('open','pr_ready') "
+                           'ORDER BY issue_number', (c.id, *required)).fetchall()
+    if not eligible:
+        return
+    reasons = []
+    for issue in eligible:
+        number = issue['issue_number']
+        if issue['state'] == 'pr_ready':
+            reasons.append(f"{slack_number(number)} has a ready PR {slack_number(issue['pr_number'], 'pr')}")
+        elif previous.get(number) == 'escalated':
+            reasons.append(f'{slack_number(number)} is no longer escalated')
+        else:
+            reasons.append(f'{slack_number(number)} needs a fix')
+    with conn:
+        conn.execute("UPDATE stabilize_campaigns SET status='running',pause_reason=NULL,updated_at=? WHERE id=?",
+                     (monitor.utc_now(), c.id))
+        conn.execute('UPDATE stabilize_runtime SET pause_kind=NULL,resume_count=resume_count+1 WHERE campaign_id=?',
+                     (c.id,))
+        count = conn.execute('SELECT resume_count FROM stabilize_runtime WHERE campaign_id=?', (c.id,)).fetchone()[0]
+        notify(conn, c.id, f'auto-resumed:{count}', 'Campaign resumed automatically: ' + '; '.join(reasons) + '.')
 
 
 def tick_campaign(conn, campaign_id):
@@ -973,6 +1095,10 @@ def tick_campaign(conn, campaign_id):
         advance_start(conn, c.id)
         c = campaign(conn, c.id)
     if c.status not in ('running', 'paused'):
+        return
+    if c.status == 'paused':
+        refresh_escalated_pause(conn, c)
+        # Even an automatic resume leaves dispatch/gates/rounds to the next tick.
         return
     if conn.execute("SELECT 1 FROM stabilize_gate_merges WHERE campaign_id=? AND stage='nightly' AND state='merged'",
                     (c.id,)).fetchone():
@@ -991,7 +1117,7 @@ def tick_campaign(conn, campaign_id):
         return
     tip = ref_sha(c.branch)
     if not tip:
-        pause(conn, c, 'Campaign branch is missing')
+        pause(conn, c, 'Campaign branch is missing', kind='branch_missing')
         return
     if tip != c.tip_sha:
         with conn:
@@ -1001,7 +1127,7 @@ def tick_campaign(conn, campaign_id):
         c = campaign(conn, c.id)
         rounds = conn.execute('SELECT stage_rounds FROM stabilize_runtime WHERE campaign_id=?', (c.id,)).fetchone()[0]
         if rounds > 8:
-            pause(conn, c, f'Eight rounds exhausted within {c.stage}')
+            pause(conn, c, f'Eight rounds exhausted within {c.stage}', kind='round_limit')
             return
     required = state.STAGES[:state.STAGES.index(c.stage) + 1]
     settled = True
@@ -1027,7 +1153,7 @@ def tick_campaign(conn, campaign_id):
         blockers = conn.execute('SELECT state FROM stabilize_issues WHERE campaign_id=? AND stage IN (' +
             ','.join('?' * len(required)) + ") AND state IN ('open','pr_ready','escalated')", (c.id, *required)).fetchall()
         if settled and blockers and all(r['state'] == 'escalated' for r in blockers):
-            pause(conn, c, f'Only escalated issues remain in {c.stage} after available fixes landed')
+            pause(conn, c, f'Only escalated issues remain in {c.stage} after available fixes landed', kind='escalated_only')
 
 
 def run_campaign_tick(conn, campaign_id, transport=None, *, advance=True):
@@ -1099,7 +1225,7 @@ def resume_campaign(conn, campaign_id, requested_by):
                      'AND permission_denied=1 AND run_id IS NULL AND cancelled_at IS NULL', (monitor.utc_now(), c.id))
         conn.execute("UPDATE stabilize_campaigns SET status=?,pause_reason=NULL,updated_at=? WHERE id=?",
                      ('running' if c.tip_sha else 'starting', monitor.utc_now(), c.id))
-        conn.execute('UPDATE stabilize_runtime SET resume_count=resume_count+1 WHERE campaign_id=?', (c.id,))
+        conn.execute('UPDATE stabilize_runtime SET pause_kind=NULL,resume_count=resume_count+1 WHERE campaign_id=?', (c.id,))
         count = conn.execute('SELECT resume_count FROM stabilize_runtime WHERE campaign_id=?', (c.id,)).fetchone()[0]
         notify(conn, c.id, f'resumed:{count}', f'Campaign resumed by {requested_by}: {c.branch}.')
 
@@ -1173,17 +1299,19 @@ def resolve(commitish=None):
 def _view(conn, row):
     result = dict(row)
     result['branch_url'] = f"https://github.com/{monitor.REPO_NAME}/tree/{urllib.parse.quote(row['branch'], safe='/')}"
-    result['slack_thread_url'] = None
-    if row['thread_ts'] and monitor.CHANNEL_PATH.exists():
-        channel = monitor.CHANNEL_PATH.read_text().strip()
-        if re.fullmatch(r'[A-Z0-9]+', channel):
-            result['slack_thread_url'] = f"https://app.slack.com/archives/{channel}/p{row['thread_ts'].replace('.', '')}"
+    result['slack_thread_url'] = slack_thread_url(row['thread_ts'])
     result['issues'] = [dict(r) for r in conn.execute('SELECT issue_number AS number,stage,source,state,pr_number '
                                                    'FROM stabilize_issues WHERE campaign_id=? ORDER BY issue_number', (row['id'],))]
     result['gate_merges'] = [dict(r) for r in conn.execute('SELECT stage,tip_sha,gate_branch,pr_number,state '
                                                         'FROM stabilize_gate_merges WHERE campaign_id=?', (row['id'],))]
     result['latest_runs'] = {}
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    result['stage_threads'] = []
+    if 'stabilize_stage_threads' in tables:
+        result['stage_threads'] = [dict(stage=r['stage'], thread_ts=r['thread_ts'],
+                                      slack_thread_url=slack_thread_url(r['thread_ts'])) for r in conn.execute(
+            'SELECT stage,thread_ts FROM stabilize_stage_threads WHERE campaign_id=? '
+            "ORDER BY CASE stage WHEN 'push' THEN 0 WHEN 'hourly' THEN 1 ELSE 2 END", (row['id'],))]
     if 'stabilize_runs' in tables:
         for stage in state.STAGES:
             run = conn.execute('SELECT * FROM stabilize_runs WHERE campaign_id=? AND stage=? AND tip_sha=? '

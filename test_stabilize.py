@@ -569,7 +569,7 @@ class CampaignTests(unittest.TestCase):
         self.gh.side_effect = lambda args, **kwargs: json.dumps({'state':'MERGED', 'labels':[]}) if args[:2] == ['pr','view'] else json.dumps([{'number':99,'url':'https://example/pr/99'}])
         engine.observe_gates(self.conn, c)
         self.assertEqual(self.current().status, 'completed')
-        self.assertIn('https://example/pr/99', self.conn.execute("SELECT text FROM stabilize_messages WHERE checkpoint='completed:0'").fetchone()[0])
+        self.assertIn(engine.slack_number(99, 'pr'), self.conn.execute("SELECT text FROM stabilize_messages WHERE checkpoint='completed:0'").fetchone()[0])
 
     def test_gate_rejection_pauses_and_abort_keeps_branches_and_prs(self):
         c = self.campaign(sha=B)
@@ -601,6 +601,120 @@ class CampaignTests(unittest.TestCase):
              mock.patch.object(automerge, 'collect_failure_report_for_run', return_value=report()), mock.patch.object(engine, 'observe_gates'):
             engine.tick_campaign(self.conn, c.id)
         self.assertEqual(self.current().status, 'paused')
+        self.assertEqual(self.conn.execute('SELECT pause_kind FROM stabilize_runtime').fetchone()[0], 'escalated_only')
+
+    def paused_campaign(self, stage='hourly'):
+        c = self.campaign(stage=stage, sha=B)
+        self.issue(c, status='escalated', stage=stage)
+        engine.pause(self.conn, c, f'Only escalated issues remain in {stage} after available fixes landed',
+                     kind='escalated_only')
+        return self.current()
+
+    def paused_tick_without_stage_work(self):
+        with mock.patch.object(engine, 'ensure_dispatch') as dispatch, \
+             mock.patch.object(engine, 'observe_gates') as gates, \
+             mock.patch.object(engine, 'ingest_run') as ingest, \
+             mock.patch.object(engine, 'branch_runs') as runs, \
+             mock.patch.object(engine, 'ref_sha') as ref, \
+             mock.patch.object(engine, 'open_gate') as publish:
+            engine.tick_campaign(self.conn, 'test')
+        for operation in (dispatch, gates, ingest, runs, ref, publish):
+            operation.assert_not_called()
+
+    def test_escalated_pause_auto_resumes_after_deescalation_without_stage_work(self):
+        self.paused_campaign()
+        self.issue_reads()
+        self.paused_tick_without_stage_work()
+        self.assertEqual(self.issue_state(), 'open')
+        self.assertEqual(self.current().status, 'running')
+        row = self.conn.execute('SELECT pause_reason FROM stabilize_campaigns').fetchone()
+        self.assertIsNone(row[0])
+        self.assertIsNone(self.conn.execute('SELECT pause_kind FROM stabilize_runtime').fetchone()[0])
+        message = self.conn.execute("SELECT text FROM stabilize_messages WHERE checkpoint LIKE 'auto-resumed:%'").fetchone()[0]
+        self.assertIn(f'{engine.slack_number(7)} is no longer escalated', message)
+        with mock.patch.object(engine, 'ref_sha', return_value=B), \
+             mock.patch.object(engine, 'branch_runs', return_value=[]), \
+             mock.patch.object(engine, 'ensure_dispatch'):
+            engine.tick_campaign(self.conn, 'test')
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM stabilize_messages WHERE checkpoint LIKE 'auto-resumed:%'").fetchone()[0], 1)
+        self.assertEqual((self.current().round, self.current().tip_sha, self.current().stage), (1, B, 'hourly'))
+
+    def test_escalated_pause_auto_resumes_after_ready_pr(self):
+        self.paused_campaign()
+        self.issue_reads([self.pr(number=5158)])
+        self.paused_tick_without_stage_work()
+        self.assertEqual((self.current().status, self.issue_state()), ('running', 'pr_ready'))
+        text = self.conn.execute("SELECT text FROM stabilize_messages WHERE checkpoint LIKE 'auto-resumed:%'").fetchone()[0]
+        self.assertIn(f"{engine.slack_number(7)} has a ready PR {engine.slack_number(5158, 'pr')}", text)
+
+    def test_auto_resume_notice_names_ready_and_deescalated_blockers_together(self):
+        c = self.paused_campaign()
+        self.issue(c, number=8, status='escalated', stage='push')
+        self.issue_reads([self.pr(number=5158)])
+        self.paused_tick_without_stage_work()
+        text = self.conn.execute("SELECT text FROM stabilize_messages WHERE checkpoint LIKE 'auto-resumed:%'").fetchone()[0]
+        self.assertIn(f"{engine.slack_number(7)} has a ready PR {engine.slack_number(5158, 'pr')}", text)
+        self.assertIn(f'{engine.slack_number(8)} is no longer escalated', text)
+        self.assertEqual(self.current().status, 'running')
+
+    def test_escalated_pause_stays_quiet_while_all_escalated(self):
+        self.paused_campaign()
+        self.issue_reads(labels=['Escalated'])
+        initial = self.conn.execute('SELECT COUNT(*) FROM stabilize_messages').fetchone()[0]
+        for _ in range(3):
+            self.paused_tick_without_stage_work()
+        self.assertEqual(self.current().status, 'paused')
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM stabilize_messages').fetchone()[0], initial)
+
+    def test_other_pause_kinds_never_auto_resume_even_with_legacy_reason_prefix(self):
+        c = self.campaign(stage='hourly')
+        self.issue(c, status='escalated', stage='hourly')
+        self.issue_reads([self.pr(number=5158)])
+        for kind in ('operator', 'dispatch_refused', 'dispatch_undiscovered', 'round_limit', 'infrastructure',
+                     'gate_ref_changed', 'gate_closed', 'gate_head_changed', 'gate_rejected_or_closed', 'branch_missing'):
+            engine.pause(self.conn, self.current(), 'Only escalated issues remain (stale description)', kind=kind)
+            with mock.patch.object(engine, 'refresh_issues') as refresh:
+                self.paused_tick_without_stage_work()
+            refresh.assert_not_called()
+            self.assertEqual(self.current().status, 'paused')
+            self.assertEqual(self.issue_state(), 'escalated')
+        engine.resume_campaign(self.conn, 'test', 'admin')
+        self.assertIsNone(self.conn.execute('SELECT pause_kind FROM stabilize_runtime').fetchone()[0])
+
+    def test_legacy_escalated_reason_maps_kind_and_then_auto_resumes(self):
+        self.paused_campaign()
+        with self.conn:
+            self.conn.execute('UPDATE stabilize_runtime SET pause_kind=NULL')
+        self.issue_reads(labels=['Escalated'])
+        self.paused_tick_without_stage_work()
+        self.assertEqual(self.conn.execute('SELECT pause_kind FROM stabilize_runtime').fetchone()[0], 'escalated_only')
+        self.issue_reads()
+        self.paused_tick_without_stage_work()
+        self.assertEqual(self.current().status, 'running')
+
+    def test_later_stage_deescalation_does_not_resume_current_stage(self):
+        c = self.paused_campaign()
+        self.issue(c, number=8, status='escalated', stage='nightly')
+        def read(args, **kwargs):
+            if args[:2] == ['issue', 'view']:
+                labels = [{'name': 'Escalated'}] if args[2] == '7' else []
+                return json.dumps({'state': 'OPEN', 'labels': labels})
+            return '[]'
+        self.gh.side_effect = read
+        self.paused_tick_without_stage_work()
+        self.assertEqual((self.current().status, self.issue_state(7), self.issue_state(8)), ('paused', 'escalated', 'open'))
+
+    def test_pause_kind_additive_migration_preserves_runtime_row(self):
+        with sqlite3.connect(':memory:') as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute('CREATE TABLE stabilize_runtime(campaign_id TEXT PRIMARY KEY,seeded INTEGER DEFAULT 0,'
+                         'stage_rounds INTEGER DEFAULT 0,ref_attempt_at TEXT)')
+            conn.execute("INSERT INTO stabilize_runtime VALUES ('legacy',1,4,NULL)")
+            engine.ensure_schema(conn)
+            engine.ensure_schema(conn)
+            row = conn.execute('SELECT * FROM stabilize_runtime').fetchone()
+            self.assertEqual((row['campaign_id'], row['seeded'], row['stage_rounds']), ('legacy', 1, 4))
+            self.assertIsNone(row['pause_kind'])
 
     def test_slack_outage_does_not_block_campaign_and_retries_checkpoint(self):
         c = self.campaign()
@@ -1181,6 +1295,154 @@ class CampaignTests(unittest.TestCase):
             self.assertTrue(engine.slack_commit(A) in message or engine.slack_commit(B) in message)
         self.assertEqual(engine.get(c.id)['pause_reason'], f'Checks deferred at {B[:7]}')
 
+    def stage_transition(self):
+        c = self.campaign(sha=B)
+        monitor.CHANNEL_PATH.write_text('C1')
+        with self.conn:
+            self.conn.execute("UPDATE stabilize_campaigns SET thread_ts='100.001'")
+        engine.notify(self.conn, c.id, 'old-pending', 'Push result pending.')
+        self.gate(c)
+        with self.conn:
+            engine.advance_gate_stage(self.conn, c.id, 'push')
+        return self.current()
+
+    def test_stage_thread_root_intro_routing_and_view_are_once_only(self):
+        c = self.stage_transition()
+        self.assertIsNone(c.thread_ts)
+        engine.notify(self.conn, c.id, 'new-pending', 'Hourly dispatch pending.')
+        with mock.patch.object(monitor, 'slack_send', return_value=(True, '200.002')) as send:
+            engine.deliver_slack(self.conn)
+            engine.deliver_slack(self.conn)
+        roots = [call for call in send.call_args_list if not call.kwargs.get('thread_ts')]
+        self.assertEqual(len(roots), 1)
+        expected = (f'{monitor.slack_project_prefix()} stable release branch from {engine.slack_commit(A)}: '
+                    f'hourly stage started (push passed at {engine.slack_commit(B)}).')
+        self.assertEqual(roots[0].args[1], expected)
+        self.assertNotIn('stabilize/test', expected)
+        self.assertNotIn('campaign `test`', expected)
+        replies = [call for call in send.call_args_list if call.kwargs.get('thread_ts') == '200.002']
+        self.assertIn('https://app.slack.com/archives/C1/p100001', replies[0].args[1])
+        self.assertIn('campaign `test`', replies[0].args[1])
+        self.assertIn('https://github.com/BrokkAi/bifrost-dev/tree/stabilize/test', replies[0].args[1])
+        self.assertEqual(replies[1].args[1], 'Hourly dispatch pending.')
+        old = next(call for call in send.call_args_list if call.args[1] == 'Push result pending.')
+        self.assertEqual(old.kwargs['thread_ts'], '100.001')
+        view = engine.get(c.id)
+        self.assertEqual(view['slack_thread_url'], 'https://app.slack.com/archives/C1/p200002')
+        self.assertEqual(view['stage_threads'], [
+            {'stage': 'push', 'thread_ts': '100.001', 'slack_thread_url': 'https://app.slack.com/archives/C1/p100001'},
+            {'stage': 'hourly', 'thread_ts': '200.002', 'slack_thread_url': 'https://app.slack.com/archives/C1/p200002'}])
+        self.assertEqual(engine.list_campaigns()[0]['stage_threads'], view['stage_threads'])
+
+    def test_stage_root_outage_queues_new_progress_without_old_thread_fallback(self):
+        c = self.stage_transition()
+        engine.notify(self.conn, c.id, 'new-pending', 'New stage pending.')
+        def send(transport, text, thread_ts=None):
+            return (True, 'reply') if thread_ts else (False, None)
+        with mock.patch.object(monitor, 'slack_send', side_effect=send) as slack:
+            engine.deliver_slack(self.conn)
+        self.assertIsNone(self.current().thread_ts)
+        message = self.conn.execute("SELECT * FROM stabilize_messages WHERE checkpoint='new-pending:0'").fetchone()
+        self.assertIsNone(message['sent_at'])
+        self.assertEqual(message['thread_stage'], 'hourly')
+        self.assertFalse(any(call.args[1] == 'New stage pending.' for call in slack.call_args_list))
+        self.assertEqual(self.current().stage, 'hourly')
+        with mock.patch.object(monitor, 'slack_send', return_value=(True, '200.002')) as slack:
+            engine.deliver_slack(self.conn)
+        self.assertEqual(slack.call_args.kwargs['thread_ts'], '200.002')
+
+    def test_stage_first_reply_failure_retries_without_reposting_root(self):
+        c = self.stage_transition()
+        engine.notify(self.conn, c.id, 'new-pending', 'New progress.')
+        with mock.patch.object(monitor, 'slack_send', side_effect=[(True, 'reply'), (True, '200.002'), (False, None)]):
+            engine.deliver_slack(self.conn)
+        with mock.patch.object(monitor, 'slack_send', return_value=(True, 'reply')) as slack:
+            engine.deliver_slack(self.conn)
+            engine.deliver_slack(self.conn)
+        self.assertEqual(len(slack.call_args_list), 2)
+        self.assertTrue(slack.call_args_list[0].args[1].startswith('Previous push stage thread:'))
+        self.assertEqual(slack.call_args_list[1].args[1], 'New progress.')
+        self.assertTrue(all(call.kwargs['thread_ts'] == '200.002' for call in slack.call_args_list))
+
+    def test_stage_intro_checkpoint_error_does_not_lose_accepted_root(self):
+        self.stage_transition()
+        with mock.patch.object(engine, 'stage_first_reply', side_effect=OSError('checkpoint deferred')), \
+             mock.patch.object(monitor, 'slack_send', return_value=(True, '200.002')):
+            engine.deliver_slack(self.conn)
+        self.assertEqual(self.current().thread_ts, '200.002')
+        with mock.patch.object(monitor, 'slack_send', return_value=(True, 'reply')) as send:
+            engine.deliver_slack(self.conn)
+            engine.deliver_slack(self.conn)
+        self.assertEqual(len(send.call_args_list), 1)
+        self.assertIn('Previous push stage thread', send.call_args.args[1])
+        self.assertEqual(send.call_args.kwargs['thread_ts'], '200.002')
+
+    def test_existing_hourly_thread_is_adopted_without_retroactive_root(self):
+        c = self.campaign(stage='hourly')
+        with self.conn:
+            self.conn.execute("UPDATE stabilize_campaigns SET thread_ts='100.001'")
+        with mock.patch.object(monitor, 'slack_send') as send:
+            engine.deliver_slack(self.conn)
+            engine.deliver_slack(self.conn)
+        send.assert_not_called()
+        self.assertEqual([r['stage'] for r in engine.get(c.id)['stage_threads']], ['hourly'])
+        self.assertEqual(self.current().thread_ts, '100.001')
+
+    def test_no_pr_gate_transition_starts_thread_and_routes_later_pause_and_completion(self):
+        c = self.campaign(sha=B)
+        monitor.CHANNEL_PATH.write_text('C1')
+        with self.conn:
+            self.conn.execute("UPDATE stabilize_campaigns SET thread_ts='100.001'")
+        self.master.return_value = B
+        self.assertTrue(engine.open_gate(self.conn, c))
+        with mock.patch.object(monitor, 'slack_send', return_value=(True, '200.002')):
+            engine.deliver_slack(self.conn)
+        hourly = self.current()
+        with self.conn:
+            engine.advance_gate_stage(self.conn, hourly.id, 'hourly')
+        with mock.patch.object(monitor, 'slack_send', return_value=(True, '300.003')):
+            engine.deliver_slack(self.conn)
+        engine.pause(self.conn, self.current(), 'Gate PR #40 rejected', kind='gate_rejected_or_closed')
+        engine.notify(self.conn, c.id, 'auto-resumed:test', 'Ready again.')
+        self.issue_reads([{'number': 99}])
+        engine.completion_notice(self.conn, self.current())
+        with mock.patch.object(monitor, 'slack_send', return_value=(True, 'reply')) as send:
+            engine.deliver_slack(self.conn)
+        self.assertTrue(all(call.kwargs['thread_ts'] == '300.003' for call in send.call_args_list))
+        self.assertEqual([r['stage'] for r in engine.get(c.id)['stage_threads']], ['push', 'hourly', 'nightly'])
+
+    def test_transition_before_initial_slack_root_preserves_old_pending_messages(self):
+        c = self.campaign(sha=B)
+        engine.notify(self.conn, c.id, 'old-pending', 'Push pending.')
+        self.gate(c)
+        with self.conn:
+            engine.advance_gate_stage(self.conn, c.id, 'push')
+        engine.notify(self.conn, c.id, 'new-pending', 'Hourly pending.')
+        def send(transport, text, thread_ts=None):
+            return True, (thread_ts or ('100.001' if 'started from' in text else '200.002'))
+        with mock.patch.object(monitor, 'slack_send', side_effect=send) as slack:
+            engine.deliver_slack(self.conn)
+            engine.deliver_slack(self.conn)
+        old = next(call for call in slack.call_args_list if call.args[1] == 'Push pending.')
+        new = next(call for call in slack.call_args_list if call.args[1] == 'Hourly pending.')
+        self.assertEqual((old.kwargs['thread_ts'], new.kwargs['thread_ts']), ('100.001', '200.002'))
+        self.assertEqual(sum(not call.kwargs.get('thread_ts') for call in slack.call_args_list), 2)
+
+    def test_issue_and_pr_slack_references_are_links_but_github_comments_unchanged(self):
+        c = self.campaign(sha=B, seeded=0)
+        self.seed_row()
+        self.issue_reads()
+        engine.seed_issues(self.conn, c)
+        engine.pause(self.conn, c, 'Gate PR #40 rejected', kind='gate_rejected_or_closed')
+        engine.notify(self.conn, c.id, 'remaining-test', engine.slack_number(99, 'pr'))
+        messages = [row['text'] for row in self.conn.execute('SELECT text FROM stabilize_messages')]
+        self.assertTrue(any(engine.slack_number(7) in text for text in messages))
+        self.assertTrue(any(engine.slack_number(40, 'pr') in text for text in messages))
+        self.assertTrue(any(engine.slack_number(99, 'pr') in text for text in messages))
+        self.issue_reads(assignees=['David'])
+        engine.assignee_guidance(self.conn, c.id)
+        self.assertIn('Fixes #7', json.loads(self.guidance_writes()[0]['payload'])['comment'])
+
     def test_zero_fix_push_gate_lands_without_pr_and_advances(self):
         c = self.campaign()
         self.master.return_value = C  # Historical anchor is behind, not equal to, master.
@@ -1251,7 +1513,7 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual((gate['state'], gate['pr_number']), ('merged', 40))
         self.assertIsNone(engine.get(c.id)['pause_reason'])
         notice = self.conn.execute("SELECT text FROM stabilize_messages WHERE checkpoint LIKE 'gate-in-master:%'").fetchone()[0]
-        self.assertIn('Gate PR #40 is no longer needed', notice)
+        self.assertIn(f"Gate PR {engine.slack_number(40, 'pr')} is no longer needed", notice)
 
     def test_closed_gate_pr_rechecks_master_advanced_during_read(self):
         c = self.campaign(sha=B)
