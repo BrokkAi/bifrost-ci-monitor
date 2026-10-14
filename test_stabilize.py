@@ -83,14 +83,151 @@ class CampaignTests(unittest.TestCase):
         return dict(number=number, state=status, headRefOid=sha, headRefName='repair', baseRefName='stabilize/test',
                     body='CI-Repair-Issue: 7\nFixes #7', isDraft=draft, mergeCommit={'oid': sha}, labels=[])
 
-    def issue_reads(self, prs=None, status='OPEN', labels=None):
+    def issue_reads(self, prs=None, status='OPEN', labels=None, assignees=None):
         def read(args, **kwargs):
             if args[:2] == ['issue', 'view']:
-                return json.dumps({'state': status, 'labels': [{'name': l} for l in (labels or ['buildfailure'])]})
+                return json.dumps({'state': status, 'labels': [{'name': l} for l in (labels or ['buildfailure'])],
+                                   'assignees': [{'login': login} for login in (assignees or [])]})
             if args[:2] == ['pr', 'list']:
                 return json.dumps(prs or [])
             return '[]'
         self.gh.side_effect = read
+
+    def guidance_writes(self):
+        return self.conn.execute("SELECT * FROM stabilize_writes WHERE kind='assignee-guidance'").fetchall()
+
+    def test_assignee_guidance_once_per_set_with_branch_trailers(self):
+        c = self.campaign()
+        self.issue(c)
+        self.issue_reads(assignees=['DavidBakerEffendi', 'Alice', 'brokk-service', 'mergemarshall[bot]'])
+        engine.assignee_guidance(self.conn, c.id)
+        self.issue_reads(assignees=['alice', 'DAVIDBAKEREFFENDI', 'BROKK-SERVICE'])
+        engine.assignee_guidance(self.conn, c.id)
+        rows = self.guidance_writes()
+        self.assertEqual(len(rows), 1)
+        payload = json.loads(rows[0]['payload'])
+        self.assertEqual(payload['assignees'], ['alice', 'davidbakereffendi'])
+        for text in ('@alice', '@davidbakereffendi', '`stabilize/test`', 'Fixes #7',
+                     'CI-Repair-Issue: 7', 'unassign yourself', "MergeMarshall's fixer"):
+            self.assertIn(text, payload['comment'])
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM stabilize_messages').fetchone()[0], 0)
+        self.issue_reads(assignees=['Bob'])
+        engine.assignee_guidance(self.conn, c.id)
+        self.assertEqual(len(self.guidance_writes()), 2)
+
+    def test_assignee_guidance_ignores_service_bot_and_unassigned(self):
+        c = self.campaign()
+        self.issue(c)
+        for owners in ([], ['brokk-service'], ['mergemarshall[bot]'], ['BROKK-SERVICE', 'mergemarshall[bot]']):
+            self.issue_reads(assignees=owners)
+            engine.assignee_guidance(self.conn, c.id)
+        self.assertFalse(self.guidance_writes())
+
+    def test_assignee_guidance_checkpoint_scoped_to_campaign(self):
+        c = self.campaign()
+        self.issue(c)
+        self.issue_reads(assignees=['David'])
+        engine.assignee_guidance(self.conn, c.id)
+        with self.conn:
+            self.conn.execute("UPDATE stabilize_campaigns SET status='completed'")
+            self.conn.execute("INSERT INTO stabilize_campaigns(id,branch,anchor_sha,tip_sha,status,created_at,updated_at) "
+                              "SELECT 'next','stabilize/next',anchor_sha,tip_sha,'running',created_at,updated_at "
+                              "FROM stabilize_campaigns WHERE id='test'")
+        next_campaign = engine.campaign(self.conn, 'next')
+        self.issue(next_campaign)
+        engine.assignee_guidance(self.conn, next_campaign.id)
+        self.assertEqual(len(self.guidance_writes()), 2)
+        self.assertIn('`stabilize/next`', json.loads(self.guidance_writes()[1]['payload'])['comment'])
+
+    def test_assignee_guidance_delivery_fences_campaign_and_member_state(self):
+        c = self.campaign()
+        self.issue(c)
+        self.issue_reads(assignees=['David'])
+        engine.assignee_guidance(self.conn, c.id)
+        with self.conn:
+            self.conn.execute("UPDATE stabilize_issues SET state='pr_ready'")
+        engine.deliver_writes(self.conn)
+        self.assertIsNotNone(self.guidance_writes()[0]['cancelled_at'])
+        self.assertFalse(any('/comments' in str(call.args[0]) for call in self.gh.call_args_list))
+
+    def test_assignee_guidance_requires_live_open_member_and_github_issue(self):
+        c = self.campaign()
+        self.issue(c)
+        self.issue_reads(assignees=['David'], status='CLOSED')
+        engine.assignee_guidance(self.conn, c.id)
+        self.issue_reads(assignees=['David'])
+        for status in ('pr_ready', 'landed', 'escalated', 'closed', 'dropped'):
+            with self.conn:
+                self.conn.execute('UPDATE stabilize_issues SET state=?', (status,))
+            engine.assignee_guidance(self.conn, c.id)
+        with self.conn:
+            self.conn.execute("UPDATE stabilize_issues SET state='open'")
+            self.conn.execute("UPDATE stabilize_campaigns SET status='completed'")
+        engine.assignee_guidance(self.conn, c.id)
+        self.assertFalse(self.guidance_writes())
+
+    def test_assignee_guidance_delivered_once_and_retry_adopts_bot_comment(self):
+        c = self.campaign(status='paused')
+        self.issue(c)
+        self.issue_reads(assignees=['David'])
+        engine.assignee_guidance(self.conn, c.id)
+        read = self.gh.side_effect
+        comments = []
+        posted = []
+        def external(args, **kwargs):
+            if args[0] == 'api' and '/comments' in args[1]:
+                if '--method' not in args:
+                    return json.dumps([comments])
+                body = next(arg[5:] for arg in args if arg.startswith('body='))
+                comments.append({'body': body, 'user': {'login': 'mergemarshall[bot]'}})
+                posted.append(body)
+                raise monitor.CommandError('accepted but response lost')
+            return read(args, **kwargs)
+        self.gh.side_effect = external
+        engine.deliver_writes(self.conn)
+        self.assertIsNone(self.guidance_writes()[0]['done_at'])
+        engine.deliver_writes(self.conn)
+        engine.assignee_guidance(self.conn, c.id)
+        engine.deliver_writes(self.conn)
+        self.assertEqual(len(posted), 1)
+        self.assertIsNotNone(self.guidance_writes()[0]['done_at'])
+
+    def test_assignee_guidance_cancels_pending_comment_after_unassignment(self):
+        c = self.campaign()
+        self.issue(c)
+        self.issue_reads(assignees=['David'])
+        engine.assignee_guidance(self.conn, c.id)
+        self.issue_reads(assignees=['brokk-service'])
+        engine.deliver_writes(self.conn)
+        self.assertIsNotNone(self.guidance_writes()[0]['cancelled_at'])
+        self.assertFalse(any('/comments' in str(call.args[0]) for call in self.gh.call_args_list))
+        engine.assignee_guidance(self.conn, c.id)
+        self.assertEqual(len(self.guidance_writes()), 1)
+
+    def test_assignee_guidance_tick_queues_and_delivers_without_slack_notice(self):
+        c = self.campaign(status='paused')
+        self.issue(c)
+        self.issue_reads(assignees=['David'])
+        with mock.patch.object(engine, 'deliver_slack'), mock.patch.object(engine, 'tick_campaign'), \
+             mock.patch.object(engine, 'notify') as notify:
+            engine.run_campaign_tick(self.conn, c.id)
+            engine.run_campaign_tick(self.conn, c.id)
+        self.assertEqual(len(self.guidance_writes()), 1)
+        self.assertIsNotNone(self.guidance_writes()[0]['done_at'])
+        posts = [call for call in self.gh.call_args_list
+                 if '/comments' in str(call.args[0]) and 'POST' in call.args[0]]
+        self.assertEqual(len(posts), 1)
+        notify.assert_not_called()
+
+    def test_assignee_guidance_read_failure_does_not_block_other_tick_work(self):
+        c = self.campaign()
+        self.issue(c)
+        self.gh.side_effect = monitor.CommandError('read unavailable')
+        with mock.patch.object(engine, 'deliver_slack'), mock.patch.object(engine, 'tick_campaign'), \
+             mock.patch.object(engine, 'deliver_writes') as deliver:
+            engine.run_campaign_tick(self.conn, c.id)
+        deliver.assert_called_once_with(self.conn, campaign_id=c.id)
+        self.assertFalse(self.guidance_writes())
 
     def test_anchor_newest_completed_non_cancelled_push(self):
         items = [dict(run(1), headBranch='master', event='push', createdAt='2026-01-01'),
