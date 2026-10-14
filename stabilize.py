@@ -6,6 +6,7 @@ import argparse
 from contextlib import contextmanager
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import re
 import sqlite3
@@ -130,6 +131,43 @@ def queue_write(conn, campaign_id, checkpoint, kind, payload):
                      'VALUES (?,?,?,?)', (campaign_id, checkpoint, kind, json.dumps(payload)))
 
 
+def human_assignees(issue):
+    """Canonical ownership set, excluding the fixer and the App bot."""
+    from issue_fixer import ASSIGNEE
+    ignored = {ASSIGNEE.casefold(), 'mergemarshall[bot]'}
+    return sorted({a['login'].casefold() for a in issue.get('assignees', [])
+                   if a.get('login') and a['login'].casefold() not in ignored})
+
+
+def assignee_guidance(conn, campaign_id):
+    """Checkpoint one ticket comment per campaign/issue/foreign-assignee set."""
+    c = campaign(conn, campaign_id)
+    if not c.live:
+        return
+    for row in conn.execute("SELECT issue_number FROM stabilize_issues WHERE campaign_id=? AND state='open'",
+                            (c.id,)).fetchall():
+        number = row['issue_number']
+        try:
+            issue = gh(['issue', 'view', str(number), '--repo', monitor.REPO_NAME,
+                        '--json', 'state,assignees'])
+        except Exception as exc:
+            monitor.log(f'stabilize campaign {c.id} issue {number} assignee read deferred: {type(exc).__name__}')
+            continue
+        owners = human_assignees(issue)
+        if issue.get('state') != 'OPEN' or not owners:
+            continue
+        ownership = hashlib.sha256(json.dumps(owners).encode()).hexdigest()
+        checkpoint = f'assignee-guidance:{number}:{ownership}'
+        mentions = ', '.join('@' + owner for owner in owners)
+        comment = (f"{mentions}: this issue is part of stabilize campaign `{c.branch}`. "
+                   f"Please open your fix as a PR against `{c.branch}` (rather than master), "
+                   f"with `Fixes #{number}` and `CI-Repair-Issue: {number}` in the PR body "
+                   "so the campaign can land it. If you are not working on it, you can "
+                   "unassign yourself and MergeMarshall's fixer will take it.")
+        queue_write(conn, c.id, checkpoint, 'assignee-guidance',
+                    {'number': number, 'assignees': owners, 'comment': comment})
+
+
 def close_is_current(conn, campaign_id, payload):
     """Fence a close to the exact fix and immutable merged gate that authorized it."""
     required = ('gate_stage', 'gate_tip_sha', 'gate_pr_number', 'fix_sha', 'fix_pr_number', 'fix_head_sha')
@@ -211,6 +249,24 @@ def deliver_writes(conn, *, campaign_id=None):
                     conn.execute("UPDATE stabilize_issues SET state='closed',updated_at=? "
                                  'WHERE campaign_id=? AND issue_number=?',
                                  (monitor.utc_now(), row['campaign_id'], number))
+            elif row['kind'] == 'assignee-guidance':
+                c = campaign(conn, row['campaign_id'])
+                member = conn.execute('SELECT state FROM stabilize_issues WHERE campaign_id=? AND issue_number=?',
+                                      (c.id, number)).fetchone()
+                issue = gh(['issue', 'view', str(number), '--repo', monitor.REPO_NAME,
+                            '--json', 'state,assignees'])
+                if (not c.live or not member or member['state'] != 'open' or
+                        issue.get('state') != 'OPEN' or not payload['assignees'] or
+                        human_assignees(issue) != payload['assignees']):
+                    cancel_write(conn, row, 'Campaign, issue state or assignees changed')
+                    continue
+                marker = f"<!-- stabilize:{c.id}:{row['checkpoint']} -->"
+                comments = api(f'issues/{number}/comments?per_page=100', '--paginate', '--slurp')
+                comments = [comment for page in comments for comment in page] if comments and isinstance(comments[0], list) else comments
+                if not any(marker in str(comment.get('body', '')) and
+                           comment.get('user', {}).get('login') == 'mergemarshall[bot]' for comment in comments):
+                    api(f'issues/{number}/comments', '--method', 'POST', '-f',
+                        f"body={payload['comment']}\n{marker}")
             else:
                 raise ValueError('unknown campaign write')
             with conn:
@@ -986,6 +1042,7 @@ def run_campaign_tick(conn, campaign_id, transport=None, *, advance=True):
     if advance:
         steps.append(('advance', lambda: tick_campaign(conn, campaign_id)))
     steps.extend([
+        ('assignee guidance', lambda: assignee_guidance(conn, campaign_id)),
         ('GitHub writes', lambda: deliver_writes(conn, campaign_id=campaign_id)),
         ('completion notice', report_completion),
         ('Slack replies', lambda: deliver_slack(conn, transport, campaign_id=campaign_id)),
