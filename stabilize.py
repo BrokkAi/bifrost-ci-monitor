@@ -74,6 +74,13 @@ def ensure_schema(conn):
     monitor.ensure_column(conn, 'stabilize_stage_threads', 'intro_pending', 'INTEGER NOT NULL DEFAULT 0')
     monitor.ensure_column(conn, 'stabilize_dispatches', 'permission_denied', 'INTEGER NOT NULL DEFAULT 0')
     monitor.ensure_column(conn, 'stabilize_dispatches', 'cancelled_at', 'TEXT')
+    # Redispatch caps count only dispatches since the latest resume. Rows from before
+    # this column existed belong to the campaign's current resume epoch.
+    if 'resume_epoch' not in {r['name'] for r in conn.execute('PRAGMA table_info(stabilize_dispatches)')}:
+        with conn:
+            monitor.ensure_column(conn, 'stabilize_dispatches', 'resume_epoch', 'INTEGER NOT NULL DEFAULT 0')
+            conn.execute('UPDATE stabilize_dispatches SET resume_epoch=COALESCE((SELECT resume_count FROM stabilize_runtime r '
+                         'WHERE r.campaign_id=stabilize_dispatches.campaign_id),0)')
     monitor.ensure_column(conn, 'stabilize_writes', 'cancelled_at', 'TEXT')
     monitor.ensure_column(conn, 'stabilize_writes', 'cancel_reason', 'TEXT')
     monitor.ensure_column(conn, 'stabilize_runs', 'url', "TEXT NOT NULL DEFAULT ''")
@@ -662,6 +669,11 @@ def ingest_run(conn, c, stage, item):
                    f"{'green' if green else item.get('conclusion')} — {item.get('url', '')}")
 
 
+# A resume starts a new epoch, so an operator who inspects a capped stage and resumes
+# gets fresh redispatches without deleting the earlier dispatch evidence.
+RESUME_EPOCH = '(SELECT COALESCE(MAX(resume_count),0) FROM stabilize_runtime WHERE campaign_id=?)'
+
+
 def ensure_dispatch(conn, c, stage, runs):
     exact = [r for r in runs if r.get('headSha') == c.tip_sha]
     intent = conn.execute('SELECT * FROM stabilize_dispatches WHERE campaign_id=? AND stage=? AND tip_sha=? '
@@ -697,8 +709,8 @@ def ensure_dispatch(conn, c, stage, runs):
             # GitHub reports a job that hits its time limit as cancelled, and cancelled
             # runs are not ingested, so an unbounded retry would loop silently.
             retries = conn.execute("SELECT COUNT(*) FROM stabilize_dispatches WHERE campaign_id=? AND stage=? "
-                "AND tip_sha=? AND reason='cancelled' AND cancelled_at IS NULL AND permission_denied=0",
-                (c.id, stage, c.tip_sha)).fetchone()[0]
+                "AND tip_sha=? AND reason='cancelled' AND cancelled_at IS NULL AND permission_denied=0 "
+                "AND resume_epoch=" + RESUME_EPOCH, (c.id, stage, c.tip_sha, c.id)).fetchone()[0]
             if retries >= 2:
                 pause(conn, c, f'{stage} run cancelled after two redispatches at {c.tip_sha[:7]}; a job may be '
                       'hitting its time limit (GitHub reports job timeouts as cancelled). Inspect the run, then resume',
@@ -707,8 +719,8 @@ def ensure_dispatch(conn, c, stage, runs):
         elif infra:
             reason = 'infrastructure'
             retries = conn.execute("SELECT COUNT(*) FROM stabilize_dispatches WHERE campaign_id=? AND stage=? "
-                "AND tip_sha=? AND reason='infrastructure' AND cancelled_at IS NULL AND permission_denied=0",
-                (c.id, stage, c.tip_sha)).fetchone()[0]
+                "AND tip_sha=? AND reason='infrastructure' AND cancelled_at IS NULL AND permission_denied=0 "
+                "AND resume_epoch=" + RESUME_EPOCH, (c.id, stage, c.tip_sha, c.id)).fetchone()[0]
             if retries >= 2:
                 pause(conn, c, f'{stage} infrastructure/incomplete jobs persisted after two redispatches at {c.tip_sha[:7]}',
                       kind='infrastructure', commit_sha=c.tip_sha)
@@ -723,8 +735,9 @@ def ensure_dispatch(conn, c, stage, runs):
     now = monitor.utc_now()
     after = max([r['databaseId'] for r in runs] or [0])
     with conn:
-        conn.execute('INSERT INTO stabilize_dispatches(campaign_id,stage,tip_sha,attempt,intent_at,after_run_id,reason) '
-                     'VALUES (?,?,?,?,?,?,?)', (c.id, stage, c.tip_sha, attempt, now, after, reason))
+        conn.execute('INSERT INTO stabilize_dispatches(campaign_id,stage,tip_sha,attempt,intent_at,after_run_id,reason,'
+                     'resume_epoch) VALUES (?,?,?,?,?,?,?,' + RESUME_EPOCH + ')',
+                     (c.id, stage, c.tip_sha, attempt, now, after, reason, c.id))
         notify(conn, c.id, f'dispatch:{stage}:{c.tip_sha}:{attempt}',
                f'Round {c.round}: dispatching {stage} at {slack_commit(c.tip_sha)} ({reason}).')
     try:

@@ -531,6 +531,43 @@ class CampaignTests(unittest.TestCase):
         self.assertIn('cancelled after two redispatches', campaign['pause_reason'])
         self.assertEqual(self.conn.execute('SELECT pause_kind FROM stabilize_runtime').fetchone()[0], 'cancelled_limit')
 
+    def capped_then_resumed(self, conclusion, incomplete):
+        c = self.campaign()
+        with mock.patch.object(engine, 'ref_sha', return_value=A), \
+             mock.patch.object(automerge, 'collect_failure_report_for_run', return_value=report(incomplete=incomplete)):
+            engine.ensure_dispatch(self.conn, c, 'push', [])
+            for number in (1, 2, 3):
+                item = run(number, conclusion=conclusion)
+                engine.ingest_run(self.conn, c, 'push', item)
+                engine.ensure_dispatch(self.conn, c, 'push', [item])
+            self.assertEqual(self.current().status, 'paused')
+            engine.resume_campaign(self.conn, 'test', 'admin')
+            for number in (4, 5, 6):
+                item = run(number, conclusion=conclusion)
+                engine.ingest_run(self.conn, c, 'push', item)
+                engine.ensure_dispatch(self.conn, c, 'push', [item])
+        # Resuming grants two fresh redispatches, then the cap pauses again; no evidence is removed.
+        rows = self.conn.execute('SELECT reason,resume_epoch FROM stabilize_dispatches ORDER BY attempt').fetchall()
+        self.assertEqual([r['resume_epoch'] for r in rows], [0, 0, 0, 1, 1])
+        self.assertEqual(self.current().status, 'paused')
+        return [r['reason'] for r in rows]
+
+    def test_resume_after_cancelled_cap_redispatches(self):
+        self.assertEqual(self.capped_then_resumed('cancelled', False), ['initial'] + ['cancelled'] * 4)
+
+    def test_resume_after_infrastructure_cap_redispatches(self):
+        self.assertEqual(self.capped_then_resumed('failure', True), ['initial'] + ['infrastructure'] * 4)
+
+    def test_resume_epoch_migration_keeps_existing_caps(self):
+        c = self.campaign()
+        with self.conn:
+            self.conn.execute('UPDATE stabilize_runtime SET resume_count=3')
+            self.conn.execute("INSERT INTO stabilize_dispatches(campaign_id,stage,tip_sha,attempt,intent_at,after_run_id,reason) "
+                              "VALUES ('test','push',?,1,?,0,'cancelled')", (A, monitor.utc_now()))
+        self.conn.execute('ALTER TABLE stabilize_dispatches DROP COLUMN resume_epoch')
+        engine.ensure_schema(self.conn)
+        self.assertEqual(self.conn.execute('SELECT resume_epoch FROM stabilize_dispatches').fetchone()[0], 3)
+
     def test_classified_infrastructure_redispatches(self):
         c = self.campaign()
         with mock.patch.object(automerge, 'collect_failure_report_for_run', return_value=report()):
