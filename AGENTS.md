@@ -1075,8 +1075,10 @@ branch, so the engine closes landed campaign issues when the gate merge that
 contains their fix lands in master. Dropping needs later-tip proof for every
 identity.
 
-The round gate (`merge_gate_open`) opens when the campaign is running, no issue
-at or before the current stage is `open`, and at least one is `pr_ready`. The
+The round gate (`merge_gate_open`) opens when the campaign is running and no issue
+at or before the current stage is `open`. It does not require a `pr_ready` issue,
+so branch PRs with no campaign issue (such as workflow changes) merge through the
+normal lane; the "merge gate open" Slack notice still needs a `pr_ready` fix. The
 merger checks it at selection and expansion only. Campaign batches persist
 `automerge_batches.target_ref` (NULL means master) and contain one target. They
 run in an independent campaign lane: at most one live campaign batch, alongside

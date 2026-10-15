@@ -150,21 +150,19 @@ def issue_priorities(conn):
 def merge_gate_open(conn, campaign_id):
     """Whether the merger may select PRs into this campaign's branch now.
 
-    The round gate opens when the campaign is running, no issue at or before
-    the current stage still needs a PR, and at least one issue has a ready PR.
-    Ready PRs for later-stage issues are included without holding the gate.
-    The merger checks this at selection/expansion only; an in-flight batch is
-    not aborted when the gate closes.
+    The round gate opens when the campaign is running and no issue at or before
+    the current stage still needs a PR. Ready PRs for later-stage issues, and
+    branch PRs with no campaign issue (such as workflow changes), are included
+    without holding the gate. The merger checks this at selection/expansion
+    only; an in-flight batch is not aborted when the gate closes.
     """
     row = conn.execute("SELECT * FROM stabilize_campaigns WHERE id=?", (campaign_id,)).fetchone()
     if row is None or row['status'] != 'running' or row['stage'] not in STAGES:
         return False
     current = STAGES[:STAGES.index(row['stage']) + 1]
-    states = {(r['stage'], r['state']) for r in conn.execute(
-        "SELECT stage,state FROM stabilize_issues WHERE campaign_id=?", (campaign_id,))}
-    if any(stage in current and state == 'open' for stage, state in states):
-        return False
-    return any(state == 'pr_ready' for _, state in states)
+    return conn.execute(
+        "SELECT 1 FROM stabilize_issues WHERE campaign_id=? AND state='open' AND stage IN ("
+        + ','.join('?' * len(current)) + ")", (campaign_id, *current)).fetchone() is None
 
 
 def observations(conn, issue_url=None):

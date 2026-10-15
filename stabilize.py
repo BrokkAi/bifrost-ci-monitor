@@ -839,7 +839,9 @@ def refresh_issues(conn, c):
         if new != old:
             notify(conn, c.id, f'issue-state:{row["issue_number"]}:{c.round}:{new}',
                    f"Issue {slack_number(row['issue_number'])}: {new}.")
-    if c.status == 'running' and state.merge_gate_open(conn, c.id):
+    # The gate is also open with nothing to merge; announce it only for fix PRs.
+    if c.status == 'running' and state.merge_gate_open(conn, c.id) and conn.execute(
+            "SELECT 1 FROM stabilize_issues WHERE campaign_id=? AND state='pr_ready'", (c.id,)).fetchone():
         notify(conn, c.id, f'merge-gate:{c.round}:{c.stage}',
                f'Round {c.round}: fix merge gate open for {c.branch} ({c.stage}).')
 

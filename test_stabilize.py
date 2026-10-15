@@ -963,6 +963,31 @@ class CampaignTests(unittest.TestCase):
             self.assertEqual(self.issue_state(), 'pr_ready')
             self.assertTrue(state.merge_gate_open(self.conn, c.id))
 
+    def test_merge_gate_admits_issueless_branch_prs_once_no_ticket_needs_a_fix(self):
+        c = self.campaign(stage='hourly', sha=B)
+        # No campaign issues at all: a workflow-only PR to the branch can merge.
+        self.assertTrue(state.merge_gate_open(self.conn, c.id))
+        self.issue(c, number=7, status='closed', stage='push')
+        self.issue(c, number=8, status='escalated', stage='hourly')
+        self.issue(c, number=9, status='open', stage='nightly')
+        self.assertTrue(state.merge_gate_open(self.conn, c.id), 'closed, escalated and later-stage issues do not hold the gate')
+        self.issue(c, number=10, status='open', stage='hourly')
+        self.assertFalse(state.merge_gate_open(self.conn, c.id), 'a current-stage ticket without a PR holds the round')
+        with self.conn:
+            self.conn.execute("UPDATE stabilize_issues SET state='closed' WHERE issue_number=10")
+            self.conn.execute("UPDATE stabilize_campaigns SET status='paused'")
+        self.assertFalse(state.merge_gate_open(self.conn, c.id), 'only running campaigns admit PRs')
+
+    def test_merge_gate_notice_needs_a_ready_fix(self):
+        c = self.campaign(sha=B)
+        self.issue(c, status='closed')
+        self.issue_reads([], status='CLOSED')
+        with mock.patch.object(engine, 'pull_requests', return_value=[]):
+            engine.refresh_issues(self.conn, c)
+        self.assertTrue(state.merge_gate_open(self.conn, c.id))
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM stabilize_messages WHERE checkpoint LIKE 'merge-gate:%'").fetchone())
+
     def queue_gate_close(self, c, stage='push', tip=B, number=40):
         self.gate(c, stage=stage, tip=tip, number=number)
         self.gh.side_effect = None
