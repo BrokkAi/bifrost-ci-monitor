@@ -4064,6 +4064,29 @@ class MissingFailedJobLogTests(TestCase):
         self.assertEqual(report.successful_steps['CI/completed'], frozenset({'Upload results'}))
         self.assertEqual(report.details['CI/lost mid-test'].tests, frozenset({'pytest:tests/test_api.py::test_bad'}))
 
+    def test_runson_spot_interruption_marks_failed_step_job_incomplete(self):
+        # Push run 38715851284: RunsOn marked the cut-off step and its own cleanup step failed.
+        jobs = {'workflowName': 'CI', 'jobs': [
+            {'name': 'Everything else (MCP, RQL, policy)', 'databaseId': 201, 'conclusion': 'failure', 'steps': [
+                {'name': 'Build', 'conclusion': 'success'},
+                {'name': 'Run policy integration tests', 'conclusion': 'failure'},
+                {'name': 'Complete runner', 'conclusion': 'failure'}]},
+            {'name': 'ordinary failure', 'databaseId': 202, 'conclusion': 'failure', 'steps': [
+                {'name': 'Run tests', 'conclusion': 'failure'}]},
+        ]}
+        spot_log = ('Everything else (MCP, RQL, policy)\tRun policy integration tests\t2026-10-15T10:23:45.0290118Z '
+                    '##[error]AWS interrupted the EC2 Spot instance running this job. RunsOn can retry it after '
+                    'the workflow run finishes.\n'
+                    'Everything else (MCP, RQL, policy)\tRun policy integration tests\t2026-10-15T10:23:45.0438116Z '
+                    '##[error]Process completed with exit code 137.\n')
+        test_log = 'FAILED tests/test_api.py::test_bad - AssertionError'
+        with mock.patch.object(automerge, 'gh_json', return_value=jobs), \
+             mock.patch.object(automerge, 'run_gh', side_effect=[spot_log, test_log]):
+            report = automerge.collect_failure_report_for_run(38715851284)
+        self.assertEqual(report.incomplete_jobs, frozenset({'CI/Everything else (MCP, RQL, policy)'}))
+        self.assertEqual(report.details['CI/Everything else (MCP, RQL, policy)'].failed_steps,
+                         frozenset({'Run policy integration tests', 'Complete runner'}))
+
     def test_missing_log_uses_metadata_steps_and_continues_to_other_jobs(self):
         conn = make_db()
         jobs = {

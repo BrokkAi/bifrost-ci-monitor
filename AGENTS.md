@@ -922,7 +922,8 @@ runs per workflow in the last 24 hours. A later passing job closes its rows.
 Within a red job, retire an absent identity only when its recorded failed
 steps passed, or completed test results from those steps establish its absence.
 `FailureReport.successful_steps` carries per-step passes; `incomplete_jobs`
-marks runner loss/acquisition, unfinished/timed-out steps, or unavailable logs.
+marks runner loss/acquisition (including a RunsOn Spot interruption message in a
+failed step's log), unfinished/timed-out steps, or unavailable logs.
 Partial logs can add failures, but cannot prove prior failures disappeared.
 A failure in checkout/build does not resolve unexecuted tests. `known-failure:` text can diagnose only an
 existing observed identity; it never creates evidence.

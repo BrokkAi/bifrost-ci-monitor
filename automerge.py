@@ -3140,6 +3140,9 @@ def compare_failure_reports(
     return True, "integration CI failures are a subset of baseline failures"
 
 
+RUNNER_INTERRUPTED = re.compile(r"AWS interrupted the EC2 Spot instance running this job", re.I)
+
+
 def collect_failure_report_for_run(run_id: int) -> FailureReport:
     """Collect per-failed-job step names and logs from one selected CI run."""
     jobs_data = gh_json(["run", "view", str(run_id), "--repo", REPO_NAME,
@@ -3201,7 +3204,9 @@ def collect_failure_report_for_run(run_id: int) -> FailureReport:
                 # provides authoritative failed-step identities, and missing
                 # logs must not stop processing this or later jobs.
                 log(f"failed-job log unavailable for run {run_id}, job {name}: {exc}")
-        if not raw_log:
+        # RunsOn reports a reclaimed Spot runner as an ordinary failed step, so
+        # only its message shows that the step was cut off, not that it failed.
+        if not raw_log or RUNNER_INTERRUPTED.search(raw_log):
             incomplete.add(key)
         tests = parse_test_identities(raw_log)
         previous = details.get(key)
