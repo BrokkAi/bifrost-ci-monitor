@@ -14,7 +14,7 @@ import urllib.request
 
 import mm_attest_capture
 
-ATTEST_VERSION = "0.1.4"
+ATTEST_VERSION = "0.1.5"
 
 
 def git(cwd, *args):

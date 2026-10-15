@@ -791,8 +791,10 @@ environment-certification jobs use native runners. Format 3 adds required runtim
 inputs gathered from project-wide env_inputs declarations. Native capture preserves
 actual inherited values, including script overrides, without imposing suite defaults.
 Formats 1/2 remain readable but cannot supply passes without recorded runtime inputs.
-Consumers accept summary formats 1/2/3, request CLI 0.1.4, retain
+Consumers accept summary formats 1/2/3, request CLI 0.1.5, retain
 summaries and leave compatibility decisions to Attest.
+Capture removes only its hook directory from the effective child PATH, retaining
+script-added toolchains and deliberate PATH removals during native execution.
 Automatic capture never skips tests, changes assessments or authorizes a merge.
 `automerge_executions` retains command/arguments, committed head/tree, safe build
 settings and host metadata, start/end times, duration, exit status, source changes,
