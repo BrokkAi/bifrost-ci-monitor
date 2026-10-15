@@ -694,6 +694,16 @@ def ensure_dispatch(conn, c, stage, runs):
             (c.id, stage, latest['databaseId'])).fetchone()
         if latest.get('conclusion') in ('cancelled', 'canceled'):
             reason = 'cancelled'
+            # GitHub reports a job that hits its time limit as cancelled, and cancelled
+            # runs are not ingested, so an unbounded retry would loop silently.
+            retries = conn.execute("SELECT COUNT(*) FROM stabilize_dispatches WHERE campaign_id=? AND stage=? "
+                "AND tip_sha=? AND reason='cancelled' AND cancelled_at IS NULL AND permission_denied=0",
+                (c.id, stage, c.tip_sha)).fetchone()[0]
+            if retries >= 2:
+                pause(conn, c, f'{stage} run cancelled after two redispatches at {c.tip_sha[:7]}; a job may be '
+                      'hitting its time limit (GitHub reports job timeouts as cancelled). Inspect the run, then resume',
+                      kind='cancelled_limit', commit_sha=c.tip_sha)
+                return
         elif infra:
             reason = 'infrastructure'
             retries = conn.execute("SELECT COUNT(*) FROM stabilize_dispatches WHERE campaign_id=? AND stage=? "

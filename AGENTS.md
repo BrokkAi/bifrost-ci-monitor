@@ -1045,7 +1045,7 @@ dispatches all stages up to S there. Persist dispatch intent first and discover
 runs by branch, event, exact tip, intent time and run-ID floor. Never resubmit
 an ambiguous dispatch; an undiscovered one pauses after the ten-minute grace.
 Cancelled runs, and runs classified as infrastructure or incomplete, are the
-only redispatches (infrastructure at most twice per tip). Eight rounds in one
+only redispatches (each at most twice per stage and tip; a cancelled run is often a job time limit, so the cancelled cap pauses with that reason). Eight rounds in one
 stage, or blockers that are only escalated issues, pause the campaign. The
 escalated-only pause (`stabilize_runtime.pause_kind`, including legacy rows with
 that reason text) keeps refreshing issue states and resumes automatically once an

@@ -516,6 +516,21 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(self.current().status, 'paused')
         self.assertIn('two redispatches', self.conn.execute('SELECT pause_reason FROM stabilize_campaigns').fetchone()[0])
 
+    def test_cancelled_redispatch_cap_pauses_instead_of_looping(self):
+        c = self.campaign()
+        with mock.patch.object(engine, 'ref_sha', return_value=A):
+            engine.ensure_dispatch(self.conn, c, 'push', [])
+            for number in (1, 2, 3):
+                item = run(number, conclusion='cancelled')
+                engine.ingest_run(self.conn, c, 'push', item)
+                engine.ensure_dispatch(self.conn, c, 'push', [item])
+        reasons = [r[0] for r in self.conn.execute('SELECT reason FROM stabilize_dispatches ORDER BY attempt')]
+        self.assertEqual(reasons, ['initial', 'cancelled', 'cancelled'])
+        campaign = self.conn.execute('SELECT status,pause_reason FROM stabilize_campaigns').fetchone()
+        self.assertEqual(campaign['status'], 'paused')
+        self.assertIn('cancelled after two redispatches', campaign['pause_reason'])
+        self.assertEqual(self.conn.execute('SELECT pause_kind FROM stabilize_runtime').fetchone()[0], 'cancelled_limit')
+
     def test_classified_infrastructure_redispatches(self):
         c = self.campaign()
         with mock.patch.object(automerge, 'collect_failure_report_for_run', return_value=report()):
