@@ -134,6 +134,28 @@ class DurableFindings(TestCase):
         self.record(run(12), False, baseline='f')
         self.assertEqual(len(p.observations(self.conn)), 1)
 
+    def test_triage_resolution_is_not_a_passing_measurement_or_a_new_episode(self):
+        self.record(run(8))
+        first = triage.pending(self.conn)[0]
+        finding = {'outcome': 'resolved', 'diagnosis': 'private engine fixed; public projection stale',
+                   'evidence': 'Private replay passed; observed public engine still fails', 'issue': None}
+        with self.conn:
+            self.assertTrue(triage.retire_resolved_observation(self.conn, {'id': 'review'}, finding, first))
+            triage.record_observation(self.conn, {'id': 'review'}, finding, first, None)
+        row = p.observations(self.conn)[0]
+        self.assertEqual((row['status'], row['triage_outcome'], row['episode']), ('open', 'resolved', 1))
+        self.assertEqual(triage.pending(self.conn), [])
+        self.record(run(9))
+        self.assertEqual(triage.pending(self.conn), [])
+        row = p.observations(self.conn)[0]
+        self.assertEqual((row['status'], row['triage_outcome'], row['episode']), ('open', 'resolved', 1))
+        self.record(run(10), False)
+        self.assertEqual(p.observations(self.conn), [])
+        self.record(run(11))
+        again = triage.pending(self.conn)[0]
+        self.assertEqual(again['episode'], 2)
+        self.assertNotEqual(again['fingerprint'], first['fingerprint'])
+
     def test_missing_measurement_is_coverage_and_never_a_measured_regression(self):
         with (mock.patch.object(p, 'api', side_effect=[{'total_count': 0, 'artifacts': []},
                 {'jobs': [{'name': 'Build', 'conclusion': 'failure', 'steps': []}]}])):

@@ -980,6 +980,11 @@ harness and actual engine revisions, compact measurements and triage ownership.
 Repeated same-head observations share an investigation. Explicit comparable
 passes retire only their cases; missing/partial output and baseline changes do
 not prove recovery. A recurrence after recovery starts a new durable episode.
+Triage resolution records that an investigation needs no additional product repair;
+it does not mark a benchmark measurement as passing. In particular, private-engine
+recovery does not retire a still-failing public UsageBench observation. Keep its
+classification deduplicated for the same tested engine and episode; a changed
+engine or measured recovery followed by recurrence gets fresh review.
 
 Reuse the benchmark's comparison flags/thresholds and preserve environment-variance
 context for agent review. No measured result is distinct coverage evidence, never

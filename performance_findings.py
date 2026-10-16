@@ -225,10 +225,12 @@ def observations(conn):
 
 
 def classify(conn, identifier, outcome, diagnosis, issue_url=None):
+    # Triage can establish that no further product repair is needed (for example,
+    # the public projection is stale). Only comparable passing results can prove
+    # that the observed benchmark failure itself recovered.
     conn.execute("UPDATE performance_findings SET diagnosis=?,triage_outcome=?,"
-                 "triage_issue_url=COALESCE(?,triage_issue_url),"
-                 "status=CASE WHEN ?='resolved' THEN 'fixed' ELSE status END WHERE id=? AND status='open'",
-                 (diagnosis, outcome, issue_url, outcome, identifier))
+                 "triage_issue_url=COALESCE(?,triage_issue_url) WHERE id=? AND status='open'",
+                 (diagnosis, outcome, issue_url, identifier))
 
 
 def record(conn, repository, workflow, run, context, candidates, passing, summary):

@@ -153,7 +153,8 @@ def pending(conn) -> list[dict]:
         if digest in claimed:
             continue
         prior = conn.execute("SELECT resolved_run_id FROM triage_observations WHERE fingerprint=?", (digest,)).fetchone()
-        if prior and (prior["resolved_run_id"] is None or prior["resolved_run_id"] == row["last_seen_run_id"]):
+        if prior and ('performance_finding_id' in row.keys() or
+                      prior["resolved_run_id"] is None or prior["resolved_run_id"] == row["last_seen_run_id"]):
             continue
         observation = dict(row, failure_id=len(result) + 1, fingerprint=digest)
         # Local excerpts can be larger than parser-derived CI identities. Keep
