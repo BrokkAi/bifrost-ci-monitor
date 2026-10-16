@@ -35,7 +35,7 @@ import git_ancestry
 REPO_NAME = "BrokkAi/bifrost-dev"
 TRACKED_WORKFLOWS: tuple[tuple[str, str | None], ...] = (
     ("CI", "push"),
-    ("Hourly CI", None),
+    ("Release gate", None),
     ("Nightly CI", None),
 )
 BRANCH = "master"
@@ -1806,7 +1806,7 @@ def poll_ci(
     # Do not clear an episode while any tracked run is still settling. Once all
     # three latest runs are terminal and none is red, a successful push CI run
     # re-arms the monitor. Cancelled scheduled runs are neutral rather than
-    # holding an episode open until the next hourly or nightly tick.
+    # holding an episode open until the next release-gate or nightly tick.
     active_runs = [run for run in runs if run.status != "completed"]
     if active_runs:
         selected = max(active_runs, key=lambda run: run.created_at)

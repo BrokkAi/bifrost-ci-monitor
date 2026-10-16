@@ -108,7 +108,7 @@ class PollCiTests(unittest.TestCase):
         run_command.side_effect = [
             workflow_run("CI", 30, "2026-08-25T17:00:00Z"),
             workflow_run(
-                "Hourly CI",
+                "Release gate",
                 20,
                 "2026-08-25T17:10:00Z",
                 conclusion="failure",
@@ -133,7 +133,7 @@ class PollCiTests(unittest.TestCase):
         run_command.side_effect = [
             workflow_run("CI", 30, "2026-08-25T17:00:00Z"),
             workflow_run(
-                "Hourly CI",
+                "Release gate",
                 20,
                 "2026-08-25T17:10:00Z",
                 conclusion="failure",
@@ -157,7 +157,7 @@ class PollCiTests(unittest.TestCase):
         run_command.side_effect = [
             workflow_run("CI", 30, "2026-08-25T17:00:00Z"),
             workflow_run(
-                "Hourly CI",
+                "Release gate",
                 20,
                 "2026-08-25T17:10:00Z",
                 status="in_progress",
@@ -177,11 +177,11 @@ class PollCiTests(unittest.TestCase):
         self.assertEqual(result.run.attempt, 2)
 
     @mock.patch.object(monitor, "run_command")
-    def test_hourly_failure_takes_precedence_over_newer_green_push(self, run_command):
+    def test_release_gate_failure_takes_precedence_over_newer_green_push(self, run_command):
         run_command.side_effect = [
             workflow_run("CI", 30, "2026-08-20T12:30:00Z"),
             workflow_run(
-                "Hourly CI",
+                "Release gate",
                 20,
                 "2026-08-20T12:00:00Z",
                 conclusion="failure",
@@ -193,15 +193,15 @@ class PollCiTests(unittest.TestCase):
 
         self.assertEqual(result.state, "red")
         self.assertIsNotNone(result.run)
-        self.assertEqual(result.run.workflow, "Hourly CI")
+        self.assertEqual(result.run.workflow, "Release gate")
         self.assertEqual(result.run.run_id, 20)
 
     @mock.patch.object(monitor, "run_command")
-    def test_nightly_failure_is_selected_while_hourly_is_running(self, run_command):
+    def test_nightly_failure_is_selected_while_release_gate_is_running(self, run_command):
         run_command.side_effect = [
             workflow_run("CI", 30, "2026-08-20T12:30:00Z"),
             workflow_run(
-                "Hourly CI",
+                "Release gate",
                 20,
                 "2026-08-20T12:00:00Z",
                 status="in_progress",
@@ -225,7 +225,7 @@ class PollCiTests(unittest.TestCase):
     def test_handled_red_does_not_hide_an_unhandled_red(self, run_command):
         run_command.side_effect = [
             workflow_run("CI", 30, "2026-08-20T12:30:00Z", conclusion="failure"),
-            workflow_run("Hourly CI", 20, "2026-08-20T12:00:00Z", conclusion="failure"),
+            workflow_run("Release gate", 20, "2026-08-20T12:00:00Z", conclusion="failure"),
             workflow_run("Nightly CI", 10, "2026-08-20T08:00:00Z"),
         ]
 
@@ -239,7 +239,7 @@ class PollCiTests(unittest.TestCase):
     def test_all_handled_red_runs_still_prevent_green_reset(self, run_command):
         run_command.side_effect = [
             workflow_run("CI", 30, "2026-08-20T12:30:00Z", conclusion="failure"),
-            workflow_run("Hourly CI", 20, "2026-08-20T12:00:00Z", conclusion="failure"),
+            workflow_run("Release gate", 20, "2026-08-20T12:00:00Z", conclusion="failure"),
             workflow_run("Nightly CI", 10, "2026-08-20T08:00:00Z"),
         ]
 
@@ -253,7 +253,7 @@ class PollCiTests(unittest.TestCase):
     def test_green_requires_all_three_workflows_to_be_terminal(self, run_command):
         run_command.side_effect = [
             workflow_run("CI", 30, "2026-08-20T12:30:00Z"),
-            workflow_run("Hourly CI", 20, "2026-08-20T12:00:00Z"),
+            workflow_run("Release gate", 20, "2026-08-20T12:00:00Z"),
             workflow_run(
                 "Nightly CI", 10, "2026-08-20T08:00:00Z", conclusion="cancelled"
             ),
@@ -265,7 +265,7 @@ class PollCiTests(unittest.TestCase):
         calls = [call.args[0] for call in run_command.call_args_list]
         self.assertEqual(
             [call[call.index("--workflow") + 1] for call in calls],
-            ["CI", "Hourly CI", "Nightly CI"],
+            ["CI", "Release gate", "Nightly CI"],
         )
         self.assertIn("--event", calls[0])
         self.assertNotIn("--event", calls[1])
@@ -288,7 +288,7 @@ class PollCiTests(unittest.TestCase):
         run_command.side_effect = [
             workflow_run("CI", 30, "2026-08-20T12:30:00Z"),
             workflow_run(
-                "Hourly CI",
+                "Release gate",
                 20,
                 "2026-08-20T12:00:00Z",
                 status="in_progress",
@@ -301,7 +301,7 @@ class PollCiTests(unittest.TestCase):
 
         self.assertEqual(result.state, "in_progress")
         self.assertIsNotNone(result.run)
-        self.assertEqual(result.run.workflow, "Hourly CI")
+        self.assertEqual(result.run.workflow, "Release gate")
 
 
 def episode_db() -> sqlite3.Connection:
@@ -2566,6 +2566,57 @@ class KnownFailureLedgerTests(unittest.TestCase):
             self.assertTrue(monitor.update_known_failures(self.conn, self.transport, force=True))
         count = self.conn.execute("SELECT COUNT(*) FROM known_failure_errors").fetchone()[0]
         self.assertEqual(count, 0)
+
+    def test_release_gate_replaces_deleted_hourly_without_rewriting_history(self):
+        import automerge
+
+        def failure(workflow):
+            key = f"{workflow}/os matrix / rust (x86_64-pc-windows-msvc)"
+            return automerge.FailureReport(frozenset({key}), {
+                key: automerge.FailedJobDetails(
+                    frozenset({"Run tests"}), frozenset({"nextest:test_pipe_shutdown"})
+                ),
+            }, "failure")
+
+        monitor._process_known_failure_run(
+            self.conn, "Hourly CI", self.run_item(100, "a" * 40),
+            report=failure("Hourly CI"),
+        )
+        historical = dict(self.conn.execute("SELECT * FROM known_failures").fetchone())
+        monitor._record_known_failure_error(
+            self.conn, self.transport, "github_command_failed", "deleted Hourly CI"
+        )
+        now = dt.datetime(2026, 10, 16, 9, tzinfo=dt.timezone.utc)
+        item = {**self.run_item(200, "b" * 40), "headBranch": "master",
+                "createdAt": now.isoformat()}
+
+        def list_runs(args, **_kwargs):
+            workflow = args[args.index("--workflow") + 1]
+            if workflow == "Hourly CI":
+                raise monitor.CommandError("could not find any workflows named Hourly CI")
+            if workflow == "CI":
+                self.assertEqual(args[args.index("--event") + 1], "push")
+            else:
+                self.assertNotIn("--event", args)
+            return json.dumps([item] if workflow == "Release gate" else [])
+
+        with (
+            mock.patch.object(monitor, "run_gh", side_effect=list_runs) as gh,
+            mock.patch.object(automerge, "collect_failure_report_for_run",
+                              return_value=failure("Release gate")),
+            mock.patch.object(monitor, "refresh_known_failure_link_states"),
+            mock.patch.object(monitor, "_sync_known_failure_issue"),
+        ):
+            self.assertTrue(monitor.update_known_failures(self.conn, self.transport, now=now))
+        self.assertEqual(
+            [c.args[0][c.args[0].index("--workflow") + 1] for c in gh.call_args_list],
+            ["CI", "Release gate", "Nightly CI"],
+        )
+        rows = {r["workflow"]: dict(r) for r in self.conn.execute("SELECT * FROM known_failures")}
+        self.assertEqual(rows["Hourly CI"], historical)
+        self.assertEqual(rows["Release gate"]["last_seen_run_id"], 200)
+        self.assertEqual(rows["Release gate"]["status"], "open")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM known_failure_errors").fetchone()[0], 0)
 
 
 class HeartbeatTests(unittest.TestCase):
