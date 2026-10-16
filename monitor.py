@@ -38,6 +38,9 @@ TRACKED_WORKFLOWS: tuple[tuple[str, str | None], ...] = (
     ("Release gate", None),
     ("Nightly CI", None),
 )
+# The restored Windows detector supplies observations, not release qualification.
+# Keep legacy run-wide polling and campaign/merge gates unchanged.
+FAILURE_LEDGER_WORKFLOWS = (*TRACKED_WORKFLOWS, ("Hourly CI", None))
 BRANCH = "master"
 HOME_DIR = Path.home()
 
@@ -1098,7 +1101,7 @@ def update_known_failures(
         ).fetchone() is None
         conn.commit()
         cutoff = current_time - dt.timedelta(hours=24)
-        for workflow, event in TRACKED_WORKFLOWS:
+        for workflow, event in FAILURE_LEDGER_WORKFLOWS:
             runs = _known_failure_runs(
                 workflow, event, limit=5 if processed_state_empty else 100
             )

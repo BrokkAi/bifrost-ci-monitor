@@ -2291,7 +2291,7 @@ class KnownFailureLedgerTests(unittest.TestCase):
                 self.assertFalse(monitor.update_known_failures(
                     second, self.transport, now=now + dt.timedelta(minutes=4, seconds=59)
                 ))
-            self.assertEqual(list_runs.call_count, len(monitor.TRACKED_WORKFLOWS))
+            self.assertEqual(list_runs.call_count, len(monitor.FAILURE_LEDGER_WORKFLOWS))
             first.close()
             second.close()
 
@@ -2321,7 +2321,7 @@ class KnownFailureLedgerTests(unittest.TestCase):
 
         self.assertEqual(
             [(call.args[0], call.kwargs["limit"]) for call in list_runs.call_args_list],
-            [(workflow, 5) for workflow, _event in monitor.TRACKED_WORKFLOWS],
+            [(workflow, 5) for workflow, _event in monitor.FAILURE_LEDGER_WORKFLOWS],
         )
         calls_by_workflow = {}
         for call in process_run.call_args_list:
@@ -2330,7 +2330,7 @@ class KnownFailureLedgerTests(unittest.TestCase):
             )
         expected_ids = {701, 703, 704, 705, 706}
         self.assertEqual(set(calls_by_workflow), {
-            workflow for workflow, _event in monitor.TRACKED_WORKFLOWS
+            workflow for workflow, _event in monitor.FAILURE_LEDGER_WORKFLOWS
         })
         for selected_ids in calls_by_workflow.values():
             self.assertEqual(set(selected_ids), expected_ids)
@@ -2567,7 +2567,7 @@ class KnownFailureLedgerTests(unittest.TestCase):
         count = self.conn.execute("SELECT COUNT(*) FROM known_failure_errors").fetchone()[0]
         self.assertEqual(count, 0)
 
-    def test_release_gate_replaces_deleted_hourly_without_rewriting_history(self):
+    def test_release_gate_and_restored_hourly_retain_distinct_observations(self):
         import automerge
 
         def failure(workflow):
@@ -2592,8 +2592,6 @@ class KnownFailureLedgerTests(unittest.TestCase):
 
         def list_runs(args, **_kwargs):
             workflow = args[args.index("--workflow") + 1]
-            if workflow == "Hourly CI":
-                raise monitor.CommandError("could not find any workflows named Hourly CI")
             if workflow == "CI":
                 self.assertEqual(args[args.index("--event") + 1], "push")
             else:
@@ -2610,13 +2608,34 @@ class KnownFailureLedgerTests(unittest.TestCase):
             self.assertTrue(monitor.update_known_failures(self.conn, self.transport, now=now))
         self.assertEqual(
             [c.args[0][c.args[0].index("--workflow") + 1] for c in gh.call_args_list],
-            ["CI", "Release gate", "Nightly CI"],
+            ["CI", "Release gate", "Nightly CI", "Hourly CI"],
         )
         rows = {r["workflow"]: dict(r) for r in self.conn.execute("SELECT * FROM known_failures")}
         self.assertEqual(rows["Hourly CI"], historical)
         self.assertEqual(rows["Release gate"]["last_seen_run_id"], 200)
         self.assertEqual(rows["Release gate"]["status"], "open")
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM known_failure_errors").fetchone()[0], 0)
+
+        # A fresh detector failure must reach triage without retiring or renaming
+        # either the historical hourly identity or the separate release failure.
+        detector = {**item, "databaseId": 201, "headSha": "c" * 40}
+        def detector_runs(workflow, event, **kwargs):
+            return [detector] if workflow == "Hourly CI" else []
+        with (
+            mock.patch.object(monitor, "_known_failure_runs", side_effect=detector_runs),
+            mock.patch.object(automerge, "collect_failure_report_for_run",
+                              return_value=failure("Hourly CI")),
+            mock.patch.object(monitor, "refresh_known_failure_link_states"),
+            mock.patch.object(monitor, "_sync_known_failure_issue"),
+        ):
+            self.assertTrue(monitor.update_known_failures(
+                self.conn, self.transport, force=True, now=now))
+        rows = {r["workflow"]: dict(r) for r in self.conn.execute("SELECT * FROM known_failures")}
+        self.assertEqual(rows["Hourly CI"]["first_seen_run_id"], 100)
+        self.assertEqual(rows["Hourly CI"]["last_seen_run_id"], 201)
+        self.assertEqual(rows["Hourly CI"]["status"], "open")
+        self.assertEqual(rows["Release gate"]["last_seen_run_id"], 200)
+        self.assertEqual(rows["Release gate"]["status"], "open")
 
 
 class HeartbeatTests(unittest.TestCase):

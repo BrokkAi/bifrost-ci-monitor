@@ -934,10 +934,13 @@ Retry the Slack outcome independently when delivery is unavailable.
 The ledger key is workflow/job plus deterministic test identity, or failed
 step when no test can be parsed. Normalize RunsOn run labels while keeping
 real matrix values; exclude aggregate `PR verification`. All three jobs use
-shared persisted five-minute upkeep. Track push `CI`, `Release gate` and
-`Nightly CI`. Release gate replaced the
-deleted Hourly CI workflow in Bifrost #5409; retain historical Hourly CI rows
-under their original workflow identity, without treating the rename as recovery.
+shared persisted five-minute upkeep. `FAILURE_LEDGER_WORKFLOWS` tracks push `CI`,
+`Release gate`, `Nightly CI` and `Hourly CI`. Release gate replaced the old hourly
+release lane in Bifrost #5409; #5428 later restored Hourly CI as a Windows/x86
+regression detector. Include its failures in ordinary triage while keeping release,
+campaign and legacy run-wide polling gates unchanged. Retain historical Hourly CI
+rows under their original workflow identity; neither the rename nor detector
+restoration proves recovery.
 Process each completed master run once, ignore cancelled runs, fetch logs only
 for failed jobs, and use failed-step
 metadata if logs are unavailable. First backfill is at most five completed
