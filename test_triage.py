@@ -75,6 +75,7 @@ class TriageTests(TestCase):
         self.patch(monitor, "LOCK_PATH", Path(self.directory.name) / "fixer.lock")
         self.patch(monitor, "run_gh", side_effect=AssertionError("unexpected real GitHub call"))
         self.patch(monitor, "mj_command", side_effect=AssertionError("unexpected real mj call"))
+        self.patch(triage.performance_findings, 'tick')
         self.patch(monitor, "_sync_known_failure_issue")
         self.patch(monitor, 'load_slack_transport', return_value=monitor.SlackTransport('chat', token='test', channel='test'))
         self.slack = self.patch(monitor, 'slack_send', return_value=(True, 'notice'))

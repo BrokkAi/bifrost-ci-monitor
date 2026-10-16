@@ -229,7 +229,7 @@ def github_app_token(*, force_refresh: bool = False) -> str | None:
     return GH_TOKEN_CACHE
 
 
-def run_gh(args: list[str], *, timeout: int = 60) -> str:
+def run_gh(args: list[str], *, timeout: int = 60, binary: bool = False) -> str | bytes:
     """Run a host-side gh command with the shared Mjolnir app-token seam."""
     def acquire_token(*, force_refresh: bool = False) -> str | None:
         try:
@@ -244,16 +244,16 @@ def run_gh(args: list[str], *, timeout: int = 60) -> str:
 
     token = acquire_token()
 
-    def invoke(current_token: str | None) -> subprocess.CompletedProcess[str]:
+    def invoke(current_token: str | None):
         env = os.environ.copy()
         if current_token:
             env["GH_TOKEN"] = current_token
         try:
             return subprocess.run(
                 [str(GH_BIN), *args],
-                text=True,
+                text=not binary,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE if binary else subprocess.STDOUT,
                 timeout=read_budget.timeout(timeout),
                 check=False,
                 env=env,
@@ -264,19 +264,23 @@ def run_gh(args: list[str], *, timeout: int = 60) -> str:
             raise CommandError(f"gh {' '.join(args[:3])} failed: {exc}") from exc
 
     result = invoke(token)
-    output = (result.stdout or "").strip()
+    def error_text(result):
+        value = result.stderr if binary else result.stdout
+        return value.decode('utf-8', errors='replace') if isinstance(value, bytes) else (value or '')
+
+    output = error_text(result).strip()
     if result.returncode != 0 and re.search(
         r"(?:HTTP\s+401|401\s+Unauthorized|Bad credentials)", output, re.IGNORECASE
     ):
         token = acquire_token(force_refresh=True)
         result = invoke(token)
-        output = (result.stdout or "").strip()
+        output = error_text(result).strip()
     if result.returncode != 0:
         raise CommandError(
             f"gh {' '.join(args[:3])} exited {result.returncode}"
-            + (f": {output}" if output else "")
+            + (f": {output}" if output and not binary else "")
         )
-    return output
+    return (result.stdout or b'') if binary else output
 
 
 class MjError(RuntimeError):

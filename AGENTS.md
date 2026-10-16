@@ -66,6 +66,9 @@ Cron executes `monitor.py` straight from this working tree every five minutes
 - `attest_store.py` and `attest_ci.py`: standalone Attest storage proxy and
   retryable completed-CI artifact intake. Detailed results live in S3; receipts
   retain compact summaries. Intake never changes a merge gate.
+- `performance_findings.py`: bounded, retryable daily Benchmark/UsageBench JSON
+  intake and durable benchmark observations consumed by the existing triage lane.
+  Benchmark evidence never authorizes a merge or changes a CI gate.
 - `merge_failover.py`: consecutive Bedrock 503 detection and durable native Move
   to DeepSeek Flash, retaining the same session, container and execution evidence.
 - `stabilize_state.py`: the shared campaign contract (tables and read API) used
@@ -958,6 +961,36 @@ new view; never repeat an investigation or CI-log parse just to retry a write.
 Title search is only for initial setup. Triage issue links do not suppress the fixer;
 it reuses those issues. A repair PR associates observations with proposed
 work, but is not evidence that failures are fixed.
+
+Benchmark intake runs in the existing triage poll after active-session supervision,
+once per five minutes, at most one new run per source. Its explicit sources are
+`BrokkAi/bifrost-dev` master `benchmark.yml` and `BrokkAi/usagebench` main
+`benchmark.yml`, for scheduled/manual completed runs in the last three days.
+Validate same-repository origin, workflow path, branch, attempt and artifact
+provenance; read bounded JSON ZIP members without extracting or executing them.
+The shared `monitor.run_gh(binary=True)` retains App authentication and renewal
+while preserving archive bytes and excluding binary bodies from errors.
+`performance_runs` checkpoints intake/errors; failed imports retry independently,
+and unseen runs may advance past a bad import. `performance_findings` retains
+scenario/case identity, baseline/configuration context, original and latest run,
+harness and actual engine revisions, compact measurements and triage ownership.
+Repeated same-head observations share an investigation. Explicit comparable
+passes retire only their cases; missing/partial output and baseline changes do
+not prove recovery. A recurrence after recovery starts a new durable episode.
+
+Reuse the benchmark's comparison flags/thresholds and preserve environment-variance
+context for agent review. No measured result is distinct coverage evidence, never
+an invented slowdown. UsageBench expected failures/unsupported cases are not new
+regressions. It tests the public engine; never use the harness SHA as its tested
+Bifrost SHA or assume a public failure exists in private master. Performance
+product tickets use `performance-regression`, separate from fixer `buildfailure`
+admission. Actual compiler/product defects found in coverage investigations retain
+the normal buildfailure route. The optional issue repository is allowlisted:
+Bifrost defects use the normal repository, and only UsageBench observations may
+publish harness/ground-truth defects to `BrokkAi/usagebench`. Durable publications
+pin both repository and issue number through an additive migration; retries cannot
+retarget them. Closed UsageBench issues require current main-head verification.
+Existing CI/local/campaign observations keep their original shapes and behavior.
 
 Triage groups up to 40 new observations by captured workflow/job/identity,
 failed steps and commit, not repeated runs of the same observation. Its

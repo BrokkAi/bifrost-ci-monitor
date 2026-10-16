@@ -20,6 +20,7 @@ import local_findings
 import stabilize_state
 import agent_recovery
 import git_ancestry
+import performance_findings
 
 LOCK_PATH = monitor.STATE_DIR.parent / "bifrost-ci-triage" / "triage.lock"
 KEY = ("workflow", "job_name", "identity_kind", "identity")
@@ -48,6 +49,7 @@ def lock(path: Path):
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     local_findings.ensure_schema(conn)
+    performance_findings.ensure_schema(conn)
     stabilize_state.ensure_schema(conn)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS triage_jobs (
@@ -81,6 +83,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     monitor.ensure_column(conn, "triage_observations", "resolved_run_id", "INTEGER")
     monitor.ensure_column(conn, "triage_jobs", "recovery_json", "TEXT NOT NULL DEFAULT '{}'")
     monitor.ensure_column(conn, "triage_jobs", "report_after_seq", "INTEGER NOT NULL DEFAULT 0")
+    monitor.ensure_column(conn, 'triage_publications', 'repository',
+                          "TEXT NOT NULL DEFAULT 'BrokkAi/bifrost-dev'")
     backfill_outcomes(conn)
 
 
@@ -101,7 +105,8 @@ def backfill_outcomes(conn) -> None:
                     continue  # Old unclassified reports cannot establish infrastructure.
                 for number in finding['failure_ids']:
                     observation = observations[number]
-                    if observation.get('stabilize_campaign_id') or observation.get('local_finding_id'):
+                    if (observation.get('stabilize_campaign_id') or observation.get('local_finding_id')
+                            or observation.get('performance_finding_id')):
                         continue  # This migration only upgrades the master ledger.
                     if current_observation(conn, observation) is not None:
                         conn.execute(f"UPDATE known_failures SET triage_outcome=? "
@@ -111,6 +116,9 @@ def backfill_outcomes(conn) -> None:
 
 
 def fingerprint(row) -> str:
+    if 'performance_finding_id' in row.keys():
+        return 'performance:' + performance_findings.digest([
+            row['performance_finding_id'], row['last_seen_sha'], row['episode']])
     if 'local_finding_id' in row.keys():
         return 'local:' + row['local_finding_id']
     # Repeated hourly runs of the same tree are the same investigation.
@@ -135,7 +143,8 @@ def pending(conn) -> list[dict]:
         for o in json.loads(job['observations_json'])}
     rows = conn.execute("SELECT * FROM known_failures WHERE status='open' "
                         "ORDER BY last_seen_at DESC,workflow,job_name,identity").fetchall()
-    rows = sorted([*rows, *local_findings.observations(conn), *branch_observations(conn)],
+    rows = sorted([*rows, *local_findings.observations(conn), *branch_observations(conn),
+                   *performance_findings.observations(conn)],
                   key=lambda row: row['last_seen_at'], reverse=True)
     result = []
     size = 0
@@ -160,6 +169,10 @@ def pending(conn) -> list[dict]:
 
 
 def current_observation(conn, observation):
+    if observation.get('performance_finding_id'):
+        return next((row for row in performance_findings.observations(conn)
+                     if row['performance_finding_id'] == observation['performance_finding_id']
+                     and fingerprint(row) == observation['fingerprint']), None)
     if observation.get('stabilize_campaign_id'):
         return next((row for row in branch_observations(conn)
                      if row['stabilize_campaign_id'] == observation['stabilize_campaign_id']
@@ -172,8 +185,8 @@ def current_observation(conn, observation):
     return row if row and row["status"] == "open" and fingerprint(row) == observation["fingerprint"] else None
 
 
-def gh_api(endpoint: str, *, method: str = "GET", payload=None, pages=False):
-    args = ["api", f"repos/{monitor.REPO_NAME}/{endpoint}", "--method", method]
+def gh_api(endpoint: str, *, method: str = "GET", payload=None, pages=False, repository=None):
+    args = ["api", f"repos/{repository or monitor.REPO_NAME}/{endpoint}", "--method", method]
     if pages:
         args += ["--paginate", "--slurp"]
     if payload is None:
@@ -209,6 +222,28 @@ observation, not its cause: group the same cause across master and branch refs.
         branch_dedup = """Use one issue per cause across refs: a matching master-only issue also covers
 stabilize observations. Update or reopen that issue instead of creating another.
 """
+    performance_guidance = '''
+Observations with performance_finding_id are benchmark evidence, independent of CI gates.
+Read evidence_json, the original repository/run/artifacts, current source and existing issues.
+The workflow SHA identifies the harness; engine_sha identifies the actual Bifrost tested.
+UsageBench runs in BrokkAi/usagebench against the public BrokkAi/bifrost engine; never
+substitute the harness SHA or assume its public engine failure exists in private master.
+Use existing comparison thresholds and blessed baseline identity; don't invent a threshold,
+bless a baseline, run benchmarks, or reinterpret release exceptions as evidence of recovery.
+Raw regression flags are candidates for review: consider the whole-run environment-variance
+context before attributing slowdown to code. Group related cases by cause, search open and
+closed tickets, and publish measured impact, exact source/baseline/case identity and a useful
+next diagnostic step. Missing coverage means no performance measurement: inspect failed job
+logs and distinguish actual product/compiler/harness defects from infrastructure interruption.
+Expected failures, unsupported cases and incomplete output are not newly demonstrated regressions.
+Without a prior comparable pass, describe an observed defect, not a proven new regression.
+Existing performance tickets may carry performance-regression instead of buildfailure; search
+both. Inspect newer report evidence and fix commits before ticketing a historical observation.
+Publish Bifrost product defects in this repository. If a UsageBench harness or ground-truth
+defect owns the cause, set issue.repository to BrokkAi/usagebench and verify against its main
+branch when reopening. This target is allowed only for UsageBench observations; split findings
+with different owners. Never turn a harness defect into a Bifrost code bug.
+'''
     return f"""Diagnose {subjects} in {monitor.REPO_NAME}. This is triage job {job['id']}.
 Your checkout starts at master {job['base_sha']}. You have {CPUS} CPUs and {MEMORY_GIB} GiB RAM.
 Investigate logs, source, history, existing issues and repair PRs. Do not run builds or
@@ -223,6 +258,7 @@ source locations. Distinguish confirmed facts from hypotheses. You can file a us
 failure ticket without proving the root cause: say what remains unknown and the next
 useful diagnostic step. Avoid prescribing fixes unsupported by the evidence.
 
+{performance_guidance if any(o.get('performance_finding_id') for o in json.loads(job['observations_json'])) else ''}
 Observations with local_finding_id come from a merge agent's committed-tree checks,
 not a CI run. Read their command, evidence, tested SHA, kind and originating batch/
 session. Baseline findings were reproduced at that batch's captured master base;
@@ -322,6 +358,7 @@ def parse_report(text: str, observations: list[dict]) -> dict:
             if 'verified_head' in issue and (not isinstance(issue['verified_head'], str)
                     or not re.fullmatch(r'[0-9a-fA-F]{40}', issue['verified_head'])):
                 raise ValueError('issue verified_head must be a full Git commit SHA')
+            issue_repository(finding, [o for o in observations if o['failure_id'] in ids])
     if seen != expected:
         raise ValueError(f"missing failure_ids: {sorted(expected - seen)}")
     return report
@@ -484,13 +521,33 @@ def collect_report_step(conn, job) -> None:
                      (json.dumps(report), job["id"]))
 
 
-def existing_number(url) -> int | None:
-    match = re.fullmatch(rf"https://github\.com/{re.escape(monitor.REPO_NAME)}/issues/(\d+)", url or "")
+def existing_number(url, repository=None) -> int | None:
+    match = re.fullmatch(rf"https://github\.com/{re.escape(repository or monitor.REPO_NAME)}/issues/(\d+)", url or "")
     return int(match[1]) if match else None
+
+
+def issue_repository(finding, observations):
+    repository = finding['issue'].get('repository', monitor.REPO_NAME)
+    if repository == monitor.REPO_NAME:
+        return repository
+    if repository == 'BrokkAi/usagebench' and observations and all(
+            dict(o).get('performance_finding_id') and dict(o).get('repository') == repository
+            for o in observations):
+        return repository
+    raise ValueError('issue repository is not authorized for these observations')
+
+
+def record_publication(conn, job_id, index, repository, number):
+    conn.execute('INSERT OR REPLACE INTO triage_publications(job_id,group_index,repository,issue_number) '
+                 'VALUES (?,?,?,?)', (job_id, index, repository, number))
 
 
 def issue_body(job, index, finding, observations) -> str:
     def source(row):
+        if 'performance_finding_id' in row.keys():
+            return (f"- Benchmark `{row['repository']}` / `{row['workflow']}` / `{row['identity']}`: "
+                    f"{row['last_seen_run_url']} (harness `{row['harness_sha']}`).\n"
+                    f"  Evidence: `{row['evidence_json']}`")
         if 'local_finding_id' in row.keys():
             return (f"- Local {row['kind']}: `{row['identity']}` at `{row['last_seen_sha']}`; "
                     f"command: `{row['command']}`; batch `{row['batch_id']}`, "
@@ -528,12 +585,14 @@ class ReopenReviewRequired(ValueError):
     """The report needs current Git/test facts before changing a closed ticket."""
 
 
-def verify_reopening(conn, issue, finding, observations):
+def verify_reopening(conn, issue, finding, observations, *, repository=None):
     if issue['state'] == 'open':
         return
     refs = set()
+    repository = repository or monitor.REPO_NAME
     for row in (dict(o) for o in observations):
-        ref = row['stabilize_branch'] if row.get('stabilize_campaign_id') else 'master'
+        ref = ('main' if repository == 'BrokkAi/usagebench' else
+               row['stabilize_branch'] if row.get('stabilize_campaign_id') else 'master')
         if row.get('local_finding_id') and conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='automerge_batches'").fetchone():
             batch = conn.execute('SELECT target_ref FROM automerge_batches WHERE batch_id=?',
@@ -551,7 +610,7 @@ def verify_reopening(conn, issue, finding, observations):
         raise ReopenReviewRequired(guidance)
     # A GitHub closure is metadata, not evidence that the cause is gone. The
     # agent owns the diagnosis; Git owns freshness of its explicit verification.
-    heads = {git_ancestry.remote_head(monitor.REPO_NAME, ref, monitor.github_app_token,
+    heads = {git_ancestry.remote_head(repository, ref, monitor.github_app_token,
                                     refresh_token=lambda: monitor.github_app_token(force_refresh=True))
              for ref in refs}
     if verified.lower() not in heads:
@@ -559,54 +618,74 @@ def verify_reopening(conn, issue, finding, observations):
 
 
 def publish_issue(conn, job, index, finding, observations) -> str:
+    repository = issue_repository(finding, observations)
+    def github(endpoint, **kwargs):
+        return (gh_api(endpoint, **kwargs) if repository == monitor.REPO_NAME else
+                gh_api(endpoint, repository=repository, **kwargs))
     marker = f"<!-- mergemarshall-triage:{job['id']}:{index} -->"
-    stored = conn.execute("SELECT issue_number FROM triage_publications WHERE job_id=? AND group_index=?",
+    stored = conn.execute("SELECT issue_number,repository FROM triage_publications WHERE job_id=? AND group_index=?",
                           (job["id"], index)).fetchone()
+    if stored and stored['repository'] != repository:
+        raise ValueError('durable issue publication target changed')
     number = stored["issue_number"] if stored else finding["issue"].get("existing_number")
     # A fixer may have escalated while this agent was investigating. Reuse that claim.
-    linked = {existing_number(row["linked_issue_url"]) for row in observations}
+    linked = {existing_number(row["linked_issue_url"], repository) for row in observations}
     linked.discard(None)
     if not stored and linked:
         if len(linked) > 1:
             raise ValueError("finding spans multiple escalation tickets; review grouping before publication")
         number = next(iter(linked))
     body = finding['issue_body']
-    labels = ['buildfailure']
+    performance = any(row.get('performance_finding_id') and row.get('kind') != 'coverage'
+                      for row in (dict(o) for o in observations))
+    labels = [performance_findings.LABEL if performance else 'buildfailure']
+    if performance:
+        try:
+            github('labels/' + quote(performance_findings.LABEL, safe=''))
+        except monitor.CommandError as exc:
+            if 'HTTP 404' not in str(exc):
+                raise
+            github('labels', method='POST', payload={'name': performance_findings.LABEL,
+                'color': 'D93F0B', 'description': 'Triaged benchmark regression'})
     if any('stabilize_campaign_id' in row.keys() for row in observations):
         ensure_stabilize_label()
         labels.append(stabilize_state.LABEL)
     if not number:
         # REST enumeration also finds a successful POST whose response was lost.
-        issues = gh_api("issues?state=all&labels=buildfailure&per_page=100", pages=True)
+        issues = github(f"issues?state=all&labels={labels[0]}&per_page=100", pages=True)
         match = next((i for i in issues if marker in (i.get("body") or "") and "pull_request" not in i), None)
         if match:
             number = match["number"]
         else:
-            created = gh_api("issues", method="POST", payload={
+            created = github("issues", method="POST", payload={
                 "title": finding["issue"]["title"], "body": body, "labels": labels})
             number = created["number"]
         with conn:
-            conn.execute("INSERT OR REPLACE INTO triage_publications VALUES (?,?,?)", (job["id"], index, number))
-    issue = gh_api(f"issues/{number}")
+            record_publication(conn, job['id'], index, repository, number)
+    issue = github(f"issues/{number}")
     aggregate = monitor._known_failure_state(conn, "issue_number")
-    if "pull_request" in issue or str(number) == aggregate or issue["title"] == monitor.KNOWN_FAILURE_ISSUE_TITLE:
+    if ("pull_request" in issue or (repository == monitor.REPO_NAME and str(number) == aggregate)
+            or issue["title"] == monitor.KNOWN_FAILURE_ISSUE_TITLE):
         raise ValueError(f"#{number} is not an individual failure issue")
-    verify_reopening(conn, issue, finding, observations)
+    if repository == monitor.REPO_NAME:
+        verify_reopening(conn, issue, finding, observations)
+    else:
+        verify_reopening(conn, issue, finding, observations, repository=repository)
     # Pin an existing ticket before commenting too, so a restart keeps the same
     # publication target even if another component changes a ledger link.
     with conn:
-        conn.execute("INSERT OR REPLACE INTO triage_publications VALUES (?,?,?)", (job["id"], index, number))
+        record_publication(conn, job['id'], index, repository, number)
     if marker not in (issue.get("body") or ""):
-        comments = gh_api(f"issues/{number}/comments?per_page=100", pages=True)
+        comments = github(f"issues/{number}/comments?per_page=100", pages=True)
         if not any(marker in (comment.get("body") or "") for comment in comments):
-            gh_api(f"issues/{number}/comments", method="POST", payload={"body": body})
+            github(f"issues/{number}/comments", method="POST", payload={"body": body})
     if issue["state"] != "open":
-        gh_api(f"issues/{number}", method="PATCH", payload={"state": "open"})
+        github(f"issues/{number}", method="PATCH", payload={"state": "open"})
     missing_labels = [name for name in labels if not any(
         label['name'] == name for label in issue.get('labels', []))]
     if missing_labels:
-        gh_api(f"issues/{number}/labels", method="POST", payload={"labels": missing_labels})
-    url = f"https://github.com/{monitor.REPO_NAME}/issues/{number}"
+        github(f"issues/{number}/labels", method="POST", payload={"labels": missing_labels})
+    url = f"https://github.com/{repository}/issues/{number}"
     finding['published_issue'] = dict(url=url, title=issue['title'])
     return url
 
@@ -627,6 +706,10 @@ def retire_resolved_observation(conn, job, finding, observation) -> bool:
     current = current_observation(conn, observation)
     if current is None or current["last_seen_run_id"] != observation["last_seen_run_id"]:
         return False
+    if observation.get('performance_finding_id'):
+        performance_findings.classify(conn, observation['performance_finding_id'], 'resolved',
+                                     finding['diagnosis'] + ' Evidence: ' + finding['evidence'])
+        return True
     if observation.get('stabilize_campaign_id'):
         stabilize_state.classify(conn, observation['stabilize_campaign_id'],
                                  tuple(observation[k] for k in KEY), 'resolved',
@@ -762,7 +845,8 @@ def queue_product_announcement(conn, job, report, observations) -> None:
     current = f"{monitor.slack_project_prefix()} triage: {count} product issue{'s' if count != 1 else ''}"
     for url, title in issues.items():
         title = ' '.join(title.split())[:240].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('|', '¦')
-        line = f"• <{url}|#{existing_number(url)}: {title}>"
+        number = existing_number(url) or existing_number(url, 'BrokkAi/usagebench')
+        line = f"• <{url}|#{number}: {title}>"
         if len(current) + 1 + len(line) > monitor.SLACK_MESSAGE_LIMIT:
             messages.append(current)
             current = 'Additional issues from this triage investigation'
@@ -846,14 +930,18 @@ def publish(conn, job) -> None:
                 if url:
                     # The earlier publication row pins the external-write target;
                     # accepted publication and its classification checkpoint together.
-                    conn.execute('INSERT OR REPLACE INTO triage_publications VALUES (?,?,?)',
-                                 (job['id'], index, existing_number(url)))
+                    repository = issue_repository(finding, [row for _, row in active])
+                    record_publication(conn, job['id'], index, repository, existing_number(url, repository))
                 for n in finding["failure_ids"]:
                     o = observations[n]
                     record_observation(conn, job, finding, o, url)
                     if finding['outcome'] == 'resolved':
                         retire_resolved_observation(conn, job, finding, o)
                     elif current_observation(conn, o) is not None:
+                        if o.get('performance_finding_id'):
+                            performance_findings.classify(conn, o['performance_finding_id'], finding['outcome'],
+                                finding['diagnosis'] + ' Evidence: ' + finding['evidence'], url)
+                            continue
                         if o.get('stabilize_campaign_id'):
                             stabilize_state.classify(conn, o['stabilize_campaign_id'],
                                                      tuple(o[k] for k in KEY), finding['outcome'],
@@ -907,6 +995,20 @@ def tick(conn) -> None:
             monitor.log(f"triage {publication['id']}: cached publication will retry: {exc}")
     cleanup(conn)
     job = conn.execute("SELECT * FROM triage_jobs WHERE status IN ('queued','launching','running') ORDER BY created_at LIMIT 1").fetchone()
+    # Supervise existing work before bounded, independently retryable report intake.
+    if job is not None:
+        try:
+            if job['status'] in {'queued', 'launching'}:
+                launch(conn, job)
+            elif job['status'] == 'running':
+                collect_report(conn, job)
+        except Exception as exc:
+            with conn:
+                conn.execute('UPDATE triage_jobs SET last_error=? WHERE id=?', (str(exc), job['id']))
+            raise
+        performance_findings.tick(conn)
+        return
+    performance_findings.tick(conn)
     if job is None:
         observations = pending(conn)
         if not observations:
