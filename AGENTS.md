@@ -484,6 +484,22 @@ Slack-only terminal retries do not reserve slots. Lowering the limit lets existi
 repairs finish. Selection and admission stay under the existing fixer lock.
 One active job addresses only its selected issue and linked observations.
 
+When a submitted master repair has merged but its issue remains open with its
+exact trusted MergeMarshall claim, a new completed product investigation naming
+that issue may resume the original session. The investigation must have started
+after the previous repair completed; a newer repair, human assignment, escalation,
+released/replaced claim, or unmerged PR prevents continuation. This also covers
+intermittent failures whose ledger observation was retired by a later passing run.
+Confirm the preserved session is still suspended; defer if an operator has already
+resumed it rather than cancelling their useful work.
+The continuation authorizes investigation and verification against current source;
+it never reopens a closed issue or establishes that a historical cause remains.
+Archive the prior completion, prompt and recovery privately in
+`issue_repair_followups`, checkpoint the new recovery atomically, and use the
+existing cancellation/typed-clear path with its report boundary. Preserve the
+session, checkout and evidence. Deduplicate each investigation's handoff, respect
+fixer slots, and isolate follow-up read failures from unrelated admission.
+
 The dossier contains the issue, recent comments, its own ledger observations
 and diagnosis provenance, and an open-PR inventory. The agent judges PR
 relevance from committed Git changes and applicable local test evidence.

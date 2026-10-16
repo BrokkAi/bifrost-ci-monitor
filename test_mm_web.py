@@ -315,6 +315,18 @@ class WebTests(unittest.TestCase):
             self.assertNotIn(SECRET, result.text)
         self.assertEqual(self.get('/batches/primary').json()['state']['recovery'], {'stage': 'clear'})
 
+    def test_repair_followup_archive_is_private(self):
+        conn = sqlite3.connect(monitor.DB_PATH)
+        conn.execute('INSERT INTO issue_repair_followups VALUES (?,?,?,?)',
+                     ('repair', 'triage', 'now', json.dumps({'prompt': PROMPT, 'report_json': SECRET})))
+        conn.commit()
+        conn.close()
+        self.assertNotIn('issue_repair_followups',
+                         [t['name'] for t in self.get('/schema').json()['tables']])
+        result = self.post('/sql', {'sql': 'SELECT prior_state_json FROM issue_repair_followups'}).json()
+        self.assertEqual(result['rows'], [[None]])
+        self.assertNotIn(SECRET, json.dumps(result))
+
     def test_sql_rejects_writes_and_multiple_statements(self):
         before = monitor.DB_PATH.read_bytes()
         for sql in ['DELETE FROM automerge_batches', "UPDATE issue_repairs SET prompt='oops'",

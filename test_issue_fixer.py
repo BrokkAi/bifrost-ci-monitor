@@ -60,6 +60,189 @@ class IssueFixerTests(TestCase):
             self.conn.execute("UPDATE issue_repairs SET status='completed',cleanup_done=1,repair_pr_number=30 WHERE id=?", (job["id"],))
         return job
 
+    def triaged_repair(self):
+        import triage
+        triage.ensure_schema(self.conn)
+        job = self.job()
+        report = dict(issue=12, outcome='submitted', pr=30, summary='Diagnostic blocker only')
+        finding = dict(outcome='product', diagnosis='Intermittent pipe wait remains',
+                       evidence='Symbolized stacks from the later run', issue=dict(existing_number=12))
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='completed',session_id='original',"
+                              "finished_at='2026-10-16T01:00:00+00:00',cleanup_done=1,outcome_sent=1,"
+                              "start_notified=1,repair_pr_number=30,report_json=? WHERE id=?",
+                              (json.dumps(report), job['id']))
+            self.conn.execute("INSERT INTO triage_jobs (id,title,base_sha,created_at,status,"
+                              "observations_json,report_json,finished_at,cleanup_done) VALUES "
+                              "('later-triage','triage','base','2026-10-16T02:00:00+00:00','completed',"
+                              "'[]',?,'2026-10-16T03:00:00+00:00',1)",
+                              (json.dumps(dict(findings=[finding])),))
+        return self.conn.execute('SELECT * FROM issue_repairs WHERE id=?', (job['id'],)).fetchone()
+
+    def followup_github(self, job, *, target=None, merged=True, claim_login=None):
+        def github(endpoint, **kwargs):
+            if endpoint == 'issues/12':
+                return target if target is not None else issue(progress=True)
+            if endpoint == 'pulls/30':
+                return dict(pr(), merged=merged, head=dict(pr()['head'], ref=job['branch']))
+            if endpoint.startswith('issues/12/comments'):
+                return [dict(user=dict(login=claim_login or automerge.TRUSTED_REJECTION_LOGIN),
+                             body=f"<!-- mergemarshall-fixer:{job['id']} -->")]
+            self.fail(f'Unexpected GitHub endpoint: {endpoint}')
+        return github
+
+    def test_fresh_triage_resumes_merged_repair_in_original_session_and_archives_completion(self):
+        job = self.triaged_repair()
+        candidates = fixer.triaged_followups(self.conn, [issue(progress=True)])
+        self.assertEqual(len(candidates), 1)
+        # No open ledger row is needed: a later pass may retire an intermittent observation.
+        self.assertFalse(fixer.observations(self.conn, issue()['html_url']))
+        with mock.patch.object(fixer, 'api', side_effect=self.followup_github(job)), \
+             mock.patch.object(monitor, 'require_mj_success', return_value='{"state":"suspended"}') as mj:
+            resumed = fixer.resume_triaged_repair(self.conn, candidates[0], [])
+        mj.assert_called_once_with(['sessions', '--session', 'original', '--json'])
+        # Native mutation waits for the committed recovery intent.
+        for key in ('id', 'session_id', 'branch', 'base_sha', 'work_key'):
+            self.assertEqual(resumed[key], job[key])
+        self.assertEqual(resumed['status'], 'running')
+        self.assertIsNone(resumed['report_json'])
+        self.assertIsNone(resumed['finished_at'])
+        self.assertEqual(resumed['cleanup_done'], 0)
+        self.assertEqual(resumed['outcome_sent'], 0)
+        recovery = json.loads(resumed['recovery_json'])
+        self.assertEqual(recovery['stage'], 'stop')
+        self.assertEqual(recovery['triage_job_id'], 'later-triage')
+        self.assertIn('Intermittent pipe wait remains', recovery['prompt'])
+        self.assertIn('own exact claim', recovery['prompt'])
+        self.assertTrue(fixer.prompt_fits(resumed['prompt']))
+        prior = json.loads(self.conn.execute('SELECT prior_state_json FROM issue_repair_followups').fetchone()[0])
+        self.assertEqual(prior['report_json'], job['report_json'])
+        self.assertEqual(prior['prompt'], job['prompt'])
+        self.assertEqual(prior['finished_at'], job['finished_at'])
+        self.assertEqual(fixer.occupied_slots(self.conn), 1)
+        self.assertFalse(fixer.triaged_followups(self.conn, [issue(progress=True)]))
+        self.assertIsNone(fixer.resume_triaged_repair(self.conn, candidates[0], []))
+        with mock.patch.object(fixer, 'recover_session') as recover, \
+             mock.patch.object(monitor, 'wait_once') as wait:
+            fixer.collect_step(self.conn, self.transport, resumed)
+        recover.assert_called_once()
+        wait.assert_not_called()  # An old completed report cannot bypass the clear boundary.
+
+    def test_followup_requires_new_completed_product_triage_after_previous_completion(self):
+        self.triaged_repair()
+        for update in (
+            "status='running'", "created_at='2026-10-16T00:00:00+00:00'",
+            "report_json='{}'",
+            "report_json='{\"findings\":[{\"outcome\":\"resolved\",\"issue\":{\"existing_number\":12}}]}'",
+            "report_json='{\"findings\":[{\"outcome\":\"product\",\"issue\":{\"existing_number\":13}}]}'",
+        ):
+            with self.subTest(update=update):
+                self.conn.execute('SAVEPOINT followup_case')
+                self.conn.execute('UPDATE triage_jobs SET '+update)
+                self.assertFalse(fixer.triaged_followups(self.conn, [issue(progress=True)]))
+                self.conn.execute('ROLLBACK TO followup_case')
+                self.conn.execute('RELEASE followup_case')
+
+    def test_followup_never_takes_closed_unclaimed_or_human_owned_issue(self):
+        job = self.triaged_repair()
+        candidate = fixer.triaged_followups(self.conn, [issue(progress=True)])[0]
+        for target in (dict(issue(progress=True), state='closed'), issue(),
+                       issue(progress=True, assignees=['someone']),
+                       dict(issue(progress=True), labels=issue(progress=True)['labels']+[dict(name='escalated')]),
+                       dict(issue(progress=True), labels=[dict(name='agent-in-progress')])):
+            with self.subTest(target=target):
+                self.assertFalse(fixer.triaged_followups(self.conn, [target]))
+                with mock.patch.object(fixer, 'api', side_effect=self.followup_github(job, target=target)) as github:
+                    self.assertIsNone(fixer.resume_triaged_repair(self.conn, candidate, []))
+                self.assertEqual(github.call_count, 1)
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM issue_repair_followups').fetchone()[0], 0)
+
+    def test_followup_waits_for_merge_and_authenticates_exact_claim(self):
+        job = self.triaged_repair()
+        candidate = fixer.triaged_followups(self.conn, [issue(progress=True)])[0]
+        for kwargs in (dict(merged=False), dict(claim_login='someone')):
+            with self.subTest(kwargs=kwargs), \
+                 mock.patch.object(fixer, 'api', side_effect=self.followup_github(job, **kwargs)):
+                self.assertIsNone(fixer.resume_triaged_repair(self.conn, candidate, []))
+        github = self.followup_github(job)
+        for bad in (dict(pr(), merged=True),  # Original branch does not match the recorded job.
+                    dict(pr(), merged=True, head=dict(pr()['head'], ref=job['branch'],
+                                                     repo=dict(full_name='someone/fork')))):
+            def changed(endpoint, **kwargs):
+                return bad if endpoint == 'pulls/30' else github(endpoint, **kwargs)
+            with self.subTest(bad=bad), mock.patch.object(fixer, 'api', side_effect=changed):
+                self.assertIsNone(fixer.resume_triaged_repair(self.conn, candidate, []))
+        def changed_claim(endpoint, **kwargs):
+            result = github(endpoint, **kwargs)
+            if 'comments' in endpoint:
+                result.append(dict(user=dict(login=automerge.TRUSTED_REJECTION_LOGIN),
+                                   body='<!-- mergemarshall-fixer:another-repair -->'))
+            return result
+        with mock.patch.object(fixer, 'api', side_effect=changed_claim):
+            self.assertIsNone(fixer.resume_triaged_repair(self.conn, candidate, []))
+
+    def test_followup_never_supersedes_newer_repair_or_campaign_target(self):
+        job = self.triaged_repair()
+        for update in ("status='running'", "cleanup_done=0", "target_branch='stabilize/old'",
+                       "report_json='{\"outcome\":\"escalated\"}'", "session_id=NULL"):
+            with self.subTest(update=update):
+                self.conn.execute('SAVEPOINT followup_case')
+                self.conn.execute('UPDATE issue_repairs SET '+update)
+                self.assertFalse(fixer.triaged_followups(self.conn, [issue(progress=True)]))
+                self.conn.execute('ROLLBACK TO followup_case')
+                self.conn.execute('RELEASE followup_case')
+        with mock.patch.object(fixer, 'api', return_value=[]):
+            newer = fixer.create_job(self.conn, issue(), None, None, 'new-observation', [], 'b'*40)
+        # Timestamps have second precision and UUIDs do not encode insertion order.
+        with self.conn:
+            self.conn.execute('UPDATE issue_repairs SET created_at=?,id=? WHERE id=?',
+                              (job['created_at'], '000-newer', newer['id']))
+        self.assertFalse(fixer.triaged_followups(self.conn, [issue(progress=True)]))
+        self.assertEqual(fixer.occupied_slots(self.conn), 1)
+        self.assertEqual(newer['status'], 'selected')
+
+    def test_followup_preserves_a_session_already_resumed_by_an_operator(self):
+        job = self.triaged_repair()
+        candidate = fixer.triaged_followups(self.conn, [issue(progress=True)])[0]
+        with mock.patch.object(fixer, 'api', side_effect=self.followup_github(job)), \
+             mock.patch.object(monitor, 'require_mj_success', return_value='{"state":"running"}') as mj:
+            self.assertIsNone(fixer.resume_triaged_repair(self.conn, candidate, []))
+        mj.assert_called_once_with(['sessions', '--session', 'original', '--json'])
+        self.assertEqual(self.conn.execute('SELECT status FROM issue_repairs').fetchone()[0], 'completed')
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM issue_repair_followups').fetchone()[0], 0)
+
+    def test_followup_failure_does_not_starve_unrelated_admission(self):
+        self.triaged_repair()
+        def github(endpoint, **kwargs):
+            if endpoint.startswith('issues?'):
+                return [issue(progress=True), issue(13)]
+            if endpoint == 'issues/12':
+                raise RuntimeError('unavailable repair metadata')
+            if endpoint == 'commits/master':
+                return dict(sha='b'*40)
+            return []
+        with mock.patch.object(fixer, 'api', side_effect=github), \
+             mock.patch.object(fixer, 'launch') as launch, \
+             mock.patch.object(monitor, 'slack_send', return_value=(True, 'thread')):
+            with self.assertRaisesRegex(RuntimeError, 'unavailable repair metadata'):
+                fixer.tick(self.conn, self.transport)
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(launch.call_args.args[1]['issue_number'], 13)
+
+    def test_followup_intent_is_not_replayed_after_completion_or_schema_upgrade(self):
+        job = self.triaged_repair()
+        candidate = fixer.triaged_followups(self.conn, [issue(progress=True)])[0]
+        with mock.patch.object(fixer, 'api', side_effect=self.followup_github(job)), \
+             mock.patch.object(monitor, 'require_mj_success', return_value='{"state":"suspended"}'):
+            resumed = fixer.resume_triaged_repair(self.conn, candidate, [])
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='completed',cleanup_done=1,"
+                              "finished_at='2026-10-16T04:00:00+00:00',report_json=? WHERE id=?",
+                              (job['report_json'], resumed['id']))
+        fixer.ensure_schema(self.conn)
+        self.assertFalse(fixer.triaged_followups(self.conn, [issue(progress=True)]))
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM issue_repair_followups').fetchone()[0], 1)
+
     def campaign(self, members):
         with self.conn:
             self.conn.execute("INSERT INTO stabilize_campaigns "
