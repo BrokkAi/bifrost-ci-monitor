@@ -1234,6 +1234,81 @@ class TriageTests(TestCase):
         with self.assertRaisesRegex(ValueError, "missing failure_ids"):
             triage.parse_report('triage-result: {"findings":[]}', observations)
 
+    def shared_step_findings(self):
+        self.add_failure()
+        report = self.make_job()
+        second = copy.deepcopy(report['findings'][0])
+        second['diagnosis'] = 'Independent fixture dedup timeout'
+        second['issue']['title'] = 'Fix fixture dedup timeout'
+        report['findings'].append(second)
+        with self.conn:
+            self.conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=?',
+                              (json.dumps(report), 'job'))
+        return report
+
+    def test_shared_step_publishes_both_causes_and_announces_both_tickets(self):
+        self.shared_step_findings()
+        triage.publish(self.conn, self.job())
+        self.reopen()
+        triage.publish(self.conn, self.job())
+        self.assertEqual(set(self.github.issues), {101, 102})
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM triage_finding_receipts').fetchone()[0], 2)
+        self.assertEqual(self.conn.execute('SELECT status FROM known_failures').fetchone()[0], 'open')
+        self.assertEqual(triage.pending(self.conn), [])
+        self.assertEqual(self.slack.call_count, 1)
+        self.assertIn('2 product issues', self.slack.call_args.args[1])
+        self.assertIn('/issues/101|#101:', self.slack.call_args.args[1])
+        self.assertIn('/issues/102|#102:', self.slack.call_args.args[1])
+        for number in (101, 102):
+            rows = issue_fixer.observations(self.conn, f'https://github.com/{monitor.REPO_NAME}/issues/{number}')
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['identity'], 'Cargo nextest')
+        with self.conn:
+            self.conn.execute("UPDATE known_failures SET last_seen_sha=?", ('b' * 40,))
+        # The first ticket's report link cannot supply a stale head's dossier.
+        self.assertEqual(issue_fixer.observations(self.conn, f'https://github.com/{monitor.REPO_NAME}/issues/101'), [])
+
+    def test_shared_step_second_issue_lost_reply_retries_without_repeating_first(self):
+        self.shared_step_findings()
+        original = self.github.__call__
+        def lose_second(endpoint, **kwargs):
+            if endpoint == 'issues' and kwargs.get('method') == 'POST' and len(self.github.issues) == 1:
+                self.github.lose_response_to = ('POST', 'issues')
+            return original(endpoint, **kwargs)
+        with mock.patch.object(triage, 'gh_api', side_effect=lose_second):
+            with self.assertRaisesRegex(RuntimeError, 'response lost'):
+                triage.publish(self.conn, self.job())
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM triage_finding_receipts').fetchone()[0], 1)
+        self.reopen()
+        triage.publish(self.conn, self.job())
+        self.assertEqual(set(self.github.issues), {101, 102})
+        self.assertEqual(sum(m == 'POST' and e == 'issues' for m, e, _ in self.github.calls), 2)
+        self.assertEqual(self.job()['status'], 'completed')
+
+    def test_shared_step_cannot_retarget_new_cause_to_another_causes_escalation(self):
+        self.shared_step_findings()
+        with self.conn:
+            self.conn.execute("UPDATE known_failures SET linked_issue_url=?", (f'https://github.com/{monitor.REPO_NAME}/issues/77',))
+        self.github.issues[77] = dict(number=77, title='Other cause owned by human', body='Original', state='open', labels=[])
+        triage.publish(self.conn, self.job())
+        self.assertEqual(set(self.github.issues), {77, 78, 79})
+        self.assertEqual(self.github.comments.get(77, []), [])
+
+    def test_shared_observations_cannot_resolve_another_cause_or_split_a_test(self):
+        report = self.shared_step_findings()
+        observations = json.loads(self.job()['observations_json'])
+        for outcome in ('resolved', 'infrastructure'):
+            invalid = copy.deepcopy(report)
+            invalid['findings'][1].update(outcome=outcome, issue=None)
+            with self.subTest(outcome=outcome), self.assertRaisesRegex(ValueError, 'only step observations'):
+                triage.parse_report('triage-result: ' + json.dumps(invalid), observations)
+        observations[0]['identity_kind'] = 'test'
+        with self.assertRaisesRegex(ValueError, 'only step observations'):
+            triage.parse_report('triage-result: ' + json.dumps(report), observations)
+        observations[0].update(identity_kind='step', stabilize_campaign_id='campaign')
+        with self.assertRaisesRegex(ValueError, 'only step observations'):
+            triage.parse_report('triage-result: ' + json.dumps(report), observations)
+
     def test_launch_persists_intent_and_uses_small_flash_session(self):
         self.add_failure()
         self.make_job(status="queued")

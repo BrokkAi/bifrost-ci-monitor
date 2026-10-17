@@ -99,13 +99,34 @@ def available(issue, *, own_retry=False):
 
 
 def observations(conn, issue_url):
+    # The ledger has one legacy summary link per observed step. Its reviewed
+    # publications retain every independent cause without changing that ledger key.
+    linked = ''
+    params = [issue_url, issue_url]
+    if 'repository' in {r['name'] for r in conn.execute('PRAGMA table_info(triage_publications)')}:
+        linked = """ OR EXISTS (
+            SELECT 1 FROM triage_publications AS publication
+            JOIN triage_jobs AS job ON job.id=publication.job_id AND job.status='completed'
+            JOIN json_each(job.observations_json) AS captured
+            JOIN json_each(job.report_json, '$.findings') AS finding
+                ON CAST(finding.key AS INTEGER)=publication.group_index
+            JOIN json_each(finding.value, '$.failure_ids') AS source
+                ON source.value=json_extract(captured.value, '$.failure_id')
+            WHERE 'https://github.com/' || publication.repository || '/issues/' || publication.issue_number=?
+              AND json_extract(captured.value, '$.workflow')=known_failures.workflow
+              AND json_extract(captured.value, '$.job_name')=known_failures.job_name
+              AND json_extract(captured.value, '$.identity_kind')=known_failures.identity_kind
+              AND json_extract(captured.value, '$.identity')=known_failures.identity
+              AND json_extract(captured.value, '$.last_seen_sha')=known_failures.last_seen_sha
+        )"""
+        params.append(issue_url)
     return [dict(r) for r in conn.execute(
         "SELECT workflow,job_name,identity_kind,identity,first_seen_sha,first_seen_at,"
         "first_seen_run_id,first_seen_run_url,last_seen_sha,last_seen_run_id,"
         "last_seen_run_url,diagnosis,diagnosis_source,triage_issue_url,linked_pr_url,"
         "linked_pr_state,linked_issue_url,linked_issue_state FROM known_failures "
-        "WHERE status='open' AND (triage_issue_url=? OR linked_issue_url=?) "
-        "ORDER BY workflow,job_name,identity", (issue_url, issue_url))] + local_findings.observations(conn, issue_url)
+        "WHERE status='open' AND (triage_issue_url=? OR linked_issue_url=?" + linked + ") "
+        "ORDER BY workflow,job_name,identity", params)] + local_findings.observations(conn, issue_url)
 
 
 def initial_work_key(issue, rows, *, target_branch=None):

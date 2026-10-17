@@ -280,6 +280,8 @@ not change the agent's batch revision. The integration PR create and exact-head
 merge remain synchronous. Fixer tables are
 `issue_repairs` and `issue_repair_messages`; triage uses `triage_jobs`,
 `triage_observations`, `triage_publications`, and `triage_product_announcements`.
+`triage_finding_receipts` checkpoints classification per finding, so independent
+product causes in one failed step can publish distinct issues and retry safely.
 Historical `invocations`
 remain readable. An active legacy invocation blocks new issue repairs until
 it is retired. Never replace or discard the live database to fix scheduling.
@@ -1008,6 +1010,13 @@ failed steps and commit, not repeated runs of the same observation. Its
 2-CPU/4-GiB session reads logs/source/history but does not build or fix code.
 Validate final JSON, deduplicate causes against open/closed issues, reopen
 matching issues, and persist publication markers to recover lost replies.
+One master CI step-level observation may support several product findings, each with its
+own cause and ticket; failure IDs remain unique within each finding. Test, local
+and performance observations and campaign branches retain one finding each. Shared steps cannot mix
+product with resolved/infrastructure outcomes. A linked escalation from one
+cause does not override the other findings' reviewed ticket choices. Publication
+receipts and announcements use finding indices, not the step's single legacy
+summary link, and ordinary issue selection admits each unclaimed product ticket.
 Each published investigation announces its product issues in one Slack thread,
 with actual ticket titles and links for created, updated or reopened issues.
 List each ticket once and split long lists into replies within Slack's message
