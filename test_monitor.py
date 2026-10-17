@@ -512,13 +512,14 @@ class MjRunnerTests(unittest.TestCase):
             "chat", token="xoxb-test", channel="C0123456789"
         )
 
-    def test_mj_new_argv_uses_single_model_subagents_when_configured(self):
+    def test_mj_new_argv_uses_both_subagent_types_when_configured(self):
         with mock.patch.object(monitor, "MJ_SUBAGENT_MODEL", "gpt-6-luna"):
             argv = monitor.new_session_argv(make_run(), "a" * 40, 1, "/tmp/p")
         start = argv.index("--subagents")
         self.assertEqual(
-            argv[start:start + 4],
-            ["--subagents", "single-model", "--subagent-model", "gpt-6-luna"],
+            argv[start:start + 6],
+            ["--subagents", "mjolnir", "--subagent-straightforward", "gpt-6-luna",
+             "--subagent-subtle", "gpt-6-luna"],
         )
 
     def test_mj_new_argv_has_required_selectors_and_no_profile(self):

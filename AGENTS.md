@@ -412,13 +412,16 @@ their handoff even when all source heads remain unchanged. Recovery retains the
 checkout and execution evidence; a metadata refresh alone does not require new
 tests. Already-confirmed GitHub landing can still be reconciled.
 
-At creation, integration batches with exactly one source PR select DeepSeek
-Flash (`deepseek-flash`) on `podman` with `--subagents none`; batches with
-multiple source PRs select Opus 5.5 (`opus`) on `bedrock-podman` with Mjolnir
-Luna 6 (`global.openai.gpt-6-luna`, high effort) subagents. Persist this choice
-in `automerge_batches.agent_configuration`; expansion, exclusion, recovery and
-promotion retain it. Existing rows migrate to `multi-pr`, preserving their
-Opus/Luna sessions. Prompt delegation guidance follows the persisted choice.
+Every new integration session uses DeepSeek Flash (`deepseek-flash`) at max
+effort on `podman` with `--subagents none`, regardless of source count or lane,
+including speculative successors. Persist `flash-max` in
+`automerge_batches.agent_configuration`; expansion, exclusion, recovery and
+promotion retain it. Existing live rows keep their `single-pr`, `multi-pr`,
+`flash-none` or `flash-luna` policy and prompt delegation guidance. After exact-title
+lookup establishes absence and a new launch is allowed, a legacy row creating a
+session also checkpoints `flash-max`. Adoption of an existing session keeps its
+persisted configuration. Historical schema defaults remain `multi-pr` for old rows.
+Legacy live Opus/Luna (`multi-pr`) sessions retain Bedrock failover:
 Two distinct consecutive agent messages beginning `API Error: 503` and naming
 Bedrock trigger automatic same-session failover to DeepSeek Flash. Normal agent
 output or completed tool work resets the count; quoted errors, tool HTTP errors,
@@ -438,7 +441,7 @@ before an operator changes environments. Valid handoffs continue through normal
 landing gates. Priority/other batches and maintenance remain independent while
 Move runs; continuation and its checkpoint commit atomically. A completed failover
 posts one threaded notice, retrying delivery without gating agent progress.
-The CI Opus profile enables one-hour prompt caching via
+The legacy CI Opus profile enables one-hour prompt caching via
 `ENABLE_PROMPT_CACHING_1H = "1"`. The CI Mjolnir configuration allows up to
 16 concurrent subagents per session. The primary coordinates the
 checkout and branch and owns Git operations, batch mutations, test assessment,
@@ -730,7 +733,8 @@ environment conventions, without rerunning ci-impact. Select useful targeted or
 broad/grouped checks from the diff, dependencies, interactions, conflict
 resolutions, existing results, and specific unresolved concerns.
 
-Delegate bounded investigation, review, or implementation to Luna. Divide large
+For legacy sessions with delegation enabled, delegate bounded investigation,
+review, or implementation to Luna. New sessions have no subagents. Divide large
 merges into independent PR groups or conflict clusters with explicit ownership;
 the primary combines and assesses the work. Builds are expensive: normally
 consolidate changes and validation through the primary. Subagents propose the

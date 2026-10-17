@@ -17,10 +17,9 @@ their prerequisites land. A rejection applies
 to the exact head that failed, so a corrected branch can re-enter the queue.
 The optional approved-review policy can require an approval before selection.
 
-For a branch behind master, one DeepSeek Flash agent integrates the PR and
-resolves conflicts, with subagents disabled. Batches starting with multiple
-PRs use Opus 5.5 with Luna 6 subagents. Each batch keeps its initial agent
-configuration if membership changes. The supervisor
+DeepSeek Flash at max effort integrates each new batch and resolves conflicts,
+with subagents disabled, regardless of the number of PRs. Existing live batches
+keep their initial agent configuration if membership changes. The supervisor
 runs Bifrost's ci-impact: docs batches skip all local tests and builds; otherwise
 the agent uses its judgment to choose useful checks and expands testing when
 needed. A full impact classification does not mandate a full local CI run. It opens one

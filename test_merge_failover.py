@@ -35,7 +35,7 @@ class FailoverTests(unittest.TestCase):
         self.addCleanup(self.conn.close)
         self.batch = a.create_batch(self.conn, [pull(), pull(2, HEAD_ONE)], BASE_SHA, ci_mode='async')
         with self.conn:
-            self.conn.execute("UPDATE automerge_batches SET status='running',session_id='session',"
+            self.conn.execute("UPDATE automerge_batches SET agent_configuration='multi-pr',status='running',session_id='session',"
                               "thread_ts='thread' WHERE batch_id=?", (self.batch,))
         self.session = self.patch(a, '_session_status', return_value={
             'id': 'session', 'target_id': a.MJ_TARGET, 'profile_id': 'bedrock'})
@@ -259,14 +259,16 @@ class FailoverTests(unittest.TestCase):
         self.assertIn('maintenance', kinds)
 
     def test_failover_configuration_survives_membership_changes(self):
-        for configuration, policy in [('flash-luna', 'single-model'), ('flash-none', 'none')]:
+        for configuration in ['flash-luna', 'flash-none']:
             with self.conn:
                 self.conn.execute('UPDATE automerge_batches SET agent_configuration=?, '
                                   'active_pull_requests_json=? WHERE batch_id=?',
                                   (configuration, json.dumps([pull().as_json()]), self.batch))
             args = a.new_session_argv(self.row(), 'prompt')
             self.assertEqual(args[args.index('--model') + 1], f.MODEL)
-            self.assertEqual(args[args.index('--subagents') + 1], policy)
+            self.assertEqual(args[args.index('--subagents') + 1], 'none')
+            self.assertEqual(args[args.index('--effort') + 1], 'max')
+            self.assertEqual(self.row()['agent_configuration'], configuration)
 
 
 class NativeCommandTests(unittest.TestCase):
@@ -279,6 +281,7 @@ class NativeCommandTests(unittest.TestCase):
         self.assertIn('--yes', args)
         self.assertNotIn('--target', args)
         self.assertNotIn('--subagents', args)
+        self.assertNotIn('--effort', args)
         self.assertNotIn('--clear-resources', args)
 
 

@@ -41,22 +41,23 @@ service use only the standard library; the merger uses host Node.js to run
 Bifrost's CI impact classifier. The web dashboard (below) also needs `uv` and
 `npm` to install its dependencies and build its UI.
 Configure Mjolnir's `CI` workspace, `bifrost` bundle, and the `podman` and
-`bedrock-podman` targets before enabling cron. Batches starting with one source PR
-use DeepSeek Flash (`deepseek-flash`) on `podman`, with subagents disabled.
-Larger batches use Opus 5.5 (`opus`) on `bedrock-podman` with Luna 6 subagents
-(`global.openai.gpt-6-luna`, high effort), with up to 16 concurrent subagents
-per session. Each batch retains its configuration through expansion and
-recovery. After two consecutive Bedrock 503 provider errors, the supervisor
-automatically moves that merger to DeepSeek Flash in the same container,
-retaining its session, work, validation evidence and Luna delegation. Successful
-agent or tool progress resets the error count. A threaded notice confirms the
-switch. Native Move failures or uncertain acceptance produce an actionable
-alert; the original session and recovery state remain available. Set
-`max_concurrent = 16` under `[subagents]` and make the Luna profile eligible
-under `[subagents.eligible_profiles]`.
+`bedrock-podman` targets before enabling cron. Every new integration session
+uses DeepSeek Flash (`deepseek-flash`) at max effort on `podman`, with subagents
+disabled, including campaign batches and speculative successors. Each batch
+retains its configuration through expansion and recovery. Existing live sessions
+keep their model and delegation settings. Legacy Opus/Luna sessions still move
+automatically to DeepSeek Flash after two consecutive Bedrock 503 provider
+errors, retaining the session, container, work, validation evidence and Luna
+delegation. Successful agent or tool progress resets the error count. A threaded
+notice confirms the switch. Native Move failures or uncertain acceptance produce
+an actionable alert; the original session and recovery state remain available.
+On mj 2.46, configure `[subagents.straightforward]` and `[subagents.subtle]` with
+`model = "global.openai.gpt-6-luna"` and `effort = "high"` for legacy delegation;
+keep `max_concurrent = 16` under `[subagents]`.
 Fixer and triage sessions use the `deepseek-flash` model.
 
-For one-hour Opus prompt caching, set `ENABLE_PROMPT_CACHING_1H = "1"` under
+For legacy Opus sessions using one-hour prompt caching, set
+`ENABLE_PROMPT_CACHING_1H = "1"` under
 `[profiles.bedrock-claude.environment]` in the CI host's Mjolnir `config.toml`.
 New workers pick up the setting automatically.
 

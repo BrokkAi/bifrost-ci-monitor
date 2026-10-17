@@ -74,7 +74,7 @@ MJ_BUNDLE = "bifrost"
 MJ_CPUS = 32
 MJ_MEMORY_GIB = 28
 MJ_MODEL = "deepseek-flash"
-# Model for single-model sub-agents, e.g. "gpt-6-luna"; None runs without sub-agents.
+# Model for both Mjolnir sub-agent types, e.g. "gpt-6-luna"; None runs without sub-agents.
 MJ_SUBAGENT_MODEL: str | None = None
 AGENT_LABEL = "DeepSeek Flash (mj)"
 CARGO_TEST_ENV_GUIDANCE = """Build/test environment: eatmydata is installed in this container. Run every cargo build and test command through it, for example `eatmydata cargo nextest run ...`, the way CI does (see `.github/workflows/AGENTS.md`, "Disk sync writes"). The wrapper applies only to that command; do not export LD_PRELOAD for the whole session, and do not check for or install eatmydata. Cargo builds go through the mbx build cache: build output lives in mbx's managed target directory, not in `./target`, so a missing `./target` in the checkout is expected. Do not look for, create, or clean target directories; just run the cargo commands.
@@ -2316,7 +2316,9 @@ def repair_dossier(run: CiRun, base_sha: str) -> str:
 def subagent_args() -> list[str]:
     if MJ_SUBAGENT_MODEL is None:
         return ["--subagents", "none"]
-    return ["--subagents", "single-model", "--subagent-model", MJ_SUBAGENT_MODEL]
+    return ["--subagents", "mjolnir",
+            "--subagent-straightforward", MJ_SUBAGENT_MODEL,
+            "--subagent-subtle", MJ_SUBAGENT_MODEL]
 
 
 def new_session_argv(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sqlite3
@@ -864,14 +865,12 @@ class IdentityAndPromptTests(TestCase):
         argv = automerge.new_session_argv(row, "/tmp/prompt")
         self.assertEqual(monitor.MJ_CPUS, 32)
         self.assertEqual(monitor.MJ_MEMORY_GIB, 28)
-        self.assertEqual(automerge.AUTOMERGE_MODEL, "opus")
+        self.assertEqual(automerge.AUTOMERGE_MODEL, "deepseek-flash")
         self.assertEqual(argv, [
             "new", "--workspace", monitor.MJ_WORKSPACE,
-            "--target", "bedrock-podman", "--bundle", monitor.MJ_BUNDLE,
+            "--target", "podman", "--bundle", monitor.MJ_BUNDLE,
             "--cpus", "32", "--memory-gib", "28",
-            "--model", "opus", "--subagents", "single-model",
-            "--subagent-model", "global.openai.gpt-6-luna",
-            "--subagent-effort", "high",
+            "--model", "deepseek-flash", "--effort", "max", "--subagents", "none",
             "--at", BASE_SHA, "--branch", "mergemarshall/batch-batch-test",
             "--title", "Bifrost automerge batch batch-test",
             "--prompt-file", "/tmp/prompt", "--json",
@@ -888,6 +887,7 @@ class IdentityAndPromptTests(TestCase):
             self.assertEqual(argv[argv.index("--model") + 1], "deepseek-flash")
             self.assertEqual(argv[argv.index("--target") + 1], "podman")
             self.assertEqual(argv[argv.index("--subagents") + 1], "none")
+            self.assertEqual(argv[argv.index("--effort") + 1], "max")
             self.assertNotIn("--subagent-model", argv)
             self.assertNotIn("--subagent-effort", argv)
             return subprocess.CompletedProcess(argv, 0, '{"session_id":"flash-session"}', '')
@@ -902,13 +902,55 @@ class IdentityAndPromptTests(TestCase):
         self.assertNotIn("delegate independent", prompts[0])
         self.assertNotIn("delegated inspection", prompts[0])
 
+    def test_new_launches_checkpoint_flash_max_for_all_lanes_and_legacy_policies(self):
+        for target in ('master', 'stabilize/test'):
+            for count in (1, 3):
+                for configuration in ('flash-max', 'single-pr', 'multi-pr', 'flash-none', 'flash-luna'):
+                    with self.subTest(target=target, count=count, configuration=configuration):
+                        pulls = [dataclasses.replace(pull(n), target_ref=target) for n in range(1, count + 1)]
+                        conn = make_db(pulls=pulls, session_id=None, status='launching', ci_mode='async')
+                        self.addCleanup(conn.close)
+                        self.assertEqual(row_for(conn)['agent_configuration'], 'flash-max')
+                        self.assertEqual(automerge.batch_target(row_for(conn)), target)
+                        with conn:
+                            conn.execute("UPDATE automerge_batches SET agent_configuration=?, launch_attempted=1",
+                                         (configuration,))
+                        def launch(argv, **kwargs):
+                            self.assertEqual(row_for(conn)['agent_configuration'], 'flash-max')
+                            for flag, value in (('--model', 'deepseek-flash'), ('--target', 'podman'),
+                                                ('--effort', 'max'), ('--subagents', 'none')):
+                                self.assertEqual(argv[argv.index(flag) + 1], value)
+                            self.assertFalse(any(arg.startswith('--subagent-') for arg in argv))
+                            prompt = Path(argv[argv.index('--prompt-file') + 1]).read_text()
+                            self.assertIn('Subagents are disabled', prompt)
+                            self.assertNotIn('Luna', prompt)
+                            return subprocess.CompletedProcess(argv, 0, '{"session_id":"flash-session"}', '')
+                        with (mock.patch.object(automerge, 'lookup_batch_session', return_value=None),
+                              mock.patch.object(automerge, '_validation_impact', return_value={}),
+                              mock.patch.object(automerge, 'skills_connection_prompt', return_value=''),
+                              mock.patch.object(monitor, 'mj_command', side_effect=launch)):
+                            self.assertEqual(automerge.launch_batch_session(row_for(conn), pulls, conn=conn),
+                                             'flash-session')
+
+    def test_legacy_live_batch_recovery_retains_delegation(self):
+        conn = make_db(ci_mode='async')
+        self.addCleanup(conn.close)
+        with conn:
+            conn.execute("UPDATE automerge_batches SET agent_configuration='multi-pr'")
+        speculation.invalidate(automerge, conn, row_for(conn))
+        row = row_for(conn)
+        with mock.patch.object(automerge, 'skills_connection_prompt', return_value=''):
+            prompt = speculation.reset_brief(automerge, conn, row, json.loads(row['recovery_json']))
+        self.assertIn('Luna', prompt)
+        self.assertEqual(row_for(conn)['agent_configuration'], 'multi-pr')
+
     @unchanged_queue()
     def test_configuration_survives_expansion_and_source_removal(self):
         for initial in ([pull()], [pull(), pull(8, HEAD_TWO)]):
             with self.subTest(initial_count=len(initial)):
                 conn = make_db(ci_mode="async", pulls=initial)
                 self.addCleanup(conn.close)
-                expected = "single-pr" if len(initial) == 1 else "multi-pr"
+                expected = "flash-max"
                 additions = initial + [pull(9, HEAD_THREE)]
                 with (mock.patch.object(automerge, "_recheck_sources", side_effect=lambda pulls, **kw: (pulls, [])),
                       mock.patch.object(automerge, "select_eligible_pull_requests", return_value=additions)):
@@ -916,8 +958,8 @@ class IdentityAndPromptTests(TestCase):
                 expanded = row_for(conn)
                 self.assertEqual(len(automerge._active_sources(expanded)), len(initial) + 1)
                 self.assertEqual(expanded['agent_configuration'], expected)
-                self.assertEqual(automerge._batch_subagents(expanded), len(initial) > 1)
-                self.assertEqual("Luna" in expanded['pending_prompt'], len(initial) > 1)
+                self.assertFalse(automerge._batch_subagents(expanded))
+                self.assertNotIn("Luna", expanded['pending_prompt'])
                 with (mock.patch.object(automerge, "_recheck_sources", side_effect=lambda pulls, **kw: (pulls, [])),
                       mock.patch.object(automerge, "select_eligible_pull_requests", return_value=[])):
                     self.assertTrue(automerge._request_rebuild(conn, expanded, [initial[0]], "removed"))
@@ -925,7 +967,7 @@ class IdentityAndPromptTests(TestCase):
                 self.assertEqual(len(automerge._active_sources(reduced)), 1)
                 argv = automerge.new_session_argv(reduced, "/tmp/prompt")
                 self.assertEqual(argv[argv.index('--model') + 1],
-                                 'deepseek-flash' if expected == 'single-pr' else 'opus')
+                                 'deepseek-flash')
 
     def test_single_pr_feedback_and_sync_prompt_do_not_request_delegation(self):
         conn = make_db(ci_mode="sync")
@@ -938,7 +980,7 @@ class IdentityAndPromptTests(TestCase):
             self.assertNotIn("delegate independent", prompt)
             self.assertNotIn("delegated inspection", prompt)
 
-    def test_legacy_single_pr_batch_keeps_opus_configuration(self):
+    def test_legacy_batch_keeps_delegation_but_new_session_uses_flash_max(self):
         conn = make_db()
         self.addCleanup(conn.close)
         with conn:
@@ -946,8 +988,11 @@ class IdentityAndPromptTests(TestCase):
             automerge.ensure_column(conn, 'automerge_batches', 'agent_configuration',
                                     "TEXT NOT NULL DEFAULT 'multi-pr'")
         argv = automerge.new_session_argv(row_for(conn), '/tmp/prompt')
-        self.assertEqual(argv[argv.index('--model') + 1], 'opus')
-        self.assertEqual(argv[argv.index('--subagents') + 1], 'single-model')
+        self.assertTrue(automerge._batch_subagents(row_for(conn)))
+        self.assertEqual(row_for(conn)['agent_configuration'], 'multi-pr')
+        self.assertEqual(argv[argv.index('--model') + 1], 'deepseek-flash')
+        self.assertEqual(argv[argv.index('--effort') + 1], 'max')
+        self.assertEqual(argv[argv.index('--subagents') + 1], 'none')
 
     @unchanged_queue()
     def test_build_turn_discovers_and_persists_integration_pr(self):
@@ -3823,11 +3868,14 @@ class LaunchAndLifecycleTests(TestCase):
 
     def test_launch_failure_adopts_exact_title_without_duplicate(self):
         conn = make_db(phase="building", session_id=None, status="launching")
+        with conn:
+            conn.execute("UPDATE automerge_batches SET agent_configuration='multi-pr'")
         row = row_for(conn)
         session_list = json.dumps({"sessions": [{"id": "adopted-session", "title": row["title"]}]})
         with mock.patch.object(monitor, "require_mj_success", return_value=session_list):
             adopted = automerge.launch_batch_session(row, [pull()], conn=conn, allow_new=False)
         self.assertEqual(adopted, "adopted-session")
+        self.assertEqual(row_for(conn)["agent_configuration"], "multi-pr")
         conn.close()
 
     @unchanged_queue()

@@ -122,6 +122,8 @@ def prepare(session_id):
 def submit_move(session_id, *, timeout=15):
     # No target/mount/resource override: native in-place Move retains the Git
     # directory, ignored logs, build caches and any useful Luna child work.
+    # Omit --subagents: both mj 2.34 and 2.46 retain the source session policy.
+    # No effort override is needed for this provider-only recovery.
     # The caller reserves this observation budget before checkpointing intent.
     # Rechecking the shared deadline after that checkpoint could defer without
     # ever submitting, leaving a falsely ambiguous Move. Keep the reserved bound.

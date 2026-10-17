@@ -42,11 +42,9 @@ GH_BIN = monitor.GH_BIN
 MJ_WORKSPACE = monitor.MJ_WORKSPACE
 MJ_TARGET = "bedrock-podman"
 MJ_BUNDLE = monitor.MJ_BUNDLE
-AUTOMERGE_MODEL = "opus"
-AUTOMERGE_SUBAGENT_MODEL = "global.openai.gpt-6-luna"
-AUTOMERGE_SUBAGENT_EFFORT = "high"
-SINGLE_PR_MODEL = "deepseek-flash"
-SINGLE_PR_TARGET = "podman"
+AUTOMERGE_MODEL = "deepseek-flash"
+AUTOMERGE_EFFORT = "max"
+AUTOMERGE_TARGET = "podman"
 MJ_WAIT_POLL_SECONDS = monitor.MJ_WAIT_POLL_SECONDS
 SLACK_MESSAGE_LIMIT = monitor.SLACK_MESSAGE_LIMIT
 
@@ -1519,7 +1517,7 @@ def create_batch(
             (
                 identifier,
                 kind,
-                "single-pr" if len(pulls) == 1 else "multi-pr",
+                "flash-max",
                 source,
                 int(any(pull.priority for pull in pulls)),
                 status,
@@ -1692,7 +1690,7 @@ def _batch_subagents(row: sqlite3.Row | dict[str, Any]) -> bool:
     # Old batches retain their Opus/Luna configuration. Membership can expand
     # or shrink, so never derive a live session's configuration from its PR list.
     configuration = row["agent_configuration"] if "agent_configuration" in row.keys() else "multi-pr"
-    if configuration not in {"single-pr", "multi-pr", "flash-none", "flash-luna"}:
+    if configuration not in {"single-pr", "multi-pr", "flash-none", "flash-luna", "flash-max"}:
         raise AutomergeError(f"unknown agent configuration: {configuration}",
                              reason="database_state_invalid")
     return configuration in {"multi-pr", "flash-luna"}
@@ -1973,21 +1971,16 @@ Keep the captured base for this turn. After you finish, the supervisor checks {p
 def new_session_argv(
     row: sqlite3.Row | dict[str, Any], prompt_file: str
 ) -> list[str]:
-    subagents = _batch_subagents(row)
-    flash = not subagents or speculation.get(row, "agent_configuration") == "flash-luna"
-    delegation = (["--subagents", "single-model",
-                   "--subagent-model", AUTOMERGE_SUBAGENT_MODEL,
-                   "--subagent-effort", AUTOMERGE_SUBAGENT_EFFORT] if subagents
-                  else ["--subagents", "none"])
     return [
         "new",
         "--workspace", MJ_WORKSPACE,
-        "--target", SINGLE_PR_TARGET if flash else MJ_TARGET,
+        "--target", AUTOMERGE_TARGET,
         "--bundle", MJ_BUNDLE,
         "--cpus", str(monitor.MJ_CPUS),
         "--memory-gib", str(monitor.MJ_MEMORY_GIB),
-        "--model", SINGLE_PR_MODEL if flash else AUTOMERGE_MODEL,
-        *delegation,
+        "--model", AUTOMERGE_MODEL,
+        "--effort", AUTOMERGE_EFFORT,
+        "--subagents", "none",
         "--at", str(row["base_sha"]),
         "--branch", str(row["branch"]),
         "--title", str(row["title"]),
@@ -2087,7 +2080,7 @@ def launch_batch_session(
         ci_mode=_batch_ci_mode(row), target_ref=batch_target(row),
         known_failures_context=_known_failures_prompt(conn) if conn is not None else "",
         validation_impact=impact,
-        subagents=_batch_subagents(row),
+        subagents=False,
     )
     prompt += "\n\n" + batch_speculation_guidance(row) + skills_connection_prompt(row)
     with tempfile.NamedTemporaryFile(
@@ -2099,11 +2092,14 @@ def launch_batch_session(
     launch_error: monitor.MjError | None = None
     try:
         if conn is not None:
+            # Only a proven-absent launch changes a legacy row; title adoption
+            # above must preserve the live session policy. Checkpoint the new
+            # configuration with intent before mj can create a session.
             # Prepare classification and prompt before recording launch intent.
             # After mj new, an empty session list is not proof of absence.
             with conn:
                 conn.execute(
-                    "UPDATE automerge_batches SET launch_attempted = 1, "
+                    "UPDATE automerge_batches SET agent_configuration = 'flash-max', launch_attempted = 1, "
                     "launch_attempted_at = ?, validation_impact_json = ? WHERE batch_id = ?",
                     (utc_now(), json.dumps(impact), row["batch_id"]),
                 )

@@ -113,13 +113,28 @@ class StateTests(unittest.TestCase):
         return self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?',
                                  (identifier or self.child,)).fetchone()
 
+    def test_multi_pr_successor_starts_flash_max_without_delegation(self):
+        identifier = a.create_batch(self.conn, [pull(10), pull(11, HEAD_TWO)], HEAD_THREE,
+                                    batch_id='multi-successor', ci_mode='async',
+                                    predecessor_id=self.parent,
+                                    predecessor_candidate=s.candidate(a, self.row(self.parent)))
+        row = self.row(identifier)
+        self.assertEqual(row['agent_configuration'], 'flash-max')
+        self.assertFalse(a._batch_subagents(row))
+        argv = a.new_session_argv(row, '/tmp/prompt')
+        for flag, value in (('--model', 'deepseek-flash'), ('--target', 'podman'),
+                            ('--effort', 'max'), ('--subagents', 'none')):
+            self.assertEqual(argv[argv.index(flag) + 1], value)
+        self.assertFalse(any(arg.startswith('--subagent-') for arg in argv))
+
     def test_single_pr_successor_recovery_retains_flash_without_delegation(self):
         s.invalidate(a, self.conn, self.row())
         row = self.row()
-        self.assertEqual(row['agent_configuration'], 'single-pr')
+        self.assertEqual(row['agent_configuration'], 'flash-max')
         argv = a.new_session_argv(row, '/tmp/prompt')
         self.assertEqual(argv[argv.index('--model') + 1], 'deepseek-flash')
         self.assertEqual(argv[argv.index('--subagents') + 1], 'none')
+        self.assertEqual(argv[argv.index('--effort') + 1], 'max')
         with mock.patch.object(a, 'skills_connection_prompt', return_value=''):
             prompt = s.reset_brief(a, self.conn, row, json.loads(row['recovery_json']))
         self.assertIn('Subagents are disabled', prompt)
