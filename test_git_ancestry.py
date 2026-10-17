@@ -218,7 +218,7 @@ class GitReads(unittest.TestCase):
         result.returncode = 128
         result.stderr = 'private-test-token'
         with mock.patch.object(g.subprocess, 'run', side_effect=[mock.Mock(returncode=0), result]):
-            with self.assertRaisesRegex(OSError, r'^remote Git branch could not be read \(unknown\)$'):
+            with self.assertRaisesRegex(OSError, r'^remote Git branch could not be read \(unknown\) \[exit=128\]$'):
                 g.remote_head('owner/repo', 'master', lambda: 'private-test-token')
 
     def test_remote_auth_failure_renews_once_and_reads_a_fresh_head(self):
@@ -241,6 +241,8 @@ class GitReads(unittest.TestCase):
                  ('Repository not found', 'repository_access'),
                  ('Could not resolve host', 'transport'),
                  ('GnuTLS connection terminated', 'transport'),
+                 ('RPC failed; curl 92 HTTP/2 stream 3 was not closed cleanly: INTERNAL_ERROR', 'transport'),
+                 ('Empty reply from server', 'transport'),
                  ('unexpected failure', 'unknown')]
         for detail, category in cases:
             with self.subTest(category=category, detail=detail):
@@ -258,6 +260,26 @@ class GitReads(unittest.TestCase):
                 self.assertNotIn(detail, str(error.exception))
                 self.assertEqual(refresh.call_count, int(category == 'authentication'))
                 self.assertEqual(run.call_count, 3 if category == 'authentication' else 2)
+
+    def test_remote_protocol_diagnostics_are_numeric_and_never_expose_stderr(self):
+        for detail, diagnostics in [
+                ('RPC failed; curl 92 HTTP/2 stream 3 private-test-token', {'exit': 128, 'curl': 92}),
+                ('The requested URL returned error: 503 https://private-test-token@github.com',
+                 {'exit': 128, 'http': 503}),
+                ('unknown private-test-token curl secret returned error: token', {'exit': 128})]:
+            with self.subTest(detail=detail):
+                rejected = subprocess.CompletedProcess([], 128, '', detail)
+                refresh = mock.Mock()
+                with mock.patch.object(g.subprocess, 'run', side_effect=[mock.Mock(returncode=0), rejected]) as run:
+                    with self.assertRaises(g.RemoteReadError) as error:
+                        g.remote_head('owner/repo', 'master', lambda: 'private-test-token',
+                                      refresh_token=refresh)
+                self.assertEqual(error.exception.diagnostics, diagnostics)
+                self.assertNotIn('private-test-token', str(error.exception))
+                self.assertNotIn('https://', str(error.exception))
+                self.assertFalse(hasattr(error.exception, 'stderr'))
+                refresh.assert_not_called()
+                self.assertEqual(run.call_count, 2)
 
     def test_remote_missing_branch_and_malformed_response_never_renew_or_return_a_head(self):
         for result, category in [(subprocess.CompletedProcess([], 2, '', ''), 'missing_branch'),

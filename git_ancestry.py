@@ -59,10 +59,22 @@ def repository_url(repository):
 
 
 class RemoteReadError(OSError):
-    """Only a reviewed category leaves the Git process; never its stderr."""
-    def __init__(self, category):
+    """Only a reviewed category and numeric diagnostics leave the Git process."""
+    def __init__(self, category, *, result=None):
         self.category = category
-        super().__init__(f'remote Git branch could not be read ({category})')
+        self.diagnostics = {}
+        if result is not None:
+            self.diagnostics['exit'] = int(result.returncode)
+            # Do not retain stderr, URLs, headers or arbitrary error fragments.
+            for key, pattern in (
+                    ('curl', r'\bcurl ([0-9]{1,3})\b'),
+                    ('http', r'returned error: ([1-5][0-9]{2})\b')):
+                match = re.search(pattern, result.stderr or '', re.IGNORECASE)
+                if match:
+                    self.diagnostics[key] = int(match[1])
+        suffix = (' [' + ', '.join(f'{k}={v}' for k, v in self.diagnostics.items()) + ']'
+                  if self.diagnostics else '')
+        super().__init__(f'remote Git branch could not be read ({category})' + suffix)
 
 
 def remote_error_category(result):
@@ -79,7 +91,8 @@ def remote_error_category(result):
         return 'repository_access'
     if any(marker in detail for marker in (
             'could not resolve', 'failed to connect', 'connection', 'timed out',
-            'ssl', 'tls', 'returned error: 50')):
+            'ssl', 'tls', 'returned error: 50', 'rpc failed', 'http/2 stream',
+            'empty reply from server', 'remote end hung up', 'early eof')):
         return 'transport'
     if result.returncode == 2:
         return 'missing_branch'
@@ -116,7 +129,7 @@ def remote_head(repository, branch, token, *, refresh_token=None):
         if attempt == 0 and category == 'authentication' and refresh_token is not None:
             current_token = refresh_token()
             continue
-        raise RemoteReadError(category)
+        raise RemoteReadError(category, result=result)
     if '\t' not in lines[0]:
         raise ValueError('invalid remote Git branch response')
     sha, name = lines[0].split('\t', 1)

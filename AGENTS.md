@@ -239,6 +239,9 @@ access, transport, rate limit, missing branch or invalid/unknown response), neve
 Git stderr. Explicit authentication failure permits one renewal through the same
 App-token provider and a fresh probe within the original read budget. Other
 failures are not retried inline and never supply a stale head or negative fact.
+Failed current-ref reads retain only the numeric process exit and recognized
+curl/HTTP error codes alongside their category. RPC/HTTP2 failures are transport
+errors; these diagnostics never authorize authentication renewal or inline retry.
 Cache immutable tree identities, behind counts, merge-base changed paths, and
 base-pinned classifier results across polls/batches. Changed-path reads include
 rename endpoints without loading file blobs; retrieve only the pinned classifier
