@@ -740,6 +740,70 @@ class IssueFixerTests(TestCase):
         self.assertEqual(data["observed_failures"], [])
         self.assertEqual(data["open_pr_inventory"][0]["number"], 30)
 
+    def test_dossier_retains_scoped_completed_reports_after_comments_roll_off(self):
+        for number, index in [(12, i) for i in range(5)] + [(13, 5)]:
+            with mock.patch.object(fixer, 'api', return_value=[]):
+                job = fixer.create_job(self.conn, issue(number), None, None,
+                                       f'history:{index}', [], 'b' * 40)
+            report = dict(issue=number, outcome='deferred', pr=30,
+                          summary=f'Native validation {index}: ' + 'evidence ' * 500)
+            with self.conn:
+                self.conn.execute(
+                    "UPDATE issue_repairs SET status=?,session_id=?,finished_at=?,report_json=?,"
+                    "prompt='PRIVATE STORED PROMPT',cleanup_done=1 WHERE id=?",
+                    ('running' if index == 4 else 'completed', f'session-{index}',
+                     f'2026-10-18T12:0{index}:00Z', json.dumps(report), job['id']))
+        comments = [dict(html_url=f'comment/{i}', user=dict(login='bot'), body='Claim update')
+                    for i in range(20)]
+        with mock.patch.object(fixer, 'api', return_value=comments):
+            data = fixer.dossier(self.conn, issue(), [pr(sha='f' * 40)])
+        self.assertEqual([r['session_id'] for r in data['previous_repairs']],
+                         ['session-3', 'session-2', 'session-1'])
+        self.assertEqual(data['previous_repairs_omitted'], 1)
+        self.assertEqual(data['comments_omitted'], 12)
+        self.assertTrue(data['previous_repairs'][0]['summary']['truncated'])
+        self.assertEqual(data['previous_repairs'][0]['checkout_base_sha'], 'b' * 40)
+        self.assertEqual(data['previous_repairs'][0]['target_branch'], 'master')
+        self.assertEqual(data['open_pr_inventory'][0]['head_sha'], 'f' * 40)
+        self.assertNotIn('PRIVATE STORED PROMPT', json.dumps(data))
+        self.assertNotIn('session-5', json.dumps(data))
+
+    def test_invalid_legacy_completion_cannot_supply_another_issues_evidence(self):
+        job = self.job()
+        for report in ('malformed JSON', json.dumps(dict(issue=13, summary='Another issue')),
+                       json.dumps(dict(issue=12, outcome='deferred', summary=None)),
+                       json.dumps(dict(issue=12, outcome={'prompt': 'PRIVATE'}, summary='Invalid'))):
+            with self.subTest(report=report), self.conn:
+                self.conn.execute("UPDATE issue_repairs SET status='completed',report_json=? "
+                                  "WHERE id=?", (report, job['id']))
+            with mock.patch.object(fixer, 'api', return_value=[]):
+                data = fixer.dossier(self.conn, issue(), [])
+            self.assertEqual(data['previous_repairs'], [])
+            self.assertEqual(data['previous_repairs_omitted'], 1)
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET report_json=? WHERE id=?",
+                              (json.dumps(dict(issue=12, outcome='deferred',
+                                               summary='Existing test evidence',
+                                               pr={'prompt': 'PRIVATE'})), job['id']))
+        with mock.patch.object(fixer, 'api', return_value=[]):
+            data = fixer.dossier(self.conn, issue(), [])
+        self.assertIsNone(data['previous_repairs'][0]['pr_number'])
+        self.assertNotIn('PRIVATE', json.dumps(data))
+
+    def test_prompt_compacts_prior_reports_before_target_and_rejection_evidence(self):
+        with mock.patch.object(fixer, 'api', return_value=[]):
+            data = fixer.dossier(self.conn, issue(), [], rejection='Exact rejected-head evidence')
+        data['target_issue']['body'] = fixer.excerpt('Original target evidence ' * 80, 4000)
+        original = data['target_issue']['body'].copy()
+        data['previous_repairs'] = [dict(summary=fixer.excerpt('Prior evidence ' * 200, 2000))
+                                    for _ in range(3)]
+        with mock.patch.object(fixer, 'MAX_PROMPT_CHARS', 6000):
+            prompt = fixer.render_prompt('Prefix ' * 300, data)
+        self.assertLessEqual(len(prompt), 6000)
+        self.assertGreater(data['previous_repairs_omitted'], 0)
+        self.assertEqual(data['target_issue']['body'], original)
+        self.assertEqual(data['merger_rejection']['text'], 'Exact rejected-head evidence')
+
     def test_encoded_prompt_stays_below_transport_limit_even_with_large_unicode_inventory(self):
         target = issue()
         target["body"] = "\U0001f9ea" * 65000

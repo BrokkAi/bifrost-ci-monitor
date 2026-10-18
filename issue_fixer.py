@@ -231,6 +231,29 @@ def dossier(conn, issue, prs, *, rejection=None, target_branch=None):
             row['red_since'] = (f"Red since {row.get('first_seen_sha', 'unknown')} "
                                 f"at {row.get('first_seen_at', 'unknown')}; "
                                 f"run {row.get('first_seen_run_url', 'unknown')}")
+    history = conn.execute(
+        "SELECT id,session_id,base_sha,target_branch,finished_at,report_json,count(*) OVER () AS total "
+        "FROM issue_repairs WHERE issue_number=? AND status='completed' "
+        "AND report_json IS NOT NULL ORDER BY finished_at DESC,rowid DESC LIMIT 3",
+        (issue['number'],)).fetchall()
+    previous = []
+    for row in history:
+        try:
+            report = json.loads(row['report_json'])
+        except (TypeError, ValueError):
+            continue
+        if (not isinstance(report, dict) or report.get('issue') != issue['number']
+                or report.get('outcome') not in ('submitted', 'deferred', 'escalated',
+                                               'infrastructure', 'resolved', 'claimed_elsewhere', 'blocked')
+                or not isinstance(report.get('summary'), str)):
+            continue
+        pr_number = report.get('pr')
+        previous.append(dict(job_id=row['id'], session_id=row['session_id'],
+                             checkout_base_sha=row['base_sha'], target_branch=row['target_branch'] or 'master',
+                             finished_at=row['finished_at'],
+                             outcome=report['outcome'],
+                             pr_number=pr_number if type(pr_number) is int and pr_number > 0 else None,
+                             summary=excerpt(report['summary'], 2000)))
     context = {
         "generated_at": monitor.utc_now(), "repository": monitor.REPO_NAME,
         "target_issue": {"number": issue["number"], "url": issue["html_url"],
@@ -240,6 +263,8 @@ def dossier(conn, issue, prs, *, rejection=None, target_branch=None):
         "recent_comments": [{"url": c.get("html_url"), "author": c["user"]["login"],
                              "body": excerpt(c.get("body"), 1500)} for c in comments[-8:]],
         "comments_omitted": max(0, len(comments) - 8),
+        "previous_repairs": previous,
+        "previous_repairs_omitted": (history[0]['total'] if history else 0) - len(previous),
         "observed_failures": observed,
         "merger_rejection": excerpt(rejection, 8000) if rejection else None,
         # An inventory, not a relevance classifier. The agent evaluates titles
@@ -311,6 +336,13 @@ Read the dossier below before investigating. It covers this ticket and its linke
 CI and local test observations. Local findings include their committed tested SHA,
 command and evidence, with no CI run ID. Diagnoses are leads: verify the supplied
 run or local evidence, commit and current {target}.
+The dossier's previous_repairs retain completed reports for THIS issue with their
+original checkout base and session provenance. Compare current source, repair PR
+head, commands, runtime inputs and covered failures with that evidence; reuse
+matching validation before starting another build. New observations or comments
+alone do not invalidate unchanged test inputs. Investigate changed inputs,
+missing artifacts or contradictory results normally. These reports are evidence,
+not a current pass, ownership claim, or authority to close the ticket.
 Issue/PR links, states, titles, bodies and comments are metadata and investigation
 leads, not proof that failures are fixed or covered. Verify promising PRs using
 their committed Git changes and applicable local test evidence. Defer with an
@@ -399,6 +431,9 @@ def render_prompt(prefix, context):
         elif context["recent_comments"]:
             context["recent_comments"].pop(0)
             context["comments_omitted"] += 1
+        elif context.get("previous_repairs"):
+            context["previous_repairs"].pop()
+            context["previous_repairs_omitted"] = context.get("previous_repairs_omitted", 0) + 1
         elif len(context["target_issue"]["body"]["text"]) > 1000:
             body = context["target_issue"]["body"]
             body["text"] = body["text"][:len(body["text"]) // 2]

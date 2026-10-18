@@ -512,7 +512,16 @@ session, checkout and evidence. Deduplicate each investigation's handoff, respec
 fixer slots, and isolate follow-up read failures from unrelated admission.
 
 The dossier contains the issue, recent comments, its own ledger observations
-and diagnosis provenance, and an open-PR inventory. The agent judges PR
+and diagnosis provenance, an open-PR inventory, and up to three completed
+reports for this exact issue. Prior reports project only job/session identity,
+original checkout base and target, completion, outcome, PR and a bounded summary;
+never copy stored prompts or recovery state. They retain evidence after comments
+roll out of the recent window. Reuse matching validation after reconciling
+current heads, commands, inputs and scope; newer observations alone do not
+invalidate unchanged checks. Reports never establish a current pass, ownership
+or issue closure, and do not suppress admission. Prompt compaction drops older
+prior reports after comments and before target evidence, with omission counts.
+The agent judges PR
 relevance from committed Git changes and applicable local test evidence.
 Issue/PR links, states and descriptions are metadata, not proof of coverage or
 resolution, and do not suppress issue selection. Defer to an existing PR only
