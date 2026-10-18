@@ -830,6 +830,12 @@ actual inherited values, including script overrides, without imposing suite defa
 Formats 1/2 remain readable but cannot supply passes without recorded runtime inputs.
 Consumers accept summary formats 1/2/3, request CLI 0.1.5, retain
 summaries and leave compatibility decisions to Attest.
+Prompt and execution-skill guidance must carry Bifrost's ad hoc test-only
+`BIFROST_OPEN_PACKS_DISABLE="${BIFROST_OPEN_PACKS_DISABLE-1}"` default, preserving
+explicit zero/empty overrides. Scope it to test invocations, including tests
+inside scripts; never apply it to session-wide build/acquisition/benchmark
+environments or rewrite the inputs of existing evidence. Attest continues to
+compare the actual effective inputs rather than imposing suite defaults.
 Capture removes only its hook directory from the effective child PATH, retaining
 script-added toolchains and deliberate PATH removals during native execution.
 Automatic capture never skips tests, changes assessments or authorizes a merge.

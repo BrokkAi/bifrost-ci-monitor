@@ -66,8 +66,15 @@ their native exit status. If needed, the helper downloads the versioned binary
 through the authenticated service; cloud credentials remain on the host.
 `attest SUITE --filter EXPR` is still available for an explicit configured suite.
 
+Apply Bifrost's existing test-only default to each ad hoc test invocation:
+`BIFROST_OPEN_PACKS_DISABLE="${BIFROST_OPEN_PACKS_DISABLE-1}"`. Default only an
+unset value; preserve explicit `0` and explicit empty values. Inside a script,
+apply it to the test command. Keep compile-only commands, acquisition and
+benchmarks on their existing environment. Attest records the actual inputs;
+an earlier run without this default cannot be relabeled as compatible with CI.
+
 ```sh
-python3 <this skill>/scripts/mm_db.py run -- eatmydata cargo nextest run -E 'test(changed_behavior)'
+python3 <this skill>/scripts/mm_db.py run -- env BIFROST_OPEN_PACKS_DISABLE="${BIFROST_OPEN_PACKS_DISABLE-1}" eatmydata cargo nextest run -E 'test(changed_behavior)'
 python3 <this skill>/scripts/mm_db.py run --script /tmp/check.sh
 python3 <this skill>/scripts/mm_db.py execution --receipt /path/to/receipt.json
 ```
