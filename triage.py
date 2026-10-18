@@ -284,6 +284,7 @@ as infrastructure with issue:null, never a Bifrost ticket or a request to change
 owner's Spot policy. State the observed mechanism, uncertainty, impact and useful
 operator diagnostic step. Do not claim capacity or quota without provider evidence.
 An unpinned introducing commit alone is not evidence of infrastructure.
+{monitor.RESOURCE_FAILURE_GUIDANCE}
 
 Check current origin/master{branch_recovery} and the latest completed result for each affected job,
 even if its containing workflow is still running. For a recovered product failure,

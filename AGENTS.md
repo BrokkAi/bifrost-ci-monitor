@@ -540,6 +540,15 @@ and releases its own claim. The supervisor closes that ticket as not planned
 only after checking it has no remaining owner/claim, then posts the cached
 summary at channel level. Do not assign David or create another product ticket
 for runner/provider/quota/network failures. Flaky product tests remain defects.
+Runner memory/disk exhaustion, including an OOM-killed compiler and exhausted
+swap, is infrastructure unless evidence identifies a source, compiler or harness
+defect. A missing benchmark report alone is not a product regression. Triage and
+fixer prompts share `monitor.RESOURCE_FAILURE_GUIDANCE`; do not create a product
+ticket merely to request a larger runner. Preserve runner allocation and the
+build/benchmark recipe, comparison thresholds and baseline. Capacity, spending
+and IAM changes require separate operator authorization; ordinary CI repair
+authority does not supply it. Complete independent diagnosis and report the
+precise decision when that boundary blocks recovery.
 
 A rejection retry requires the recorded fixer association and a trusted
 `mergemarshall:rejected-head` comment exactly matching the current head. Stale

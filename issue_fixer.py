@@ -347,6 +347,7 @@ not Bifrost product defects. If this ticket is infrastructure, leave the evidenc
 and any recovery in a useful comment, release your own claim, and report outcome
 infrastructure with pr:null. Do not assign David or create another ticket. The
 supervisor closes this misplaced ticket and sends a channel-visible Slack notice.
+{monitor.RESOURCE_FAILURE_GUIDANCE}
 Flaky product tests or an unpinned product cause may still escalate on THIS ticket.
 Do not file duplicate tickets. Handle no unrelated failure as part of this repair;
 record unrelated validation failures as limitations with evidence.
