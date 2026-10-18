@@ -696,7 +696,8 @@ class IssueFixerTests(TestCase):
         with mock.patch.object(fixer, 'api', side_effect=[issue(), closed]), \
              mock.patch.object(monitor, 'run_gh') as gh:
             fixer.finish(self.conn, job)
-        gh.assert_called_once_with(['issue', 'close', '12', '--repo', monitor.REPO_NAME, '--reason', 'not_planned'])
+        # #5679: the CLI uses a space; not_planned is GitHub's API spelling.
+        gh.assert_called_once_with(['issue', 'close', '12', '--repo', monitor.REPO_NAME, '--reason', 'not planned'])
         with mock.patch.object(monitor, 'slack_send', side_effect=[(False, None), (True, 'notice')]) as slack, \
              mock.patch.object(monitor, 'require_mj_success', return_value='{}') as mj:
             fixer.cleanup(self.conn, self.transport)

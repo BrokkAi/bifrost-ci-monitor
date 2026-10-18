@@ -684,7 +684,7 @@ def finish(conn, job):
             if owners or 'agent-in-progress' in labels(issue):
                 raise ValueError('release your infrastructure claim without taking another person\'s ticket')
             monitor.run_gh(['issue', 'close', str(job['issue_number']), '--repo', monitor.REPO_NAME,
-                            '--reason', 'not_planned'])
+                            '--reason', 'not planned'])
             if api(f"issues/{job['issue_number']}")['state'] != 'closed':
                 raise RuntimeError('infrastructure ticket closure pending; retry cached report')
     if report["outcome"] == "escalated":
