@@ -143,6 +143,83 @@ class IssueFixerTests(TestCase):
                 self.conn.execute('ROLLBACK TO followup_case')
                 self.conn.execute('RELEASE followup_case')
 
+    def resumed_retry(self):
+        job = self.triaged_repair()
+        with self.conn:
+            self.conn.execute('UPDATE issue_repairs SET retry_pr_number=30,rejected_head_sha=? WHERE id=?',
+                              ('a' * 40, job['id']))
+        candidate = fixer.triaged_followups(self.conn, [issue(progress=True)])[0]
+        with mock.patch.object(fixer, 'api', side_effect=self.followup_github(job)), \
+             mock.patch.object(monitor, 'require_mj_success', return_value='{"state":"suspended"}'):
+            return fixer.resume_triaged_repair(self.conn, candidate, [])
+
+    def test_followup_archives_and_retires_the_merged_rejection_retry(self):
+        resumed = self.resumed_retry()
+        self.assertIsNone(resumed['retry_pr_number'])
+        self.assertIsNone(resumed['rejected_head_sha'])
+        self.assertNotIn('top-priority repair of merger-rejected PR', resumed['prompt'])
+        prior = json.loads(self.conn.execute('SELECT prior_state_json FROM issue_repair_followups').fetchone()[0])
+        self.assertEqual(prior['retry_pr_number'], 30)
+        self.assertEqual(prior['rejected_head_sha'], 'a' * 40)
+
+    def test_old_resumed_retry_finishes_new_pr_without_replacing_its_session(self):
+        resumed = self.resumed_retry()
+        recovery = json.loads(resumed['recovery_json'])
+        recovery['stage'] = 'running'
+        prior = json.loads(self.conn.execute('SELECT prior_state_json FROM issue_repair_followups').fetchone()[0])
+        prior.pop('retry_pr_number')
+        prior.pop('rejected_head_sha')
+        with self.conn:
+            # Simulate a continuation checkpointed by the older supervisor.
+            self.conn.execute('UPDATE issue_repair_followups SET prior_state_json=?', (json.dumps(prior),))
+            self.conn.execute("UPDATE issue_repairs SET status='finishing',retry_pr_number=30,"
+                              "rejected_head_sha=?,recovery_json=?,report_json=? WHERE id=?",
+                              ('a' * 40, json.dumps(recovery), json.dumps(dict(issue=12, outcome='submitted',
+                               pr=31, summary='Follow-up repair')), resumed['id']))
+        submitted = pr(31, sha='c' * 40)
+        submitted['head']['ref'] = resumed['branch']
+        job = self.conn.execute('SELECT * FROM issue_repairs WHERE id=?', (resumed['id'],)).fetchone()
+        with mock.patch.object(fixer, 'api', return_value=submitted) as github:
+            fixer.finish(self.conn, job)
+        github.assert_called_once_with('pulls/31')
+        saved = self.conn.execute('SELECT * FROM issue_repairs WHERE id=?', (resumed['id'],)).fetchone()
+        self.assertEqual(saved['status'], 'completed')
+        self.assertEqual(saved['repair_pr_number'], 31)
+        for key in ('id', 'session_id', 'branch', 'base_sha', 'work_key'):
+            self.assertEqual(saved[key], resumed[key])
+        self.assertIsNone(saved['retry_pr_number'])
+        self.assertIsNone(saved['rejected_head_sha'])
+        prior = json.loads(self.conn.execute('SELECT prior_state_json FROM issue_repair_followups').fetchone()[0])
+        self.assertEqual(prior['retry_pr_number'], 30)
+        self.assertEqual(prior['rejected_head_sha'], 'a' * 40)
+
+    def test_retry_fence_requires_matching_authenticated_followup_archive(self):
+        resumed = self.resumed_retry()
+        archived = self.conn.execute('SELECT prior_state_json FROM issue_repair_followups').fetchone()[0]
+        recovery = json.loads(resumed['recovery_json']);recovery['stage'] = 'running'
+        variants = [dict(recovery={}), dict(recovery=dict(recovery, triage_job_id='another')),
+                    dict(prior=dict(json.loads(archived), repair_pr_number=99)),
+                    dict(prior=dict(json.loads(archived), cleanup_done=0)),
+                    dict(prior=dict(json.loads(archived), report_json='{}'))]
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.conn.execute('SAVEPOINT retry_fence')
+                self.conn.execute("UPDATE issue_repairs SET status='finishing',retry_pr_number=30,"
+                                  "rejected_head_sha=?,recovery_json=?,report_json=? WHERE id=?",
+                                  ('a' * 40, json.dumps(variant.get('recovery', recovery)),
+                                   json.dumps(dict(issue=12, outcome='submitted', pr=31, summary='Other PR')), resumed['id']))
+                self.conn.execute('UPDATE issue_repair_followups SET prior_state_json=?',
+                                  (json.dumps(variant['prior']) if 'prior' in variant else archived,))
+                job = self.conn.execute('SELECT * FROM issue_repairs WHERE id=?', (resumed['id'],)).fetchone()
+                submitted = pr(31);submitted['head']['ref'] = resumed['branch']
+                with mock.patch.object(fixer, 'api', return_value=submitted):
+                    with self.assertRaisesRegex(ValueError, 'submitted PR does not match'):
+                        fixer.finish(self.conn, job)
+                self.assertEqual(self.conn.execute('SELECT retry_pr_number FROM issue_repairs WHERE id=?',
+                                                 (resumed['id'],)).fetchone()[0], 30)
+                self.conn.execute('ROLLBACK TO retry_fence')
+                self.conn.execute('RELEASE retry_fence')
+
     def test_followup_never_takes_closed_unclaimed_or_human_owned_issue(self):
         job = self.triaged_repair()
         candidate = fixer.triaged_followups(self.conn, [issue(progress=True)])[0]

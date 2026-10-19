@@ -505,6 +505,11 @@ Confirm the preserved session is still suspended; defer if an operator has alrea
 resumed it rather than cancelling their useful work.
 The continuation authorizes investigation and verification against current source;
 it never reopens a closed issue or establishes that a historical cause remains.
+The merged PR ends any earlier rejected-head retry: archive its retry PR/head,
+then clear those fields before rendering the continuation. The follow-up keeps
+the same branch but may publish a new PR. Completion also upgrades older resumed
+jobs using their matching durable follow-up archive and recovery identity;
+ordinary rejected-PR retries retain their exact PR/head fence.
 Archive the prior completion, prompt and recovery privately in
 `issue_repair_followups`, checkpoint the new recovery atomically, and use the
 existing cancellation/typed-clear path with its report boundary. Preserve the

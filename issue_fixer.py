@@ -709,7 +709,38 @@ def collect_step(conn, transport, job):
                      (json.dumps(report), job["id"]))
 
 
+def retire_followup_retry(conn, job):
+    """Upgrade a resumed repair whose original rejected PR has already merged."""
+    if not job['retry_pr_number']:
+        return job
+    recovery = json.loads(job['recovery_json'])
+    if recovery.get('outcome') != 'new_product_evidence' or recovery.get('stage') != 'running':
+        return job
+    archived = conn.execute(
+        'SELECT prior_state_json FROM issue_repair_followups WHERE job_id=? AND triage_job_id=?',
+        (job['id'], recovery.get('triage_job_id'))).fetchone()
+    if archived is None:
+        return job
+    prior = json.loads(archived['prior_state_json'])
+    report = json.loads(prior.get('report_json') or '{}')
+    if (prior.get('repair_pr_number') != job['retry_pr_number']
+            or not prior.get('finished_at') or not prior.get('cleanup_done')
+            or report.get('outcome') != 'submitted' or report.get('pr') != job['retry_pr_number']):
+        return job
+    # resume_triaged_repair authenticated this merged PR before archiving it.
+    # Preserve the old rejection evidence while retiring its publication fence.
+    prior.setdefault('retry_pr_number', job['retry_pr_number'])
+    prior.setdefault('rejected_head_sha', job['rejected_head_sha'])
+    with conn:
+        conn.execute('UPDATE issue_repair_followups SET prior_state_json=? WHERE job_id=? AND triage_job_id=?',
+                     (json.dumps(prior), job['id'], recovery['triage_job_id']))
+        conn.execute('UPDATE issue_repairs SET retry_pr_number=NULL,rejected_head_sha=NULL WHERE id=?',
+                     (job['id'],))
+    return conn.execute('SELECT * FROM issue_repairs WHERE id=?', (job['id'],)).fetchone()
+
+
 def finish(conn, job):
+    job = retire_followup_retry(conn, job)
     report = json.loads(job["report_json"])
     pr = None
     if report['outcome'] == 'infrastructure':
@@ -877,7 +908,8 @@ def resume_triaged_repair(conn, candidate, prs):
     finding = json.loads(candidate['finding_json'])
     evidence = {k: excerpt(finding.get(k), limit) for k, limit in
                 (('diagnosis', 6000), ('evidence', 12000))}
-    prompt = build_prompt(dict(job), dossier(conn, issue, prs))
+    continuation = dict(job, retry_pr_number=None, rejected_head_sha=None)
+    prompt = build_prompt(continuation, dossier(conn, issue, prs))
     prompt = bounded_stored_prompt(
         f"Continue your existing repair of issue #{job['issue_number']} in this SAME session, branch "
         f"and checkout. Your recorded PR #{job['repair_pr_number']} merged, but the issue remains "
@@ -899,7 +931,8 @@ def resume_triaged_repair(conn, candidate, prs):
     # These private snapshots may contain prompts; never expose them through the dashboard.
     prior = {k: job[k] for k in ('finished_at', 'report_json', 'prompt', 'recovery_json',
                                 'repair_pr_number', 'repair_pr_url', 'cleanup_done',
-                                'outcome_sent', 'report_after_seq', 'feedback_digest')}
+                                'outcome_sent', 'report_after_seq', 'feedback_digest',
+                                'retry_pr_number', 'rejected_head_sha')}
     with conn:
         inserted = conn.execute('INSERT OR IGNORE INTO issue_repair_followups VALUES (?,?,?,?)',
                                 (job['id'], candidate['triage_job_id'], monitor.utc_now(),
@@ -908,6 +941,7 @@ def resume_triaged_repair(conn, candidate, prs):
             return None
         conn.execute("UPDATE issue_repairs SET status='running',finished_at=NULL,cleanup_done=0,"
                      "outcome_sent=0,report_json=NULL,feedback_digest=NULL,last_error=NULL,"
+                     "retry_pr_number=NULL,rejected_head_sha=NULL,"
                      "prompt=?,recovery_json=? WHERE id=?", (prompt, json.dumps(recovery), job['id']))
     monitor.log(f"issue #{job['issue_number']}: queued triage follow-up in original session {job['session_id']}")
     return conn.execute('SELECT * FROM issue_repairs WHERE id=?', (job['id'],)).fetchone()
