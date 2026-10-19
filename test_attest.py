@@ -59,7 +59,12 @@ class AttestIntegrationTests(unittest.TestCase):
                     mock.patch.object(monitor, 'run_gh', side_effect=gh), \
                     mock.patch.object(attest_store, 'request', side_effect=RuntimeError('offline')):
                 with self.assertRaises(RuntimeError): attest_ci.tick(conn)
-                self.assertEqual(conn.execute('SELECT count(*) FROM attest_ci_imports').fetchone()[0], 0)
+                self.assertEqual(conn.execute('SELECT status FROM attest_ci_imports').fetchone()[0], 'pending')
+            original_gh = gh
+            def gh(args, **kwargs):
+                if args[0] == 'api' and 'artifacts' not in args[1]:
+                    return json.dumps({'workflow_runs': []})  # The failed attempt left discovery.
+                return original_gh(args, **kwargs)
             with mock.patch.dict('os.environ', ATTEST_STORAGE_CONFIG=str(config)), \
                     mock.patch.object(monitor, 'run_gh', side_effect=gh), \
                     mock.patch.object(attest_store, 'request', return_value={'reference': 's3://bucket/result'}) as put:
@@ -68,6 +73,76 @@ class AttestIntegrationTests(unittest.TestCase):
                 sent = put.call_args.args[0]
                 self.assertEqual(json.loads(gzip.decompress(base64.b64decode(sent['data']))), bundle)
                 self.assertEqual(conn.execute('SELECT status FROM attest_ci_imports').fetchone()[0], 'done')
+
+    def test_discovery_reaches_results_beyond_twenty_and_preserves_legacy_receipts(self):
+        import monitor
+        conn = make_db()
+        conn.execute('CREATE TABLE attest_ci_imports (run_id INTEGER,attempt INTEGER,status TEXT,'
+                     'updated_at TEXT,objects_json TEXT,PRIMARY KEY(run_id,attempt))')
+        conn.execute("INSERT INTO attest_ci_imports VALUES (9,1,'done','old','[\"original\"]')")
+        run = {'id': 10, 'run_attempt': 1, 'head_repository': {'full_name': monitor.REPO_NAME},
+               'event': 'push', 'head_branch': 'master', 'head_sha': HEAD_ONE,
+               'unreviewed_payload': 'must not persist'}
+        foreign = dict(run, head_repository={'full_name': 'someone/fork'})
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'storage.toml'; config.touch()
+            def gh(args, **kwargs):
+                if 'artifacts' in args[1]: return json.dumps({'artifacts': []})
+                self.assertIn('per_page=100', args[1])
+                return json.dumps({'workflow_runs': [foreign] * 24 + [run]})
+            with mock.patch.dict('os.environ', ATTEST_STORAGE_CONFIG=str(config)), \
+                    mock.patch.object(monitor, 'run_gh', side_effect=gh):
+                attest_ci.tick(conn)
+        self.assertEqual(conn.execute('SELECT objects_json FROM attest_ci_imports WHERE run_id=9').fetchone()[0],
+                         '["original"]')
+        saved = conn.execute('SELECT status,run_json FROM attest_ci_imports WHERE run_id=10').fetchone()
+        self.assertEqual(saved[0], 'done')
+        self.assertNotIn('unreviewed_payload', json.loads(saved[1]))
+
+    def test_discovery_checkpoints_pages_and_revisits_older_completion_days(self):
+        import monitor
+        conn = make_db(); attest_ci.ensure_schema(conn)
+        today = attest_ci.datetime.datetime.now(attest_ci.datetime.timezone.utc).date()
+        run = {'id': 10, 'run_attempt': 1, 'head_repository': {'full_name': monitor.REPO_NAME},
+               'event': 'push', 'head_branch': 'master', 'head_sha': HEAD_ONE}
+        foreign = dict(run, head_repository={'full_name': 'someone/fork'})
+        requests = []
+        def gh(args, **kwargs):
+            url = args[1]; requests.append(url)
+            if f'created={today}&per_page=100&page=1' in url:
+                return json.dumps({'workflow_runs': [foreign] * 100})
+            return json.dumps({'workflow_runs': [run]})
+        with mock.patch.object(monitor, 'run_gh', side_effect=gh):
+            attest_ci.discover(conn)
+            self.assertEqual(conn.execute('SELECT page FROM attest_ci_scan').fetchone()[0], 2)
+            attest_ci.discover(conn)
+            self.assertEqual(conn.execute('SELECT status FROM attest_ci_imports').fetchone()[0], 'pending')
+            self.assertEqual(tuple(conn.execute('SELECT day,page FROM attest_ci_scan').fetchone()),
+                             ((today - attest_ci.datetime.timedelta(days=1)).isoformat(), 1))
+            attest_ci.discover(conn)
+        self.assertTrue(any(f'created={today - attest_ci.datetime.timedelta(days=1)}' in u for u in requests))
+        self.assertEqual(conn.execute('SELECT count(*) FROM attest_ci_imports').fetchone()[0], 1)
+
+    def test_failed_pending_import_does_not_starve_another_attempt(self):
+        import monitor
+        conn = make_db(); attest_ci.ensure_schema(conn)
+        for identifier in (10, 11):
+            run = {'id': identifier, 'run_attempt': 1, 'event': 'push', 'head_branch': 'master',
+                   'head_sha': HEAD_ONE, 'head_repository': {'full_name': monitor.REPO_NAME}}
+            conn.execute("INSERT INTO attest_ci_imports VALUES (?,1,'pending','2000-01-01T00:00:00+00:00','[]',?)",
+                         (identifier, json.dumps(run)))
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'storage.toml'; config.touch()
+            def gh(args, **kwargs):
+                if '/10/artifacts' in args[1]: raise RuntimeError('unavailable')
+                if 'artifacts' in args[1]: return json.dumps({'artifacts': []})
+                return json.dumps({'workflow_runs': []})
+            with mock.patch.dict('os.environ', ATTEST_STORAGE_CONFIG=str(config)), \
+                    mock.patch.object(monitor, 'run_gh', side_effect=gh):
+                with self.assertRaises(RuntimeError): attest_ci.tick(conn)
+                attest_ci.tick(conn)
+        self.assertEqual([tuple(r) for r in conn.execute('SELECT run_id,status FROM attest_ci_imports ORDER BY run_id')],
+                         [(10, 'pending'), (11, 'done')])
 
 
 if __name__ == '__main__':

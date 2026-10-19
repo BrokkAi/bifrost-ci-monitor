@@ -626,9 +626,12 @@ can publish under `attest/results/v1/` in the CI cache bucket. Results expire
 after seven days; the separate versioned binary lives under `agents/attest/`.
 
 Completed master CI and exact-head integration CI upload narrow result
-artifacts. The fixer entry point imports one completed run per tick after
-supervising repairs, checkpointing `attest_ci_imports` only after accepted
-publication. Failed imports retry; they never authorize or block a merge.
+artifacts. The fixer entry point queues trusted completed attempts durably,
+then imports one per tick after supervising repairs. Discovery refreshes
+today's results and walks older pages across the seven-day evidence retention
+window, so a delayed poll does not lose results beyond the newest page.
+`attest_ci_imports` shows `pending` until publication succeeds; failed attempts
+retry independently. Intake never authorizes or blocks a merge.
 Look for `Attest CI evidence import deferred` in monitor logs and inspect
 `automerge_executions` summaries for potential reuse, contradictions, and
 contract mismatch reasons. Investigate low reuse before changing policy: match

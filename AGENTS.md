@@ -66,6 +66,11 @@ Cron executes `monitor.py` straight from this working tree every five minutes
 - `attest_store.py` and `attest_ci.py`: standalone Attest storage proxy and
   retryable completed-CI artifact intake. Detailed results live in S3; receipts
   retain compact summaries. Intake never changes a merge gate.
+  Discovery queues trusted attempts durably before importing one per tick,
+  refreshing today's first page and checkpointing one older day/page through
+  the seven-day evidence retention window. Pending retries survive discovery
+  churn; failed imports rotate behind other pending attempts. Additive run
+  metadata contains only reviewed run identity, event, branch and repository.
 - `performance_findings.py`: bounded, retryable daily Benchmark/UsageBench JSON
   intake and durable benchmark observations consumed by the existing triage lane.
   Benchmark evidence never authorizes a merge or changes a CI gate.
