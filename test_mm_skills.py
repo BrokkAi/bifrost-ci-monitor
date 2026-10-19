@@ -280,6 +280,38 @@ class ExecutionTests(GitFixture):
             with self.assertRaisesRegex(ValueError, "not accepting new checks"):
                 db.mm_execution.run(client, command=["true"])
 
+    def test_attest_delegates_recipe_selection_to_checkout_and_retains_native_failure(self):
+        launcher = self.repo / "scripts" / "merge-nextest.py"
+        launcher.parent.mkdir()
+        launcher.write_text('''import json, os, sys
+print(json.dumps({"args": sys.argv[1:], "rustflags": os.environ["RUSTFLAGS"]}))
+sys.exit(7)
+''')
+        (self.repo / "attest.toml").write_text("version=1\n")
+        client = self.client()
+        with (mock.patch.object(db.mm_execution.Path, "cwd", return_value=self.repo),
+              mock.patch.dict(db.mm_execution.os.environ, {"RUSTFLAGS": "--cfg actual_local_input"}),
+              mock.patch.object(db.mm_execution, "ensure_attest", side_effect=RuntimeError("unavailable"))):
+            receipt = db.mm_execution.run_attest(client, "push-tests", filterset="test(regression)",
+                                                selection=["-p", "brokk-bifrost-analysis", "--lib"])
+        result = json.loads(Path(receipt["stdout"]["path"]).read_text())
+        self.assertEqual(result, dict(args=["push-tests", "--config", "attest.toml", "--filter",
+                         "test(regression)", "--", "-p", "brokk-bifrost-analysis", "--lib"],
+                         rustflags="--cfg actual_local_input"))
+        self.assertEqual(receipt["exit_code"], 7)
+        self.assertEqual(receipt["argv"][:2], ["python3", str(launcher)])
+        self.assertEqual(receipt["attest_capture"]["unavailable"], 1)
+        client.call.return_value = dict(self.context(), ready={"head": self.base})
+        with mock.patch.object(db.mm_execution.Path, "cwd", return_value=self.repo):
+            with self.assertRaisesRegex(ValueError, "not accepting new checks"):
+                db.mm_execution.run_attest(client, "push-tests")
+
+    def test_attest_cannot_broaden_narrow_checks_on_old_checkouts(self):
+        with (mock.patch.object(db.mm_execution.Path, "cwd", return_value=self.repo),
+              mock.patch.object(db.mm_execution, "ensure_attest", side_effect=AssertionError("launched"))):
+            with self.assertRaisesRegex(ValueError, "lacks scripts/merge-nextest.py"):
+                db.mm_execution.run_attest(self.client(), "push-tests", selection=["--lib"])
+
     def test_automatic_capture_uses_standalone_interface_and_preserves_command(self):
         (self.repo / "attest.toml").write_text("version=1\nrepository='fixture'\n")
         self.run_git("add", "attest.toml")
@@ -867,6 +899,18 @@ class ExecutionHttpTests(GitFixture):
             self.assertEqual(client.call("executions")["executions"], [receipt])
             self.assertEqual(client.call("state")["revision"], before["revision"])
             self.assertEqual(Path(receipt["stdout"]["path"]).read_text(), "checked\n")
+            launcher = self.repo / "scripts" / "merge-nextest.py"
+            launcher.parent.mkdir()
+            launcher.write_text('import json, sys\nprint(json.dumps(sys.argv[1:]))\nsys.exit(7)\n')
+            configured = subprocess.run([sys.executable, script, "attest", "push-tests", "--filter",
+                                         "test(regression)", "--", "-p", "brokk-bifrost-analysis", "--lib"],
+                                        cwd=self.repo, text=True, capture_output=True)
+            self.assertEqual(configured.returncode, 7, configured.stderr)
+            configured_receipt = json.loads(configured.stdout)
+            self.assertEqual(json.loads(Path(configured_receipt["stdout"]["path"]).read_text()),
+                             ["push-tests", "--config", "attest.toml", "--filter", "test(regression)",
+                              "--", "-p", "brokk-bifrost-analysis", "--lib"])
+            self.assertEqual(client.call("state")["revision"], before["revision"])
             assessment = subprocess.run([sys.executable, script, "tests", "--revision", before["revision"],
                                          "--head", self.base, "--verdict", "fail", "--tests", "check exited 7",
                                          "--baseline", "none", "--execution", receipt["id"]],

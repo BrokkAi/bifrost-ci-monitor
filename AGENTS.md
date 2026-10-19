@@ -849,6 +849,17 @@ actual inherited values, including script overrides, without imposing suite defa
 Formats 1/2 remain readable but cannot supply passes without recorded runtime inputs.
 Consumers accept summary formats 1/2/3, request CLI 0.1.5, retain
 summaries and leave compatibility decisions to Attest.
+For Bifrost integration validation, `mm-db attest SUITE --filter EXPR --
+-p CRATE --lib` (or `--test BINARY`) delegates to that checkout's
+`scripts/merge-nextest.py` when available. Bifrost owns recipe construction and
+selection validation; the monitor only forwards arguments through normal
+execution evidence and shadow capture. This shares CI features/profile/filter
+while retaining local Cargo settings and narrow package/binary selection.
+Older checkouts retain the original configured-suite path without selectors;
+use an explicit matching native command there to avoid CI-only build settings.
+Keep push/contract checks featureless, Python limited to policy integration,
+and release-tooling on its existing semantic-pack checks. This guidance is for
+merger-to-CI reuse on matching contents, not developer-wide recipe enforcement.
 Prompt and execution-skill guidance must carry Bifrost's ad hoc test-only
 `BIFROST_OPEN_PACKS_DISABLE="${BIFROST_OPEN_PACKS_DISABLE-1}"` default, preserving
 explicit zero/empty overrides. Scope it to test invocations, including tests

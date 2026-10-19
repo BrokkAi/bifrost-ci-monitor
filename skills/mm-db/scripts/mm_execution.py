@@ -156,7 +156,7 @@ def execute(argv, cwd, output, *, client=None, state=None, script=None, stdout=N
     return receipt
 
 
-def run_attest(client, suite, *, filterset=None, config="attest.toml"):
+def run_attest(client, suite, *, filterset=None, config="attest.toml", selection=None):
     current = client.call("state")
     if (current["status"] not in {"running", "launching"}
             or current["phase"] not in {"building", "fixing"} or current.get("ready")
@@ -165,6 +165,18 @@ def run_attest(client, suite, *, filterset=None, config="attest.toml"):
     cwd = Path.cwd()
     common = Path(git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"))
     output = common / "mm-executions" / uuid.uuid4().hex
+    launcher = cwd / "scripts" / "merge-nextest.py"
+    if launcher.is_file():
+        command = ["python3", str(launcher), suite, "--config", config]
+        if filterset:
+            command += ["--filter", filterset]
+        if selection:
+            command += ["--", *selection]
+        # The repository owns its recipe. Normal shadow capture records the
+        # actual native invocation without imposing Attest's CI build environment.
+        return execute(command, cwd, output, client=client, state=current)
+    if selection:
+        raise ValueError("this checkout lacks scripts/merge-nextest.py; use mm-db run for a narrow native check")
     attest_output = output / "attest"
     binary = ensure_attest(client, common)
     command = [binary, "run", suite, "--config", config, "--shadow", "--output", str(attest_output)]

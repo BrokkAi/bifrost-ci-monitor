@@ -166,7 +166,7 @@ def main():
     run.add_argument("--output", type=Path)
     run.add_argument("--script", type=Path)
     run.add_argument("command", nargs=argparse.REMAINDER)
-    attest = sub.add_parser("attest", help="run a configured Attest suite in shadow mode")
+    attest = sub.add_parser("attest", help="run a CI recipe locally with shadow capture; use -- for narrower Cargo selectors")
     attest.add_argument("suite")
     attest.add_argument("--filter", dest="filterset")
     attest.add_argument("--config", default="attest.toml")
@@ -207,7 +207,12 @@ def main():
     tests.add_argument("--baseline", required=True)
     tests.add_argument("--execution", action="append", default=[])
     tests.add_argument("--reuse-execution", action="append", nargs=2, metavar=("ID", "REASON"), default=[])
-    args = vars(parser.parse_args())
+    argv = sys.argv[1:]
+    selection = None
+    if argv and argv[0] == "attest" and "--" in argv:
+        split = argv.index("--")
+        argv, selection = argv[:split], argv[split + 1:]
+    args = vars(parser.parse_args(argv))
     operation = args.pop("operation")
     if operation == "configure":
         configure(json.loads(args["connection_file"].read_text()))
@@ -215,7 +220,7 @@ def main():
         return
     client = Client()
     if operation == "attest":
-        receipt = mm_execution.run_attest(client, **args)
+        receipt = mm_execution.run_attest(client, **args, selection=selection)
         print(json.dumps(receipt, indent=2))
         code = receipt["exit_code"]
         return code if code >= 0 else 128 - code

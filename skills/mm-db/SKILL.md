@@ -64,7 +64,23 @@ Unsupported arguments or unavailable capture run natively and retain command
 evidence. Observation failures after execution do not rerun tests or replace
 their native exit status. If needed, the helper downloads the versioned binary
 through the authenticated service; cloud credentials remain on the host.
-`attest SUITE --filter EXPR` is still available for an explicit configured suite.
+For Bifrost merge validation, prefer its CI recipe launcher through
+`attest SUITE --filter EXPR -- -p CRATE --lib` (or `--test BINARY`). It reads
+`attest.toml` for features, profile and the suite filter; the extra Cargo
+selectors only narrow packages/binaries. The filter intersects CI's selection.
+For example, `attest push-tests --filter 'test(regression)' -- -p
+brokk-bifrost-analysis --lib` builds only that library's tests without Python.
+`policy-integration` supplies Python and `suite_bench_policy`;
+`release-authoring`/`demand-not-run` supply `release-tooling`.
+The repository launcher preserves inherited local Cargo settings and omits a
+redundant same-host `--target`. It applies test-only defaults, clears
+`JAVA_HOME`, and keeps explicit runtime overrides. Capture remains shadow.
+For Python-feature tests, use the repository's uv Python 3.12 environment.
+Older checkouts without `scripts/merge-nextest.py` retain configured Attest runs
+(which impose CI build settings); use `run` with an explicit narrow native
+command there instead. Never broaden validation merely to populate Attest.
+Attest reuse primarily connects the merger's tested integration tree to CI on
+the same contents; developer branches do not need to adopt these recipes.
 
 Apply Bifrost's existing test-only default to each ad hoc test invocation:
 `BIFROST_OPEN_PACKS_DISABLE="${BIFROST_OPEN_PACKS_DISABLE-1}"`. Default only an
