@@ -15,6 +15,7 @@ import sqlite3
 
 import monitor
 import read_budget
+import session_policy
 
 
 PROFILE = 'deepseek'
@@ -247,8 +248,12 @@ def advance(a, conn, row):
                       'Changing providers alone does not require new tests.\n\n' +
                       str(latest['pending_prompt'] or ''))
             def checkpoint():
-                conn.execute("UPDATE automerge_batches SET agent_configuration='flash-luna' "
-                             'WHERE batch_id=?', (row['batch_id'],))
+                configuration = (session_policy.FAILOVER_CONFIGURATION
+                                 if latest['agent_configuration'] in {
+                                     session_policy.CONFIGURATION, session_policy.FAILOVER_CONFIGURATION,
+                                 } else 'flash-luna')
+                conn.execute("UPDATE automerge_batches SET agent_configuration=? "
+                             'WHERE batch_id=?', (configuration, row['batch_id']))
                 value['continuation_queued'] = True
                 value['stage'] = 'completed'
                 conn.execute('UPDATE automerge_provider_failovers SET state_json=?,updated_at=? '

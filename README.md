@@ -41,22 +41,27 @@ service use only the standard library; the merger uses host Node.js to run
 Bifrost's CI impact classifier. The web dashboard (below) also needs `uv` and
 `npm` to install its dependencies and build its UI.
 Configure Mjolnir's `CI` workspace, `bifrost` bundle, and the `podman` and
-`bedrock-podman` targets before enabling cron. Every new integration session
-uses DeepSeek Flash (`deepseek-flash`) at max effort on `podman`, with subagents
-disabled, including campaign batches and speculative successors. Each batch
+`bedrock-podman` targets before enabling cron. Every new integration and fixer
+session uses Opus (`opus`) at high effort on `bedrock-podman`, with straightforward
+DeepSeek Flash (`deepseek-flash`) subagents at high effort and no subtle
+subagents, including campaign batches and speculative successors. Each batch
 retains its configuration through expansion and recovery. Existing live sessions
-keep their model and delegation settings. Legacy Opus/Luna sessions still move
+keep their model and delegation settings. Opus merger sessions still move
 automatically to DeepSeek Flash after two consecutive Bedrock 503 provider
-errors, retaining the session, container, work, validation evidence and Luna
+errors, retaining the session, container, work, validation evidence and
 delegation. Successful agent or tool progress resets the error count. A threaded
 notice confirms the switch. Native Move failures or uncertain acceptance produce
 an actionable alert; the original session and recovery state remain available.
-On mj 2.46, configure `[subagents.straightforward]` and `[subagents.subtle]` with
-`model = "global.openai.gpt-6-luna"` and `effort = "high"` for legacy delegation;
-keep `max_concurrent = 16` under `[subagents]`.
-Fixer and triage sessions use the `deepseek-flash` model.
+On mj 2.46, configure `[subagents.straightforward]` with
+`model = "deepseek-flash"` and `effort = "high"`, remove `[subagents.subtle]`,
+and enable `deepseek = true` under `[subagents.eligible_profiles]`.
+Keep `max_concurrent = 16` under `[subagents]`. Launches explicitly set the
+straightforward choice; an omitted subtle override inherits the global setting,
+so removing that global choice is required. Triage uses `deepseek-flash` with
+no subagents. Apply model preferences to future launches; do not Move active
+sessions to apply them.
 
-For legacy Opus sessions using one-hour prompt caching, set
+For Opus sessions using one-hour prompt caching, set
 `ENABLE_PROMPT_CACHING_1H = "1"` under
 `[profiles.bedrock-claude.environment]` in the CI host's Mjolnir `config.toml`.
 New workers pick up the setting automatically.

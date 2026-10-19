@@ -428,7 +428,9 @@ class IssueFixerTests(TestCase):
             if args[0] == 'sessions':
                 return '{"sessions":[]}'
             sent.append(args)
-            self.assertEqual(Path(args[args.index('--prompt-file') + 1]).read_text(), job['prompt'])
+            prompt = Path(args[args.index('--prompt-file') + 1]).read_text()
+            self.assertTrue(prompt.endswith(job['prompt']))
+            self.assertIn('There are no subtle subagents', prompt)
             return '{"session_id":"session"}'
         with mock.patch.object(monitor, 'require_mj_success', side_effect=mj), \
              mock.patch.object(fixer, 'api', return_value=issue()):
@@ -959,6 +961,14 @@ class IssueFixerTests(TestCase):
         args = mj.call_args_list[-1].args[0]
         self.assertNotIn("--at", args)
         self.assertEqual(args[args.index("--branch") + 1], pr()["head"]["ref"])
+        for flag, value in (('--target', 'bedrock-podman'), ('--model', 'opus'),
+                            ('--effort', 'high'), ('--subagents', 'mjolnir'),
+                            ('--subagent-straightforward', 'deepseek-flash'),
+                            ('--subagent-straightforward-effort', 'high')):
+            self.assertEqual(args[args.index(flag) + 1], value)
+        self.assertNotIn('--subagent-subtle', args)
+        saved_prompt = self.conn.execute('SELECT prompt FROM issue_repairs').fetchone()[0]
+        self.assertIn('There are no subtle subagents', saved_prompt)
 
     def test_launch_recovery_adopts_session_without_reprompt_or_recreation(self):
         job = self.job()
@@ -966,6 +976,7 @@ class IssueFixerTests(TestCase):
             fixer.launch(self.conn, job)
         self.assertEqual(mj.call_count, 1)
         self.assertEqual(self.conn.execute("SELECT session_id FROM issue_repairs").fetchone()[0], "existing")
+        self.assertEqual(self.conn.execute('SELECT prompt FROM issue_repairs').fetchone()[0], job['prompt'])
 
     def test_explicit_prompt_rejection_is_retryable_without_waiting_for_a_session(self):
         for rejection in ["400 Bad Request: prompt must contain 1-65536 characters",

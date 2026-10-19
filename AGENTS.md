@@ -45,6 +45,8 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   session per work item, rejected-repair retries, report validation and cleanup.
 - `agent_recovery.py`: shared native cancellation and context-reset steps for
   failed triage/fixer turns; each supervisor checkpoints through its own tables.
+- `session_policy.py`: future merger/fixer Opus/high launches and straightforward
+  DeepSeek Flash/high delegation; existing sessions retain their launch policy.
 - `triage.py`: observation-scoped investigations, validated report publication,
   deduplicated failure issues and retirement of exact resolved observations.
 - `automerge.py`: queue selection, batch/direct/operator state machines,
@@ -419,16 +421,24 @@ their handoff even when all source heads remain unchanged. Recovery retains the
 checkout and execution evidence; a metadata refresh alone does not require new
 tests. Already-confirmed GitHub landing can still be reconciled.
 
-Every new integration session uses DeepSeek Flash (`deepseek-flash`) at max
-effort on `podman` with `--subagents none`, regardless of source count or lane,
-including speculative successors. Persist `flash-max` in
-`automerge_batches.agent_configuration`; expansion, exclusion, recovery and
-promotion retain it. Existing live rows keep their `single-pr`, `multi-pr`,
-`flash-none` or `flash-luna` policy and prompt delegation guidance. After exact-title
-lookup establishes absence and a new launch is allowed, a legacy row creating a
-session also checkpoints `flash-max`. Adoption of an existing session keeps its
-persisted configuration. Historical schema defaults remain `multi-pr` for old rows.
-Legacy live Opus/Luna (`multi-pr`) sessions retain Bedrock failover:
+Every new integration and issue-fixer session uses Opus (`opus`) at high effort
+on `bedrock-podman`, with Mjolnir straightforward subagents using DeepSeek Flash
+(`deepseek-flash`) at high effort. There are no subtle subagents. This applies
+regardless of source count or lane, including speculative successors. Persist
+`opus-high-dsf-high` in `automerge_batches.agent_configuration`; expansion,
+exclusion, recovery and promotion retain it. Existing live rows keep their
+`single-pr`, `multi-pr`, `flash-none`, `flash-luna` or `flash-max` policy and prompt
+delegation guidance. Do not Move or reconfigure active sessions for this change.
+After exact-title lookup establishes absence and a new launch is allowed, a
+legacy row creating a session also checkpoints `opus-high-dsf-high`. Adoption of
+an existing session keeps its persisted configuration. Historical schema defaults
+remain `multi-pr` for old rows.
+The CI daemon has `[subagents.straightforward]` set to `deepseek-flash`/`high`,
+no `[subagents.subtle]`, and `deepseek = true` under `eligible_profiles`.
+Launches explicitly override straightforward model/effort; omitting a subtle
+override would otherwise inherit the global subtle choice. Triage remains
+DeepSeek Flash with `--subagents none`.
+Opus merger sessions retain Bedrock failover:
 Two distinct consecutive agent messages beginning `API Error: 503` and naming
 Bedrock trigger automatic same-session failover to DeepSeek Flash. Normal agent
 output or completed tool work resets the count; quoted errors, tool HTTP errors,
@@ -436,10 +446,12 @@ retry prompts and repeated observations do not count as another provider failure
 Read to the transcript tail before acting, independently of Slack delivery.
 `automerge_provider_failovers` checkpoints the cursor, error identities, native
 Move operation and continuation. Profile-only in-place Move retains the target,
-mounts, resource allocation, Git directory, logs, caches and Luna delegation.
+mounts, resource allocation, Git directory, logs, caches and recorded delegation.
 Confirm Flash configuration before queuing the normal durable continuation;
-persist `flash-luna` for retained delegation (`flash-none` for an operator Move
-that disabled subagents). Native Move owns cancellation/recovery; observe its
+persist `flash-dsf-high` for retained straightforward Flash/high delegation on
+new Opus sessions, or `flash-luna` for legacy Luna delegation (`flash-none` for
+an operator Move that disabled subagents). Native Move owns cancellation/recovery;
+observe its
 read-only journal after a CLI timeout, without idleness or new work deadlines.
 Never resubmit an ambiguous Move with no matching journal. Report that uncertainty
 or failed native recovery for operator reconciliation. Refuse automatic transfers
@@ -448,7 +460,7 @@ before an operator changes environments. Valid handoffs continue through normal
 landing gates. Priority/other batches and maintenance remain independent while
 Move runs; continuation and its checkpoint commit atomically. A completed failover
 posts one threaded notice, retrying delivery without gating agent progress.
-The legacy CI Opus profile enables one-hour prompt caching via
+The CI Opus profile enables one-hour prompt caching via
 `ENABLE_PROMPT_CACHING_1H = "1"`. The CI Mjolnir configuration allows up to
 16 concurrent subagents per session. The primary coordinates the
 checkout and branch and owns Git operations, batch mutations, test assessment,
@@ -763,10 +775,12 @@ environment conventions, without rerunning ci-impact. Select useful targeted or
 broad/grouped checks from the diff, dependencies, interactions, conflict
 resolutions, existing results, and specific unresolved concerns.
 
-For legacy sessions with delegation enabled, delegate bounded investigation,
-review, or implementation to Luna. New sessions have no subagents. Divide large
-merges into independent PR groups or conflict clusters with explicit ownership;
-the primary combines and assesses the work. Builds are expensive: normally
+For new merger and fixer sessions, delegate only straightforward work with a
+clear method to DeepSeek Flash/high. Keep ambiguous diagnosis, design choices,
+subtle correctness decisions, integration and final assessment with the Opus
+primary; no subtle task type is available. Use bounded tasks and explicit file
+ownership. Existing sessions retain their recorded delegation policy.
+The primary combines and assesses the work. Builds are expensive: normally
 consolidate changes and validation through the primary. Subagents propose the
 smallest useful check and build only when assigned a check that resolves a
 specific decision. Concurrent builds are appropriate when independent useful

@@ -865,29 +865,34 @@ class IdentityAndPromptTests(TestCase):
         argv = automerge.new_session_argv(row, "/tmp/prompt")
         self.assertEqual(monitor.MJ_CPUS, 32)
         self.assertEqual(monitor.MJ_MEMORY_GIB, 28)
-        self.assertEqual(automerge.AUTOMERGE_MODEL, "deepseek-flash")
+        self.assertEqual(automerge.AUTOMERGE_MODEL, "opus")
         self.assertEqual(argv, [
             "new", "--workspace", monitor.MJ_WORKSPACE,
-            "--target", "podman", "--bundle", monitor.MJ_BUNDLE,
+            "--target", "bedrock-podman", "--bundle", monitor.MJ_BUNDLE,
             "--cpus", "32", "--memory-gib", "28",
-            "--model", "deepseek-flash", "--effort", "max", "--subagents", "none",
+            "--model", "opus", "--effort", "high", "--subagents", "mjolnir",
+            "--subagent-straightforward", "deepseek-flash",
+            "--subagent-straightforward-effort", "high",
             "--at", BASE_SHA, "--branch", "mergemarshall/batch-batch-test",
             "--title", "Bifrost automerge batch batch-test",
             "--prompt-file", "/tmp/prompt", "--json",
         ])
         conn.close()
 
-    def test_single_pr_launch_uses_flash_without_subagents(self):
+    def test_single_pr_launch_uses_opus_with_straightforward_flash_subagents(self):
         conn = make_db(phase="building", session_id=None, status="launching", ci_mode="async")
         self.addCleanup(conn.close)
         prompts = []
 
         def launch(argv, **kwargs):
             prompts.append(Path(argv[argv.index("--prompt-file") + 1]).read_text())
-            self.assertEqual(argv[argv.index("--model") + 1], "deepseek-flash")
-            self.assertEqual(argv[argv.index("--target") + 1], "podman")
-            self.assertEqual(argv[argv.index("--subagents") + 1], "none")
-            self.assertEqual(argv[argv.index("--effort") + 1], "max")
+            self.assertEqual(argv[argv.index("--model") + 1], "opus")
+            self.assertEqual(argv[argv.index("--target") + 1], "bedrock-podman")
+            self.assertEqual(argv[argv.index("--subagents") + 1], "mjolnir")
+            self.assertEqual(argv[argv.index("--effort") + 1], "high")
+            self.assertEqual(argv[argv.index("--subagent-straightforward") + 1], "deepseek-flash")
+            self.assertEqual(argv[argv.index("--subagent-straightforward-effort") + 1], "high")
+            self.assertNotIn("--subagent-subtle", argv)
             self.assertNotIn("--subagent-model", argv)
             self.assertNotIn("--subagent-effort", argv)
             return subprocess.CompletedProcess(argv, 0, '{"session_id":"flash-session"}', '')
@@ -897,32 +902,35 @@ class IdentityAndPromptTests(TestCase):
               mock.patch.object(monitor, "mj_command", side_effect=launch)):
             self.assertEqual(automerge.launch_batch_session(row_for(conn), [pull()], conn=conn),
                              "flash-session")
-        self.assertIn("Subagents are disabled", prompts[0])
+        self.assertIn("There are no subtle subagents", prompts[0])
+        self.assertIn("DeepSeek Flash/high", prompts[0])
         self.assertNotIn("Luna", prompts[0])
         self.assertNotIn("delegate independent", prompts[0])
-        self.assertNotIn("delegated inspection", prompts[0])
+        self.assertIn("ambiguous diagnosis", prompts[0])
 
-    def test_new_launches_checkpoint_flash_max_for_all_lanes_and_legacy_policies(self):
+    def test_new_launches_checkpoint_opus_policy_for_all_lanes_and_legacy_policies(self):
         for target in ('master', 'stabilize/test'):
             for count in (1, 3):
-                for configuration in ('flash-max', 'single-pr', 'multi-pr', 'flash-none', 'flash-luna'):
+                for configuration in ('opus-high-dsf-high', 'flash-dsf-high', 'flash-max', 'single-pr', 'multi-pr', 'flash-none', 'flash-luna'):
                     with self.subTest(target=target, count=count, configuration=configuration):
                         pulls = [dataclasses.replace(pull(n), target_ref=target) for n in range(1, count + 1)]
                         conn = make_db(pulls=pulls, session_id=None, status='launching', ci_mode='async')
                         self.addCleanup(conn.close)
-                        self.assertEqual(row_for(conn)['agent_configuration'], 'flash-max')
+                        self.assertEqual(row_for(conn)['agent_configuration'], 'opus-high-dsf-high')
                         self.assertEqual(automerge.batch_target(row_for(conn)), target)
                         with conn:
                             conn.execute("UPDATE automerge_batches SET agent_configuration=?, launch_attempted=1",
                                          (configuration,))
                         def launch(argv, **kwargs):
-                            self.assertEqual(row_for(conn)['agent_configuration'], 'flash-max')
-                            for flag, value in (('--model', 'deepseek-flash'), ('--target', 'podman'),
-                                                ('--effort', 'max'), ('--subagents', 'none')):
+                            self.assertEqual(row_for(conn)['agent_configuration'], 'opus-high-dsf-high')
+                            for flag, value in (('--model', 'opus'), ('--target', 'bedrock-podman'),
+                                                ('--effort', 'high'), ('--subagents', 'mjolnir'),
+                                                ('--subagent-straightforward', 'deepseek-flash'),
+                                                ('--subagent-straightforward-effort', 'high')):
                                 self.assertEqual(argv[argv.index(flag) + 1], value)
-                            self.assertFalse(any(arg.startswith('--subagent-') for arg in argv))
+                            self.assertFalse(any(arg.startswith('--subagent-subtle') for arg in argv))
                             prompt = Path(argv[argv.index('--prompt-file') + 1]).read_text()
-                            self.assertIn('Subagents are disabled', prompt)
+                            self.assertIn('There are no subtle subagents', prompt)
                             self.assertNotIn('Luna', prompt)
                             return subprocess.CompletedProcess(argv, 0, '{"session_id":"flash-session"}', '')
                         with (mock.patch.object(automerge, 'lookup_batch_session', return_value=None),
@@ -950,7 +958,7 @@ class IdentityAndPromptTests(TestCase):
             with self.subTest(initial_count=len(initial)):
                 conn = make_db(ci_mode="async", pulls=initial)
                 self.addCleanup(conn.close)
-                expected = "flash-max"
+                expected = "opus-high-dsf-high"
                 additions = initial + [pull(9, HEAD_THREE)]
                 with (mock.patch.object(automerge, "_recheck_sources", side_effect=lambda pulls, **kw: (pulls, [])),
                       mock.patch.object(automerge, "select_eligible_pull_requests", return_value=additions)):
@@ -958,7 +966,8 @@ class IdentityAndPromptTests(TestCase):
                 expanded = row_for(conn)
                 self.assertEqual(len(automerge._active_sources(expanded)), len(initial) + 1)
                 self.assertEqual(expanded['agent_configuration'], expected)
-                self.assertFalse(automerge._batch_subagents(expanded))
+                self.assertTrue(automerge._batch_subagents(expanded))
+                self.assertIn("There are no subtle subagents", expanded['pending_prompt'])
                 self.assertNotIn("Luna", expanded['pending_prompt'])
                 with (mock.patch.object(automerge, "_recheck_sources", side_effect=lambda pulls, **kw: (pulls, [])),
                       mock.patch.object(automerge, "select_eligible_pull_requests", return_value=[])):
@@ -967,11 +976,13 @@ class IdentityAndPromptTests(TestCase):
                 self.assertEqual(len(automerge._active_sources(reduced)), 1)
                 argv = automerge.new_session_argv(reduced, "/tmp/prompt")
                 self.assertEqual(argv[argv.index('--model') + 1],
-                                 'deepseek-flash')
+                                 'opus')
 
     def test_single_pr_feedback_and_sync_prompt_do_not_request_delegation(self):
         conn = make_db(ci_mode="sync")
         self.addCleanup(conn.close)
+        with conn:
+            conn.execute("UPDATE automerge_batches SET agent_configuration='flash-max'")
         prompts = [automerge.build_prompt("batch-test", [pull()], BASE_SHA, subagents=False),
                    automerge.build_ci_feedback(row_for(conn), {"ci.yml/test"}, set(), "logs", "baseline")]
         for prompt in prompts:
@@ -980,7 +991,7 @@ class IdentityAndPromptTests(TestCase):
             self.assertNotIn("delegate independent", prompt)
             self.assertNotIn("delegated inspection", prompt)
 
-    def test_legacy_batch_keeps_delegation_but_new_session_uses_flash_max(self):
+    def test_legacy_batch_keeps_delegation_but_new_session_uses_opus_high(self):
         conn = make_db()
         self.addCleanup(conn.close)
         with conn:
@@ -990,9 +1001,9 @@ class IdentityAndPromptTests(TestCase):
         argv = automerge.new_session_argv(row_for(conn), '/tmp/prompt')
         self.assertTrue(automerge._batch_subagents(row_for(conn)))
         self.assertEqual(row_for(conn)['agent_configuration'], 'multi-pr')
-        self.assertEqual(argv[argv.index('--model') + 1], 'deepseek-flash')
-        self.assertEqual(argv[argv.index('--effort') + 1], 'max')
-        self.assertEqual(argv[argv.index('--subagents') + 1], 'none')
+        self.assertEqual(argv[argv.index('--model') + 1], 'opus')
+        self.assertEqual(argv[argv.index('--effort') + 1], 'high')
+        self.assertEqual(argv[argv.index('--subagents') + 1], 'mjolnir')
 
     @unchanged_queue()
     def test_build_turn_discovers_and_persists_integration_pr(self):

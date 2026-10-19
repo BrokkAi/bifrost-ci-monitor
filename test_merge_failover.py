@@ -163,6 +163,22 @@ class FailoverTests(unittest.TestCase):
         self.assertEqual(self.value()['stage'], 'completed')
         self.submit.assert_called_once_with('session', timeout=15)
 
+    def test_new_opus_failover_retains_straightforward_flash_guidance(self):
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET agent_configuration='opus-high-dsf-high'")
+        self.trigger()
+        self.native.side_effect = [None, self.operation(), self.operation()]
+        self.submit.side_effect = read_budget.Deferred('poll budget ended')
+        self.session.return_value = {'id': 'session', 'profile_id': f.PROFILE}
+        f.advance(a, self.conn, self.row())
+        self.assertEqual(self.value()['stage'], 'completed')
+        self.assertEqual(self.row()['agent_configuration'], 'flash-dsf-high')
+        guidance = a._validation_guidance(BASE_SHA, subagents=a._batch_subagents(self.row()),
+                                         configuration=a._batch_configuration(self.row()))
+        self.assertIn('DeepSeek Flash/high', guidance)
+        self.assertIn('There are no subtle subagents', guidance)
+        self.assertNotIn('Luna', guidance)
+
     def test_no_second_move_when_acceptance_is_unknown_or_native_move_failed(self):
         self.trigger()
         value = self.value()
@@ -265,9 +281,9 @@ class FailoverTests(unittest.TestCase):
                                   'active_pull_requests_json=? WHERE batch_id=?',
                                   (configuration, json.dumps([pull().as_json()]), self.batch))
             args = a.new_session_argv(self.row(), 'prompt')
-            self.assertEqual(args[args.index('--model') + 1], f.MODEL)
-            self.assertEqual(args[args.index('--subagents') + 1], 'none')
-            self.assertEqual(args[args.index('--effort') + 1], 'max')
+            self.assertEqual(args[args.index('--model') + 1], 'opus')
+            self.assertEqual(args[args.index('--subagents') + 1], 'mjolnir')
+            self.assertEqual(args[args.index('--effort') + 1], 'high')
             self.assertEqual(self.row()['agent_configuration'], configuration)
 
 

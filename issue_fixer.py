@@ -15,6 +15,7 @@ import monitor
 import local_findings
 import agent_recovery
 import stabilize_state
+import session_policy
 
 ASSIGNEE = "brokk-service"
 ESCALATION_ASSIGNEE = "DavidBakerEffendi"
@@ -527,14 +528,20 @@ def launch(conn, job):
                 conn.execute("UPDATE issue_repairs SET status='cancelled',finished_at=?,cleanup_done=1 "
                              "WHERE id=?", (monitor.utc_now(), job["id"]))
             return
-        prompt = bounded_stored_prompt(job["prompt"])
+        prompt = job["prompt"]
+        # Only a proven-new launch receives this policy. Adoption and recovery
+        # retain the original session's stored instructions and configuration.
+        if session_policy.DELEGATION_GUIDANCE not in prompt:
+            prompt = session_policy.DELEGATION_GUIDANCE + "\n\n" + prompt
+        prompt = bounded_stored_prompt(prompt)
         with tempfile.NamedTemporaryFile(mode="w", suffix=".prompt") as handle:
             handle.write(prompt)
             handle.flush()
-            args = ["new", "--workspace", monitor.MJ_WORKSPACE, "--target", monitor.MJ_TARGET,
-                    "--bundle", monitor.MJ_BUNDLE, "--model", monitor.MJ_MODEL,
+            args = ["new", "--workspace", monitor.MJ_WORKSPACE, "--target", session_policy.TARGET,
+                    "--bundle", monitor.MJ_BUNDLE, "--model", session_policy.MODEL,
+                    "--effort", session_policy.EFFORT,
                     "--cpus", str(monitor.MJ_CPUS), "--memory-gib", str(monitor.MJ_MEMORY_GIB),
-                    "--subagents", "none", "--no-review", "--branch", job["branch"],
+                    *session_policy.subagent_args(), "--no-review", "--branch", job["branch"],
                     "--title", job["title"], "--prompt-file", handle.name, "--json"]
             # --at creates a branch. A rejected PR must check out its existing
             # remote branch; the prompt verifies its exact rejected head.
