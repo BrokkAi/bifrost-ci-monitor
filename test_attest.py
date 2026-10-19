@@ -129,12 +129,13 @@ class AttestIntegrationTests(unittest.TestCase):
         for identifier in (10, 11):
             run = {'id': identifier, 'run_attempt': 1, 'event': 'push', 'head_branch': 'master',
                    'head_sha': HEAD_ONE, 'head_repository': {'full_name': monitor.REPO_NAME}}
-            conn.execute("INSERT INTO attest_ci_imports VALUES (?,1,'pending','2000-01-01T00:00:00+00:00','[]',?)",
+            conn.execute("INSERT INTO attest_ci_imports (run_id,attempt,status,updated_at,objects_json,run_json) "
+                         "VALUES (?,1,'pending','2000-01-01T00:00:00+00:00','[]',?)",
                          (identifier, json.dumps(run)))
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / 'storage.toml'; config.touch()
             def gh(args, **kwargs):
-                if '/10/artifacts' in args[1]: raise RuntimeError('unavailable')
+                if '/11/artifacts' in args[1]: raise RuntimeError('unavailable')
                 if 'artifacts' in args[1]: return json.dumps({'artifacts': []})
                 return json.dumps({'workflow_runs': []})
             with mock.patch.dict('os.environ', ATTEST_STORAGE_CONFIG=str(config)), \
@@ -142,7 +143,51 @@ class AttestIntegrationTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError): attest_ci.tick(conn)
                 attest_ci.tick(conn)
         self.assertEqual([tuple(r) for r in conn.execute('SELECT run_id,status FROM attest_ci_imports ORDER BY run_id')],
-                         [(10, 'pending'), (11, 'done')])
+                         [(10, 'done'), (11, 'pending')])
+
+    def test_fresh_completed_results_precede_backfill_and_failed_fresh_import_yields(self):
+        import monitor
+        conn = make_db(); attest_ci.ensure_schema(conn)
+        def enqueue(identifier):
+            run = dict(id=identifier, run_attempt=1, event='push', head_branch='master',
+                       head_sha=HEAD_ONE, head_repository=dict(full_name=monitor.REPO_NAME))
+            conn.execute('INSERT INTO attest_ci_imports '
+                         '(run_id,attempt,status,updated_at,run_json) VALUES (?,1,\'pending\',?,?)',
+                         (identifier, f'2026-01-01T00:00:{identifier:02d}+00:00', json.dumps(run)))
+        for identifier in (10, 20, 30): enqueue(identifier)
+        imported = []
+        def gh(args, **kwargs):
+            if 'artifacts' not in args[1]: return json.dumps({'workflow_runs': []})
+            identifier = int(args[1].split('/runs/')[1].split('/')[0]); imported.append(identifier)
+            if identifier == 30 and imported.count(30) == 1: raise RuntimeError('transient')
+            return json.dumps({'artifacts': []})
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'storage.toml'; config.touch()
+            with (mock.patch.dict('os.environ', ATTEST_STORAGE_CONFIG=str(config)),
+                  mock.patch.object(monitor, 'run_gh', side_effect=gh)):
+                with self.assertRaises(RuntimeError): attest_ci.tick(conn)
+                enqueue(40)  # A fresh completion arrives while a retry and backfill wait.
+                for _ in range(4): attest_ci.tick(conn)
+        self.assertEqual(imported, [30, 40, 20, 10, 30])
+        self.assertEqual(conn.execute("SELECT count(*) FROM attest_ci_imports WHERE status='done'").fetchone()[0], 4)
+        self.assertTrue(all(r[0] for r in conn.execute('SELECT last_attempt_at FROM attest_ci_imports')))
+
+    def test_connect_db_migrates_import_queue_without_replacing_saved_evidence(self):
+        import monitor
+        import sqlite3
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'legacy.db'
+            with sqlite3.connect(path) as conn:
+                conn.execute('CREATE TABLE attest_ci_imports (run_id INTEGER,attempt INTEGER,status TEXT,'
+                             'updated_at TEXT,objects_json TEXT,run_json TEXT,PRIMARY KEY(run_id,attempt))')
+                conn.execute("INSERT INTO attest_ci_imports VALUES (10,1,'pending','queued','[\"original\"]','{}')")
+            with mock.patch.object(monitor, 'DB_PATH', path):
+                for attempt in (None, 'retained'):
+                    conn = monitor.connect_db()
+                    row = conn.execute('SELECT status,objects_json,last_attempt_at FROM attest_ci_imports').fetchone()
+                    self.assertEqual(tuple(row), ('pending', '["original"]', attempt))
+                    with conn: conn.execute("UPDATE attest_ci_imports SET last_attempt_at='retained'")
+                    conn.close()
 
 
 if __name__ == '__main__':

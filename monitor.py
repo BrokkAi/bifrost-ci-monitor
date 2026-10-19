@@ -1469,6 +1469,8 @@ def connect_db() -> sqlite3.Connection:
     if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='issue_repairs'").fetchone():
         ensure_column(conn, 'issue_repairs', 'recovery_json', "TEXT NOT NULL DEFAULT '{}'")
         ensure_column(conn, 'issue_repairs', 'report_after_seq', 'INTEGER NOT NULL DEFAULT 0')
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='attest_ci_imports'").fetchone():
+        ensure_column(conn, 'attest_ci_imports', 'last_attempt_at', 'TEXT')
     return conn
 
 

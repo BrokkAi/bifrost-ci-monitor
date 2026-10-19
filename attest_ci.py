@@ -17,6 +17,7 @@ def ensure_schema(conn):
         updated_at TEXT NOT NULL, objects_json TEXT NOT NULL DEFAULT '[]',
         PRIMARY KEY (run_id, attempt))""")
     monitor.ensure_column(conn, 'attest_ci_imports', 'run_json', "TEXT NOT NULL DEFAULT '{}'")
+    monitor.ensure_column(conn, 'attest_ci_imports', 'last_attempt_at', 'TEXT')
     conn.execute("""CREATE TABLE IF NOT EXISTS attest_ci_scan (
         singleton INTEGER PRIMARY KEY CHECK(singleton=1),
         day TEXT NOT NULL, page INTEGER NOT NULL)""")
@@ -78,12 +79,18 @@ def tick(conn):
     ensure_schema(conn)
     conn.commit()
     discover(conn)
+    # Newly completed CI must not wait behind days of historical discovery.
+    # Failed/interrupted imports yield to untouched work, then retry oldest first.
     pending = conn.execute("SELECT run_json FROM attest_ci_imports WHERE status='pending' "
-                           'ORDER BY updated_at,run_id,attempt LIMIT 1').fetchone()
+                           'ORDER BY last_attempt_at IS NOT NULL,last_attempt_at,'
+                           'run_id DESC,attempt DESC LIMIT 1').fetchone()
     if not pending:
         return
     run = json.loads(pending[0])
     identifier, attempt = run['id'], run['run_attempt']
+    with conn:
+        conn.execute('UPDATE attest_ci_imports SET last_attempt_at=? WHERE run_id=? AND attempt=?',
+                     (monitor.utc_now(), identifier, attempt))
     try:
         artifacts = json.loads(monitor.run_gh(["api", f"repos/{monitor.REPO_NAME}/actions/runs/"
                                                f"{identifier}/artifacts?per_page=100"], timeout=20))["artifacts"]

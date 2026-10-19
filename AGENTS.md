@@ -69,7 +69,9 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   Discovery queues trusted attempts durably before importing one per tick,
   refreshing today's first page and checkpointing one older day/page through
   the seven-day evidence retention window. Pending retries survive discovery
-  churn; failed imports rotate behind other pending attempts. Additive run
+  churn. Untouched attempts import newest first so fresh CI is not blocked by
+  historical backfill; failed/interrupted imports yield to untouched work and
+  then retry oldest first through additive `last_attempt_at` checkpoints. Additive run
   metadata contains only reviewed run identity, event, branch and repository.
 - `performance_findings.py`: bounded, retryable daily Benchmark/UsageBench JSON
   intake and durable benchmark observations consumed by the existing triage lane.
