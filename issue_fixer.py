@@ -469,11 +469,14 @@ def bounded_stored_prompt(prompt):
     return render_prompt(prefix + separator, json.loads(context))
 
 
-def prompt_request_rejected(error):
+def launch_request_rejected(error):
     """Only recognize rejections known to happen before session creation."""
     return bool(re.search(
         r"the Mjolnir API answered (?:400 Bad Request: prompt must contain\b"
-        r"|413 (?:Payload Too Large|Content Too Large)\b)", str(error)))
+        r"|413 (?:Payload Too Large|Content Too Large)\b"
+        r"|422 Unprocessable Entity: Mjolnir requires "
+        r"\[subagents\.(?P<task>straightforward|subtle)\] "
+        r"or --subagent-(?P=task) <MODEL>)", str(error)))
 
 
 def create_job(conn, issue, pr, rejection, key, prs, base_sha):
@@ -515,7 +518,7 @@ def launch(conn, job):
     if found:
         session_id = found["id"]
     else:
-        if job["status"] == "launching":
+        if job["status"] == "launching" and not launch_request_rejected(job["last_error"]):
             # Preserve the original error for diagnosis. An absent session is
             # not enough to retry a request that may still be provisioning.
             monitor.log(f"issue #{job['issue_number']}: mj launch outcome unknown; "
@@ -553,7 +556,7 @@ def launch(conn, job):
             try:
                 raw = monitor.require_mj_success(args, timeout=180)
             except monitor.MjError as exc:
-                status = "selected" if prompt_request_rejected(exc) else "launching"
+                status = "selected" if launch_request_rejected(exc) else "launching"
                 with conn:
                     conn.execute("UPDATE issue_repairs SET status=?,last_error=? WHERE id=?",
                                  (status, str(exc), job["id"]))

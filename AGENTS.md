@@ -435,6 +435,8 @@ an existing session keeps its persisted configuration. Historical schema default
 remain `multi-pr` for old rows.
 The CI daemon has `[subagents.straightforward]` set to `deepseek-flash`/`high`,
 no `[subagents.subtle]`, and `deepseek = true` under `eligible_profiles`.
+Straightforward-only delegation requires Mjolnir 2.47.0 or later; 2.46.0
+rejects these launches before creating a session.
 Launches explicitly override straightforward model/effort; omitting a subtle
 override would otherwise inherit the global subtle choice. Triage remains
 DeepSeek Flash with `--subagents none`.
@@ -480,6 +482,10 @@ out of the note.
 Persist the exact launch title/intent before a request may create a session.
 On an ambiguous result, list the CI workspace and adopt the matching title;
 never duplicate a session because creation timed out or a response was lost.
+Fixer launches recognize only specific pre-creation prompt-size and missing
+subagent-choice rejections as retryable, including old `launching` rows that
+retained such a rejection. Always perform the exact-title lookup first; other
+422 responses and transport failures remain ambiguous.
 Merger launch-grace logic is separate from an agent work deadline. Absence
 must be established before creation is retried. Preserve the original error
 while awaiting discovery.

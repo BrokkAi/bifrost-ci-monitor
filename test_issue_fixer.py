@@ -1011,6 +1011,48 @@ class IssueFixerTests(TestCase):
         self.assertEqual(mj.call_args.args[0][0], "sessions")
         self.assertEqual(self.conn.execute("SELECT last_error FROM issue_repairs WHERE id=?", (job["id"],)).fetchone()[0], str(error))
 
+    # Hard-won: de22861: a pre-creation 422 otherwise reserves a fixer slot forever.
+    def test_subagent_validation_rejection_retries_persisted_launch_after_absence_lookup(self):
+        for number, task in enumerate(("straightforward", "subtle"), 14):
+            with self.subTest(task=task):
+                job = self.job(number=number)
+                error = monitor.MjError(
+                    "mj new --workspace exited 1: Error: the Mjolnir API answered "
+                    f"422 Unprocessable Entity: Mjolnir requires [subagents.{task}] "
+                    f"or --subagent-{task} <MODEL>")
+                with mock.patch.object(monitor, "require_mj_success", side_effect=['{"sessions":[]}', error]), \
+                     mock.patch.object(fixer, "api", return_value=issue(number)):
+                    with self.assertRaises(monitor.MjError):
+                        fixer.launch(self.conn, job)
+                saved = self.conn.execute("SELECT * FROM issue_repairs WHERE id=?", (job["id"],)).fetchone()
+                self.assertEqual(saved["status"], "selected")
+                # Upgrade also recovers rows already persisted by the old supervisor.
+                with self.conn:
+                    self.conn.execute("UPDATE issue_repairs SET status='launching' WHERE id=?", (job["id"],))
+                saved = self.conn.execute("SELECT * FROM issue_repairs WHERE id=?", (job["id"],)).fetchone()
+                with mock.patch.object(monitor, "require_mj_success", side_effect=[
+                        '{"sessions":[]}', '{"session_id":"recovered"}']) as mj, \
+                     mock.patch.object(fixer, "api", return_value=issue(number)):
+                    fixer.launch(self.conn, saved)
+                self.assertEqual(mj.call_args_list[0].args[0][0], "sessions")
+                self.assertEqual(mj.call_args_list[1].args[0][0], "new")
+                restored = self.conn.execute("SELECT * FROM issue_repairs WHERE id=?", (job["id"],)).fetchone()
+                self.assertEqual(restored["id"], job["id"])
+                self.assertEqual(restored["branch"], job["branch"])
+                self.assertEqual(restored["session_id"], "recovered")
+
+    def test_other_422_launch_errors_remain_ambiguous(self):
+        job = self.job()
+        message = "the Mjolnir API answered 422 Unprocessable Entity: worker setup failed"
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='launching',last_error=? WHERE id=?",
+                              (message, job["id"]))
+        saved = self.conn.execute("SELECT * FROM issue_repairs WHERE id=?", (job["id"],)).fetchone()
+        with mock.patch.object(monitor, "require_mj_success", return_value='{"sessions":[]}') as mj:
+            fixer.launch(self.conn, saved)
+        self.assertEqual(mj.call_count, 1)
+        self.assertEqual(mj.call_args.args[0][0], "sessions")
+
     def test_running_session_is_left_live(self):
         job = dict(self.job(), session_id="session")
         with mock.patch.object(monitor, "wait_once", return_value=monitor.TurnResult("running", "timeout", True)), \
