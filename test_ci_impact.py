@@ -170,7 +170,7 @@ class ValidationPolicyTests(TestCase):
             self.assertIn('Do not run tests, builds, or baseline reproductions', prompt)
             self.assertIn('Tests run: none', prompt)
             self.assertNotIn('eatmydata cargo', prompt)
-            self.assertNotIn('Rerun each failing test', prompt)
+            self.assertNotIn('Baseline from existing evidence', prompt)
 
     def test_every_other_mode_delegates_selection_without_full_suite_requirement(self):
         for mode in ('impact', 'full', 'unknown'):
@@ -179,7 +179,7 @@ class ValidationPolicyTests(TestCase):
             self.assertIn('Use your best judgment', prompt)
             self.assertIn('no full suite is mandatory', prompt)
             self.assertIn('Do not rerun ci-impact', prompt)
-            self.assertIn('Rerun each failing test', prompt)
+            self.assertIn('Baseline from existing evidence', prompt)
             self.assertNotIn('Run the full selected scope', prompt)
 
     def test_docs_gate_still_requires_verdict_and_nonempty_summaries(self):

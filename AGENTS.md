@@ -811,7 +811,7 @@ history, focused diffs and tracing the assertion through data/control flow. Merg
 order and the first merge touching the relevant files are evidence. Do not build
 to decide which source caused a failure (no bisection, merge-chain prefixes, base
 plus suspected heads, standalone heads or subtraction rebuilds). The failure path
-builds only the base reproduction that separates baseline from new failures and
+builds only a base-side run when the baseline rules below require one and
 validation of the rebuilt candidate. When in doubt, throw it out: reject the one
 head inspection implicates, every head it cannot distinguish between, or the heads
 whose diffs reach the failing code. Evidence names the failing tests, candidate
@@ -854,16 +854,25 @@ committed tree without blessing enabled. Record a fresh assessment for the final
 HEAD and current source set, distinguishing checks run there from reused results
 with their original tested SHAs and applicability reasons.
 
-Reproduce only failures observed in the candidate's selected checks at the exact
-base, reusing existing exact-tree evidence where available. Passing tests and
-ledger failures absent from the candidate need no baseline runs. Test committed
+Classify only failures observed in the candidate's selected checks; passing tests
+and ledger failures absent from the candidate need no baseline work. A candidate
+failure is baseline without a base run when inspection shows no batch source diff
+reaches its code path, assertions, goldens or fixtures, and existing evidence ties
+the test to master: an open ledger entry in the prompt, a baseline finding at the
+base or an ancestor, or an open `buildfailure` issue for that test confirmed with
+`mm-db issue`. The baseline summary names that evidence. Run failing tests at the
+exact base only when a batch diff reaches the failing code or no such evidence
+exists; that run covers only the base side through `mm-db run` and reuses the
+candidate's recorded results (no candidate rerun or mm-compare). Test committed
 trees without temporary source edits or validation shims. Baseline build failures
 may block dependent checks; report those as blocked and run unaffected useful
-checks. Baseline summaries contain candidate failures reproduced at base;
-repaired tests belong in fix notes. The final assessment describes the resulting
-committed candidate. When selected checks pass or only reproduced baseline
-failures remain, proceed to the mode's publication/reporting step. No local test
-command registry is implemented.
+checks. Baseline summaries list candidate failures that are baseline by a base run
+or existing master evidence; repaired tests belong in fix notes. Register baseline
+findings only for failures reproduced at the base and not already tracked by an
+open issue or ledger entry. The final assessment describes the resulting
+committed candidate. When selected checks pass or only baseline failures remain,
+proceed to the mode's publication/reporting step. No local test command registry
+is implemented.
 
 Run selected local builds/tests through `mm-db run -- COMMAND...` or
 `mm-db run --script FILE`; configured `mm-compare` records both sides automatically.
@@ -959,7 +968,8 @@ renders `mergemarshall:local: pass|fail`, `Tests run:` and `Baseline failures:`;
 its arrival is not a scheduling gate. `Tests run: none` is accepted only for a
 supervisor-confirmed docs candidate; baseline/test summaries remain required.
 Any new failure must be fixed or the exact responsible
-head removed/rejected; a baseline requires a local rerun at the captured base.
+head removed/rejected; a baseline needs a local base-side run or existing master
+evidence under the baseline rules above, never a candidate rerun.
 The supervisor does not wait for/query CI or dispatch baseline runs. There is
 no sync-style CI-round limit. Master CI after landing is handled by triage
 and the issue fixer. Agent reports and PR-produced tests are trusted evidence

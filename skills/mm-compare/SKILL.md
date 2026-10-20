@@ -11,7 +11,8 @@ python3 <this skill>/scripts/mm_compare.py --a BASE_SHA --b CANDIDATE_SHA --scri
 
 Use this helper when fresh runs at both commits are needed. Reuse existing
 exact-tree evidence when available; baseline checks cover failures observed in
-the candidate. The primary schedules expensive comparisons and may assign a
+the candidate. Do not use it to reproduce failures already observed on the
+candidate: run only the base side with `mm-db run` in a base worktree. The primary schedules expensive comparisons and may assign a
 specific check to a subagent.
 
 It snapshots the supplied script, runs both sides concurrently in temporary

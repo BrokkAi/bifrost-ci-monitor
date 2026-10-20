@@ -798,7 +798,10 @@ class IdentityAndPromptTests(TestCase):
             "refreshing the revision between mutations",
             "Do not rebuild and retest between individual exclusions",
             "reassess them after the combined rebuild",
-            "Reproduced baseline failures alone require no rebuild",
+            "Baseline failures alone require no rebuild",
+            "Baseline from existing evidence",
+            "only the base side, in a separate worktree through `mm-db run`",
+            "do not rerun the candidate side",
         )
         for prompt in prompts:
             for phrase in expected:

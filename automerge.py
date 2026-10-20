@@ -134,7 +134,8 @@ SKILLS_GUIDANCE = (
     "authorize landing. Include any known-failure diagnosis lines in the handoff "
     "--notes-file so they are recorded even if no final message arrives. mm-compare runs "
     "a supplied Bash check at two commits; choose the checks and assess failures yourself. "
-    "Record unresolved locally reproduced baseline failures and flaky product tests "
+    "Record baseline failures you reproduced at the base, unless an open issue or "
+    "ledger entry already tracks that test, and flaky product tests "
     "for later triage with mm-db finding --revision REV --kind baseline|flaky "
     "--head TESTED_SHA --identity TEST_NAME --command 'actual check command' "
     "--evidence-file FILE. Baseline findings must name the captured base SHA. "
@@ -1769,7 +1770,7 @@ def _validation_guidance(
            "delegate independent investigations" if subagents else "investigate each group")
         + " against the "
         "same candidate and captured source heads. Assess every observed failure "
-        "group as a reproduced baseline, an interaction or mechanical fix to make "
+        "group as a baseline, an interaction or mechanical fix to make "
         "in the batch, or a source PR to reject. A new failure without a "
         "straightforward fix leads to rejecting its suspects; do not hold the batch "
         "for more attribution evidence. This diagnosis covers observed failures "
@@ -1783,8 +1784,8 @@ def _validation_guidance(
         "touched the relevant files are evidence. Do not run builds to decide "
         "which source caused a failure: no bisection, merge-chain prefixes, base "
         "plus suspected heads, standalone heads or subtraction rebuilds. The only "
-        "builds in the failure path are the base reproduction that separates "
-        "baseline from new failures and validation of the rebuilt candidate. When "
+        "builds in the failure path are a base-side run when the baseline rules "
+        "below require one and validation of the rebuilt candidate. When "
         "inspection names one head with a plausible mechanism, reject it. When it "
         "narrows a failure to several heads but cannot choose, reject each of them. "
         "When it cannot narrow a failure further, reject the heads whose diffs reach "
@@ -1804,7 +1805,7 @@ def _validation_guidance(
         "without independently rejecting them. If sources were excluded, rebuild "
         "the recorded remainder once, preserving applicable fixes and conflict "
         "resolutions. Apply fixes for retained PRs as appended commits, then validate "
-        "the resulting committed candidate. Reproduced baseline failures alone "
+        "the resulting committed candidate. Baseline failures alone "
         "require no rebuild. Do not rebuild and retest between "
         "individual exclusions from the same diagnosis pass. Complete the available "
         "failure diagnosis before ending the turn. A build blocker can hide further "
@@ -1823,19 +1824,29 @@ def _validation_guidance(
         "Record a fresh assessment for the resulting HEAD and current source set, "
         "distinguishing checks run there from earlier results reused with their "
         "original tested SHAs and applicability reasons.\n\n"
-        "Baseline and completion: reproduce only failures observed in the "
-        "candidate's selected checks, reusing existing exact-tree evidence where "
-        "available. Passing tests and ledger failures absent from the candidate "
-        "need no baseline runs. "
-        f"Compare failures with the exact base commit {base_sha}. Rerun each failing test "
-        "at that base in a separate worktree or checkout if it has not already been "
-        "reproduced there. Test committed candidate/base trees without temporary "
+        "Baseline from existing evidence: classify only failures observed in the "
+        "candidate's selected checks; passing tests and ledger failures absent from "
+        "the candidate need no baseline work. A candidate failure is baseline "
+        "without any base run when inspection shows that no source diff in this "
+        "batch reaches its code path, assertions, goldens or fixtures, and existing "
+        "evidence already ties that test to master: an open entry in this "
+        "prompt's known-failure ledger, a baseline finding from `mm-db findings` at "
+        "the base or an ancestor of it, or an open `buildfailure` issue for that "
+        "test confirmed with "
+        "`mm-db issue`. Name that evidence in the baseline summary. "
+        f"Run failing tests at the exact base commit {base_sha} only when a batch diff "
+        "does reach the failing code or no such evidence exists. That run covers "
+        "only the base side, in a separate worktree through `mm-db run`; reuse the "
+        "candidate's recorded results and do not rerun the candidate side or use "
+        "mm-compare for failures already observed on the candidate. Test committed "
+        "candidate/base trees without temporary "
         "source edits or validation shims. Every new failure must be fixed or its "
         "responsible PR removed. Report baseline build blockers as blocked, run "
         "unaffected useful checks, and never claim blocked checks passed. Baseline "
-        "summaries contain candidate failures reproduced at base; repaired tests "
+        "summaries list candidate failures that are baseline by a base run or by "
+        "existing master evidence; repaired tests "
         "belong in fix notes. The final assessment must describe the resulting "
-        "committed candidate. When selected checks pass or only reproduced baseline "
+        "committed candidate. When selected checks pass or only baseline "
         "failures remain, proceed "
         "to this mode's publication/reporting step.\n\n"
         + monitor.CARGO_TEST_ENV_GUIDANCE
@@ -1932,8 +1943,9 @@ def _format_known_failure_prompt(context: str) -> str:
     parts = []
     if context:
         parts.append(
-            context + "\nUse this ledger to guide diagnosis. Entries may be stale; "
-            "apply this batch's test and baseline requirements before accepting a failure."
+            context + "\nUse this ledger to guide diagnosis. An open entry for a "
+            "failing test is existing master evidence under this batch's baseline rules; "
+            "a closed or absent entry is not."
         )
     parts.append(
         "For each diagnosed parser-observed ledger identity, include one final-message "
@@ -2002,13 +2014,13 @@ Use mm-merge to fetch and verify the listed exact heads and retain their ancestr
 This batch uses async CI mode. The supervisor does not wait for CI and does not use GitHub CI results to authorize this batch. Before publishing, follow this validation policy:
 {_validation_guidance(base_sha, validation_impact, subagents=subagents, configuration=configuration)}
 {FIX_VS_EJECT_GUIDANCE}
-Apply that guidance to every new failure. The local gate passes when the documentation-only policy is satisfied, or the checks you choose pass or have only reproduced baseline failures; this batch has no time limit.
+Apply that guidance to every new failure. The local gate passes when the documentation-only policy is satisfied, or the checks you choose pass or have only baseline failures; this batch has no time limit.
 
 When the local gate passes, publish `{branch}` through mm-autopr. It creates or updates exactly one integration PR titled `{integration_title}`, with included source heads, conflict-resolution/fix notes, and label `{INTEGRATION_LABEL}`. Do not publish before the local gate passes. Never wait for CI, inspect CI results, or merge the integration PR yourself. The supervisor runs the common pre-merge checks, posts the required verdict status, and merges the exact locally tested head; CI runs after merge and the CI monitor handles any resulting breakage through later PR batches.
 
 Use the same safe removal and rejection rules as sync mode. Diagnose the available failure groups, then eject by rebuilding once from {base_sha} without the combined rejected source set, never by revert. Force-push only `{branch}` using `git push --force-with-lease origin HEAD:refs/heads/{branch}` when rebuilding. {REJECTION_TOOL_GUIDANCE} For each ejected PR include the standalone line `mergemarshall:ejected-pr: <PR number> <exact listed full head SHA>` in your final message.
 
-Your final message must contain exactly one standalone verdict line `mergemarshall:local: pass` or `mergemarshall:local: fail`, a one-line `Tests run: ...` listing every targeted test/command run (or `none` for a docs batch), and a one-line `Baseline failures: ...` listing reproduced failures or `none`. Name the validated full HEAD SHA. Include a short explanation for any failure and one `known-failure: <workflow> | <job> | <test or step> | <one-line diagnosis>` line per ledger failure you diagnose; do not invent identities. Record the exact-head pass and both evidence summaries with mm-db tests before mm-autopr. Its accepted DB handoff authorizes supervisor processing; the final message is informational. The supervisor does not interpret CI state in async mode.
+Your final message must contain exactly one standalone verdict line `mergemarshall:local: pass` or `mergemarshall:local: fail`, a one-line `Tests run: ...` listing every targeted test/command run (or `none` for a docs batch), and a one-line `Baseline failures: ...` listing baseline failures with their evidence (base run or existing master evidence) or `none`. Name the validated full HEAD SHA. Include a short explanation for any failure and one `known-failure: <workflow> | <job> | <test or step> | <one-line diagnosis>` line per ledger failure you diagnose; do not invent identities. Record the exact-head pass and both evidence summaries with mm-db tests before mm-autopr. Its accepted DB handoff authorizes supervisor processing; the final message is informational. The supervisor does not interpret CI state in async mode.
 
 Keep the captured base for this turn. After you finish, the supervisor checks {prompt_base} freshness and source PR heads. If either changed, it sends this live session the exact update or rebuild needed. Do not suspend the session yourself.
 """

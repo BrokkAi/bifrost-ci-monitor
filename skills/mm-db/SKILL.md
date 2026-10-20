@@ -122,7 +122,10 @@ python3 <this skill>/scripts/mm_db.py finding --revision REV --kind flaky --head
 ```
 
 Record unresolved baseline failures and flaky product tests for later repair with
-`finding`. Include the failure output, settings/environment, exact committed
+`finding`. Register a baseline only for a failure you reproduced at the base, and
+skip it when an open issue or ledger entry already tracks that test. A failure
+classified as baseline from existing master evidence needs no base run and no new
+finding; name the evidence in the `tests` baseline summary. Include the failure output, settings/environment, exact committed
 tested SHA, reusable log paths, and any subsequent pass/fail outcomes. Finding
 evidence is limited to 12,000 characters (40 KiB after JSON encoding with the
 identity and command); reference full logs when longer. Baseline
