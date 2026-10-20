@@ -244,6 +244,12 @@ Fetch branch and PR refs together with full history and filtered blobs; fetch
 detached historical tips in batches only when still missing. This bare cache uses
 `fetch`, never `pull`, and never changes agent checkouts. Fetch workers maintain
 Git commit-graphs so repeated immutable ancestry comparisons stay inexpensive.
+Queue ancestry reads reuse a complete `rev-list` walk per immutable descendant
+within a cache client, keeping at most four walks in memory. Positive object
+presence is remembered by type; missing objects are never remembered. Failed,
+interrupted, malformed or incomplete walks produce no ancestry facts. Individual
+positive and negative pair results retain their existing durable checkpoints;
+mutable ref reads and every dependency/rejection/landing gate remain fresh.
 Read current master and published batch heads freshly with `ls-remote`, including
 final landing gates.
 Current-ref failures expose only sanitized categories (authentication, repository
