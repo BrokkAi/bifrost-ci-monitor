@@ -382,6 +382,17 @@ class ExecutionTests(GitFixture):
         self.assertEqual(result["status"], "interrupted")
         self.assertEqual(result["exit_code"], -15)
 
+    def test_checks_run_whether_or_not_the_predecessor_is_live(self):
+        # Batch 1d3646f3 on 2026-10-20: its predecessor landed and every check
+        # was refused, so no assessment or handoff could start its promotion.
+        for live in (True, False):
+            client = self.client()
+            client.call.return_value = dict(self.context(),
+                                            predecessor={"batch_id": "parent", "current": live})
+            with mock.patch.object(db.mm_execution, "execute", return_value={"exit_code": 0}) as execute:
+                db.mm_execution.run(client, command=["true"])
+            execute.assert_called_once()
+
     def test_wrapper_refuses_new_checks_after_handoff(self):
         client = self.client()
         client.call.return_value = dict(self.context(), ready={"head": self.base})

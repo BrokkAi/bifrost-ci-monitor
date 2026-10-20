@@ -159,8 +159,7 @@ def execute(argv, cwd, output, *, client=None, state=None, script=None, stdout=N
 def run_attest(client, suite, *, filterset=None, config="attest.toml", selection=None):
     current = client.call("state")
     if (current["status"] not in {"running", "launching"}
-            or current["phase"] not in {"building", "fixing"} or current.get("ready")
-            or (current.get("predecessor") and not current["predecessor"]["current"])):
+            or current["phase"] not in {"building", "fixing"} or current.get("ready")):
         raise ValueError("batch is not accepting new checks; wait for the supervisor")
     cwd = Path.cwd()
     common = Path(git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"))
@@ -242,8 +241,7 @@ def ensure_attest(client, common):
 def run(client, *, command=None, script=None, output=None):
     current = client.call("state")
     if (current["status"] not in {"running", "launching"}
-            or current["phase"] not in {"building", "fixing"} or current.get("ready")
-            or (current.get("predecessor") and not current["predecessor"]["current"])):
+            or current["phase"] not in {"building", "fixing"} or current.get("ready")):
         raise ValueError("batch is not accepting new checks; wait for the supervisor")
     cwd = Path.cwd()
     common = Path(git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"))
