@@ -142,8 +142,11 @@ revision. Diagnostic intake remains available after publication/completion;
 membership, test and publication mutations retain their lifecycle guards.
 
 Removal updates the supervisor immediately. Rejection records the exact-head
-marker and evidence for delivery by the supervisor's App identity; use it only after
-establishing a new failure attributable to that source head. Changed or closed
+marker and evidence for delivery by the supervisor's App identity; use it for a new
+failure (absent at the captured base) that inspection attributes to that head. When
+inspection cannot choose between suspects, reject each of them; do not build to
+attribute. State in the evidence whether attribution is by inspection or by
+reproduction. A wrong rejection is cleared by the author pushing a new head. Changed or closed
 PRs are removed without rejection. Diagnose the available failure groups before
 recording the combined rejection set. Record all established exact-head exclusions,
 refreshing the revision between mutations, then read state again for the remaining

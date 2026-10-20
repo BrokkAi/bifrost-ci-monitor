@@ -364,6 +364,8 @@ class GithubOutboxTests(TestCase):
         comment, label = write.call_args_list
         self.assertIn(f'mergemarshall:rejected-head: {HEAD_ONE}', comment.args[2]['body'])
         self.assertNotIn('automerge-rejected-head:', comment.args[2]['body'])
+        self.assertIn('push a new commit to this branch', comment.args[2]['body'])
+        self.assertTrue(comment.args[2]['body'].endswith(f'mergemarshall:rejected-head: {HEAD_ONE}'))
         self.assertEqual(label.args, ('issues/7/labels', 'POST', {'labels': ['mergemarshall:rejected']}))
         self.assertEqual(self.ensure_label.call_args.args[0], 'mergemarshall:rejected')
 
@@ -784,7 +786,11 @@ class IdentityAndPromptTests(TestCase):
             "test stale in another PR's code",
             "broken on its own",
             "redesign or substantially rewrite",
-            "When unsure, eject",
+            "When in doubt, throw it out",
+            "pushes a new head, which re-enters the queue",
+            "Do not run builds to decide which source caused a failure",
+            "reject each of them",
+            "says plainly when attribution is by inspection",
             "Conflicts are never grounds for rejection",
             "preserve the failing committed candidate and its logs",
             "Do not rebuild immediately after identifying the first broken PR",
@@ -797,6 +803,8 @@ class IdentityAndPromptTests(TestCase):
         for prompt in prompts:
             for phrase in expected:
                 self.assertIn(phrase, prompt)
+            self.assertNotIn("base plus suspected exact heads", prompt)
+            self.assertNotIn("Resolve outstanding attribution questions", prompt)
             for phrase in (
                 "`eatmydata cargo nextest run ...`",
                 "do not export LD_PRELOAD for the whole session",

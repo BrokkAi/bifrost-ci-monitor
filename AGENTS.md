@@ -800,30 +800,33 @@ checks justify their cost and use the existing mbx configuration. Throttling
 controls resource contention; avoid duplicate or speculative diagnostic builds.
 The supervisor's next-batch lookahead is an independent useful build.
 
-Prefer blame, history, focused diffs, and tracing the failing assertion through
-data/control flow; inspection is almost always faster here than rebuilding Rust
-bisect variants. Before an expensive experiment, record the pending decision,
-smallest useful check, what results would change, and reusable evidence or built
-trees. Use bisect or subtraction/rebuild experiments when inspection cannot
-distinguish specific alternatives and the build justifies its cost. Attribution
-prefers captured base versus that base plus suspected exact heads through real
-merges with consistent settings; account for an older PR-head base. Patch
-reversals may suggest hypotheses; acceptance/rejection requires evidence from
-the required committed trees. On contradictory results, reconcile tested trees,
-commands, and settings first. Record sufficient fix/eject conclusions in the
-progress note.
+Attribute new failures by inspection, not by building: map each failure to the
+source diffs that touch its code path, assertions, goldens or fixtures with blame,
+history, focused diffs and tracing the assertion through data/control flow. Merge
+order and the first merge touching the relevant files are evidence. Do not build
+to decide which source caused a failure (no bisection, merge-chain prefixes, base
+plus suspected heads, standalone heads or subtraction rebuilds). The failure path
+builds only the base reproduction that separates baseline from new failures and
+validation of the rebuilt candidate. When in doubt, throw it out: reject the one
+head inspection implicates, every head it cannot distinguish between, or the heads
+whose diffs reach the failing code. Evidence names the failing tests, candidate
+and base results, implicated paths/commits and mechanism, and says when
+attribution is by inspection only. A failure that persists after the rebuild is
+attributed again against the remaining heads. Rejection comments tell authors that
+a new head re-enters the queue; that is the recourse for a wrong rejection.
+Record fix/eject conclusions in the progress note.
 
 When validation fails, preserve the failing committed candidate and logs while
 diagnosing the available failures. Collect failures from selected checks, avoiding
 fail-fast behavior where practical, and continue useful independent checks when
 others are blocked. Group failures by likely cause and delegate independent
 investigations against the same candidate and captured source heads. Assess every
-observed group as reproduced baseline, interaction/mechanical fix, independently
-broken source, or unresolved failure needing evidence. This covers observed
-failures and specific concerns, not separate testing of every PR or hypothetical
-defects. Before changing the integration tree or ending the turn, consolidate
-established rejections and applicable fixes. Resolve attribution questions before
-rejecting a source. Record the combined exact-head exclusion set through mm-db,
+observed group as reproduced baseline, interaction/mechanical fix, or a
+source to reject; never hold a batch for more attribution evidence. This covers
+observed failures and specific concerns, not separate testing of every PR or
+hypothetical defects. Before changing the integration tree or ending the turn,
+consolidate established rejections and applicable fixes, settling attribution by
+inspection. Record the combined exact-head exclusion set through mm-db,
 refreshing revisions between mutations, then read the remaining membership;
 dependent descendants are removed without independently rejecting them. If sources
 were excluded, rebuild the recorded remainder once, preserving applicable
