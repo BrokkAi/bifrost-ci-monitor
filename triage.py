@@ -933,6 +933,7 @@ def publish(conn, job) -> None:
             prepared = True
     if prepared:
         cache_report(conn, job, report)
+    publication_errors = []
     # The fixer can investigate concurrently; serialize ticket ownership decisions.
     with lock(monitor.LOCK_PATH) as acquired:
         if not acquired:
@@ -962,6 +963,12 @@ def publish(conn, job) -> None:
                 cache_report(conn, job, report)
                 request_report_correction(conn, job, json.dumps(report), exc)
                 return
+            except monitor.CommandError as exc:
+                # An inaccessible issue repository or a failed GitHub write
+                # must not strand the other independent findings in this report.
+                # Keep this finding unreceipted for the normal cached retry.
+                publication_errors.append(f'finding {index}: {exc}')
+                continue
             with conn:
                 conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=?', (json.dumps(report), job['id']))
                 if url:
@@ -998,6 +1005,11 @@ def publish(conn, job) -> None:
                                       *(o[k] for k in KEY)))
                 conn.execute('INSERT INTO triage_finding_receipts(job_id,group_index,completed_at) '
                              'VALUES (?,?,?)', (job['id'], index, monitor.utc_now()))
+        if publication_errors:
+            with conn:
+                conn.execute('UPDATE triage_jobs SET last_error=? WHERE id=?',
+                             ('; '.join(publication_errors), job['id']))
+            return
         with conn:
             queue_product_announcement(conn, job, report, observations)
             conn.execute("UPDATE triage_jobs SET status='completed',finished_at=?,last_error=NULL WHERE id=?",

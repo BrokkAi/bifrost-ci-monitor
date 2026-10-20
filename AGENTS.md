@@ -351,8 +351,11 @@ retry never duplicates an accepted legacy comment.
 Each entry point takes its own non-blocking file lock. Operator abort and
 fast-track commands wait up to 120 seconds for the merger's same lock.
 Triage publication also coordinates with the fixer lock before deciding
-whether an issue should be created. Preserve these ownership boundaries when
-changing selection/publication; do not make independent workers decide the
+whether an issue should be created. A GitHub command failure for one finding
+leaves it pending while other independent findings publish and checkpoint.
+The cached report stays `publishing` with the error until those writes succeed;
+its combined Slack issue announcement waits for the complete report. Preserve
+these ownership boundaries when changing selection/publication; do not make independent workers decide the
 same claim from separate snapshots.
 
 Host-side GitHub operations go through `monitor.run_gh`, which obtains an

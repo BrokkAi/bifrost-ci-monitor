@@ -744,6 +744,42 @@ class TriageTests(TestCase):
             self.conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=?', (json.dumps(report), 'job'))
         return report
 
+    def test_failed_issue_write_does_not_strand_later_findings(self):
+        self.add_failure('Blocked repository')
+        self.add_failure('Independent defect')
+        self.add_failure('Independent resolution')
+        report = self.separate_product_findings()
+        report['findings'][2].update(outcome='resolved', issue=None)
+        with self.conn:
+            self.conn.execute('UPDATE triage_jobs SET report_json=? WHERE id=?',
+                              (json.dumps(report), 'job'))
+        original = triage.publish_issue
+        def blocked(conn, job, index, *args, **kwargs):
+            if index == 0:
+                raise monitor.CommandError('HTTP 403: Resource not accessible by integration')
+            return original(conn, job, index, *args, **kwargs)
+        with mock.patch.object(triage, 'publish_issue', side_effect=blocked):
+            triage.publish(self.conn, self.job())
+        self.assertEqual(self.job()['status'], 'publishing')
+        self.assertIn('finding 0: HTTP 403', self.job()['last_error'])
+        self.assertEqual(len(self.github.issues), 1)
+        self.assertEqual([r[0] for r in self.conn.execute(
+            'SELECT group_index FROM triage_finding_receipts ORDER BY group_index')], [1, 2])
+        self.assertEqual(self.conn.execute(
+            "SELECT status FROM known_failures WHERE identity='Independent resolution'").fetchone()[0], 'fixed')
+        self.slack.assert_not_called()  # The combined notice waits for the complete report.
+        self.reopen()
+        calls_before = list(self.github.calls)
+        triage.publish(self.conn, self.job())
+        self.assertEqual(self.job()['status'], 'completed')
+        self.assertIsNone(self.job()['last_error'])
+        self.assertEqual(len(self.github.issues), 2)
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM triage_finding_receipts').fetchone()[0], 3)
+        self.assertEqual(sum(m == 'POST' and e == 'issues' for m, e, _ in self.github.calls), 2)
+        self.assertEqual(sum(m == 'POST' and e == 'issues' for m, e, _ in calls_before), 1)
+        self.assertEqual(self.slack.call_count, 1)
+        self.assertIn('2 product issues', self.slack.call_args.args[1])
+
     def test_product_report_announces_created_and_reopened_issues_once(self):
         self.add_failure()
         self.add_failure('Second failure')
