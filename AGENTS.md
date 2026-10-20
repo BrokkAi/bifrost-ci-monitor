@@ -875,8 +875,11 @@ environment-certification jobs use native runners. Format 3 adds required runtim
 inputs gathered from project-wide env_inputs declarations. Native capture preserves
 actual inherited values, including script overrides, without imposing suite defaults.
 Formats 1/2 remain readable but cannot supply passes without recorded runtime inputs.
-Consumers accept summary formats 1/2/3, request CLI 0.1.5, retain
-summaries and leave compatibility decisions to Attest.
+Consumers accept summary formats 1/2/3, request CLI 0.2.1, retain
+summaries and leave compatibility decisions to Attest. A missing declared tool
+prevents that run from producing reusable passes, while it may still consume
+compatible evidence. Tool versions remain diagnostic. Keep explicit S3 storage;
+the newer default filesystem store does not replace the configured proxy.
 For Bifrost integration validation, `mm-db attest SUITE --filter EXPR --
 -p CRATE --lib` (or `--test BINARY`) delegates to that checkout's
 `scripts/merge-nextest.py` when available. Bifrost owns recipe construction and
