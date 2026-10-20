@@ -83,6 +83,13 @@ def independent_dependency_fixture(test):
     patcher.start()
 
 
+def quick_policy_passed_fixture(test):
+    """Async landing tests reach the quick policy gate; its own tests cover the lookup."""
+    patcher = mock.patch.object(automerge, 'check_quick_policy', return_value=('success', ''))
+    test.addCleanup(patcher.stop)
+    return patcher.start()
+
+
 @contextmanager
 def unchanged_queue():
     """Unchanged GitHub source heads and no arrivals for unrelated phase tests."""
@@ -1121,6 +1128,65 @@ class CiSupervisionTests(TestCase):
         ]):
             self.assertEqual(automerge.check_pr_verification(HEAD_ONE), "success")
 
+    def test_quick_policy_reads_its_own_job_and_names_failed_steps(self):
+        workflow_run = {
+            "path": ".github/workflows/ci.yml", "head_sha": HEAD_ONE,
+            "event": "pull_request", "run_attempt": 1, "run_number": 21,
+            "id": 93, "check_suite_id": 930,
+            "updated_at": "2026-10-20T15:30:00Z",
+        }
+        def check_runs(quick_status, quick_conclusion):
+            return {"check_runs": [
+                {"name": "PR verification", "check_suite": {"id": 930},
+                 "status": "completed", "conclusion": "success",
+                 "started_at": "2026-10-20T15:40:00Z"},
+                {"name": "quick policy", "id": 7731, "check_suite": {"id": 930},
+                 "status": quick_status, "conclusion": quick_conclusion,
+                 "html_url": "https://github.test/runs/7731",
+                 "started_at": "2026-10-20T15:31:00Z"},
+            ]}
+        job = {"steps": [
+            {"name": "Check open-core path classification", "conclusion": "success"},
+            {"name": "Dry-run the open-core projection", "conclusion": "failure"},
+        ]}
+        with mock.patch.object(automerge, "gh_json", side_effect=[
+            {"workflow_runs": [workflow_run]}, check_runs("completed", "failure"), job,
+        ]) as gh:
+            state, evidence = automerge.check_quick_policy(HEAD_ONE)
+        self.assertEqual(state, "failure")
+        self.assertIn("actions/jobs/7731", gh.call_args_list[2].args[0][1])
+        self.assertIn("https://github.test/runs/7731", evidence)
+        self.assertIn("failed steps: Dry-run the open-core projection", evidence)
+        self.assertNotIn("classification", evidence)
+
+        # A skipped or cancelled job checked nothing; only success lets a batch land.
+        for status, conclusion, expected in (
+            ("in_progress", None, "pending"),
+            ("completed", "success", "success"),
+        ):
+            with mock.patch.object(automerge, "gh_json", side_effect=[
+                {"workflow_runs": [workflow_run]}, check_runs(status, conclusion),
+            ]):
+                self.assertEqual(automerge.check_quick_policy(HEAD_ONE), (expected, ""))
+        with mock.patch.object(automerge, "gh_json", side_effect=[
+            {"workflow_runs": [workflow_run]}, check_runs("completed", "skipped"),
+            {"steps": []},
+        ]):
+            state, evidence = automerge.check_quick_policy(HEAD_ONE)
+        self.assertEqual(state, "failure")
+        self.assertIn("concluded skipped", evidence)
+
+        # A batch that breaks ci.yml gets a completed run with no jobs; waiting would hang.
+        broken = dict(workflow_run, status="completed", conclusion="failure",
+                      html_url="https://github.test/actions/runs/93")
+        with mock.patch.object(automerge, "gh_json", side_effect=[
+            {"workflow_runs": [broken]}, {"check_runs": []},
+        ]):
+            state, evidence = automerge.check_quick_policy(HEAD_ONE)
+        self.assertEqual(state, "failure")
+        self.assertIn("https://github.test/actions/runs/93", evidence)
+        self.assertIn("without a `quick policy` job", evidence)
+
     def test_ci_wait_polls_with_handoff_without_observing_session_idle(self):
         conn = make_db(phase="waiting_ci")
         row = row_for(conn)
@@ -1974,6 +2040,7 @@ class RulesetScriptTests(TestCase):
 class PublicationGateTests(TestCase):
     def setUp(self):
         independent_dependency_fixture(self)
+        self.quick_policy = quick_policy_passed_fixture(self)
 
     def test_async_local_pass_lands_without_querying_ci(self):
         conn = make_db(phase="building", ci_mode="async")
@@ -2014,10 +2081,68 @@ class PublicationGateTests(TestCase):
         self.assertTrue(any(call.args[0][:2] == ["pr", "merge"]
                             for call in gh.call_args_list))
         self.assertTrue(any(call.args[4:6] == (
-            "success", "async: local targeted tests passed; CI runs after merge",
+            "success", "async: local targeted tests and quick policy passed; CI runs after merge",
         ) for call in status.call_args_list))
         complete.assert_called_once()
         conn.close()
+
+    def _merge_async_with_quick_policy(self, conn, state, evidence=""):
+        self.quick_policy.return_value = (state, evidence)
+        view = {"state": "OPEN", "isDraft": False, "baseRefName": "master",
+                "headRefOid": HEAD_ONE, "baseRefOid": BASE_SHA,
+                "url": "https://github.test/pr/211"}
+        with (
+            mock.patch.object(automerge, "integration_pr_view", return_value=view),
+            mock.patch.object(automerge, "current_master_sha", return_value=BASE_SHA),
+            mock.patch.object(automerge, "_record_trusted_rejection_markers", return_value=False),
+            mock.patch.object(automerge, "_recheck_sources", return_value=([pull()], [])),
+            mock.patch.object(automerge, "verify_source_ancestry", return_value=(True, "ok")),
+            mock.patch.object(automerge, "_try_post_verdict_status", return_value=True) as status,
+            mock.patch.object(automerge, "_validation_impact", return_value={"mode": "impact"}),
+            mock.patch.object(automerge, "run_gh") as gh,
+            mock.patch.object(automerge, "_complete_landed_batch") as complete,
+        ):
+            automerge._merge_integration(conn, monitor.SlackTransport("webhook", webhook="x"),
+                                         row_for(conn))
+        self.quick_policy.assert_called_with(HEAD_ONE)
+        self.assertFalse(any(call.args[0][:2] == ["pr", "merge"] for call in gh.call_args_list))
+        complete.assert_not_called()
+        return status
+
+    def test_async_local_pass_waits_for_quick_policy(self):
+        conn = make_db(phase="merging", ci_mode="async")
+        self.addCleanup(conn.close)
+        with conn:
+            conn.execute("UPDATE automerge_batches SET agent_final_message=?",
+                         (async_local_report(),))
+        record_handoff(conn)
+        status = self._merge_async_with_quick_policy(conn, "pending")
+        self.assertEqual(status.call_args.args[3:5], (HEAD_ONE, "pending"))
+        self.assertIn("waiting for quick policy", status.call_args.args[5])
+        # The next tick re-reads the job from the same phase and receipt.
+        self.assertEqual(row_for(conn)["phase"], "merging")
+        self.assertIsNone(row_for(conn)["pending_prompt"])
+
+    def test_red_quick_policy_returns_the_batch_to_its_agent(self):
+        # BrokkAi/bifrost-dev#6083: batches #6061 and #6078 landed with a red
+        # quick policy, and the release gate failed the same checks on master.
+        conn = make_db(phase="merging", ci_mode="async")
+        self.addCleanup(conn.close)
+        with conn:
+            conn.execute("UPDATE automerge_batches SET agent_final_message=?",
+                         (async_local_report(),))
+        record_handoff(conn)
+        evidence = ("`quick policy` concluded failure at https://github.test/runs/7731; "
+                    "failed steps: Dry-run the open-core projection")
+        status = self._merge_async_with_quick_policy(conn, "failure", evidence)
+        self.assertEqual(status.call_args.args[3:5], (HEAD_ONE, "pending"))
+        self.assertIn("quick policy failed", status.call_args.args[5])
+        row = row_for(conn)
+        self.assertEqual(row["phase"], "fixing")
+        self.assertEqual(row["ready_json"], "{}")
+        self.assertIn(evidence, row["pending_prompt"])
+        self.assertIn(HEAD_ONE, row["pending_prompt"])
+        self.assertIn("empty commit", row["pending_prompt"])
 
     def test_async_pass_after_ejection_lands_without_absorbing_new_arrivals(self):
         for already_recorded in (False, True):
@@ -4327,6 +4452,9 @@ class EntrypointHeartbeatTests(TestCase):
 
 class CampaignTargetTests(TestCase):
     target = 'stabilize/test'
+
+    def setUp(self):
+        quick_policy_passed_fixture(self)
 
     def campaign_pull(self):
         return automerge.PullRequest(7, 'campaign fix', HEAD_ONE, 'url',

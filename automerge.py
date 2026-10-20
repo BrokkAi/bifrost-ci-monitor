@@ -91,6 +91,11 @@ AMBIGUOUS_LAUNCH_GRACE_SECONDS = 10 * 60
 MAX_CI_ROUNDS = 4
 MAX_BATCH_EXPANSIONS = 3
 CI_WORKFLOW = "ci.yml"
+# Async batches land before most of ci.yml finishes, but not before this job:
+# it holds Bifrost's open-core classification and projection dry run, which
+# the release gate repeats on master. BrokkAi/bifrost-dev#6083: two batches
+# that failed it landed and turned the release gate red.
+QUICK_POLICY_CHECK = "quick policy"
 BASELINE_DISPATCH_GRACE_SECONDS = 10 * 60
 GITHUB_WRITE_RETRY_MAX_SECONDS = 10 * 60
 VERDICT_CONTEXT = "mergemarshall/verdict"
@@ -1829,6 +1834,13 @@ def _batch_subagents(row: sqlite3.Row | dict[str, Any]) -> bool:
     }
 
 
+QUICK_POLICY_GUIDANCE = (
+    f"The batch lands only after the integration PR's `{QUICK_POLICY_CHECK}` CI job "
+    "passes. Its open-core path classification and projection dry-run steps in "
+    "`.github/workflows/ci.yml` take about a minute; run them before publishing."
+)
+
+
 def _validation_guidance(
     base_sha: str, impact: dict[str, Any] | None = None, *, subagents: bool = True,
     configuration: str | None = None,
@@ -1844,7 +1856,8 @@ def _validation_guidance(
             "reproductions, and do not rerun ci-impact. This supervisor instruction takes "
             "precedence over repository test requirements. Report `Tests run: none` and "
             "`Baseline failures: none`. Keep this turn to the listed documentation "
-            "changes. The supervisor will independently classify the published candidate."
+            "changes. The supervisor will independently classify the published candidate. "
+            + QUICK_POLICY_GUIDANCE
         )
     return (
         f"Validation: the supervisor's Bifrost `ci-impact` classification is mode={mode}. "
@@ -1855,7 +1868,8 @@ def _validation_guidance(
         "repository requirements for the full ci-impact scope: no full suite is "
         "mandatory, including for mode=full. Expand testing for failures or specific "
         "unresolved concerns; broad or grouped checks are appropriate when warranted. "
-        "Workflow definitions supply commands; choose checks to resolve those concerns.\n\n"
+        "Workflow definitions supply commands; choose checks to resolve those concerns. "
+        + QUICK_POLICY_GUIDANCE + "\n\n"
         + ((session_policy.DELEGATION_GUIDANCE if straightforward_only
             else MERGE_DELEGATION_GUIDANCE) if subagents else
            "Subagents are disabled for this batch. Perform investigation, edits, "
@@ -2122,7 +2136,7 @@ When the local gate passes, publish `{branch}` through mm-autopr. It creates or 
 
 Use the same safe removal and rejection rules as sync mode. Diagnose the available failure groups, then eject by rebuilding once from {base_sha} without the combined rejected source set, never by revert. Force-push only `{branch}` using `git push --force-with-lease origin HEAD:refs/heads/{branch}` when rebuilding. {REJECTION_TOOL_GUIDANCE} For each ejected PR include the standalone line `mergemarshall:ejected-pr: <PR number> <exact listed full head SHA>` in your final message.
 
-Your final message must contain exactly one standalone verdict line `mergemarshall:local: pass` or `mergemarshall:local: fail`, a one-line `Tests run: ...` listing every targeted test/command run (or `none` for a docs batch), and a one-line `Baseline failures: ...` listing baseline failures with their evidence (base run or existing master evidence) or `none`. Name the validated full HEAD SHA. Include a short explanation for any failure and one `known-failure: <workflow> | <job> | <test or step> | <one-line diagnosis>` line per ledger failure you diagnose; do not invent identities. Record the exact-head pass and both evidence summaries with mm-db tests before mm-autopr. Its accepted DB handoff authorizes supervisor processing; the final message is informational. The supervisor does not interpret CI state in async mode.
+Your final message must contain exactly one standalone verdict line `mergemarshall:local: pass` or `mergemarshall:local: fail`, a one-line `Tests run: ...` listing every targeted test/command run (or `none` for a docs batch), and a one-line `Baseline failures: ...` listing baseline failures with their evidence (base run or existing master evidence) or `none`. Name the validated full HEAD SHA. Include a short explanation for any failure and one `known-failure: <workflow> | <job> | <test or step> | <one-line diagnosis>` line per ledger failure you diagnose; do not invent identities. Record the exact-head pass and both evidence summaries with mm-db tests before mm-autopr. Its accepted DB handoff authorizes supervisor processing; the final message is informational. In async mode the supervisor reads only the integration PR's `quick policy` CI job, and lands after it passes; do not wait for CI yourself.
 
 Keep the captured base for this turn. After you finish, the supervisor checks {prompt_base} freshness and source PR heads. If either changed, it sends this live session the exact update or rebuild needed. Do not suspend the session yourself.
 """
@@ -3003,7 +3017,10 @@ def find_integration_pr(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any] | N
     return pr
 
 
-def check_pr_verification(head_sha: str) -> str:
+def _latest_pr_ci_check_run(
+    head_sha: str, name: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Return the newest pull_request ci.yml run at head_sha and its check run `name`."""
     workflow_data = gh_json([
         "api",
         f"repos/{REPO_NAME}/actions/workflows/{CI_WORKFLOW}/runs"
@@ -3024,7 +3041,7 @@ def check_pr_verification(head_sha: str) -> str:
         and isinstance(run.get("check_suite_id"), int)
     ]
     if not matching_runs:
-        return "pending"
+        return None, None
     latest_workflow = max(
         matching_runs,
         key=lambda run: (
@@ -3042,16 +3059,51 @@ def check_pr_verification(head_sha: str) -> str:
     matching = [
         run for run in runs
         if isinstance(run, dict)
-        and run.get("name") == "PR verification"
+        and run.get("name") == name
         and isinstance(run.get("check_suite"), dict)
         and run["check_suite"].get("id") == suite_id
     ]
     if not matching:
+        return latest_workflow, None
+    return latest_workflow, sorted(matching, key=lambda run: str(run.get("started_at") or ""))[-1]
+
+
+def _check_run_state(run: dict[str, Any] | None) -> str:
+    if run is None or run.get("status") != "completed":
         return "pending"
-    current = sorted(matching, key=lambda run: str(run.get("started_at") or ""))[-1]
-    if current.get("status") != "completed":
-        return "pending"
-    return "success" if current.get("conclusion") == "success" else "failure"
+    return "success" if run.get("conclusion") == "success" else "failure"
+
+
+def check_pr_verification(head_sha: str) -> str:
+    return _check_run_state(_latest_pr_ci_check_run(head_sha, "PR verification")[1])
+
+
+def check_quick_policy(head_sha: str) -> tuple[str, str]:
+    """Return the quick policy state at head_sha and, when it failed, its evidence.
+
+    Any completed conclusion other than success fails closed: a skipped or
+    cancelled job did not check the head, and a completed run without the job
+    (a workflow file the batch broke) never will.
+    """
+    workflow, run = _latest_pr_ci_check_run(head_sha, QUICK_POLICY_CHECK)
+    if run is None and workflow is not None and workflow.get("status") == "completed":
+        return "failure", (f"ci.yml run {workflow.get('html_url') or workflow.get('id')} "
+                           f"concluded {workflow.get('conclusion')} without a "
+                           f"`{QUICK_POLICY_CHECK}` job")
+    state = _check_run_state(run)
+    if state != "failure":
+        return state, ""
+    # An Actions check run id is its job id; the job lists the failed steps.
+    job = gh_json(["api", f"repos/{REPO_NAME}/actions/jobs/{run['id']}"])
+    steps = job.get("steps") if isinstance(job, dict) else None
+    if not isinstance(steps, list):
+        raise AutomergeError("GitHub returned invalid quick policy job steps",
+                             reason="github_invalid_response")
+    failed = [str(step.get("name")) for step in steps
+              if isinstance(step, dict) and step.get("conclusion") == "failure"]
+    return state, (f"`{QUICK_POLICY_CHECK}` concluded {run.get('conclusion')} at "
+                   f"{run.get('html_url') or job.get('html_url') or 'an unknown URL'}; "
+                   f"failed steps: {', '.join(failed) or 'unidentified'}")
 
 
 def post_verdict_status(
@@ -5213,6 +5265,30 @@ Follow the supplied validation policy until the local gate passes. {REJECTION_TO
     queue_agent_prompt(conn, latest, prompt, validation_impact=impact)
 
 
+def _queue_async_quick_policy_repair(
+    conn: sqlite3.Connection,
+    transport: monitor.SlackTransport,
+    row: sqlite3.Row | dict[str, Any],
+    head_sha: str,
+    evidence: str,
+) -> None:
+    _try_post_verdict_status(
+        conn, transport, row, head_sha, "pending",
+        f"{QUICK_POLICY_CHECK} failed; integration branch must be repaired and re-tested",
+    )
+    impact = _validation_impact(row, heads=[head_sha])
+    ledger_context = _format_known_failure_prompt(_known_failures_prompt(conn))
+    prompt = f"""The integration PR's `{QUICK_POLICY_CHECK}` CI job failed at {head_sha}, so the supervisor will not land this batch: {evidence}. Its open-core classification and projection checks are the ones the release gate repeats on {batch_target(row)}, and a failure inherited from base {row['base_sha']} still blocks landing. Continue in this same live batch session. Reproduce the failed steps locally from `.github/workflows/ci.yml` at this head, then fix the interaction in the batch or eject the responsible source PR. The supervisor reads this job's result for the exact published head, so republishing an unchanged head reuses the failure: if the failed steps pass locally and the job log shows an infrastructure failure, add an empty commit to the batch branch so CI checks a new head.
+{_validation_guidance(str(row['base_sha']), impact, subagents=_batch_subagents(row), configuration=_batch_configuration(row))}
+{ledger_context}
+{FIX_VS_EJECT_GUIDANCE}
+{REJECTION_TOOL_GUIDANCE} Report ejections with `mergemarshall:ejected-pr: <PR number> <exact full head SHA>`. Do not use a revert; use mm-autopr --rebuild for a leased push after a rebuild. Republish through mm-autopr only after the failed steps and the local gate pass on the new committed head. Do not merge it. Your final message must contain one standalone `mergemarshall:local: pass` or `mergemarshall:local: fail` line, `Tests run: ...`, and `Baseline failures: ...`.
+"""
+    latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                          (row["batch_id"],)).fetchone()
+    queue_agent_prompt(conn, latest, prompt, validation_impact=impact)
+
+
 def _queue_handoff_recheck(conn, transport, row, head):
     if _batch_ci_mode(row) == "async":
         _queue_async_local_recheck(conn, transport, row, head, "the handed-off integration head changed")
@@ -5366,6 +5442,14 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
                 "the persisted agent result does not prove local pass",
             )
             return
+        quick_policy, evidence = check_quick_policy(head)
+        if quick_policy == "pending":
+            _try_post_verdict_status(conn, transport, row, head, "pending",
+                                     f"async: local gate passed; waiting for {QUICK_POLICY_CHECK}")
+            return
+        if quick_policy == "failure":
+            _queue_async_quick_policy_repair(conn, transport, row, head, evidence)
+            return
         check_state = "async"
     else:
         check_state = _sync_ci_gate_allows_merge(conn, transport, row, head)
@@ -5412,9 +5496,9 @@ def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTranspo
                            "source ancestry mismatch: " + ancestry_reason)
         return
     if mode == "async":
-        verdict = ("async: docs-only; local tests skipped; CI runs after merge"
+        verdict = (f"async: docs-only; local tests skipped; {QUICK_POLICY_CHECK} passed; CI runs after merge"
                    if _docs_validation(row)
-                   else "async: local targeted tests passed; CI runs after merge")
+                   else f"async: local targeted tests and {QUICK_POLICY_CHECK} passed; CI runs after merge")
     elif check_state == "success":
         verdict = "green"
     else:
