@@ -114,8 +114,8 @@ def create_app():
         return releases.get(id)
 
     @api.post('/releases/{id}/abort', response_model=m.Campaign, tags=['releases'], responses=RELEASE_BUSY)
-    def release_abort(id: str, user: Maintainer):
-        return releases.abort(id, user.login)
+    def release_abort(id: str, user: Maintainer, body: m.AbortRelease | None = None):
+        return releases.abort(id, user.login, salvage=body.salvage if body else True)
 
     @api.post('/releases/{id}/resume', response_model=m.Campaign, tags=['releases'], responses=RELEASE_BUSY)
     def release_resume(id: str, user: Maintainer):

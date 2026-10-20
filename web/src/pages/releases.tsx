@@ -158,8 +158,9 @@ function LiveCampaign({
   canRelease: boolean;
 }) {
   const client = useQueryClient();
+  const [salvage, setSalvage] = useState(true);
   const abort = useMutation({
-    mutationFn: () => abortRelease(campaign.id),
+    mutationFn: () => abortRelease(campaign.id, salvage),
     onSuccess: () => {
       client.invalidateQueries({ queryKey: ["/releases"] });
       client.invalidateQueries({ queryKey: ["release-anchor"] });
@@ -359,6 +360,20 @@ function LiveCampaign({
                     remaining CI stages. Confirm before ending the live release
                     campaign.
                   </AlertDialogDescription>
+                  <label className="flex items-start gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={salvage}
+                      onChange={(event) => setSalvage(event.target.checked)}
+                      className="mt-0.5 accent-primary"
+                    />
+                    <span>
+                      <span className="font-medium">Merge fixes to master</span>
+                      <span className="block text-xs text-muted-foreground">
+                        Opens a final salvage gate PR from the campaign branch; the merge queue tests it like any PR.
+                      </span>
+                    </span>
+                  </label>
                   <div className="flex justify-end gap-2">
                     <AlertDialogCancel asChild>
                       <Button variant="outline">Keep running</Button>

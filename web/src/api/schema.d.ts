@@ -349,6 +349,14 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AbortRelease */
+        AbortRelease: {
+            /**
+             * Salvage
+             * @default true
+             */
+            salvage: boolean;
+        };
         /**
          * AttentionFailure
          * @description Open product CI failures that no agent is working on, grouped by issue.
@@ -2514,7 +2522,11 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["AbortRelease"] | null;
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {

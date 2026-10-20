@@ -59,8 +59,8 @@ def list_campaigns(limit=50):
     return [campaign(value) for value in call('list_campaigns', limit=limit)]
 
 
-def abort(campaign_id, login):
-    return campaign(call('abort', campaign_id, requested_by=login))
+def abort(campaign_id, login, salvage=True):
+    return campaign(call('abort', campaign_id, requested_by=login, salvage=salvage))
 
 
 
