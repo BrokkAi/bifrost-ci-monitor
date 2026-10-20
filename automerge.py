@@ -1367,6 +1367,7 @@ def connect_db() -> sqlite3.Connection:
             agent_final_message TEXT NOT NULL DEFAULT '',
             suspend_pending INTEGER NOT NULL DEFAULT 0,
             suspend_verify_failures INTEGER NOT NULL DEFAULT 0,
+            suspend_retry_after REAL NOT NULL DEFAULT 0,
             outcome_posted INTEGER NOT NULL DEFAULT 0,
             finished_at TEXT,
             phase TEXT NOT NULL DEFAULT 'building',
@@ -1457,6 +1458,7 @@ def connect_db() -> sqlite3.Connection:
         ("priority", "INTEGER NOT NULL DEFAULT 0"),
         ("suspend_pending", "INTEGER NOT NULL DEFAULT 0"),
         ("suspend_verify_failures", "INTEGER NOT NULL DEFAULT 0"),
+        ("suspend_retry_after", "REAL NOT NULL DEFAULT 0"),
         ("phase", "TEXT NOT NULL DEFAULT 'building'"),
         ("ci_mode", "TEXT NOT NULL DEFAULT 'sync'"),
         ("validation_impact_json", "TEXT NOT NULL DEFAULT '{}'"),
@@ -1529,7 +1531,8 @@ def connect_db() -> sqlite3.Connection:
         # Old supervisors requested suspension between turns. Those requests
         # must never be retried against a batch that is still doing work.
         conn.execute(
-            "UPDATE automerge_batches SET suspend_pending=0, suspend_verify_failures=0 "
+            "UPDATE automerge_batches SET suspend_pending=0, suspend_verify_failures=0, "
+            "suspend_retry_after=0 "
             "WHERE phase NOT IN ('terminal', 'aborting') AND suspend_pending=1"
         )
     monitor.ensure_known_failure_schema(conn)
@@ -2704,7 +2707,8 @@ def check_pending_suspensions(
     conn: sqlite3.Connection, transport: monitor.SlackTransport
 ) -> None:
     rows = conn.execute(
-        "SELECT batch_id, session_id, suspend_verify_failures FROM automerge_batches "
+        "SELECT batch_id, session_id, suspend_verify_failures, suspend_retry_after "
+        "FROM automerge_batches "
         "WHERE suspend_pending = 1 AND session_id IS NOT NULL AND phase = 'terminal'"
     ).fetchall()
     for row in rows:
@@ -2720,7 +2724,7 @@ def check_pending_suspensions(
                 with conn:
                     conn.execute(
                         "UPDATE automerge_batches SET suspend_pending = 0, "
-                        "suspend_verify_failures = 0 WHERE batch_id = ?",
+                        "suspend_verify_failures = 0, suspend_retry_after = 0 WHERE batch_id = ?",
                         (batch_id,),
                     )
                 continue
@@ -2739,7 +2743,20 @@ def check_pending_suspensions(
                     "mj_suspend_not_stopped",
                     f"session {session_id} still reports state {session.get('state')!r}",
                 )
-                request_suspend(conn, transport, batch_id, session_id)
+                # A failed native checkpoint can require a tool repair (for
+                # example an unresolved Git merge). Retain its environment and
+                # keep verifying completion, but do not submit the same failed
+                # lifecycle operation on every poll. Checkpoint before sending
+                # so an ambiguous response or process restart retains backoff.
+                now = time.time()
+                if now >= float(row["suspend_retry_after"] or 0):
+                    delay = min(900, 60 * 2 ** min(failures - 3, 4))
+                    with conn:
+                        conn.execute(
+                            "UPDATE automerge_batches SET suspend_retry_after = ? WHERE batch_id = ?",
+                            (now + delay, batch_id),
+                        )
+                    request_suspend(conn, transport, batch_id, session_id)
         except (monitor.MjError, ValueError) as exc:
             failures = int(row["suspend_verify_failures"] or 0) + 1
             with conn:

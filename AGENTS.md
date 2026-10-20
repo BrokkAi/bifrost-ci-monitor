@@ -394,6 +394,12 @@ retry never duplicates an accepted legacy comment.
 
 Each entry point takes its own non-blocking file lock. Operator abort and
 fast-track commands wait up to 120 seconds for the merger's same lock.
+Terminal suspension retries checkpoint `suspend_retry_after` before submission,
+with exponential backoff capped at fifteen minutes. Completion verification
+continues on each poll and clears the checkpoint after confirmed suspension.
+This applies only to terminal cleanup; active session lifecycle and scheduling
+are unchanged. Native checkpoint refusals for unresolved Git conflicts retain
+the original index, merge state, files and environment for a native tool repair.
 Triage publication also coordinates with the fixer lock before deciding
 whether an issue should be created. A GitHub command failure for one finding
 leaves it pending while other independent findings publish and checkpoint.

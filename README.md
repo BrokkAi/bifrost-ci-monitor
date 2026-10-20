@@ -419,6 +419,16 @@ PRs. Established exact-head rejections remain recorded and their delivery is
 retried; other source heads become eligible again. Aborting a predecessor also
 aborts its speculative successor. For a direct attempt, the source PR stays open.
 
+If suspension fails, the terminal batch retains its cleanup request and the
+original session. The supervisor continues checking for completion; retries of
+the suspension itself back off from one minute to at most fifteen minutes and
+survive restarts. Mjolnir currently refuses to checkpoint a clone with unresolved
+Git conflicts or an unfinished Git operation. Inspect the error's reference in
+`~/.local/share/mjolnir/logs/mj-daemon-*.log` on the CI host. Preserve the conflicted
+index, pending merge, files and environment; do not reset, stage conflict markers
+as a resolution, or destroy the session just to make cleanup succeed. This
+cleanup failure does not reserve the aborted batch's source PRs.
+
 ### Stabilize a branch
 
 A stabilize campaign cuts `stabilize/<id>` from one master commit, runs push CI,

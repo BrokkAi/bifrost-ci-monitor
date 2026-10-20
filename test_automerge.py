@@ -132,6 +132,7 @@ def make_db(
             transcript_after_seq INTEGER NOT NULL DEFAULT 0, terminal_status TEXT,
             agent_transcript TEXT NOT NULL DEFAULT '', agent_final_message TEXT NOT NULL DEFAULT '',
             suspend_pending INTEGER NOT NULL DEFAULT 0, suspend_verify_failures INTEGER NOT NULL DEFAULT 0,
+            suspend_retry_after REAL NOT NULL DEFAULT 0,
             outcome_posted INTEGER NOT NULL DEFAULT 0, finished_at TEXT,
             phase TEXT NOT NULL DEFAULT 'building', ci_mode TEXT NOT NULL DEFAULT 'sync',
             validation_impact_json TEXT NOT NULL DEFAULT '{}',
@@ -3734,6 +3735,42 @@ class LaunchAndLifecycleTests(TestCase):
         mj.assert_not_called()
         conn.close()
 
+    def test_failed_suspension_backoff_survives_reopen_and_still_observes_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "activity.db"
+            with mock.patch.object(automerge, "DB_PATH", path):
+                conn = automerge.connect_db()
+            identifier = automerge.create_batch(conn, [pull()], BASE_SHA)
+            with conn:
+                conn.execute("UPDATE automerge_batches SET status='completed', phase='terminal', "
+                             "session_id='session', suspend_pending=1, suspend_verify_failures=3 "
+                             "WHERE batch_id=?", (identifier,))
+            transport = monitor.SlackTransport("webhook", webhook="x")
+            with (mock.patch.object(monitor, "require_mj_success", return_value='{"state":"running"}') as mj,
+                  mock.patch.object(automerge, "notify_blocked_once"),
+                  mock.patch.object(automerge, "request_suspend", return_value=False) as suspend,
+                  mock.patch.object(automerge.time, "time", return_value=1000)):
+                automerge.check_pending_suspensions(conn, transport)
+                suspend.assert_called_once()
+                due = conn.execute("SELECT suspend_retry_after FROM automerge_batches").fetchone()[0]
+                self.assertGreater(due, 1000)
+                conn.close()
+                with mock.patch.object(automerge, "DB_PATH", path):
+                    conn = automerge.connect_db()
+                automerge.check_pending_suspensions(conn, transport)
+                self.assertEqual(suspend.call_count, 1)
+                self.assertEqual(mj.call_count, 2)
+                with mock.patch.object(automerge.time, "time", return_value=due):
+                    automerge.check_pending_suspensions(conn, transport)
+                self.assertEqual(suspend.call_count, 2)
+                mj.return_value = '{"state":"suspended"}'
+                automerge.check_pending_suspensions(conn, transport)
+                row = conn.execute("SELECT suspend_pending,suspend_verify_failures,suspend_retry_after "
+                                   "FROM automerge_batches").fetchone()
+                self.assertEqual(tuple(row), (0, 0, 0))
+                self.assertEqual(suspend.call_count, 2)
+            conn.close()
+
     def test_phase_and_integration_pr_fields_migrate_additively(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "activity.db"
@@ -3778,6 +3815,7 @@ class LaunchAndLifecycleTests(TestCase):
             self.assertIn("github_write_retry_after", columns)
             self.assertIn("suspend_pending", columns)
             self.assertIn("suspend_verify_failures", columns)
+            self.assertEqual(defaults["suspend_retry_after"], "0")
             self.assertIn("start_pr_list_sent", columns)
             self.assertEqual(defaults['ready_json'], "'{}'")
             self.assertIn('prompt_command_id', columns)
