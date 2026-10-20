@@ -1,0 +1,12 @@
+# Layer CI prerequisites onto the existing target image without changing its
+# Rust/harness versions. Pin BASE_IMAGE to its locally inspected image ID.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG BASE_USER=hel
+USER root
+COPY scripts/install-ci-go.sh /usr/local/libexec/mergemarshall/install-ci-go.sh
+RUN sh /usr/local/libexec/mergemarshall/install-ci-go.sh \
+    && go env GOROOT \
+    && bash -lc 'go version && command -v gofmt'
+USER ${BASE_USER}
+RUN go version && bash -lc 'go version && command -v gofmt'

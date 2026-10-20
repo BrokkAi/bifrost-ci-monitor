@@ -114,6 +114,10 @@ Cron executes `monitor.py` straight from this working tree every five minutes
 - `scripts/apply-mergemarshall-ruleset.sh`: administrator-only normal-policy
   setup. It is never called by cron. Its dry-run and confirmation behavior
   are covered by `test_automerge.py`.
+- `containers/Containerfile.ci-tools` and `scripts/install-ci-go.sh`: the pinned,
+  checksum-verified Go prerequisite layer for both CI target images. Preserve
+  the base image's user and Rust/harness versions. Per-session installations do
+  not repair future launches; operator deployment procedures are in README.
 - `mm_web/` and `web/`: the dashboard service (`mm-web.service`, FastAPI in the
   uv environment from `pyproject.toml`) and its React UI. Cron entry points and
   `mm_service.py` stay stdlib-only and must not import `mm_web`.
