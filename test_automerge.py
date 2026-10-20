@@ -491,6 +491,7 @@ class SelectionTests(TestCase):
     def test_recorded_rejection_excludes_exact_head_before_github_label_arrives(self):
         conn = make_db()
         with conn:
+            conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal'")
             automerge.enqueue_github_write(conn, "batch-test", "reject_head", 7, HEAD_ONE,
                                           {"reason": "regression", "evidence": "test fails"})
         with mock.patch.object(automerge, "list_open_pull_requests", return_value=[api_pull(7)]):
@@ -597,13 +598,13 @@ class SelectionTests(TestCase):
         self.assertEqual([item.number for item in selected], [8])
         self.assertFalse(any(args[:2] == ["pr", "edit"] for args in calls))
 
-    def test_high_and_immediate_selection_excludes_other_eligible_prs(self):
+    def test_high_selection_excludes_immediate_roots_and_ordinary_roots(self):
         rows = [api_pull(1), api_pull(2, head_sha=HEAD_TWO, labels=["mergemarshall:high"]),
                 api_pull(3, head_sha=HEAD_THREE, labels=["mergemarshall:immediate"])]
         with mock.patch.object(automerge, "run_gh", return_value=json.dumps([rows])):
             selected = automerge.select_eligible_pull_requests()
-        self.assertEqual([item.number for item in selected], [2, 3])
-        self.assertEqual([item.immediate for item in selected], [False, True])
+        self.assertEqual([item.number for item in selected], [2])
+        self.assertEqual([item.immediate for item in selected], [False])
 
     def test_priority_aliases_are_accepted(self):
         rows = [api_pull(1, labels=["mergemarshall-priority:high"]),
@@ -611,8 +612,8 @@ class SelectionTests(TestCase):
                 api_pull(3, head_sha=HEAD_THREE, labels=[automerge.PRIORITY_LABEL])]
         with mock.patch.object(automerge, "run_gh", return_value=json.dumps([rows])):
             selected = automerge.select_eligible_pull_requests()
-        self.assertEqual([item.number for item in selected], [1, 2, 3])
-        self.assertEqual([item.immediate for item in selected], [False, True, False])
+        self.assertEqual([item.number for item in selected], [1, 3])
+        self.assertEqual([item.immediate for item in selected], [False, False])
 
     def test_ci_fix_label_does_not_make_a_pr_priority(self):
         rows = [api_pull(1, labels=["ci-fix"]), api_pull(2, head_sha=HEAD_TWO)]
@@ -656,14 +657,15 @@ class InspectionTests(TestCase):
             self.assertEqual(report["state"], "ready")
             self.assertEqual(report["selected_prs"][0]["number"], 7)
             self.assertEqual(report["base_sha"], BASE_SHA)
-            select.assert_called_once_with(dry_run=True)
+            select.assert_any_call(dry_run=True)
+            select.assert_any_call(dry_run=True, priority_only=True, immediate_only=True)
             self.assertFalse(database.exists())
 
     def test_check_only_reports_historical_expansion_limit(self):
         output = StringIO()
         active = {"batch_id": "existing", "expansions": 2, "expansion_limit": 0}
         with (mock.patch.object(automerge, "read_active_batch_for_check",
-                                side_effect=[active, None]),
+                                side_effect=[active, None, None]),
               redirect_stdout(output)):
             self.assertEqual(automerge.check_only(), 0)
         report = json.loads(output.getvalue())
@@ -3182,123 +3184,6 @@ class PriorityLaneTests(TestCase):
     def setUp(self):
         independent_dependency_fixture(self)
 
-    def _preempt(self, phase: str) -> sqlite3.Connection:
-        conn = make_db(phase=phase, kind="batch")
-
-        def complete(database, _transport, row):
-            with database:
-                database.execute(
-                    "UPDATE automerge_batches SET status='completed', phase='terminal', "
-                    "terminal_status='aborted', outcome_posted=1 WHERE batch_id=?",
-                    (row["batch_id"],),
-                )
-
-        with (
-            mock.patch.object(monitor, "runtime_binary_issues", return_value=[]),
-            mock.patch.object(automerge, "_complete_abort", side_effect=complete) as abort,
-        ):
-            did_preempt = automerge.preempt_batch_for_priority(
-                conn, mock.Mock(), row_for(conn), [pull(9, HEAD_TWO, immediate=True)],
-            )
-        self.assertTrue(did_preempt)
-        self.assertEqual(row_for(conn)["abort_reason"], "preempted by immediate PR #9")
-        abort.assert_called_once()
-        return conn
-
-    def test_immediate_preempts_building_batch_through_abort_path(self):
-        conn = self._preempt("building")
-        self.assertEqual(row_for(conn)["terminal_status"], "aborted")
-        conn.close()
-
-    def test_immediate_preempts_ci_waiting_batch_through_abort_path(self):
-        conn = self._preempt("waiting_ci")
-        self.assertEqual(row_for(conn)["terminal_status"], "aborted")
-        conn.close()
-
-    def test_immediate_preempts_a_nonpriority_direct_ci_wait(self):
-        conn = make_db(
-            phase="direct_waiting_ci", kind="direct", session_id=None,
-        )
-        with mock.patch.object(automerge, "_complete_abort") as abort:
-            did_preempt = automerge.preempt_batch_for_priority(
-                conn, mock.Mock(), row_for(conn), [pull(9, HEAD_TWO, immediate=True)],
-            )
-        self.assertTrue(did_preempt)
-        self.assertEqual(row_for(conn)["abort_reason"], "preempted by immediate PR #9")
-        abort.assert_called_once()
-        conn.close()
-
-    def test_immediate_does_not_preempt_batch_in_merge_phase(self):
-        conn = make_db(phase="merging", kind="batch")
-        with mock.patch.object(automerge, "abort_batch_locked") as abort:
-            did_preempt = automerge.preempt_batch_for_priority(
-                conn, mock.Mock(), row_for(conn), [pull(9, HEAD_TWO, immediate=True)],
-            )
-        self.assertFalse(did_preempt)
-        abort.assert_not_called()
-        conn.close()
-
-    def test_immediate_does_not_preempt_after_success_status_is_posted(self):
-        conn = make_db(phase="waiting_ci", kind="batch")
-        with conn:
-            conn.execute(
-                "UPDATE automerge_batches SET verdict_status_state='success' "
-                "WHERE batch_id='batch-test'"
-            )
-        with mock.patch.object(automerge, "abort_batch_locked") as abort:
-            did_preempt = automerge.preempt_batch_for_priority(
-                conn, mock.Mock(), row_for(conn), [pull(9, HEAD_TWO, immediate=True)],
-            )
-        self.assertFalse(did_preempt)
-        abort.assert_not_called()
-        conn.close()
-
-    def test_high_does_not_preempt_an_active_high_batch(self):
-        conn = make_db(phase="building", kind="batch", pulls=[pull(priority=True)])
-        with mock.patch.object(automerge, "abort_batch_locked") as abort:
-            did_preempt = automerge.preempt_batch_for_priority(
-                conn, mock.Mock(), row_for(conn), [pull(9, HEAD_TWO, priority=True)],
-            )
-        self.assertFalse(did_preempt)
-        abort.assert_not_called()
-        conn.close()
-
-    def test_high_does_not_preempt_an_active_normal_batch(self):
-        conn = make_db(phase="building")
-        with mock.patch.object(automerge, "abort_batch_locked") as abort:
-            self.assertFalse(automerge.preempt_batch_for_priority(
-                conn, mock.Mock(), row_for(conn), [pull(9, HEAD_TWO, priority=True)],
-            ))
-        abort.assert_not_called()
-        conn.close()
-
-    def test_immediate_preempts_an_active_high_batch(self):
-        conn = make_db(phase="building", pulls=[pull(priority=True)])
-        with mock.patch.object(automerge, "abort_batch_locked") as abort:
-            self.assertTrue(automerge.preempt_batch_for_priority(
-                conn, mock.Mock(), row_for(conn), [pull(9, HEAD_TWO, immediate=True)],
-            ))
-        abort.assert_called_once()
-        conn.close()
-
-    def test_immediate_label_on_existing_normal_member_preempts(self):
-        conn = make_db(phase="building")
-        with mock.patch.object(automerge, "abort_batch_locked") as abort:
-            self.assertTrue(automerge.preempt_batch_for_priority(
-                conn, mock.Mock(), row_for(conn), [pull(immediate=True)],
-            ))
-        abort.assert_called_once()
-        conn.close()
-
-    def test_immediate_already_in_high_batch_does_not_preempt(self):
-        conn = make_db(phase="building", pulls=[pull(immediate=True)])
-        with mock.patch.object(automerge, "abort_batch_locked") as abort:
-            self.assertFalse(automerge.preempt_batch_for_priority(
-                conn, mock.Mock(), row_for(conn), [pull(immediate=True)],
-            ))
-        abort.assert_not_called()
-        conn.close()
-
     def test_slack_start_and_outcome_mark_priority_and_operator_fast_tracks(self):
         for source, selected, start_marker, outcome_marker in (
             ("priority", [pull(priority=True)], "PRIORITY", "priority direct merge"),
@@ -3433,7 +3318,7 @@ class PriorityLaneTests(TestCase):
         self.assertEqual(row_for(conn)["start_pr_list_sent"], 1)
         conn.close()
 
-    def test_preemption_starts_priority_batch_on_the_same_tick(self):
+    def test_immediate_slot_starts_alongside_primary_on_the_same_tick(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "activity.db"
             lock = mock.Mock()
@@ -3478,15 +3363,16 @@ class PriorityLaneTests(TestCase):
                 ):
                     self.assertEqual(automerge.run_automerge(), 0)
                 lock.close.assert_called_once()
-                process.assert_called_once()
+                self.assertEqual(process.call_count, 2)
                 with sqlite3.connect(database) as check:
                     check.row_factory = sqlite3.Row
                     rows = check.execute(
                         "SELECT * FROM automerge_batches ORDER BY created_at, batch_id"
                     ).fetchall()
                 old = next(row for row in rows if row["batch_id"] == old_id)
-                self.assertEqual(old["terminal_status"], "aborted")
+                self.assertIsNone(old["terminal_status"])
                 priority = next(row for row in rows if row["batch_id"] != old_id)
+                self.assertEqual(priority["lane"], "immediate")
                 self.assertEqual(priority["source"], "priority")
                 self.assertEqual(priority["priority"], 1)
                 self.assertEqual(priority["pull_requests_json"], json.dumps([

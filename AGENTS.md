@@ -706,7 +706,7 @@ descendant head retains prior relationships; unrelated replacement work does not
 
 Admit each source only when every prerequisite is in current master by actual
 commit ancestry, or is ready at its exact captured head and included earlier in
-the same batch. Apply the closure at selection, priority/preemption, rebuild
+the same batch. Apply the closure at selection, priority admission, rebuild
 rechecks, retries, direct landing, and `--land-now`. Changed, draft, rejected,
 withdrawn or closed-unmerged prerequisites block descendants while unrelated
 work proceeds.
@@ -828,7 +828,7 @@ once, through the existing recovery path, onto actual master; an in-flight
 legacy incorporation completes under its recorded promotion.
 
 Slack start headings are `*$project* new batch:`, `*$project* promoted batch:`,
-or `*$project* speculative batch:`. Derive `$project` from the repository part
+`*$project* speculative batch:`, or `*$project* immediate batch:`. Derive `$project` from the repository part
 of `monitor.REPO_NAME` using `monitor.slack_project_prefix()`; never hardcode a
 display name. Triage and fixbot thread headings use the same project prefix.
 Omit model/harness boilerplate. Speculative headings explain that the batch runs
@@ -870,8 +870,11 @@ is needed. Read final reports only after this attempt's context divider.
 
 After role promotion, and whenever current master differs from the captured
 base before landing, the supervisor queues `mm-merge --promote` (or the normal
-master update) to merge the fresh master tip into the committed candidate. The
-base becomes that master commit and the source revision changes, which
+master update) to merge the fresh master tip into the committed candidate.
+Queue promotion immediately even while building or fixing, without waiting for
+passing validation or a handoff; deliver through the durable same-session message
+path without cancelling ongoing work. Each target tip is checkpointed once.
+The base becomes that master commit and the source revision changes, which
 invalidates the earlier handoff and withdraws the checkpoint; the agent
 registers the post-merge head. The agent resolves conflicts, chooses reruns from
 the actual diff against the last tested candidate under the validation policy,

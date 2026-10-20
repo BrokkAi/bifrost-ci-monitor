@@ -558,7 +558,7 @@ class Graph:
         self._eligibility[number] = True
         return True
 
-    def select(self, *, priority=True, target_ref=None, priority_only=False):
+    def select(self, *, priority=True, target_ref=None, priority_only=False, immediate_only=False):
         # Selection is lane-local. The default remains the master queue;
         # campaigns are selected explicitly by the campaign supervisor action.
         target_ref = target_ref or self.base_branch
@@ -566,9 +566,24 @@ class Graph:
                  and self.nodes[n].ready
                  and not self.ancestor(self.nodes[n].head, self.target(n)[1]) and self.eligible(n)
                  and (self.available_targets is None or self.target(n)[0] in self.available_targets)]
+        campaign_lane = target_ref != self.base_branch
+        if not campaign_lane:
+            # Ordinary work cannot carry an unlanded immediate prerequisite,
+            # even while the immediate slot is still waiting for admission.
+            ordinary_cache = {}
+            def ordinary(number, path=()):
+                if number in ordinary_cache:
+                    return ordinary_cache[number]
+                if self.nodes[number].immediate or number in path:
+                    return False
+                ordinary_cache[number] = all(
+                    self.landed(dep.head_sha, number) or ordinary(dep.number, path + (number,))
+                    for dep in self.dependencies[number])
+                return ordinary_cache[number]
+            ready = [n for n in ready if self.nodes[n].immediate] if immediate_only else [
+                n for n in ready if ordinary(n)]
         if priority_only and not any(self.nodes[n].priority for n in ready):
             return []
-        campaign_lane = bool(ready and self.target(ready[0])[0] != self.base_branch)
         seeds = [n for n in ready if self.nodes[n].priority] if priority and not campaign_lane else []
         seeds = seeds or ready
         ordered = []

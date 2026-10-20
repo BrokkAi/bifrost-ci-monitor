@@ -72,6 +72,24 @@ class StopWorkTests(unittest.TestCase):
 
 
 class StateTests(unittest.TestCase):
+    def test_immediate_batch_has_primary_role_and_never_has_a_successor(self):
+        identifier = a.create_batch(self.conn, [pull(99, HEAD_ONE, immediate=True)], BASE_SHA, lane='immediate')
+        self.register(identifier, HEAD_THREE)
+        row = self.row(identifier)
+        self.assertEqual(service.state(self.conn, identifier)['role'], 'primary')
+        self.assertIsNone(row['predecessor_id'])
+        with mock.patch.object(a, 'dependency_graph', side_effect=AssertionError('no lookahead discovery')):
+            self.assertEqual(s.selection(a, self.conn, row), [])
+            s.launch_child(a, self.conn, row)
+        with self.assertRaisesRegex(ValueError, 'predecessors'):
+            a.create_batch(self.conn, [pull(100, HEAD_ONE)], BASE_SHA, predecessor_id=identifier)
+        with self.assertRaisesRegex(ValueError, 'predecessors'):
+            a.create_batch(self.conn, [pull(100, HEAD_ONE)], BASE_SHA, lane='immediate', predecessor_id=self.parent)
+        self.assertNotIn('lookahead', a.batch_speculation_guidance(row))
+        with mock.patch.object(monitor, 'slack_send', return_value=(True, 'thread')) as send:
+            a.send_start_notification(self.conn, self.transport, row)
+        self.assertTrue(send.call_args_list[0].args[1].startswith('*bifrost-dev* immediate batch:'))
+
     def test_campaign_parent_never_selects_or_launches_a_successor(self):
         row = dict(self.row(self.parent), target_ref='stabilize/test')
         with (mock.patch.object(a, 'dependency_graph', side_effect=AssertionError('discovery')),
@@ -768,14 +786,10 @@ class StateTests(unittest.TestCase):
         rejection = self.conn.execute("SELECT cancelled_at FROM automerge_github_outbox WHERE kind='reject_head'").fetchone()
         self.assertIsNone(rejection[0])
 
-    def test_promotion_requires_handoff_then_fresh_assessment(self):
+    def test_promotion_without_handoff_withdraws_checkpoint_and_requires_fresh_assessment(self):
         self.assess()
         self.land_parent()
-        with mock.patch.object(a, 'run_ci_impact') as impact:
-            s.promote(a, self.conn, self.transport, self.row(), self.row(self.parent))
-        impact.assert_not_called()
-        # A moved master requires incorporation after the passing handoff.
-        self.handoff()
+        self.assertIsNone(a.ready_candidate(self.row()))
         with (mock.patch.object(a, 'current_master_sha', return_value=HEAD_ONE),
               mock.patch.object(a, 'run_ci_impact', return_value={'mode': 'impact'})):
             s.promote(a, self.conn, self.transport, self.row(), self.row(self.parent))
@@ -789,6 +803,43 @@ class StateTests(unittest.TestCase):
         withdrawal = service.latest(self.conn, self.child, 'candidate_withdrawal')
         self.assertEqual(withdrawal['candidate']['head'], HEAD_TWO)
         self.assertIn('mm-merge --promote', row['pending_prompt'])
+
+    def test_active_promotion_withdraws_latest_concurrently_registered_checkpoint(self):
+        self.assess()
+        self.land_parent()
+        def impact(base, heads):
+            self.register(self.child, HEAD_THREE)
+            return {'mode': 'impact'}
+        with (mock.patch.object(a, 'current_master_sha', return_value=HEAD_ONE),
+              mock.patch.object(a, 'run_ci_impact', side_effect=impact)):
+            s.promote(a, self.conn, self.transport, self.row(), self.row(self.parent))
+        withdrawal = service.latest(self.conn, self.child, 'candidate_withdrawal')
+        self.assertEqual(withdrawal['candidate']['id'], HEAD_THREE)
+        promotion = json.loads(self.row()['promotion_json'])
+        self.assertEqual(promotion['old_candidate']['id'], HEAD_THREE)
+        self.assertEqual(promotion['previous_tests']['head'], HEAD_TWO)
+        self.assertEqual(self.row()['candidate_json'], '{}')
+
+    def test_active_promotion_defers_changed_sources_until_fresh_impact(self):
+        self.assess()
+        self.land_parent()
+        def change_sources(base, heads):
+            with self.conn:
+                self.conn.execute('UPDATE automerge_batches SET active_pull_requests_json=? WHERE batch_id=?',
+                                  (json.dumps([pull(8, HEAD_THREE).as_json()]), self.child))
+            return {'mode': 'impact'}
+        with (mock.patch.object(a, 'current_master_sha', return_value=HEAD_ONE),
+              mock.patch.object(a, 'run_ci_impact', side_effect=change_sources)):
+            s.promote(a, self.conn, self.transport, self.row(), self.row(self.parent))
+        self.assertEqual(self.row()['base_sha'], BASE_SHA)
+        self.assertEqual(self.row()['promotion_json'], '{}')
+        self.assertIsNone(self.row()['pending_prompt'])
+        with (mock.patch.object(a, 'current_master_sha', return_value=HEAD_ONE),
+              mock.patch.object(a, 'run_ci_impact', return_value={'mode': 'impact'}) as impact):
+            s.reconcile(a, self.conn, self.transport, self.row())
+        impact.assert_called_once_with(HEAD_ONE, [HEAD_THREE])
+        self.assertEqual(self.row()['base_sha'], HEAD_ONE)
+        self.assertIn('mm-merge --promote', self.row()['pending_prompt'])
 
     def test_unchanged_master_needs_no_incorporation_after_failed_parent(self):
         self.assess()
@@ -829,7 +880,7 @@ class StateTests(unittest.TestCase):
               mock.patch.object(a, 'current_master_sha', return_value=BASE_SHA),
               mock.patch.object(a, '_session_status', side_effect=AssertionError('do not wait for checks')),
               mock.patch.object(s, 'stop_work', side_effect=AssertionError('keep running work')),
-              mock.patch.object(a, 'process_batch') as process, mock.patch.object(s, 'promote') as promote):
+              mock.patch.object(a, 'process_batch') as process):
             s.tick(a, self.conn, self.transport, self.row(self.parent))
         row = self.row()
         self.assertEqual(a.active_batch(self.conn)['batch_id'], self.child)
@@ -844,7 +895,6 @@ class StateTests(unittest.TestCase):
         self.assertEqual(next_row['base_sha'], BASE_SHA)
         self.assertTrue(s.is_speculative(next_row))
         self.assertEqual([c.args[-1] for c in process.call_args_list], [self.child, next_row['batch_id']])
-        promote.assert_not_called()
 
     def test_unpromoted_successor_cannot_start_a_third_batch(self):
         self.register(self.child, HEAD_TWO)
@@ -881,8 +931,7 @@ class StateTests(unittest.TestCase):
 
     def test_immediate_work_does_not_discard_successor_at_landing(self):
         self.land_parent()
-        with (mock.patch.object(a, '_priority_preemption_target', side_effect=AssertionError('no preemption')),
-              mock.patch.object(a, 'abort_batch_locked') as abort):
+        with mock.patch.object(a, 'abort_batch_locked') as abort:
             s.reconcile(a, self.conn, self.transport, self.row(),
                         priority_pulls=[pull(10, HEAD_ONE, priority=True, immediate=True)])
         abort.assert_not_called()
@@ -1015,14 +1064,20 @@ class StateTests(unittest.TestCase):
         self.assertEqual(self.row()['terminal_status'], 'merged')
         write.assert_called_once()
 
-    def test_master_drift_during_validation_preserves_running_work(self):
+    def test_master_drift_during_validation_preserves_work_and_queues_incorporation(self):
         self.assess()
         self.land_parent()
         original = dict(self.row())
-        with mock.patch.object(a, 'current_master_sha', return_value=HEAD_ONE):
+        with (mock.patch.object(a, 'current_master_sha', return_value=HEAD_ONE),
+              mock.patch.object(a, 'run_ci_impact', return_value={'mode': 'impact'}),
+              mock.patch.object(s, 'stop_work', side_effect=AssertionError('no cancellation'))):
             s.reconcile(a, self.conn, self.transport, self.row())
         self.assertEqual(self.row()['role_promoted'], 1)
-        for key in ('base_sha', 'phase', 'session_id', 'candidate_json', 'attempt_generation', 'pending_prompt'):
+        self.assertEqual(self.row()['base_sha'], HEAD_ONE)
+        self.assertEqual(self.row()['phase'], 'fixing')
+        self.assertEqual(self.row()['candidate_json'], '{}')
+        self.assertIn('mm-merge --promote', self.row()['pending_prompt'])
+        for key in ('session_id', 'attempt_generation'):
             self.assertEqual(self.row()[key], original[key], key)
 
     def test_primary_abort_preserves_its_own_lookahead_after_role_promotion(self):
