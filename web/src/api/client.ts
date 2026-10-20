@@ -298,7 +298,10 @@ export async function createRelease(
     }),
   );
 }
-export async function abortRelease(id: string): Promise<Campaign> {
+export async function abortRelease(
+  id: string,
+  salvage = true,
+): Promise<Campaign> {
   if (isMock) {
     const campaign = campaigns.find((c) => c.id === id)!;
     campaign.status = "aborted";
@@ -310,7 +313,7 @@ export async function abortRelease(id: string): Promise<Campaign> {
     await api.POST("/api/v1/releases/{id}/abort", {
       params: { path: { id } },
       headers: { "Content-Type": "application/json" },
-      body: undefined,
+      body: { salvage },
     }),
   );
 }

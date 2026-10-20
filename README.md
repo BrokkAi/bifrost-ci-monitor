@@ -406,13 +406,16 @@ one Slack thread. Only one campaign can be live.
 python3 stabilize.py start --ref master --requested-by <github-login>
 python3 stabilize.py status --json
 python3 stabilize.py check
-python3 stabilize.py abort <campaign-id>
+python3 stabilize.py abort <campaign-id> [--no-salvage]
 python3 stabilize.py resume <campaign-id> --requested-by <github-login>
 ```
 
 `start` without `--ref` uses the newest master commit with a completed push CI
 run. `status` and `check` only read SQLite. `abort` keeps the branches and PRs
-for inspection. A paused campaign names its reason in `status` and in its
+for inspection and, unless `--no-salvage` is given, opens one final salvage gate
+PR from the campaign branch tip to master so fixes made so far still land; the
+merge queue tests it like any PR. Use `--no-salvage` when the branch itself went
+bad. A paused campaign names its reason in `status` and in its
 thread; common reasons are escalated issues, a dispatched run that could not be
 found, repeated infrastructure failures and the round limit.
 

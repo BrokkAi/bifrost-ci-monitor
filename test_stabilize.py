@@ -636,6 +636,112 @@ class CampaignTests(unittest.TestCase):
         self.gh.assert_not_called()
         self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM stabilize_gate_merges').fetchone()[0], 1)
 
+    def salvage_gh(self, pr=None):
+        """GitHub stub for salvage publication: list/create/view one gate PR."""
+        def gh(args, **kwargs):
+            if args[:2] == ['pr', 'list']:
+                return json.dumps([pr] if pr else [])
+            if args[:2] == ['pr', 'view']:
+                return json.dumps(pr or {})
+            return ''
+        self.gh.side_effect = gh
+
+    def test_abort_salvage_gate_lands_fixes_and_closes_issues_without_reviving(self):
+        c = self.campaign(sha=C)
+        self.issue(c, status='landed')
+        with self.conn:
+            self.conn.execute('INSERT INTO stabilize_fix_commits VALUES (?,?,?)', (c.id, 7, B))
+        engine.abort_campaign(self.conn, c.id)
+        gate = self.conn.execute('SELECT * FROM stabilize_gate_merges').fetchone()
+        self.assertEqual((gate['stage'], gate['tip_sha'], gate['state']), (engine.SALVAGE, C, 'pending'))
+        self.assertIn('salvage gate', self.conn.execute("SELECT text FROM stabilize_messages WHERE checkpoint LIKE 'aborted%'").fetchone()[0])
+        self.salvage_gh()
+        with mock.patch.object(engine, 'ref_sha', return_value=None), mock.patch.object(engine, 'ensure_ref', return_value=True):
+            engine.tick_campaign(self.conn, c.id)
+            created = [x.args[0] for x in self.gh.call_args_list if x.args[0][:2] == ['pr', 'create']]
+            self.assertEqual(len(created), 1)
+            self.assertIn('Salvage stabilize/test', created[0][created[0].index('--title') + 1])
+            self.assertIn('mergemarshall:high', created[0])
+            self.assertIn('aborted before all stages passed', created[0][created[0].index('--body') + 1])
+            self.salvage_gh(dict(number=50, state='OPEN', headRefOid=C, baseRefName='master', isDraft=False, labels=[]))
+            engine.tick_campaign(self.conn, c.id)
+        self.assertEqual(self.conn.execute('SELECT pr_number,state FROM stabilize_gate_merges').fetchone()[:], (50, 'open'))
+        self.salvage_gh(dict(state='MERGED', labels=[], headRefOid=C))
+        engine.tick_campaign(self.conn, c.id)
+        self.assertEqual(self.conn.execute('SELECT state FROM stabilize_gate_merges').fetchone()[0], 'merged')
+        close = json.loads(self.conn.execute("SELECT payload FROM stabilize_writes WHERE kind='close'").fetchone()[0])
+        self.assertEqual((close['number'], close['gate_stage']), (7, engine.SALVAGE))
+        current = self.current()
+        self.assertEqual((current.status, current.stage), ('aborted', 'push'))
+        self.assertIsNone(self.conn.execute('SELECT 1 FROM stabilize_stage_threads').fetchone())
+
+    def test_abort_without_salvage_or_fixes_opens_no_gate(self):
+        c = self.campaign(sha=C)
+        engine.abort_campaign(self.conn, c.id, salvage=False)
+        self.assertIn('no fixes are merged', self.conn.execute("SELECT text FROM stabilize_messages WHERE checkpoint LIKE 'aborted%'").fetchone()[0])
+        with self.conn:
+            self.conn.execute('DELETE FROM stabilize_campaigns')
+            self.conn.execute('DELETE FROM stabilize_runtime')
+        c = self.campaign(sha=A)  # Nothing landed on the branch.
+        engine.abort_campaign(self.conn, c.id)
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM stabilize_gate_merges').fetchone()[0], 0)
+
+    def test_salvage_tip_already_in_master_needs_no_pr(self):
+        c = self.campaign(sha=B)
+        engine.abort_campaign(self.conn, c.id)
+        self.master.return_value = C
+        with mock.patch.object(engine, 'ensure_ref') as create_ref:
+            engine.tick_campaign(self.conn, c.id)
+        create_ref.assert_not_called()
+        self.gh.assert_not_called()
+        self.assertEqual(self.conn.execute('SELECT state,pr_number FROM stabilize_gate_merges').fetchone()[:], ('merged', None))
+        self.assertEqual(self.current().status, 'aborted')
+
+    def test_rejected_salvage_is_abandoned_and_never_reopens_the_campaign(self):
+        c = self.campaign(sha=C)
+        engine.abort_campaign(self.conn, c.id)
+        with self.conn:
+            self.conn.execute("UPDATE stabilize_gate_merges SET pr_number=50,state='open'")
+        self.salvage_gh(dict(state='OPEN', labels=[{'name': 'mergemarshall:rejected'}], headRefOid=C))
+        engine.tick_campaign(self.conn, c.id)
+        self.assertEqual(self.current().status, 'aborted')
+        self.assertEqual(self.conn.execute('SELECT state FROM stabilize_gate_merges').fetchone()[0], 'abandoned')
+        with mock.patch.object(engine, 'run_campaign_tick') as tick:
+            engine.once(self.conn)
+        self.assertEqual(tick.call_args.kwargs['advance'], False)
+
+    def test_open_stage_gate_still_lands_after_abort_without_advancing(self):
+        c = self.campaign(sha=B)
+        self.issue(c, status='landed')
+        with self.conn:
+            self.conn.execute('INSERT INTO stabilize_fix_commits VALUES (?,?,?)', (c.id, 7, B))
+        self.gate(c)
+        engine.abort_campaign(self.conn, c.id)  # The open push gate already covers tip B.
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM stabilize_gate_merges').fetchone()[0], 1)
+        with mock.patch.object(engine, 'run_campaign_tick') as tick:
+            engine.once(self.conn)
+        self.assertEqual(tick.call_args.kwargs['advance'], True)
+        self.gh.return_value = json.dumps({'state': 'MERGED', 'labels': [], 'headRefOid': B})
+        engine.tick_campaign(self.conn, c.id)
+        self.assertEqual(self.conn.execute('SELECT state FROM stabilize_gate_merges').fetchone()[0], 'merged')
+        self.assertIsNotNone(self.conn.execute("SELECT 1 FROM stabilize_writes WHERE kind='close'").fetchone())
+        self.assertEqual((self.current().status, self.current().stage), ('aborted', 'push'))
+
+    def test_abort_api_salvages_the_fresh_branch_tip(self):
+        c = self.campaign(sha=B)
+        with mock.patch.object(engine, 'ref_sha', return_value=C):
+            view = engine.abort(c.id, 'jbellis')
+        self.assertEqual(view['status'], 'aborted')
+        self.assertEqual(self.conn.execute('SELECT tip_sha FROM stabilize_gate_merges').fetchone()[0], C)
+
+    def test_cli_abort_calls_the_engine_and_honours_no_salvage(self):
+        # Hard-won: the parser variable once shadowed abort() inside main().
+        for argv, salvage in ((['abort', 'test'], True), (['abort', 'test', '--no-salvage'], False)):
+            with mock.patch.object(engine, 'abort', return_value={'id': 'test'}) as abort, \
+                    mock.patch('sys.argv', ['stabilize.py', *argv]), mock.patch('builtins.print'):
+                engine.main()
+            abort.assert_called_once_with('test', 'CLI operator', salvage=salvage)
+
     def test_eight_round_limit(self):
         self.campaign()
         with self.conn:

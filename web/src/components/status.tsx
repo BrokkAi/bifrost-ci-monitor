@@ -12,6 +12,7 @@ import {
 import { cn } from "@/lib/utils";
 import type { Status, BatchSummary, Outcome } from "@/api/types";
 const neutralIcons: Record<string, typeof CircleSlash> = {
+  abandoned: CircleSlash,
   aborted: CircleSlash,
   withdrawn: Undo2,
 };

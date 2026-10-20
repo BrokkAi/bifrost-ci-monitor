@@ -1,6 +1,17 @@
 {
   "components": {
     "schemas": {
+      "AbortRelease": {
+        "properties": {
+          "salvage": {
+            "default": true,
+            "title": "Salvage",
+            "type": "boolean"
+          }
+        },
+        "title": "AbortRelease",
+        "type": "object"
+      },
       "AttentionFailure": {
         "description": "Open product CI failures that no agent is working on, grouped by issue.",
         "properties": {
@@ -4379,6 +4390,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/AbortRelease"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {

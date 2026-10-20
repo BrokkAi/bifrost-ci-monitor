@@ -1341,7 +1341,18 @@ campaign fixes) needs no PR: it is recorded as merged with no PR number, its
 landed issues close, and the stage advances. GitHub refuses PRs with no new
 commits, so this check runs before publication and again after PR races.
 A rejected gate PR pauses the campaign. Completion is the nightly gate landing
-in master; remaining branch PRs are reported, never retargeted. Reviewed
+in master; remaining branch PRs are reported, never retargeted.
+
+Abort salvages by default (`abort(..., salvage=True)`, CLI `--no-salvage`, web
+checkbox): one extra gate with stage `salvage` at the branch tip read at abort
+(else the last observed tip), unless the tip is the anchor or already has a gate.
+It reuses `open_gate`, `observe_gates` and `land_gate`, so the merger's gate rules,
+the already-in-master shortcut and issue close receipts apply; the merge batch
+tests it like any PR although the campaign suites did not all pass. Cron keeps
+ticking an aborted campaign only while it has an unfinished gate, including a
+stage gate opened before the abort. Gates of an aborted campaign never advance
+stages or complete it; a failure that would pause marks its unfinished gates
+`abandoned` instead. PRs still based on the aborted branch are not retargeted. Reviewed
 supersession records apply to master-targeted sources only: a gate does not
 qualify a reviewed replacement that was merged into its campaign branch.
 

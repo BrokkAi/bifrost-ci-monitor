@@ -124,6 +124,9 @@ def api(path, *args):
     return gh(['api', f'repos/{monitor.REPO_NAME}/{path}', *args])
 
 
+SALVAGE = 'salvage'  # The final gate of an aborted campaign; not a CI stage.
+
+
 def campaign(conn, campaign_id):
     row = conn.execute('SELECT * FROM stabilize_campaigns WHERE id=?', (campaign_id,)).fetchone()
     if row is None:
@@ -582,6 +585,14 @@ def advance_start(conn, campaign_id):
 
 
 def pause(conn, c, reason, *, kind='operator', commit_sha=None):
+    if campaign(conn, c.id).status == 'aborted':
+        # Only gates still run after an abort. A failed gate stops; it never
+        # reopens the campaign.
+        with conn:
+            conn.execute("UPDATE stabilize_gate_merges SET state='abandoned',updated_at=? "
+                         "WHERE campaign_id=? AND state NOT IN ('merged','abandoned')", (monitor.utc_now(), c.id))
+            notify(conn, c.id, 'gate-abandoned:' + reason, f'Gate stopped after abort: {reason}')
+        return
     with conn:
         conn.execute("UPDATE stabilize_campaigns SET status='paused',pause_reason=?,updated_at=? WHERE id=?",
                      (reason, monitor.utc_now(), c.id))
@@ -846,9 +857,14 @@ def refresh_issues(conn, c):
                f'Round {c.round}: fix merge gate open for {c.branch} ({c.stage}).')
 
 
-def gate_body(conn, c, tip):
-    lines = [f'Campaign `{c.branch}`: stages through {c.stage} passed at `{tip}`.', '',
-             'Included campaign issues and fix PRs:']
+def gate_body(conn, c, tip, stage=None):
+    if stage == SALVAGE:
+        lines = [f'Campaign `{c.branch}` was aborted before all stages passed. This salvage gate '
+                 f'merges the fixes on its branch at `{tip}` into master; the merge queue tests it '
+                 'like any other PR.', '', 'Included campaign issues and fix PRs:']
+    else:
+        lines = [f'Campaign `{c.branch}`: stages through {c.stage} passed at `{tip}`.', '',
+                 'Included campaign issues and fix PRs:']
     for row in conn.execute("SELECT * FROM stabilize_issues WHERE campaign_id=? AND state IN ('landed','closed')", (c.id,)):
         fix = conn.execute('SELECT fix_sha FROM stabilize_fix_commits WHERE campaign_id=? AND issue_number=?',
                            (c.id, row['issue_number'])).fetchone()
@@ -923,10 +939,11 @@ def land_gate(conn, c, gate, *, already_in_master=False):
                          "VALUES (?,?,'close',?)", (c.id, key, json.dumps(payload)))
         conn.execute("UPDATE stabilize_gate_merges SET state='merged',updated_at=? WHERE campaign_id=? AND stage=?",
                      (monitor.utc_now(), c.id, gate['stage']))
-        if gate['stage'] == 'nightly':
+        # An aborted campaign's gates only land its fixes; it stays aborted.
+        if c.live and gate['stage'] == 'nightly':
             conn.execute("UPDATE stabilize_campaigns SET status='completed',updated_at=?,finished_at=COALESCE(finished_at,?) WHERE id=?",
                          (monitor.utc_now(), monitor.utc_now(), c.id))
-        else:
+        elif c.live:
             advance_gate_stage(conn, c.id, gate['stage'])
         if already_in_master:
             text = f"{gate['stage']} gate needs no PR: {slack_commit(gate['tip_sha'])} is already in master."
@@ -936,26 +953,29 @@ def land_gate(conn, c, gate, *, already_in_master=False):
         else:
             notify(conn, c.id, f"gate-merged:{gate['pr_number']}",
                    f"{gate['stage']} gate PR {slack_number(gate['pr_number'], 'pr')} merged.")
-    if gate['stage'] == 'nightly':
+    if c.live and gate['stage'] == 'nightly':
         completion_notice(conn, c)
 
 
-def open_gate(conn, c):
+def open_gate(conn, c, stage=None):
+    """Publish the gate for `stage` (default: the current stage) and confirm its PR."""
+    stage = stage or c.stage
     # Completed stages may wait for the previous immutable gate to land.
-    if conn.execute("SELECT 1 FROM stabilize_gate_merges WHERE campaign_id=? AND state<>'merged' AND stage<>?",
-                    (c.id, c.stage)).fetchone():
+    if conn.execute("SELECT 1 FROM stabilize_gate_merges WHERE campaign_id=? AND state NOT IN ('merged','abandoned') AND stage<>?",
+                    (c.id, stage)).fetchone():
         return False
-    gate = conn.execute('SELECT * FROM stabilize_gate_merges WHERE campaign_id=? AND stage=?', (c.id, c.stage)).fetchone()
+    gate = conn.execute('SELECT * FROM stabilize_gate_merges WHERE campaign_id=? AND stage=?', (c.id, stage)).fetchone()
     if gate is None:
-        branch = f'{c.branch}-gate-{c.stage}'
+        branch = f'{c.branch}-gate-{stage}'
         now = monitor.utc_now()
         with conn:
             conn.execute('INSERT INTO stabilize_gate_merges(campaign_id,stage,tip_sha,gate_branch,created_at,updated_at) '
-                         'VALUES (?,?,?,?,?,?)', (c.id, c.stage, c.tip_sha, branch, now, now))
-            conn.execute('INSERT INTO stabilize_gate_intents(campaign_id,stage) VALUES (?,?)', (c.id, c.stage))
-        gate = conn.execute('SELECT * FROM stabilize_gate_merges WHERE campaign_id=? AND stage=?', (c.id, c.stage)).fetchone()
+                         'VALUES (?,?,?,?,?,?)', (c.id, stage, c.tip_sha, branch, now, now))
+            conn.execute('INSERT INTO stabilize_gate_intents(campaign_id,stage) VALUES (?,?)', (c.id, stage))
+        gate = conn.execute('SELECT * FROM stabilize_gate_merges WHERE campaign_id=? AND stage=?', (c.id, stage)).fetchone()
     notify(conn, c.id, f'gate-green:{gate["stage"]}:{gate["tip_sha"]}',
-           f"{gate['stage']} gate green at {slack_commit(gate['tip_sha'])}.")
+           f"Salvaging the aborted campaign's fixes at {slack_commit(gate['tip_sha'])}." if stage == SALVAGE
+           else f"{gate['stage']} gate green at {slack_commit(gate['tip_sha'])}.")
     covered = gate_tip_in_master(gate)
     if covered is None:
         return False
@@ -969,14 +989,14 @@ def open_gate(conn, c):
             pause(conn, c, f"Immutable gate branch {branch} changed after publication", kind='gate_ref_changed')
             return False
         intent_row = conn.execute('SELECT snapshot_attempt FROM stabilize_gate_intents WHERE campaign_id=? AND stage=?',
-                                  (c.id, c.stage)).fetchone()
+                                  (c.id, stage)).fetchone()
         attempt = intent_row['snapshot_attempt'] + 1
-        branch = f'{c.branch}-gate-{c.stage}-{attempt}'
+        branch = f'{c.branch}-gate-{stage}-{attempt}'
         with conn:
             conn.execute('UPDATE stabilize_gate_merges SET gate_branch=?,updated_at=? WHERE campaign_id=? AND stage=?',
-                         (branch, monitor.utc_now(), c.id, c.stage))
+                         (branch, monitor.utc_now(), c.id, stage))
             conn.execute('UPDATE stabilize_gate_intents SET snapshot_attempt=?,ref_attempt_at=NULL WHERE campaign_id=? AND stage=?',
-                         (attempt, c.id, c.stage))
+                         (attempt, c.id, stage))
     if not ensure_ref(branch, gate['tip_sha']):
         return False
     prs = gh(['pr', 'list', '--repo', monitor.REPO_NAME, '--head', branch, '--base', monitor.BRANCH,
@@ -991,7 +1011,7 @@ def open_gate(conn, c):
             if covered:
                 with conn:
                     conn.execute('UPDATE stabilize_gate_merges SET pr_number=? WHERE campaign_id=? AND stage=?',
-                                 (pr['number'], c.id, c.stage))
+                                 (pr['number'], c.id, stage))
                 land_gate(conn, c, dict(gate, pr_number=pr['number']), already_in_master=True)
                 return True
             pause(conn, c, f"Gate PR #{pr['number']} closed without merging", kind='gate_closed')
@@ -1001,18 +1021,19 @@ def open_gate(conn, c):
         number = pr['number']
     else:
         intent = conn.execute('SELECT intent_at FROM stabilize_gate_intents WHERE campaign_id=? AND stage=?',
-                              (c.id, c.stage)).fetchone()['intent_at']
+                              (c.id, stage)).fetchone()['intent_at']
         if intent and not _expired(intent):
             return False
-        cached_body = conn.execute('SELECT body FROM stabilize_gate_intents WHERE campaign_id=? AND stage=?', (c.id, c.stage)).fetchone()['body']
-        body = cached_body or gate_body(conn, c, gate['tip_sha'])
+        cached_body = conn.execute('SELECT body FROM stabilize_gate_intents WHERE campaign_id=? AND stage=?', (c.id, stage)).fetchone()['body']
+        body = cached_body or gate_body(conn, c, gate['tip_sha'], stage)
         with conn:
             conn.execute('UPDATE stabilize_gate_intents SET intent_at=?,body=? WHERE campaign_id=? AND stage=?',
-                         (monitor.utc_now(), body, c.id, c.stage))
+                         (monitor.utc_now(), body, c.id, stage))
         try:
             monitor.run_gh(['label', 'create', 'mergemarshall:high', '--repo', monitor.REPO_NAME, '--force', '--color', '5319e7'])
             monitor.run_gh(['pr', 'create', '--repo', monitor.REPO_NAME, '--head', branch, '--base', monitor.BRANCH,
-                '--title', f'Stabilize {c.branch}: {c.stage} green at {gate["tip_sha"][:12]}',
+                '--title', (f'Salvage {c.branch}: fixes from aborted campaign at {gate["tip_sha"][:12]}'
+                            if stage == SALVAGE else f'Stabilize {c.branch}: {stage} green at {gate["tip_sha"][:12]}'),
                 '--body', body, '--label', 'mergemarshall:high'])
         except monitor.CommandError as exc:
             monitor.log(f"stabilize gate {gate['stage']} publication failed: {type(exc).__name__}")
@@ -1023,20 +1044,20 @@ def open_gate(conn, c):
         return False  # Always confirm the PR and exact head before advancing.
     with conn:
         conn.execute("UPDATE stabilize_gate_merges SET pr_number=?,state='open',updated_at=? WHERE campaign_id=? AND stage=?",
-                     (number, monitor.utc_now(), c.id, c.stage))
+                     (number, monitor.utc_now(), c.id, stage))
     queue_write(conn, c.id, f'gate-label:{number}', 'label', {'number': number, 'label': 'mergemarshall:high'})
-    notify(conn, c.id, f'gate-open:{number}', f"{c.stage} gate PR opened: {slack_number(number, 'pr')}")
+    notify(conn, c.id, f'gate-open:{number}', f"{stage} gate PR opened: {slack_number(number, 'pr')}")
     if pr.get('state') == 'MERGED':
         land_gate(conn, c, dict(gate, pr_number=number))
-    else:
+    elif stage in state.STAGES:
         with conn:
-            advance_gate_stage(conn, c.id, c.stage)
+            advance_gate_stage(conn, c.id, stage)
     return True
 
 
 def observe_gates(conn, c):
     # Pending no-PR rows from older versions must reconcile before stage work.
-    for gate in conn.execute("SELECT * FROM stabilize_gate_merges WHERE campaign_id=? AND state<>'merged' "
+    for gate in conn.execute("SELECT * FROM stabilize_gate_merges WHERE campaign_id=? AND state NOT IN ('merged','abandoned') "
                              "ORDER BY CASE stage WHEN 'push' THEN 0 WHEN 'hourly' THEN 1 ELSE 2 END", (c.id,)).fetchall():
         covered = gate_tip_in_master(gate)
         if covered is None:
@@ -1119,6 +1140,14 @@ def tick_campaign(conn, campaign_id):
     if c.status == 'starting':
         advance_start(conn, c.id)
         c = campaign(conn, c.id)
+    if c.status == 'aborted':
+        # Gates still land after an abort; the salvage gate carries the rest.
+        observe_gates(conn, c)
+        gate = conn.execute("SELECT state,pr_number FROM stabilize_gate_merges WHERE campaign_id=? AND stage=?",
+                            (c.id, SALVAGE)).fetchone()
+        if gate and gate['state'] == 'pending' and gate['pr_number'] is None:
+            open_gate(conn, campaign(conn, c.id), SALVAGE)
+        return
     if c.status not in ('running', 'paused'):
         return
     if c.status == 'paused':
@@ -1219,18 +1248,38 @@ def once(conn, transport=None):
                         f'ORDER BY CASE WHEN status IN ({marks}) THEN 0 ELSE 1 END,created_at',
                         state.LIVE_STATUSES).fetchall()
     for row in rows:
-        run_campaign_tick(conn, row['id'], transport, advance=row['status'] in state.LIVE_STATUSES)
+        gates_pending = row['status'] == 'aborted' and conn.execute(
+            "SELECT 1 FROM stabilize_gate_merges WHERE campaign_id=? AND state NOT IN ('merged','abandoned')",
+            (row['id'],)).fetchone()
+        run_campaign_tick(conn, row['id'], transport,
+                          advance=row['status'] in state.LIVE_STATUSES or bool(gates_pending))
 
 
-def abort_campaign(conn, campaign_id):
+def abort_campaign(conn, campaign_id, *, salvage=True, tip=None):
+    """Stop the campaign; by default land its fixes through one final gate.
+
+    `tip` is the branch head read by the caller; the last observed tip is used
+    when it is unavailable. Nothing is salvaged when the tip is the anchor or
+    already has a gate, which keeps being observed after the abort.
+    """
     c = campaign(conn, campaign_id)
     if c.status == 'aborted':
         return
     if not c.live:
         raise ValueError('Only live campaigns can be aborted')
+    tip = tip or c.tip_sha
+    salvage = bool(salvage and tip and tip != c.anchor_sha and not conn.execute(
+        'SELECT 1 FROM stabilize_gate_merges WHERE campaign_id=? AND tip_sha=?', (c.id, tip)).fetchone())
+    now = monitor.utc_now()
     with conn:
-        conn.execute("UPDATE stabilize_campaigns SET status='aborted',updated_at=?,finished_at=? WHERE id=?", (monitor.utc_now(), monitor.utc_now(), c.id))
-        notify(conn, c.id, 'aborted', f'Campaign aborted: {c.branch}. Branches and PRs retained.')
+        conn.execute("UPDATE stabilize_campaigns SET status='aborted',updated_at=?,finished_at=? WHERE id=?", (now, now, c.id))
+        if salvage:
+            conn.execute('INSERT OR IGNORE INTO stabilize_gate_merges(campaign_id,stage,tip_sha,gate_branch,created_at,updated_at) '
+                         'VALUES (?,?,?,?,?,?)', (c.id, SALVAGE, tip, f'{c.branch}-gate-{SALVAGE}', now, now))
+            conn.execute('INSERT OR IGNORE INTO stabilize_gate_intents(campaign_id,stage) VALUES (?,?)', (c.id, SALVAGE))
+        notify(conn, c.id, 'aborted', f'Campaign aborted: {c.branch}. ' + (
+            f'Its fixes at {slack_commit(tip)} will merge to master through a salvage gate PR.' if salvage
+            else 'Branches and PRs retained; no fixes are merged to master.'))
 
 
 def resume_campaign(conn, campaign_id, requested_by):
@@ -1417,12 +1466,18 @@ def create(sha, requested_by, idempotency_key):
             conn.close()
 
 
-def abort(campaign_id, requested_by):
+def abort(campaign_id, requested_by, salvage=True):
     with lock(wait_seconds=120):
         conn = monitor.connect_db()
         try:
             ensure_schema(conn)
-            abort_campaign(conn, campaign_id)
+            tip = None
+            if salvage:
+                try:
+                    tip = ref_sha(campaign(conn, campaign_id).branch)
+                except Exception as exc:  # The last observed tip still salvages most work.
+                    monitor.log(f'stabilize abort tip read failed: {type(exc).__name__}')
+            abort_campaign(conn, campaign_id, salvage=salvage, tip=tip)
             notify(conn, campaign_id, 'abort-requester', f'Abort requested by {requested_by}.')
             deliver_slack(conn)
             return _view(conn, conn.execute('SELECT * FROM stabilize_campaigns WHERE id=?', (campaign_id,)).fetchone())
@@ -1453,8 +1508,10 @@ def main():
     start = commands.add_parser('start')
     start.add_argument('--ref')
     start.add_argument('--requested-by')
-    abort = commands.add_parser('abort')
-    abort.add_argument('campaign_id')
+    abort_command = commands.add_parser('abort')
+    abort_command.add_argument('campaign_id')
+    abort_command.add_argument('--no-salvage', action='store_true',
+                               help='Do not merge the campaign branch fixes to master')
     resume_command = commands.add_parser('resume', help='Resume after granting the App actions: write; ambiguous dispatches remain fenced')
     resume_command.add_argument('campaign_id')
     resume_command.add_argument('--requested-by', default='CLI operator')
@@ -1474,7 +1531,7 @@ def main():
         anchor = resolve(args.ref)
         print(create(anchor['sha'], args.requested_by or 'CLI operator', uuid.uuid4().hex)['id'])
     elif args.command == 'abort':
-        print(abort(args.campaign_id, 'CLI operator')['id'])
+        print(abort(args.campaign_id, 'CLI operator', salvage=not args.no_salvage)['id'])
     elif args.command == 'resume':
         print(resume(args.campaign_id, args.requested_by)['id'])
     else:

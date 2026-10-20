@@ -427,6 +427,10 @@ class CreateRelease(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=128)
 
 
+class AbortRelease(BaseModel):
+    salvage: bool = True
+
+
 class Logout(BaseModel):
     logged_out: bool = True
 

@@ -418,6 +418,23 @@ class WebTests(unittest.TestCase):
             self.assertEqual(self.post('/releases/' + identifier + '/abort', {}).json()['status'], 'aborted')
             self.assertEqual(self.get('/releases/missing').status_code, 404)
 
+    def test_release_abort_salvage_defaults_and_can_be_disabled(self):
+        self.permission.return_value = 'maintain'
+        with mock.patch.object(stabilize, 'ensure_ref', return_value=True), \
+                mock.patch.object(stabilize, 'deliver_slack'), \
+                mock.patch.object(stabilize, 'abort', wraps=stabilize.abort) as abort:
+            # One campaign is live at a time, so each is aborted before the next starts.
+            for key, payload in [('salvage-default', None), ('salvage-disabled', {'salvage': False})]:
+                campaign = self.post('/releases', {'sha': SHA, 'idempotency_key': key}).json()
+                path = '/api/v1/releases/' + campaign['id'] + '/abort'
+                if payload is None:
+                    result = self.client.post(path, headers=self.headers)
+                else:
+                    result = self.client.post(path, headers=self.headers, json=payload)
+                self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(abort.call_args_list[0].kwargs['salvage'], True)
+            self.assertEqual(abort.call_args_list[1].kwargs['salvage'], False)
+
     def test_stabilize_exception_mapping_real_engine(self):
         self.permission.return_value = 'maintain'
         with mock.patch.object(stabilize, 'ensure_ref', return_value=True), mock.patch.object(stabilize, 'deliver_slack'):
