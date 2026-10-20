@@ -268,7 +268,10 @@ Ordinary transport/service errors and revision conflicts are not auto-retried.
 
 `automerge_supervisor_actions` records intents bound to current batch inputs.
 Recompute actions after each transition and obsolete changed inputs; batch phases,
-readiness, and the existing landing gates remain authoritative. Recovery and
+readiness, and the existing landing gates remain authoritative. A priority closure
+read earlier in a tick is discarded when any batch reaches a terminal state, and
+priority is checked again before successor reconciliation or primary selection
+uses it; a landing must never re-batch its own merged sources. Recovery and
 pending guidance precede priority checking; eligible immediate work still fences
 landing. Advance the primary before selecting/observing its successor. Promote
 and deliver its next instruction in the same tick. Observation uses short slices
@@ -635,7 +638,11 @@ A repair unblocks descendants after they contain the new eligible prerequisite
 head. Ambiguous branches/shared heads, cycles, and unresolved relationships are
 reported through `--check` and App-owned GitHub notices. The supervisor applies
 `mergemarshall:dependency-blocked` to ready PRs with ineligible prerequisites
-and comments on the blocked PR with links and the needed action. The existing
+and comments on the blocked PR with links and the needed action. When the
+prerequisite's captured head has a recorded rejection, or the prerequisite is
+closed unmerged, the comment says so and gives the author routes (a new
+prerequisite head, or rebuilding without its commits); it reads only recorded
+state and never changes eligibility. The existing
 inventory's current block reason owns label reconciliation; changed, closed,
 draft, or unblocked heads lose the label. Exact-head/reason outbox markers
 deduplicate comments after lost replies. Retry these informational writes only
@@ -667,8 +674,10 @@ select all eligible high/immediate PRs and their prerequisite closure. Ordinary
 PRs enter that lane only as prerequisites. `high` waits for
 current work. A newly eligible immediate PR preempts an active batch through
 the durable abort path, even if the batch is high, unless already included;
-never preempt after success is posted or merging starts. Source PRs from an
-abort remain eligible. `ci-fix` is ordinary unless labeled explicitly.
+never preempt after success is posted or merging starts. A speculative
+successor follows the same rule when its predecessor lands: only such an
+immediate PR discards it; ready high-priority PRs wait for the promoted
+successor. Source PRs from an abort remain eligible. `ci-fix` is ordinary unless labeled explicitly.
 
 On interruption, removals, or rebuild/retest requests, rescan membership.
 Allow three expansions per batch; an empty scan consumes none. Priority

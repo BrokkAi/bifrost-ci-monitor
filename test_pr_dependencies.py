@@ -751,6 +751,31 @@ class DependencyTests(TestCase):
             "WHERE kind='dependency_notice' AND number=30").fetchone()[0])
         self.assertEqual(len(self.writes), 1)
 
+    def test_notice_explains_rejected_or_closed_prerequisite_from_recorded_state(self):
+        rejected, child = 'a' * 40, 'b' * 40
+        with self.conn:
+            self.conn.execute('INSERT INTO automerge_pr_dependencies '
+                              '(number,head_sha,prerequisite_number,prerequisite_head) VALUES (?,?,?,?)',
+                              (20, child, 30, rejected))
+            automerge.enqueue_github_write(self.conn, 'batch', 'reject_head', 30, rejected,
+                                           {'reason': 'regression', 'evidence': 'tests fail'})
+        reason = 'blocked by prerequisite PR #30'
+        detail = automerge._prerequisite_block_detail(self.conn, 20, child, reason)
+        self.assertEqual(detail, {'rejected_head': rejected})
+        message = automerge.dependency_block_comment(20, reason, detail)
+        self.assertIn('rejected PR #30\'s head `aaaaaaaaaaaa`', message)
+        self.assertIn('git commit --allow-empty', message)
+        self.assertIn('merge its new head into this PR', message)
+        self.assertIn('does not clear this block', message)
+        with self.conn:
+            self.conn.execute("UPDATE automerge_github_outbox SET cancelled_at='now' WHERE kind='reject_head'")
+            self.conn.execute('INSERT OR REPLACE INTO automerge_pr_inventory (number,head_sha,data_json) VALUES (?,?,?)',
+                              (30, rejected, json.dumps({'number': 30, 'state': 'closed', 'merged_at': None})))
+        detail = automerge._prerequisite_block_detail(self.conn, 20, child, reason)
+        self.assertEqual(detail, {'closed': True})
+        self.assertIn('closed without merging', automerge.dependency_block_comment(20, reason, detail))
+        self.assertEqual(automerge._prerequisite_block_detail(self.conn, 20, child, 'cycle'), {})
+
     def test_ineligible_prerequisite_notice_points_action_at_the_prerequisite(self):
         message = automerge.dependency_block_comment(20, 'blocked by prerequisite PR #30')
         self.assertIn('/pull/30)', message)

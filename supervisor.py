@@ -193,6 +193,7 @@ def run(a, conn, transport):
     priority_dependencies_checked = False
     served = set()
     priority_pulls = []
+    priority_action = None
     reconciled = set()
     result = 0
     for _ in range(32):
@@ -250,6 +251,7 @@ def run(a, conn, transport):
                        min(UNSERVED_BATCH_SECONDS, remaining / (len(waiting) + 1)))
             a.OBSERVATION_DEADLINE = outer_deadline - reserve * len(waiting)
             token = read_budget.deadline.set(a.OBSERVATION_DEADLINE)
+        row = None
         try:
             if a.OBSERVATION_DEADLINE is not None and time.monotonic() >= a.OBSERVATION_DEADLINE:
                 raise git_ancestry.Deferred('batch observation slice exhausted')
@@ -261,6 +263,7 @@ def run(a, conn, transport):
             elif kind == 'advance_provider_failover':
                 merge_failover.advance(a, conn, row)
             elif kind == 'check_priority':
+                priority_action = identifier
                 # One cheap listing avoids global discovery on an ordinary tick.
                 if any(a._priority_flags(a._labels(item))[0] for item in a.list_open_pull_requests()
                        if not a._is_integration_pull(item)):
@@ -346,6 +349,15 @@ def run(a, conn, transport):
         finally:
             if kind == 'advance_batch':
                 served.add(owner)
+                after = conn.execute('SELECT terminal_status FROM automerge_batches WHERE batch_id=?',
+                                     (owner,)).fetchone()
+                if (priority_checked and row is not None and after is not None
+                        and (after['terminal_status'] or '') != (row['terminal_status'] or '')):
+                    # A landing or release changes which priority PRs are open
+                    # and unreserved. Recheck before reconcile/selection reuse it.
+                    priority_pulls = []
+                    priority_checked = False
+                    attempted.discard(priority_action)
             a.OBSERVATION_DEADLINE = outer_deadline
             if token is not None:
                 read_budget.deadline.reset(token)

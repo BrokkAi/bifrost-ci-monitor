@@ -601,13 +601,28 @@ class StateTests(unittest.TestCase):
         self.assertIsNone(s.child(self.conn, self.child))
         select.assert_not_called()
 
-    def test_ready_priority_work_still_supersedes_ordinary_lookahead(self):
+    def test_high_priority_work_waits_for_the_promoted_lookahead(self):
         self.land_parent()
         with (mock.patch.object(a, 'select_eligible_pull_requests', return_value=[pull(10, HEAD_ONE, priority=True)]),
+              mock.patch.object(a, 'compare_commit_ancestry', return_value=True),
+              mock.patch.object(s, 'commit_tree', return_value=TREE),
+              mock.patch.object(a, 'current_master_sha', return_value=BASE_SHA),
+              mock.patch.object(s, 'selection'),
+              mock.patch.object(a, 'process_batch'),
+              mock.patch.object(a, 'abort_batch_locked') as abort):
+            s.tick(a, self.conn, self.transport, self.row(self.parent))
+        abort.assert_not_called()
+        self.assertEqual(a.active_batch(self.conn)['batch_id'], self.child)
+
+    def test_immediate_work_supersedes_ready_lookahead(self):
+        self.land_parent()
+        with (mock.patch.object(a, 'select_eligible_pull_requests',
+                                return_value=[pull(10, HEAD_ONE, priority=True, immediate=True)]),
               mock.patch.object(a, 'abort_batch_locked') as abort,
               mock.patch.object(s, 'promote_role') as promote):
             s.tick(a, self.conn, self.transport, self.row(self.parent))
         abort.assert_called_once()
+        self.assertIn('immediate PR #10', abort.call_args.args[3])
         promote.assert_not_called()
         self.assertEqual(self.row()['role_promoted'], 0)
 

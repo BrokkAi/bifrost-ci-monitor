@@ -545,8 +545,12 @@ def reconcile(a, conn, transport, row, *, priority_pulls=None):
             row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
     if parent["terminal_status"] == "merged":
         pulls = a.select_eligible_pull_requests(conn=conn) if priority_pulls is None else priority_pulls
-        if not a._batch_priority(row) and any(p.priority for p in pulls):
-            a.abort_batch_locked(conn, transport, row, 'ready priority work takes precedence over ordinary lookahead')
+        # Only immediate work discards a successor, with the same rule that
+        # preempts a primary. High-priority PRs wait for this batch to land.
+        target = a._priority_preemption_target(row, pulls)
+        if target is not None:
+            a.abort_batch_locked(conn, transport, row,
+                                 f'immediate PR #{target.number} takes precedence over speculative lookahead')
             return False
         if not get(row, 'role_promoted', 0):
             promote_role(a, conn, row, parent)

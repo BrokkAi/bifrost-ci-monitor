@@ -584,10 +584,33 @@ def _deliver_dependency_notice(conn: sqlite3.Connection, row, detail, current_he
     if blocked and row["head_sha"] == current_head and payload["reason"] == reason:
         marker = f"<!-- mergemarshall-intent:{row['intent_id']} -->"
         if not _trusted_comment(number, marker):
+            detail_text = dependency_block_comment(
+                number, reason, _prerequisite_block_detail(conn, number, current_head, reason))
             github_api_write(f"issues/{number}/comments", "POST", {
-                "body": f"{dependency_block_comment(number, reason)}\n\n{marker}",
+                "body": f"{detail_text}\n\n{marker}",
             })
     return blocked
+
+
+def _prerequisite_block_detail(conn: sqlite3.Connection, number: int, head: str, reason: str) -> dict[str, Any]:
+    """Explain an ineligible prerequisite from recorded state; never reads GitHub."""
+    blocked = re.fullmatch(r'blocked by prerequisite PR #(\d+)', reason or "")
+    if blocked is None or not pr_dependencies.has_table(conn, "automerge_pr_dependencies"):
+        return {}
+    parent = int(blocked[1])
+    for (prerequisite_head,) in conn.execute(
+            "SELECT prerequisite_head FROM automerge_pr_dependencies "
+            "WHERE number=? AND head_sha=? AND prerequisite_number=?", (number, head, parent)).fetchall():
+        if conn.execute("SELECT 1 FROM automerge_github_outbox WHERE kind='reject_head' AND number=? "
+                        "AND head_sha=? AND cancelled_at IS NULL LIMIT 1",
+                        (parent, prerequisite_head)).fetchone():
+            return {"rejected_head": prerequisite_head}
+    observed = conn.execute("SELECT data_json FROM automerge_pr_inventory WHERE number=?", (parent,)).fetchone()
+    data = json.loads(observed[0]) if observed else {}
+    if (str(data.get("state") or "").lower() == "closed"
+            and not (data.get("merged_at") or data.get("mergedAt") or data.get("merged") is True)):
+        return {"closed": True}
+    return {}
 
 
 def _record_dependency_label(conn: sqlite3.Connection, number: int, present: bool) -> None:
@@ -1203,7 +1226,7 @@ def report_dependency_blocks(conn, transport, *, deliver=True):
         retry_github_outbox(conn, transport, kind="dependency_notice")
 
 
-def dependency_block_comment(number: int, reason: str) -> str:
+def dependency_block_comment(number: int, reason: str, detail: dict[str, Any] | None = None) -> str:
     pull = f"[PR #{number}](https://github.com/{REPO_NAME}/pull/{number})"
     changed = re.fullmatch(r'PR #(\d+) changed; its current head is absent from this PR', reason)
     blocked = re.fullmatch(r'blocked by prerequisite PR #(\d+)', reason)
@@ -1217,9 +1240,27 @@ def dependency_block_comment(number: int, reason: str) -> str:
     elif blocked:
         parent = int(blocked[1])
         prerequisite = f"[PR #{parent}](https://github.com/{REPO_NAME}/pull/{parent})"
-        summary = f"{pull} is waiting for prerequisite {prerequisite} to become eligible."
-        action = (f"Action: check PR #{parent} and resolve its draft, rejection, or dependency block. "
-                  "The queue will reconsider this PR automatically.")
+        detail = detail or {}
+        not_cleared = (f"Closing PR #{parent}, deleting its branch, or editing PR descriptions "
+                       "does not clear this block.")
+        rebuild = (f"Alternatively, rebuild this PR on a fresh branch from master without PR #{parent}'s "
+                   "commits (cherry-pick or squash) and open it as a new PR.")
+        if detail.get("rejected_head"):
+            summary = (f"{pull} is waiting for prerequisite {prerequisite}. The merge queue rejected "
+                       f"PR #{parent}'s head `{str(detail['rejected_head'])[:12]}`, and this PR contains "
+                       "that commit.")
+            action = (f"Action for the authors: push a fix to PR #{parent}'s branch as a new commit, or "
+                      "an empty commit (`git commit --allow-empty`) if the rejection was wrong; a "
+                      f"rejection applies only to that exact commit. Reopen PR #{parent} if it was closed, "
+                      f"mark it ready, and merge its new head into this PR. {rebuild} {not_cleared}")
+        elif detail.get("closed"):
+            summary = (f"{pull} is waiting for prerequisite {prerequisite}, which was closed without "
+                       "merging. This PR contains its commits.")
+            action = f"Action for the authors: reopen PR #{parent} and mark it ready. {rebuild} {not_cleared}"
+        else:
+            summary = f"{pull} is waiting for prerequisite {prerequisite} to become eligible."
+            action = (f"Action: check PR #{parent} and resolve its draft, rejection, or dependency block. "
+                      "The queue will reconsider this PR automatically.")
     else:
         linked_reason = re.sub(r'#(\d+)', lambda match:
                               f"[#{match[1]}](https://github.com/{REPO_NAME}/pull/{match[1]})", html.escape(reason))

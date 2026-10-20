@@ -175,6 +175,33 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(self.row(campaign)['status'], 'launching')
         self.assertIsNone(a._priority_preemption_target(self.row(campaign), [incoming]))
 
+    def test_landing_rechecks_priority_before_selection_reuses_it(self):
+        landed = self.batch()
+        member = a.row_pulls(self.row(landed))[0]
+        high = a.PullRequest(member.number, member.title, member.head_sha, 'url', priority=True)
+        self.patch(a, 'list_open_pull_requests', return_value=[
+            {'number': member.number, 'labels': [{'name': 'mergemarshall:high'}]}])
+        priority_reads = []
+        def select(**kwargs):
+            if kwargs.get('priority_only'):
+                priority_reads.append(kwargs)
+                # Before the landing the batch's own high PR is still open; after it, merged.
+                return [high] if len(priority_reads) == 1 else []
+            return []
+        self.select.side_effect = select
+        def land(conn, transport, owner):
+            with conn:
+                conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal',"
+                             "terminal_status='merged' WHERE batch_id=?", (owner,))
+        self.patch(a, 'process_batch', side_effect=land)
+        self.patch(a, 'target_sha', return_value=BASE_SHA)
+        create = self.patch(a, 'create_selected_batch')
+        self.patch(supervisor, 'idle_summary')
+        supervisor.run(a, self.conn, self.transport)
+        self.assertEqual(self.row(landed)['terminal_status'], 'merged')
+        self.assertEqual(len(priority_reads), 2)
+        create.assert_not_called()
+
     def test_preempting_priority_closure_admitted_without_unrelated_discovery(self):
         previous = self.batch()
         prerequisite = a.PullRequest(98, 'prerequisite', HEAD_ONE, 'url')
