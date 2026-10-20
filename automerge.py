@@ -1167,10 +1167,13 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
                 deps = graph.dependencies[number]
                 # A stacked PR that absorbed a closed base PR is promoted here
                 # too, once its own head lands: the absorbed heads are then
-                # landed prerequisites.
+                # landed prerequisites. Absorption replaces their edges with
+                # inherited ones that may already have landed (#5110), so
+                # check its own head explicitly.
                 if (promote and node.base != graph.target(number)[0] and str(node.data.get('state')).lower() == 'open'
                         and deps and number not in graph.problems
-                        and all(graph.landed(dep.head_sha, number) for dep in deps)):
+                        and all(graph.landed(dep.head_sha, number) for dep in deps)
+                        and (number not in graph.absorbed or graph.landed(node.head, number))):
                     enqueue_github_write(conn, '__dependencies__', 'promote_dependency', number, node.head,
                                          {'base_ref': node.base, 'target_ref': graph.target(number)[0], 'dependencies': [dep.as_json() for dep in deps]})
     return graph

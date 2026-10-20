@@ -1099,6 +1099,30 @@ class DependencyTests(TestCase):
         master = self.git('rev-parse', 'master')
         self.assertTrue(all(self.ancestor(dep['head_sha'], master) for dep in payload['dependencies']))
 
+    def test_landed_inherited_prerequisites_do_not_retarget_unlanded_absorbed_work(self):
+        """PR #5110 on 2026-10-20: retargeted while closed base #4775 was unlanded."""
+        self.patch(automerge, 'SUPERVISOR_RUNNING', False)
+        self.items = {}
+        inherited = self.add_pr(4676, 'pack-contract', self.base)
+        self.add_pr(4775, 'preparation', inherited, base='pack-contract')
+        stacked = self.add_pr(5110, 'activation-receipts', self.items[4775]['head']['sha'],
+                              base='preparation')
+        automerge.dependency_graph(self.conn, promote=False)  # captures 4775's edge to 4676
+        self.git('checkout', '-q', 'master')
+        self.git('merge', '-q', '--no-ff', '-m', 'land 4676', inherited)
+        self.items[4676].update(state='closed', merged_at='now')
+        self.items[4775]['state'] = 'closed'
+        graph = automerge.dependency_graph(self.conn)
+        self.assertEqual({dep.number for dep in graph.absorbed[5110]}, {4775})
+        self.assertTrue(all(graph.landed(dep.head_sha, 5110) for dep in graph.dependencies[5110]))
+        self.assertIsNone(self.conn.execute("SELECT 1 FROM automerge_github_outbox "
+                                            "WHERE kind='promote_dependency' AND number=5110").fetchone())
+        self.git('merge', '-q', '--no-ff', '-m', 'land 5110', stacked)
+        automerge.dependency_graph(self.conn)
+        row = self.conn.execute("SELECT payload_json FROM automerge_github_outbox "
+                                "WHERE kind='promote_dependency' AND number=5110").fetchone()
+        self.assertEqual(json.loads(row['payload_json'])['base_ref'], 'preparation')
+
     def test_reviewed_supersession_replaces_exact_retired_head_and_keeps_external_edges(self):
         record = self.reviewed_pair()
         graph = self.reviewed_graph(record)
