@@ -283,7 +283,8 @@ def run(a, conn, transport):
                 if speculation.reconcile(a, conn, transport, row, priority_pulls=priority_pulls):
                     reconciled.add(owner)
             elif kind == 'advance_batch':
-                if speculation.is_speculative(row) and row['phase'] == 'waiting_parent':
+                if (speculation.is_speculative(row) and row['phase'] == 'waiting_parent'
+                        and speculation.parent_current(a, conn, row)):
                     speculation.recheck_waiting(a, conn, transport, row)
                 else:
                     a.process_batch(conn, transport, owner)

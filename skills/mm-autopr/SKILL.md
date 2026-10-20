@@ -6,10 +6,15 @@ description: Publish a locally tested MergeMarshall branch and reconcile its int
 First record your local assessment with mm-db for the exact committed HEAD,
 including checks run there, separately identified reused results with their
 original tested SHAs and applicability reasons, and reproduced baseline failures.
-When mm-db state has a predecessor, publication is blocked: record local pass,
-refresh state and call `mm-db ready --revision REV`, then finish the turn.
-After the supervisor requests promotion, incorporate the
-actual landed base with mm-merge, record a fresh assessment, then publish.
+The captured base is actual master; nothing is shared with the primary.
+Publication is blocked while `predecessor.current` is true (the predecessor is
+live). Record local pass, refresh state and call `mm-db ready --revision REV`,
+then wait. When the supervisor requests promotion, run `mm-merge --promote` to
+merge the recorded master tip and resolve conflicts. Choose reruns from the diff
+against the last tested candidate under the validation policy, record a fresh
+assessment, then re-register the candidate with `mm-db candidate` and publish.
+Reuse unaffected results with their original tested SHAs and applicability reasons.
+
 Then:
 
 ```sh

@@ -4073,7 +4073,7 @@ def _queue_missing_handoff(conn, row, reason, *, observed_turn=None):
     prefix = "The supervisor has no valid candidate handoff because "
     prompt = f"""{prefix}{reason}.
 Continue in this same checkout. Read mm-db state and reconcile your progress note, HEAD, pending edits and running checks. Preserve useful work and reuse applicable execution evidence; a missing handoff alone does not require rebuilding or rerunning checks.
-Complete the current supervisor instruction and resolve any remaining validation or publication problem. Record a fresh passing local assessment for the current committed HEAD and source revision. Checkpoint the candidate with mm-db candidate, then hand it back through mm-db ready while it has predecessor metadata, or mm-autopr otherwise. If it was already published, reconcile that same PR through mm-autopr. Do not merge. If blocked, explain the concrete blocker and required next action.
+Complete the current supervisor instruction and resolve any remaining validation or publication problem. Record a fresh passing local assessment for the current committed HEAD and source revision. Checkpoint the candidate with mm-db candidate, then hand it back through mm-db ready while its predecessor is live, or mm-autopr otherwise. If it was already published, reconcile that same PR through mm-autopr. Do not merge. If blocked, explain the concrete blocker and required next action.
 """
     previous = str(row['pending_prompt'] or '')
     if previous and row['phase'] == 'fixing':
@@ -4101,10 +4101,10 @@ def ready_candidate(row):
         return None
     if receipt["kind"] == "publish":
         publication = receipt.get("publication") or {}
-        if (speculation.get(row, "predecessor_id") or publication.get("head") != receipt["head"]
+        if (publication.get("head") != receipt["head"]
                 or publication.get("number") != row["integration_pr_number"]):
             return None
-    elif receipt["kind"] != "ready" or not speculation.get(row, "predecessor_id"):
+    elif receipt["kind"] != "ready":
         return None
     checkpoint = json.loads(speculation.get(row, "candidate_json", "{}"))
     if receipt.get("candidate_id") and (checkpoint.get("id") != receipt["candidate_id"]
@@ -4146,7 +4146,7 @@ def _restore_publication_handoffs(conn):
                     or evidence["source_revision"] != speculation.source_revision(sys.modules[__name__], row)):
                 continue
             publication = None
-            if speculation.get(row, "predecessor_id"):
+            if row["phase"] == "waiting_parent":
                 checkpoint = speculation.candidate(sys.modules[__name__], row)
                 if row["phase"] != "waiting_parent" or not checkpoint or checkpoint["head"] != evidence["head"]:
                     continue
@@ -4186,6 +4186,31 @@ def ready_report(receipt):
     ]).strip()
 
 
+def _publish_ready_candidate(conn, row):
+    """Publish a parked passing handoff after same-base role release."""
+    import mm_service
+    receipt = ready_candidate(row)
+    if not receipt or receipt["kind"] != "ready":
+        return
+    current = mm_service.state(conn, row["batch_id"])
+    publication = mm_service.reconcile_publication(current, receipt["head"], receipt.get("notes", ""))
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (row["batch_id"],)).fetchone()
+        accepted = ready_candidate(latest)
+        if (not accepted or accepted["id"] != receipt["id"]
+                or mm_service.state(conn, row["batch_id"])["revision"] != current["revision"]
+                or (speculation.get(latest, "predecessor_id")
+                    and speculation.parent_current(sys.modules[__name__], conn, latest))):
+            raise AutomergeError("parked publication inputs changed", reason="predecessor_pending")
+        mm_service.record(conn, row["batch_id"], "publication", publication)
+        enqueue_github_write(conn, row["batch_id"], "integration_metadata", publication["number"],
+                             receipt["head"], mm_service.integration_metadata(current, receipt["head"], receipt.get("notes", "")))
+        conn.execute("UPDATE automerge_batches SET integration_pr_number=?,integration_pr_url=? WHERE batch_id=?",
+                     (publication["number"], publication["url"], row["batch_id"]))
+        mm_service.handoff(conn, current, "publish", publication=publication, notes=receipt.get("notes", ""))
+
+
 def _consume_ready_candidate(conn, transport, row):
     receipt = ready_candidate(row)
     if not receipt or row["phase"] not in {"building", "fixing"}:
@@ -4199,7 +4224,8 @@ def _consume_ready_candidate(conn, transport, row):
         if not accepted or accepted["id"] != receipt["id"]:
             return False
         ci_round = int(current["ci_round"] or 0)
-        if speculation.get(current, "predecessor_id"):
+        if receipt["kind"] == "ready" or (speculation.get(current, "predecessor_id")
+                and speculation.parent_current(sys.modules[__name__], conn, current)):
             phase = "waiting_parent"
         elif current["ci_mode"] == "async":
             phase = "merging"
@@ -4721,10 +4747,10 @@ def _agent_turn_finished(conn: sqlite3.Connection, transport: monitor.SlackTrans
     row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                        (row["batch_id"],)).fetchone()
     if speculation.get(row, "predecessor_id"):
-        if speculation.parent_current(sys.modules[__name__], conn, row):
-            speculation.finished(sys.modules[__name__], conn, transport, row, final)
-        else:
-            speculation.invalidate(sys.modules[__name__], conn, row)
+        speculation.finished(sys.modules[__name__], conn, transport, row, final)
+        latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (row["batch_id"],)).fetchone()
+        if latest["phase"] == "waiting_parent":
+            speculation.reconcile(sys.modules[__name__], conn, transport, latest)
         return
     keep, removed = _recheck_sources(_active_sources(row), conn=conn, batch_id=str(row["batch_id"]))
     row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
@@ -4935,10 +4961,7 @@ def _recheck_sources(pulls: list[PullRequest], *, conn: sqlite3.Connection | Non
         else:
             keep.append(pull)
     if keep:
-        owner = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch_id,)).fetchone() if conn is not None and batch_id else None
-        pinned_base = owner['base_sha'] if owner is not None and speculation.get(owner, 'predecessor_id') else None
-        verified, blocked = (check_source_dependencies(keep, conn, master=pinned_base) if pinned_base
-                             else check_source_dependencies(keep, conn))
+        verified, blocked = check_source_dependencies(keep, conn)
         for pull in keep:
             if pull.number in blocked:
                 removed.append(f'PR #{pull.number} {pull.title}: {blocked[pull.number]}')
@@ -5146,7 +5169,21 @@ def _queue_master_update(
                   f"{FIX_VS_EJECT_GUIDANCE} "
                   f"{ledger_context} Push only `{row['branch']}` and update the same integration PR. Do not "
                   "force-push unless rebuilding after ejection; do not merge the PR. CI must run again.")
+    prompt += (f" Compare the resulting committed HEAD against the last tested candidate {tested_head}. "
+               "Choose diff-based reruns under the validation policy, retaining original tested SHAs and "
+               "applicability reasons for reused results. Record a fresh assessment for the resulting HEAD "
+               "and current source revision, re-register with mm-db candidate, then publish through mm-autopr. "
+               "There is no unchanged-tree shortcut or equivalent-head alias.")
+    import mm_service
     with conn:
+        checkpoint = json.loads(speculation.get(row, "candidate_json", "{}"))
+        if row["base_sha"] != master_sha:
+            withdrawal = {"id": uuid.uuid4().hex, "revision": mm_service.state(conn, row["batch_id"])["revision"],
+                          "source_revision": speculation.source_revision(sys.modules[__name__], row),
+                          "candidate": checkpoint or None}
+            mm_service.record(conn, row["batch_id"], "candidate_withdrawal", withdrawal)
+            conn.execute("UPDATE automerge_batches SET candidate_json='{}',ready_json='{}' WHERE batch_id=?",
+                         (row["batch_id"],))
         conn.execute(
             "UPDATE automerge_batches SET base_sha=?, base_failed_jobs_json='[]', "
             "base_failure_details_json='{}', base_ci_source=NULL, base_ci_run_id=NULL, "
@@ -5266,8 +5303,9 @@ def _sync_ci_gate_allows_merge(
 
 def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTransport,
                        row: sqlite3.Row | dict[str, Any]) -> None:
-    if speculation.get(row, "predecessor_id"):
-        raise AutomergeError("speculative batch cannot land before promotion", reason="predecessor_pending")
+    if (speculation.get(row, "predecessor_id")
+            and speculation.parent_current(sys.modules[__name__], conn, row)):
+        raise AutomergeError("batch cannot land while the predecessor is live", reason="predecessor_pending")
     receipt = ready_candidate(row)
     number = int(row["integration_pr_number"])
     retry_pending = _github_write_retry_pending(row)
@@ -5774,9 +5812,6 @@ def _complete_abort(
 ) -> None:
     batch_id = str(row["batch_id"])
     terminal_status = "no_sources_remain" if row["terminal_status"] == "no_sources_remain" else "aborted"
-    descendant = speculation.child(conn, batch_id)
-    if descendant is not None:
-        abort_batch_locked(conn, transport, descendant, "predecessor aborted: " + str(row['abort_reason'] or 'operator abort'))
     session_id = str(row["session_id"] or "")
     if not session_id and row["launch_attempted"] and _batch_kind(row) == "batch":
         session_id = lookup_batch_session(row) or ""
@@ -6070,13 +6105,27 @@ def process_batch(conn: sqlite3.Connection, transport: monitor.SlackTransport,
                 conn, row, "the candidate handoff became stale while waiting for the predecessor",
             )
             return
-        if speculation.get(row, "role_promoted", 0):
-            parent = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
-                                  (row["predecessor_id"],)).fetchone()
-            if parent is None or parent["terminal_status"] != "merged":
-                raise AutomergeError("primary predecessor has no confirmed landing", reason="predecessor_pending")
-            speculation.promote(sys.modules[__name__], conn, transport, row, parent)
-        return
+        speculation.recheck_waiting(sys.modules[__name__], conn, transport, row)
+        row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+        if row["phase"] != "waiting_parent" or not ready_candidate(row):
+            return
+        if (speculation.get(row, "predecessor_id")
+                and speculation.parent_current(sys.modules[__name__], conn, row)):
+            return
+        parent = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                              (row["predecessor_id"],)).fetchone()
+        speculation.promote(sys.modules[__name__], conn, transport, row, parent)
+        row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+        if row["phase"] != "waiting_parent":
+            return  # Incorporation instruction is delivered by the supervisor this tick.
+        _publish_ready_candidate(conn, row)
+        row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+        with conn:
+            conn.execute("UPDATE automerge_batches SET phase='building' WHERE batch_id=?", (batch_id,))
+        row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+        _consume_ready_candidate(conn, transport, row)
+        row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+        phase = str(row["phase"])
     if phase in {"building", "fixing", "waiting_ci"}:
         # A running turn can still produce useful work for a retained remainder.
         # When every source is ineligible, stop immediately instead of waiting

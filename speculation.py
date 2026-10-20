@@ -53,19 +53,9 @@ def is_speculative(row):
     return bool(get(row, "predecessor_id") and not get(row, "role_promoted", 0))
 
 
-def incorporating_candidate(a, row, value):
-    """Retain a pinned tree only through the approved ancestry incorporation."""
-    promotion = json.loads(get(row, "promotion_json", "{}"))
-    return bool(value and promotion.get("stage") == "incorporating"
-                and promotion["base"] == row["base_sha"]
-                and promotion["old_candidate"] == value
-                and value["source_revision"] == source_revision(a, row, base=promotion["old_base"]))
-
-
 def candidate(a, row, *, landed=False):
     value = json.loads(get(row, "candidate_json", "{}"))
-    if (not value or (value["source_revision"] != source_revision(a, row)
-                     and not incorporating_candidate(a, row, value))
+    if (not value or value["source_revision"] != source_revision(a, row)
             or row["phase"] == "aborting"
             or (row["status"] not in {"running", "launching", "finishing"} and not landed)):
         return None
@@ -77,14 +67,9 @@ def parent_current(a, conn, row):
         return True
     parent = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                           (row["predecessor_id"],)).fetchone()
-    pinned = json.loads(row["predecessor_candidate_json"])
-    if parent is None or parent["terminal_status"] not in {None, "merged"}:
-        return False
-    current = candidate(a, parent, landed=parent["terminal_status"] == "merged")
-    return bool(current and current["id"] == pinned.get("id")
-                and current["tree"] == pinned.get("tree")
-                and pinned.get("head") in {current["head"], *current.get("equivalent_heads", [])}
-                and (parent["terminal_status"] != "merged" or parent["ci_head_sha"] == current["head"]))
+    return bool(parent is not None
+                and parent['status'] in {'launching', 'running', 'finishing'}
+                and parent['phase'] != 'terminal' and not parent['terminal_status'])
 
 
 def reserved(a, conn, *, except_batch=None):
@@ -125,32 +110,30 @@ def verify_candidate(a, current, head, conn):
 
 GUIDANCE = """Candidate checkpoints and lookahead: after completing your merges and fixes, before starting expensive validation, run mm-db candidate --revision <current revision> (add --rebuild for a rebuilt branch). This pushes only your recorded batch branch and records the committed candidate; it opens no PR. Before making further edits, withdraw it with mm-db candidate --revision <current revision> --withdraw. Register the replacement when ready. The supervisor may run the next batch's useful checks concurrently through existing mbx.
 
-Read mm-db state: if predecessor is present, your captured base is its pinned candidate, and your membership contains only your own newly selected PRs. Never redo or eject the predecessor's membership. Investigate, merge, fix, validate, and record independent standalone rejections of your own exact heads normally. An interaction with the unlanded predecessor is not proof that your PR is independently broken. After local pass, record mm-db tests, refresh state, and call mm-db ready --revision <current revision> to hand off the checkpointed candidate, then finish this turn without publishing. When the predecessor lands, your role becomes primary while you keep running checks; your checkpoint can start the next speculative batch. Continue the ready protocol while predecessor metadata remains. The supervisor requests mm-merge --promote after your passing handoff; for this approved ancestry-only step, an unchanged tree can be checkpointed without withdrawal. Publication is blocked until landed ancestry is incorporated. A changed predecessor restarts this attempt with /clear in the same environment and a generated brief; caches, logs and rerere remain available.
+Read mm-db state: your captured base is actual master at launch. Your batch shares no source membership or unlanded work with the current primary. Merge, fix, validate and reject your own exact heads independently against that base. After local pass, record mm-db tests and mm-db ready --revision <current revision>, then wait without publishing while the predecessor is live. When it ends, you take the primary role with the same checkout and running work. If master has not moved, continue readiness and publication normally. If the supervisor queues promotion, run mm-merge --promote, resolve conflicts, and choose reruns from the actual diff against the last tested candidate under the validation policy. Reuse unaffected evidence only with its original tested SHA and an applicability reason. Record a fresh assessment for the resulting HEAD and re-register the post-merge candidate before publication. There is no unchanged-tree shortcut.
+
 """
 
 
-def selection(a, conn, parent):
-    # Discovery and dependency retargeting use actual master. Only this second,
-    # read-only view treats the unlanded checkpoint as a selection base.
+def selection(a, conn, parent, *, master=None):
     if a.batch_target(parent) != a.BASE_BRANCH:
         return []
-    actual = a.dependency_graph(conn, **a.lane_discovery_scope(conn, a.BASE_BRANCH))
-    checkpoint = candidate(a, parent)
+    actual = a.dependency_graph(conn, master=master or a.current_master_sha(),
+                                **a.lane_discovery_scope(conn, a.BASE_BRANCH))
     occupied = reserved(a, conn)
-    nodes = {n: replace(node, ready=False) if n in occupied or actual.target(n)[0] != a.BASE_BRANCH else node for n, node in actual.nodes.items()}
-    graph = a.pr_dependencies.Graph(nodes, actual.histories, checkpoint["head"],
-        a.compare_commit_ancestry, conn=conn, base_branch=a.BASE_BRANCH,
-        persist_comparisons=True, gates=actual.gates,
-        supersessions=tuple(actual.supersessions.values()),
-        verify_supersession=actual.verify_supersession).discover()
-    return [a.dependency_pull(graph, n) for n in graph.select() if n not in occupied]
+    actual.nodes = {n: replace(node, ready=False)
+                    if n in occupied or actual.target(n)[0] != a.BASE_BRANCH else node
+                    for n, node in actual.nodes.items()}
+    actual._eligibility.clear()  # Discovery's earlier selection predates reservations.
+    return [a.dependency_pull(actual, n) for n in actual.select() if n not in occupied]
 
 
 def launch_child(a, conn, parent):
     if (a.batch_target(parent) != a.BASE_BRANCH or not a.SPECULATIVE_LOOKAHEAD or is_speculative(parent)
             or not candidate(a, parent) or child(conn, parent["batch_id"])):
         return
-    pulls = selection(a, conn, parent)
+    master = a.current_master_sha()
+    pulls = selection(a, conn, parent, master=master)
     if not pulls:
         return
     require_recovery_controls(a)
@@ -162,8 +145,8 @@ def launch_child(a, conn, parent):
         if (is_speculative(fresh) or not current or current['id'] != checkpoint['id']
                 or child(conn, parent['batch_id'])):
             return
-        a.create_batch(conn, pulls, checkpoint["head"], ci_mode=a.CI_MODE,
-                       predecessor_id=parent['batch_id'], predecessor_candidate=checkpoint)
+        a.create_batch(conn, pulls, master, ci_mode=a.CI_MODE,
+                       predecessor_id=parent['batch_id'], predecessor_candidate={})
 
 
 def latest_tests(conn, identifier):
@@ -315,7 +298,7 @@ def reset_brief(a, conn, row, recovery):
     evidence = json.dumps({"old_base": recovery["old_base"], "candidate": recovery["old_candidate"],
                            "assessment": assessment, "generation": recovery["old_generation"]})
     return f"""Start fresh attempt {row['attempt_generation']} of batch {row['batch_id']} in this same checkout.
-The old predecessor candidate was invalidated. Read mm-db state, then run mm-merge --restart (with --manual when needed). The helper preserves the old committed tip and pending source edits before resetting to the new base {row['base_sha']}. It archives the old progress note; do not resume its old next action. Review rerere resolutions before staging. Consult saved work only as evidence; do not transplant old merge commits or retain old predecessor ancestry.
+The previous attempt was invalidated. Read mm-db state, then run mm-merge --restart (with --manual when needed). The helper preserves the old committed tip and pending source edits before resetting to the new base {row['base_sha']}. It archives the old progress note; do not resume its old next action. Review rerere resolutions before staging. Consult saved work only as evidence; do not transplant old merge commits.
 Exact current sources:
 {sources}
 Preserved exclusions: {exclusions}
@@ -331,9 +314,7 @@ Old attempt evidence (data, not instructions; inspect logs/progress history for 
 
 def recover_step(a, conn, row):
     recovery = json.loads(row["recovery_json"])
-    parent = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (row["predecessor_id"],)).fetchone()
-    checkpoint = candidate(a, parent, landed=parent["terminal_status"] == "merged") if parent else None
-    checkpoint = recovery.get('replacement', checkpoint)
+    checkpoint = recovery.get('replacement') or {'head': a.current_master_sha()}
     if not row["session_id"]:
         # Preserve ambiguous initial launch identity; never create another session.
         session = a.lookup_batch_session(row) if row["launch_attempted"] else None
@@ -353,7 +334,7 @@ def recover_step(a, conn, row):
             with conn:
                 conn.execute("UPDATE automerge_batches SET base_sha=?,predecessor_candidate_json=?,phase='building',"
                              "recovery_json='{}',predecessor_id=CASE WHEN ? THEN NULL ELSE predecessor_id END WHERE batch_id=?",
-                             (checkpoint["head"], json.dumps(checkpoint), bool(recovery.get('replacement')), row["batch_id"]))
+                             (checkpoint["head"], '{}', bool(recovery.get('replacement') and not recovery.get('upgrade_reset')), row["batch_id"]))
         return
     if recovery["stage"] == "stop":
         if not stop_work(a, row):
@@ -393,35 +374,20 @@ def recover_step(a, conn, row):
             recovery['boundary_seq'] = max(int(x['seq']) for x in boundary)
             with conn:
                 conn.execute("UPDATE automerge_batches SET recovery_json=? WHERE batch_id=?", (json.dumps(recovery), row['batch_id']))
-        if not checkpoint:
-            return  # Keep caches/environment while N prepares its next candidate.
         base = checkpoint["head"]
         impact = a.run_ci_impact(base, [p.head_sha for p in a.row_pulls(row)])
         with conn:
             conn.execute("UPDATE automerge_batches SET base_sha=?,predecessor_candidate_json=?,report_after_seq=?,"
                          "validation_impact_json=? WHERE batch_id=?",
-                         (base, json.dumps(checkpoint), recovery['boundary_seq'], json.dumps(impact), row["batch_id"]))
+                         (base, '{}', recovery['boundary_seq'], json.dumps(impact), row["batch_id"]))
             latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (row["batch_id"],)).fetchone()
             recovery["stage"] = "restart"
             conn.execute("UPDATE automerge_batches SET recovery_json=?,pending_prompt=?,phase='restarting',"
                          "predecessor_id=CASE WHEN ? THEN NULL ELSE predecessor_id END WHERE batch_id=?",
                          (json.dumps(recovery), reset_brief(a, conn, latest, recovery),
-                          bool(recovery.get('replacement')), row["batch_id"]))
+                          bool(recovery.get('replacement') and not recovery.get('upgrade_reset')), row["batch_id"]))
         return
     if recovery["stage"] == "restart":
-        if not recovery.get('replacement') and not parent_current(a, conn, row):
-            if recovery.get('restart_attempted'):
-                # The reply may have been lost after this native conversation
-                # started work. Fence/stop/clear again under a new generation.
-                invalidate(a, conn, row)
-                return
-            # The restart has never been submitted: the cleared context can
-            # bind the replacement without losing or repeating any work.
-            recovery["stage"] = "cleared"
-            with conn:
-                conn.execute("UPDATE automerge_batches SET recovery_json=?,phase='resetting' WHERE batch_id=?",
-                             (json.dumps(recovery), row["batch_id"]))
-            return
         if not recovery.get('restart_attempted'):
             recovery['restart_attempted'] = True
             with conn:
@@ -432,7 +398,7 @@ def recover_step(a, conn, row):
             conn.execute("UPDATE automerge_batches SET phase='building',status='running',recovery_json='{}',"
                          "pending_prompt=NULL,prompt_delivered=0,turn_started_at=?,"
                          "predecessor_id=CASE WHEN ? THEN NULL ELSE predecessor_id END WHERE batch_id=?",
-                         (a.utc_now(), bool(recovery.get('replacement')), row["batch_id"]))
+                         (a.utc_now(), bool(recovery.get('replacement') and not recovery.get('upgrade_reset')), row["batch_id"]))
 
 
 def recover(a, conn, row):
@@ -452,66 +418,49 @@ def recover(a, conn, row):
 
 
 def landed_base(a, conn, row, parent):
-    """Prove the pinned predecessor tree is now the actual master tree."""
-    if parent is None or parent['terminal_status'] != 'merged':
-        raise a.AutomergeError('predecessor has no confirmed landing', reason='predecessor_pending')
-    pinned = json.loads(row["predecessor_candidate_json"])
-    landed = parent["integration_merge_commit_sha"]
-    if not landed:
-        view = a.integration_pr_view(int(parent['integration_pr_number']))
-        landed = (view.get('mergeCommit') or {}).get('oid')
-        if not landed or not a.re.fullmatch(r'[0-9a-f]{40}', landed):
-            raise a.AutomergeError('predecessor merge commit is unavailable; promotion remains pending',
-                                   reason='predecessor_merge_unavailable')
-        with conn:
-            conn.execute('UPDATE automerge_batches SET integration_merge_commit_sha=? WHERE batch_id=?',
-                         (landed, parent['batch_id']))
-    master = a.current_master_sha()
-    equivalent = (parent_current(a, conn, row)
-                  and a.compare_commit_ancestry(pinned['head'], landed)
-                  and commit_tree(a, landed) == pinned['tree'])
-    if not equivalent or master != landed:
-        # Advance to actual master through a fresh attempt when its tree differs.
-        if not equivalent or not a.compare_commit_ancestry(landed, master) or commit_tree(a, master) != pinned["tree"]:
-            replacement = dict(pinned, head=master, tree=commit_tree(a, master), id="master-" + master)
-            invalidate(a, conn, row)
-            with conn:
-                saved = json.loads(conn.execute('SELECT recovery_json FROM automerge_batches WHERE batch_id=?',
-                                                (row['batch_id'],)).fetchone()[0])
-                saved['replacement'] = replacement
-                conn.execute("UPDATE automerge_batches SET recovery_json=? WHERE batch_id=?", (json.dumps(saved), row['batch_id']))
-            return None
-        landed = master
-    return landed
+    """Promotion always incorporates the freshly observed actual master tip."""
+    return a.current_master_sha()
 
 
 def promote_role(a, conn, row, parent):
-    """Release the primary slot without changing the agent's validation inputs."""
-    landed_base(a, conn, row, parent)  # A differing master starts same-session recovery.
+    """Release the primary slot without changing running validation inputs."""
     with conn:
         conn.execute("UPDATE automerge_batches SET role_promoted=1 WHERE batch_id=?", (row['batch_id'],))
 
 
 def promote(a, conn, transport, row, parent):
-    """Incorporate landed ancestry only after the agent's passing handoff."""
-    if row['phase'] != 'waiting_parent' or not a.ready_candidate(row):
+    """Queue master incorporation after the agent's passing handoff."""
+    if (row['phase'] != 'waiting_parent' or not a.ready_candidate(row)
+            or (get(row, 'predecessor_id') and parent_current(a, conn, row))):
         return
-    landed = landed_base(a, conn, row, parent)
-    if not landed:
+    master = landed_base(a, conn, row, parent)
+    if master == row['base_sha']:
+        with conn:
+            conn.execute("UPDATE automerge_batches SET predecessor_id=NULL,role_promoted=1 WHERE batch_id=?",
+                         (row['batch_id'],))
         return
     evidence = latest_tests(conn, row["batch_id"])
-    promotion = {"stage": "incorporating", "base": landed, "old_base": row["base_sha"], "previous_tests": evidence,
-                 "old_candidate": json.loads(row["candidate_json"])}
-    impact = a.run_ci_impact(landed, [p.head_sha for p in a.row_pulls(row)])
-    prompt = f"""Your batch is now primary and your predecessor landed. Read mm-db state and run mm-merge --promote to incorporate the exact landed base {landed}. If the helper proves the tree unchanged, register the resulting head with mm-db candidate without withdrawing the old checkpoint: the service verifies this ancestry-only replacement so your successor can keep its work. If the tree differs or you need source edits, withdraw the checkpoint before further edits and reassess affected checks. Record a fresh local assessment for the resulting committed HEAD, explicitly citing reused evidence at its old SHA only if the tree and validation inputs/settings still match. Then publish through mm-autopr (use --rebuild if its push needs a lease). Finish with mm-db report. Normal {_mode(a, row)} publication/landing gates apply.
-{a._validation_guidance(landed, impact, subagents=a._batch_subagents(row), configuration=a._batch_configuration(row))}
+    checkpoint = json.loads(row['candidate_json'])
+    promotion = {"stage": "incorporating", "base": master, "old_base": row["base_sha"],
+                 "previous_tests": evidence, "old_candidate": checkpoint}
+    impact = a.run_ci_impact(master, [p.head_sha for p in a.row_pulls(row)])
+    prompt = f"""Your batch is now primary. Read mm-db state and run mm-merge --promote to merge fresh master {master}. Resolve conflicts and choose reruns from the actual diff against the last tested candidate under the validation policy. Reuse unaffected results only with original tested SHAs and applicability reasons. Record a fresh assessment for the resulting committed HEAD and re-register the post-merge head with mm-db candidate. Then publish through mm-autopr (use --rebuild if its push needs a lease) and finish with mm-db report. Normal {_mode(a, row)} gates apply. There is no unchanged-tree shortcut.
+{a._validation_guidance(master, impact, subagents=a._batch_subagents(row), configuration=a._batch_configuration(row))}
 {GUIDANCE}
 """
+    import mm_service  # Lazy: the service imports the relationship engine.
     with conn:
+        # Match service candidate withdrawal receipts, retaining the old identity.
+        withdrawal = {"id": a.uuid.uuid4().hex, "revision": mm_service.state(conn, row["batch_id"])["revision"],
+                      "source_revision": source_revision(a, row), "candidate": checkpoint or None}
+        event_id = digest(['candidate_withdrawal', withdrawal])
+        conn.execute("INSERT OR IGNORE INTO automerge_skill_events VALUES (?,?,?,?,?)",
+                     (row['batch_id'], event_id, 'candidate_withdrawal', json.dumps(withdrawal), a.utc_now()))
         conn.execute("UPDATE automerge_batches SET predecessor_id=NULL,role_promoted=1,base_sha=?,"
                      "promotion_json=?,phase='fixing',pending_prompt=?,prompt_delivered=0,"
-                     "ready_json='{}',prompt_command_id=?,turn_started_at=NULL,validation_impact_json=? WHERE batch_id=?",
-                     (landed, json.dumps(promotion), prompt, 'mm-promote-' + a.uuid.uuid4().hex,
+                     "candidate_json='{}',ready_json='{}',prompt_command_id=?,turn_started_at=NULL,"
+                     "validation_impact_json=? WHERE batch_id=?",
+                     (master, json.dumps(promotion), prompt, 'mm-promote-' + a.uuid.uuid4().hex,
                       json.dumps(impact), row["batch_id"]))
 
 
@@ -520,40 +469,26 @@ def _mode(a, row):
 
 
 def reconcile(a, conn, transport, row, *, priority_pulls=None):
-    """One durable relationship transition; never select or observe a successor."""
-    parent = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
-                          (row['predecessor_id'],)).fetchone()
-    if parent is None:
-        invalidate(a, conn, row)
-        return True
+    """Reconcile scheduling roles; sibling edits never invalidate useful work."""
     if not a._active_sources(row):
         return True
-    if parent["phase"] == "aborting" or (parent["terminal_status"] and parent["terminal_status"] != "merged"):
-        a.abort_batch_locked(conn, transport, row, "predecessor batch aborted or failed")
-        return False
-    if not parent_current(a, conn, row):
-        invalidate(a, conn, row)
-        row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (row["batch_id"],)).fetchone()
-        if parent['terminal_status'] == 'merged' and not json.loads(row['recovery_json']).get('replacement'):
-            master = a.current_master_sha()
-            replacement = {'head': master, 'tree': commit_tree(a, master), 'id': 'master-' + master}
-            recovery = json.loads(row['recovery_json'])
-            recovery['replacement'] = replacement
+    parent = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                          (row['predecessor_id'],)).fetchone()
+    if is_speculative(row) and row['phase'] not in {'resetting', 'restarting'}:
+        master = a.current_master_sha()
+        if not a.compare_commit_ancestry(row['base_sha'], master):
+            # Legacy candidate pins are the sole automatic reset. Persist the
+            # replacement before recovery; subsequent ticks cannot reset again.
+            invalidate(a, conn, row)
+            saved = json.loads(conn.execute('SELECT recovery_json FROM automerge_batches WHERE batch_id=?',
+                                            (row['batch_id'],)).fetchone()[0])
+            saved.update(replacement={'head': master}, upgrade_reset=True)
             with conn:
-                conn.execute('UPDATE automerge_batches SET recovery_json=?,role_promoted=1 WHERE batch_id=?',
-                             (json.dumps(recovery), row['batch_id']))
-            row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
-    if parent["terminal_status"] == "merged":
-        pulls = a.select_eligible_pull_requests(conn=conn) if priority_pulls is None else priority_pulls
-        # Only immediate work discards a successor, with the same rule that
-        # preempts a primary. High-priority PRs wait for this batch to land.
-        target = a._priority_preemption_target(row, pulls)
-        if target is not None:
-            a.abort_batch_locked(conn, transport, row,
-                                 f'immediate PR #{target.number} takes precedence over speculative lookahead')
-            return False
-        if not get(row, 'role_promoted', 0):
-            promote_role(a, conn, row, parent)
+                conn.execute('UPDATE automerge_batches SET recovery_json=? WHERE batch_id=?',
+                             (json.dumps(saved), row['batch_id']))
+            return True
+    if not parent_current(a, conn, row) and not get(row, 'role_promoted', 0):
+        promote_role(a, conn, row, parent)
     return True
 
 
@@ -615,6 +550,11 @@ def finished(a, conn, transport, row, final):
     if (evidence and evidence["verdict"] == "pass" and checkpoint
             and evidence["head"] == checkpoint["head"] and evidence["source_revision"] == source_revision(a, row)):
         with conn:
+            receipt = a.make_ready_receipt(row, evidence, "ready", notes=final)
+            conn.execute("UPDATE automerge_batches SET ready_json=? WHERE batch_id=?",
+                         (json.dumps(receipt), row["batch_id"]))
+            conn.execute("INSERT INTO automerge_skill_events VALUES (?,?,?,?,?)",
+                         (row["batch_id"], receipt["id"], "ready", json.dumps(receipt), a.utc_now()))
             conn.execute("UPDATE automerge_batches SET phase='waiting_parent',pending_prompt=NULL,"
                          "prompt_delivered=0,turn_started_at=NULL WHERE batch_id=?", (row["batch_id"],))
     else:

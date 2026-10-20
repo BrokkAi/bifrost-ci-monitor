@@ -68,8 +68,8 @@ def state(conn, batch_id):
     result["attempt_generation"] = speculation.get(row, "attempt_generation", 0)
     result["role"] = "speculative" if speculation.is_speculative(row) else "primary"
     result["candidate"] = speculation.candidate(automerge, row)
+    # current means the predecessor exists and is live, independent of its checkpoint.
     result["predecessor"] = ({"batch_id": row["predecessor_id"],
-                              "candidate": json.loads(row["predecessor_candidate_json"]),
                               "current": speculation.parent_current(automerge, conn, row)}
                              if speculation.get(row, "predecessor_id") else None)
     result["recovery"] = json.loads(speculation.get(row, "recovery_json", "{}"))
@@ -108,8 +108,6 @@ def checked(conn, batch_id, revision):
         raise ValueError("stale revision; read mm-db state again")
     if current["ready"]:
         raise ValueError("candidate handed to supervisor; wait for its next instruction")
-    if current["predecessor"] and not current["predecessor"]["current"]:
-        raise ValueError("predecessor candidate invalidated; wait for the supervisor to restart this attempt")
     return current
 
 
@@ -236,8 +234,7 @@ def dispatch(conn, batch_id, operation, payload):
             if (receipt and isinstance(payload.get("revision"), str)
                     and receipt["kind"] == operation and receipt["head"] == payload.get("head")
                     and payload.get("revision") in {receipt["registered_revision"], current["revision"]}
-                    and receipt["notes"] == payload.get("notes", "")
-                    and (not current["predecessor"] or current["predecessor"]["current"])):
+                    and receipt["notes"] == payload.get("notes", "")):
                 conn.commit()
                 return current  # A handoff accepted before a lost reply remains accepted.
         if operation == "finding":
@@ -275,7 +272,7 @@ def dispatch(conn, batch_id, operation, payload):
             withdrawn = (payload.get('withdraw') is True and not checkpoint and withdrawal
                          and withdrawal.get('revision') == payload.get('revision')
                          and withdrawal.get('source_revision') == current['source_revision'])
-            if (registered or withdrawn) and (not current['predecessor'] or current['predecessor']['current']):
+            if registered or withdrawn:
                 conn.commit()
                 return current  # The original accepted write survived a lost reply.
         current = checked(conn, batch_id, payload.get("revision"))
@@ -294,20 +291,14 @@ def dispatch(conn, batch_id, operation, payload):
             conn.commit()
             tree = speculation.verify_candidate(automerge, current, head, conn)
             previous = current["candidate"]
-            row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
-            equivalent = bool(previous and speculation.incorporating_candidate(automerge, row, previous)
-                              and previous["tree"] == tree
-                              and automerge.compare_commit_ancestry(previous["head"], head))
             conn.execute("BEGIN IMMEDIATE")
             checked(conn, batch_id, current["revision"])
-            retain = bool(previous and (previous["head"] == head or equivalent))
+            retain = bool(previous and previous["head"] == head)
             checkpoint = {"id": previous["id"] if retain else uuid.uuid4().hex,
                           "head": head, "tree": tree, "branch": current["branch"],
                           "source_revision": current["source_revision"],
                           "registered_revision": current['revision'],
                           "attempt_generation": current["attempt_generation"]}
-            if retain:
-                checkpoint["equivalent_heads"] = sorted({previous["head"], *previous.get("equivalent_heads", [])})
             conn.execute("UPDATE automerge_batches SET candidate_json=? WHERE batch_id=?",
                          (json.dumps(checkpoint), batch_id))
             if current["promotion"].get("stage") == "incorporating":
@@ -389,10 +380,8 @@ def dispatch(conn, batch_id, operation, payload):
             handoff(conn, current, "ready", notes=notes)
             conn.commit()
         else:
-            if current["predecessor"]:
-                raise ValueError("publication is blocked until the predecessor lands and the batch is promoted")
-            if current["promotion"].get("stage") == "incorporating":
-                raise ValueError("checkpoint the incorporated landed base before publication")
+            if current["predecessor"] and current["predecessor"]["current"]:
+                raise ValueError("publication is blocked while the predecessor is live")
             head = sha(payload.get("head"))
             if not current["sources"] or not current["tests"] or current["tests"]["head"] != head or current["tests"]["verdict"] != "pass":
                 raise ValueError("publication requires a passing assessment for this exact head and source set")

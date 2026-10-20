@@ -38,21 +38,25 @@ After the supervisor creates a new attempt, run `--restart` (combine with
 progress note under the Git directory's `mm-recovery/attempt-N`, then resets to
 the recorded replacement base and assembles your original own heads. Repeating
 it in the same attempt preserves current work. Caches and logs remain available.
-Use the archived work as evidence; never transplant old merge commits or retain
-the invalidated predecessor's ancestry. Read the generated brief and current
+Use the archived work as evidence; never transplant old merge commits from the
+invalidated attempt. Read the generated brief and current
 state; the archived progress note's next action is obsolete.
 
-Taking the primary scheduling role does not require changing your checkout or
-stopping checks. Continue validation and hand off with `mm-db ready` while
-`predecessor` remains present. After the supervisor explicitly requests ancestry
-incorporation, run `--promote`. This merges the exact landed base and reports
-whether the resulting tree matches earlier passing evidence. Reuse requires
-applicable test inputs/settings as well as an unchanged tree. Record a fresh
-assessment at the resulting committed HEAD before publication. If the helper
-encounters conflicts, resolve/commit them and reassess affected checks.
-If the tree is unchanged, register the resulting head without withdrawing the
-old checkpoint so the next speculative batch can retain its work. Otherwise
-withdraw the checkpoint before further edits and register a replacement.
+The captured base is actual master; nothing is shared with the primary. Merge
+only your own recorded sources. `predecessor.current` means the predecessor is
+live, independently of its candidate. After local pass, call `mm-db ready` and
+wait without publishing while it is live. Taking the primary scheduling role
+does not stop checks or change your checkout.
+
+When the supervisor requests promotion, run `--promote` to merge the exact
+recorded master base into your committed candidate. Resolve conflicts and commit
+with the prepared trailer. Choose reruns from the diff against the last tested
+candidate under the validation policy, then record a fresh assessment and
+re-register the candidate with `mm-db candidate`. The helper summarizes changed
+paths and crates. Reuse unaffected results only with their original tested SHAs
+and applicability reasons; promotion always requires a fresh assessment. The
+supervisor withdraws the old checkpoint when it updates the base. Withdraw any
+new checkpoint before further edits. Publish through mm-autopr after validation.
 
 Only when `mm-db state` names a stabilize campaign branch in `target_ref`, apply
 these campaign instructions: use the captured `base_sha` for assembly,

@@ -840,8 +840,8 @@ class DependencyTests(TestCase):
             speculation.launch_child(automerge, self.conn, row)
             speculation.launch_child(automerge, self.conn, row)
         child = speculation.child(self.conn, identifier)
-        self.assertEqual([p.number for p in automerge.row_pulls(child)], [20, 10, 40])
-        self.assertEqual(child['base_sha'], self.x)
+        self.assertEqual([p.number for p in automerge.row_pulls(child)], [40])
+        self.assertEqual(child['base_sha'], self.base)
         self.assertEqual(child['ci_mode'], 'async')
         self.assertEqual(self.git('rev-parse', 'master'), before)
         self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM automerge_batches').fetchone()[0], 2)
@@ -1420,10 +1420,9 @@ class DependencyTests(TestCase):
         with (mock.patch.object(pr_dependencies, 'REVIEWED_SUPERSESSIONS', (record,)),
               mock.patch.object(automerge, 'list_pull_comments', return_value=[]) as reads):
             selected = speculation.selection(automerge, self.conn, row)
-        self.assertEqual([p.number for p in selected], [record.replacement_number, 20])
-        self.assertTrue(all(p.target_ref == 'master' for p in selected))
-        # The speculative view derives from this same discovery and shares
-        # its authenticated proof without another pair of comment requests.
+        self.assertEqual(selected, [])
+        # Both otherwise eligible heads require reserved PR #40 to land.
+        # Supersession is still authenticated once within actual-master discovery.
         self.assertEqual(reads.call_args_list,
                          [mock.call(record.retired_number), mock.call(record.replacement_number)])
 

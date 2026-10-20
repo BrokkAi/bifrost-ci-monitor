@@ -36,21 +36,22 @@ python3 <this skill>/scripts/mm_db.py candidate --revision REV --withdraw
 
 Withdraw before edits. After rebuilding, checkpoint with `--rebuild` for an
 explicit observed lease. Re-read state between mutations. `attempt_generation`
-fences old attempts. If `predecessor` is present, merge only your own `sources`
-on its pinned base; never redo its membership. After local pass, refresh state
-and run `ready --revision REV`, then `report` and finish without publishing.
-`ready` hands the exact checkpointed passing head to the supervisor. A stale
-predecessor blocks mutations until the supervisor clears/restarts this attempt
-in the same environment. Independently
-established rejections survive that restart and every abort.
+fences old attempts. The captured base is actual master; nothing is shared with
+the primary. Merge only your own `sources`. `predecessor.current` means the
+predecessor is live, independently of its candidate. After local pass, refresh
+state and run `ready --revision REV`, then `report` and wait without publishing
+while it is live. `ready` hands the exact checkpointed passing head to the
+supervisor. Independently established rejections survive recovery and every abort.
 
-`role` becomes `primary` as soon as the predecessor lands. Keep running your
-existing checks and use `ready` while `predecessor` remains present. The
-supervisor can start your successor from your checkpoint during validation.
-After its explicit `mm-merge --promote` instruction, register the new head
-without withdrawing only if incorporation leaves the tree unchanged. The
-service verifies ancestry and retains your successor's pinned checkpoint.
-For source edits or a changed tree, withdraw and replace it normally.
+`role` becomes `primary` when the predecessor ends, landed or not. Keep running
+your existing checks. The supervisor can start your successor from your next
+checkpoint. When requested, run `mm-merge --promote` to merge the recorded master
+tip, resolve conflicts, and choose reruns from the diff against the last tested
+candidate under the validation policy. Record a fresh assessment, identifying
+unaffected reused results by their original tested SHAs and applicability reasons,
+then re-register the candidate with `mm-db candidate`. The supervisor withdraws
+the old checkpoint when it updates the base. Each new head gets a new checkpoint
+identity; withdraw any new checkpoint before further edits.
 
 Run your chosen local builds/tests through the execution wrapper:
 
