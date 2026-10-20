@@ -378,7 +378,13 @@ issue prompt and instructions to reconcile saved progress and reuse validation.
 `report_after_seq` fences pre-reset reports. Both recovery columns migrate
 additively in `connect_db`. Recovery is silent while progressing; quota/input
 blocks and failed supervision/recovery alert once per episode without making
-Slack delivery a scheduling gate. A repeated ended-turn result cannot start
+Slack delivery a scheduling gate. A valid fixer-result can also precede native
+completion of a background-task continuation. While native wait still reports
+running, send one durable same-session handoff reminder per canonical report and
+recovery boundary through `issue_repair_messages`. Retry ambiguous sends with the
+same request ID. This reminder does not accept the report, cancel work, or inspect
+session idleness; normal native completion and validation still own cleanup.
+A repeated ended-turn result cannot start
 another reset. Accepted report corrections are quiet on subsequent polls;
 a new completed turn may receive another correction. No session-idle checks,
 new environment or elapsed-work deadline participates in recovery.

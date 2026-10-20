@@ -678,6 +678,33 @@ def collect(conn, transport, job):
         raise
 
 
+def request_report_handoff(conn, job):
+    """A valid report may outlive the harness's background-task turn boundary."""
+    lower = job['report_after_seq']
+    final = (monitor.read_final_agent_message(job['session_id'], after_seq=lower) if lower
+             else monitor.read_final_agent_message(job['session_id']))
+    try:
+        report = parse_report(final, job['issue_number'])
+    except ValueError:
+        return
+    identity = json.dumps([lower, report], sort_keys=True)
+    digest = hashlib.sha256(identity.encode()).hexdigest()
+    stable_id = 'report-handoff:' + digest
+    if conn.execute('SELECT 1 FROM issue_repair_messages WHERE job_id=? AND stable_id=?',
+                    (job['id'], stable_id)).fetchone():
+        return
+    monitor.send_session_message(
+        job['session_id'],
+        f"Your issue #{job['issue_number']} fixer-result is present, but the native turn "
+        "completion has not reached the supervisor. Finish only this completion handoff "
+        "and return the same fixer-result JSON. Preserve your checkout and evidence; "
+        "reuse your findings without another investigation or build.",
+        request_id='fixer-handoff-' + hashlib.sha256((job['id'] + digest).encode()).hexdigest()[:32])
+    with conn:
+        conn.execute('INSERT OR IGNORE INTO issue_repair_messages VALUES (?,?)',
+                     (job['id'], stable_id))
+
+
 def collect_step(conn, transport, job):
     recovery = json.loads(job['recovery_json'])
     if recovery:
@@ -688,6 +715,7 @@ def collect_step(conn, transport, job):
     turn = monitor.wait_once(job["session_id"], 1)
     relay(conn, transport, job)
     if turn.status == "running":
+        request_report_handoff(conn, job)
         with conn:
             conn.execute('UPDATE issue_repairs SET last_error=NULL WHERE id=?', (job['id'],))
         return

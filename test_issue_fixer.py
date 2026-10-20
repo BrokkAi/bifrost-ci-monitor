@@ -1056,9 +1056,57 @@ class IssueFixerTests(TestCase):
     def test_running_session_is_left_live(self):
         job = dict(self.job(), session_id="session")
         with mock.patch.object(monitor, "wait_once", return_value=monitor.TurnResult("running", "timeout", True)), \
-             mock.patch.object(fixer, "relay"), mock.patch.object(monitor, "send_session_message") as prompt:
+             mock.patch.object(fixer, "relay"), \
+             mock.patch.object(monitor, 'read_final_agent_message', return_value='Waiting on CI'), \
+             mock.patch.object(monitor, "send_session_message") as prompt:
             fixer.collect(self.conn, self.transport, job)
         prompt.assert_not_called()
+
+    def test_valid_report_with_unfinished_native_turn_requests_one_durable_handoff(self):
+        job = self.job()
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='running',session_id='original',"
+                              "feedback_digest='existing-correction' WHERE id=?", (job['id'],))
+        report = dict(issue=12, outcome='deferred', pr=30, summary='Existing PR verified')
+        with mock.patch.object(monitor, 'wait_once', return_value=monitor.TurnResult('running', 'timeout', True)), \
+             mock.patch.object(fixer, 'relay'), \
+             mock.patch.object(monitor, 'read_final_agent_message', side_effect=[
+                 'Evidence\nfixer-result: ' + json.dumps(report),
+                 'fixer-result: ' + json.dumps(report, sort_keys=True)]), \
+             mock.patch.object(monitor, 'send_session_message', return_value={'via': 'mailbox'}) as send, \
+             mock.patch.object(monitor, 'interrupt_turn') as interrupt, \
+             mock.patch.object(monitor, 'suspend_session') as suspend:
+            for _ in range(2):
+                fixer.collect(self.conn, self.transport, self.saved_job(job['id']))
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], 'original')
+        interrupt.assert_not_called()
+        suspend.assert_not_called()
+        saved = self.saved_job(job['id'])
+        self.assertEqual(saved['status'], 'running')
+        self.assertIsNone(saved['report_json'])
+        self.assertEqual(saved['feedback_digest'], 'existing-correction')
+
+    def test_report_handoff_retries_lost_reply_with_same_request_id(self):
+        job = dict(self.job(), session_id='original')
+        report = 'fixer-result: ' + json.dumps(dict(issue=12, outcome='resolved', summary='Verified'))
+        with mock.patch.object(monitor, 'read_final_agent_message', return_value=report), \
+             mock.patch.object(monitor, 'send_session_message', side_effect=[monitor.MjError('lost reply'), {}]) as send:
+            with self.assertRaises(monitor.MjError):
+                fixer.request_report_handoff(self.conn, job)
+            self.assertFalse(self.conn.execute('SELECT 1 FROM issue_repair_messages').fetchone())
+            fixer.request_report_handoff(self.conn, job)
+            fixer.request_report_handoff(self.conn, job)
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(send.call_args_list[0].kwargs['request_id'], send.call_args_list[1].kwargs['request_id'])
+
+    def test_report_handoff_reads_only_after_recovery_boundary_and_ignores_invalid_report(self):
+        job = dict(self.job(), session_id='original', report_after_seq=84)
+        with mock.patch.object(monitor, 'read_final_agent_message', return_value='Working') as read, \
+             mock.patch.object(monitor, 'send_session_message') as send:
+            fixer.request_report_handoff(self.conn, job)
+        read.assert_called_once_with('original', after_seq=84)
+        send.assert_not_called()
 
     def test_report_must_match_target_issue(self):
         with self.assertRaises(ValueError):
