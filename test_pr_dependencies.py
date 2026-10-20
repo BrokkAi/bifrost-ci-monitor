@@ -763,18 +763,25 @@ class DependencyTests(TestCase):
         detail = automerge._prerequisite_block_detail(self.conn, 20, child, reason)
         self.assertEqual(detail, {'rejected_head': rejected})
         message = automerge.dependency_block_comment(20, reason, detail)
-        self.assertIn('rejected PR #30\'s head `aaaaaaaaaaaa`', message)
+        self.assertIn('rejected its head `aaaaaaaaaaaa`', message)
+        self.assertIn('if this PR replaces PR #30, close PR #30', message)
         self.assertIn('git commit --allow-empty', message)
-        self.assertIn('merge its new head into this PR', message)
-        self.assertIn('does not clear this block', message)
         with self.conn:
-            self.conn.execute("UPDATE automerge_github_outbox SET cancelled_at='now' WHERE kind='reject_head'")
             self.conn.execute('INSERT OR REPLACE INTO automerge_pr_inventory (number,head_sha,data_json) VALUES (?,?,?)',
-                              (30, rejected, json.dumps({'number': 30, 'state': 'closed', 'merged_at': None})))
+                              (30, rejected, json.dumps({'number': 30, 'state': 'closed', 'merged_at': None,
+                                                         'head': {'ref': 'closed-work'}})))
+            self.conn.execute('INSERT OR REPLACE INTO automerge_pr_inventory (number,head_sha,data_json) VALUES (?,?,?)',
+                              (20, child, json.dumps({'number': 20, 'state': 'open',
+                                                      'base': {'ref': 'closed-work'}})))
         detail = automerge._prerequisite_block_detail(self.conn, 20, child, reason)
-        self.assertEqual(detail, {'closed': True})
-        self.assertIn('closed without merging', automerge.dependency_block_comment(20, reason, detail))
+        self.assertEqual(detail, {'rejected_head': rejected, 'closed': True, 'stacked': 'closed-work'})
+        message = automerge.dependency_block_comment(20, reason, detail)
+        self.assertIn('closed without merging', message)
+        self.assertIn('retarget this PR', message)
         self.assertEqual(automerge._prerequisite_block_detail(self.conn, 20, child, 'cycle'), {})
+        shared = automerge.dependency_block_comment(20, 'ambiguous shared head with PR #30')
+        self.assertIn('point at the same commit', shared)
+        self.assertIn('close whichever of PR #20 and PR #30', shared)
 
     def test_ineligible_prerequisite_notice_points_action_at_the_prerequisite(self):
         message = automerge.dependency_block_comment(20, 'blocked by prerequisite PR #30')
@@ -964,6 +971,131 @@ class DependencyTests(TestCase):
         self.assertTrue(any('cyclic' in r for r in reasons))
         self.assertTrue(any('unresolved' in r for r in reasons))
 
+    def consolidation_fixture(self):
+        """PR #5980/#6017/#5986 on 2026-10-20: a rejected PR consolidated into another."""
+        self.patch(automerge, 'SUPERVISOR_RUNNING', False)
+        self.items = {}
+        rejected = self.add_pr(5980, 'provider-inventories', self.base)
+        self.reject(5980)
+        self.comments[5980] = [{'user': {'login': automerge.TRUSTED_REJECTION_LOGIN},
+                                'body': f'mergemarshall:rejected-head: {rejected}\nisolated failure'}]
+        self.items[5980]['labels'] = [{'name': automerge.REJECTED_LABEL}]
+        consolidated = self.add_pr(6017, 'flip-batch', rejected)
+        child = self.add_pr(5986, 'prefix-gap', consolidated, base='flip-batch')
+        self.git('checkout', '-q', 'master')
+        self.commit('unrelated-master', 'unrelated')
+        return rejected, consolidated, child
+
+    def test_closed_rejected_prerequisite_is_absorbed_by_a_master_targeted_descendant(self):
+        rejected, consolidated, _ = self.consolidation_fixture()
+        self.items[5980]['state'] = 'closed'
+        graph = automerge.dependency_graph(self.conn, promote=False)
+        self.assertEqual(graph.absorbed[6017], (pr_dependencies.Dependency(5980, rejected),))
+        self.assertEqual(graph.dependencies[6017], ())
+        self.assertEqual(graph.dependencies[5986], (pr_dependencies.Dependency(6017, consolidated),))
+        self.assertEqual([p.number for p in self.selected()], [6017, 5986])
+
+    def test_scoped_discovery_refreshes_a_reopened_absorbed_prerequisite(self):
+        rejected, consolidated, _ = self.consolidation_fixture()
+        self.items[5980]['state'] = 'closed'
+        self.assertIn(6017, [p.number for p in self.selected()])
+        # The cached inventory still says closed; scoped discovery must load the
+        # absorbed parent's fresh state instead of trusting the cached one.
+        self.items[5980]['state'] = 'open'
+        graph = automerge.dependency_graph(self.conn, promote=False, selection_target='master')
+        self.assertNotIn(6017, graph.absorbed)
+        self.assertIn(5980, {dep.number for dep in graph.dependencies[6017]})
+        self.assertFalse(graph.eligible(6017))
+
+    # Hard-won: independent review of absorption, 2026-10-20.
+    def test_absorbed_rejection_can_pass_final_gate(self):
+        rejected, consolidated, child = self.consolidation_fixture()
+        self.items[5980]['state'] = 'closed'
+        selected = self.selected()
+        self.assertEqual([p.number for p in selected], [6017, 5986])
+        batch = automerge.create_batch(self.conn, selected, self.git('rev-parse', 'master'))
+        row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
+        ok, reason = automerge.verify_source_ancestry(row, child, conn=self.conn)
+        self.assertTrue(ok, reason)
+
+    def test_absorbed_parent_keeps_unincorporated_external_prerequisite(self):
+        # P targets Q but omits Q's commit; that explicit prerequisite must
+        # survive closing P and absorbing its head into master-targeting N.
+        self.items = {}
+        q = self.add_pr(100, 'q', self.base)
+        p = self.add_pr(200, 'p', self.base, base='q')
+        n = self.add_pr(300, 'n', p)
+        graph = automerge.dependency_graph(self.conn, promote=False)
+        self.assertFalse(graph.eligible(300))
+        self.items[200]['state'] = 'closed'
+        graph = automerge.dependency_graph(self.conn, promote=False)
+        self.assertIn(100, {d.number for d in graph.dependencies[300]})
+        self.assertFalse(graph.eligible(300))
+
+    def test_reopened_absorbed_parent_blocks_recheck(self):
+        rejected, consolidated, child = self.consolidation_fixture()
+        self.items[5980]['state'] = 'closed'
+        selected = self.selected()
+        self.items[5980]['state'] = 'open'
+        graph = automerge.dependency_graph(self.conn, roots=[p.number for p in selected], promote=False)
+        self.assertIn(6017, graph.validate(selected))
+
+    def test_cached_closed_parent_merged_to_campaign_is_refreshed(self):
+        self.items = {}
+        p = self.add_pr(200, 'campaign-parent', self.base, base='stabilize/test')
+        n = self.add_pr(300, 'master-child', p)
+        self.campaign(tip=p)
+        self.items[200]['state'] = 'closed'
+        pr_dependencies.save_observation(self.conn, 200, p, self.items[200], [p], False)
+        graph = automerge.dependency_graph(self.conn, selection_target='master', promote=False)
+        self.assertTrue(graph.eligible(300))
+        self.items[200]['merged_at'] = 'now'
+        stale = automerge.dependency_graph(self.conn, selection_target='master', promote=False)
+        # A fresh record demonstrates the campaign fence required here.
+        pr_dependencies.save_observation(self.conn, 200, p, self.items[200], [p], False)
+        fresh = automerge.dependency_graph(self.conn, selection_target='master', promote=False)
+        self.assertFalse(fresh.eligible(300))
+        self.assertFalse(stale.eligible(300), 'cached closed-unmerged record bypasses campaign dependency fence')
+
+    def test_scoped_cached_open_now_closed_and_reopened_are_rechecked(self):
+        rejected, consolidated, child = self.consolidation_fixture()
+        self.campaign()
+        automerge.dependency_graph(self.conn, selection_target='master', promote=False)
+        self.items[5980]['state'] = 'closed'
+        graph = automerge.dependency_graph(self.conn, roots=[6017], selection_target='master', promote=False)
+        self.assertTrue(graph.eligible(6017))
+        selected = [automerge.dependency_pull(graph, 6017)]
+        self.items[5980]['state'] = 'open'
+        graph = automerge.dependency_graph(self.conn, roots=[6017], selection_target='master', promote=False)
+        self.assertFalse(graph.eligible(6017))
+        self.assertIn(6017, graph.validate(selected))
+
+    def test_open_prs_at_one_head_are_ambiguous_rather_than_cyclic(self):
+        rejected, consolidated, _ = self.consolidation_fixture()
+        self.items[5980]['head']['sha'] = consolidated
+        graph = automerge.dependency_graph(self.conn, promote=False)
+        self.assertEqual(graph.problems[5980], 'ambiguous shared head with PR #6017')
+        self.assertEqual(graph.problems[6017], 'ambiguous shared head with PR #5980')
+        self.assertFalse(any('cyclic' in problem for problem in graph.problems.values()))
+        self.assertEqual(self.selected(), [])
+
+    def test_closing_one_shared_head_pr_admits_the_other_and_stacked_child_waits_for_retarget(self):
+        rejected, consolidated, child = self.consolidation_fixture()
+        self.items[5980]['head']['sha'] = consolidated
+        automerge.dependency_graph(self.conn, promote=False)  # records the ambiguous period
+        self.items[6017]['state'] = 'closed'
+        graph = automerge.dependency_graph(self.conn, promote=False)
+        self.assertEqual(graph.dependencies[5980], ())
+        self.assertIn(6017, {dep.number for dep in graph.absorbed[5980]})
+        # The stacked child's diff hides the closed PR's work until it is retargeted.
+        self.assertEqual(graph.blocked[5986], 'blocked by prerequisite PR #6017')
+        self.assertEqual([p.number for p in self.selected()], [5980])
+        self.items[5986]['base']['ref'] = 'provider-inventories'
+        self.assertEqual([p.number for p in self.selected()], [5980, 5986])
+        graph = automerge.dependency_graph(self.conn, promote=False)
+        self.assertEqual(graph.dependencies[5986], (pr_dependencies.Dependency(5980, consolidated),))
+        self.assertEqual(graph.validate([automerge.dependency_pull(graph, n) for n in (5980, 5986)]), {})
+
     def test_reviewed_supersession_replaces_exact_retired_head_and_keeps_external_edges(self):
         record = self.reviewed_pair()
         graph = self.reviewed_graph(record)
@@ -974,7 +1106,7 @@ class DependencyTests(TestCase):
         self.assertNotIn(20, graph.problems)
         self.assertNotIn(4788, {dep.number for dep in graph.dependencies[4785]})
 
-    def test_shared_supersession_is_verified_once_per_discovery_and_refreshed_next_time(self):
+    def test_shared_supersession_is_verified_once_and_absorbs_a_later_retired_rejection(self):
         record = self.reviewed_pair()
         for number in range(60, 72):
             self.add_pr(number, f'dependent-{number}', record.replacement_head,
@@ -987,17 +1119,18 @@ class DependencyTests(TestCase):
             self.assertEqual(reads.call_args_list,
                              [mock.call(record.retired_number), mock.call(record.replacement_number)])
 
-            # A subsequent discovery must see newly posted authenticated
-            # rejection evidence, even though every Git head is unchanged.
+            # A later rejection of the closed retired head no longer blocks the
+            # replacement: it carries that work in its own diff and is tested.
             self.comments[record.retired_number] = [{
                 'user': {'login': automerge.TRUSTED_REJECTION_LOGIN},
                 'body': f'mergemarshall:rejected-head: {record.retired_head}\nnew rejection',
             }]
             reads.reset_mock()
             graph = automerge.dependency_graph(self.conn)
-            self.assertTrue(all(not graph.eligible(number) for number in range(60, 72)))
+            self.assertTrue(all(graph.eligible(number) for number in range(60, 72)))
             self.assertTrue(graph.eligible(40))
-            reads.assert_called_once_with(record.retired_number)
+            self.assertIn(record.retired_number,
+                          {dep.number for dep in graph.absorbed[record.replacement_number]})
 
     def test_failed_supersession_read_defers_and_is_retried_by_next_discovery(self):
         record = self.reviewed_pair()
@@ -1221,7 +1354,7 @@ class DependencyTests(TestCase):
         self.assertEqual(selected[0].dependencies, ())
         self.assertTrue(automerge.verify_source_ancestry(row, landed, conn=self.conn)[0])
 
-    def test_reviewed_supersession_campaign_closure_stays_in_one_target_and_keeps_rejections(self):
+    def test_reviewed_supersession_campaign_closure_stays_in_one_target_and_absorbs_rejections(self):
         record = self.reviewed_pair()
         self.campaign(tip=self.w)
         for number in (20, record.retired_number, record.replacement_number):
@@ -1230,9 +1363,11 @@ class DependencyTests(TestCase):
             selected = self.selected('stabilize/test')
             self.assertEqual([p.number for p in selected], [record.replacement_number, 20])
             self.assertTrue(all(p.target_ref == 'stabilize/test' for p in selected))
+            # The closed retired PR is absorbed by its replacement, rejection included.
             self.reject(record.retired_number)
-            self.assertNotIn(record.replacement_number, [p.number for p in self.selected('stabilize/test')])
-            self.assertNotIn(20, [p.number for p in self.selected('stabilize/test')])
+            selected = self.selected('stabilize/test')
+            self.assertEqual([p.number for p in selected], [record.replacement_number, 20])
+            self.assertTrue(all(p.target_ref == 'stabilize/test' for p in selected))
 
     def test_reviewed_supersession_cannot_import_unlanded_master_replacement_into_campaign(self):
         record = self.reviewed_pair()

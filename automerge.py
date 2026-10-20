@@ -598,20 +598,25 @@ def _prerequisite_block_detail(conn: sqlite3.Connection, number: int, head: str,
     if blocked is None or not pr_dependencies.has_table(conn, "automerge_pr_dependencies"):
         return {}
     parent = int(blocked[1])
+    detail: dict[str, Any] = {}
     for (prerequisite_head,) in conn.execute(
             "SELECT prerequisite_head FROM automerge_pr_dependencies "
             "WHERE number=? AND head_sha=? AND prerequisite_number=?", (number, head, parent)).fetchall():
         if conn.execute("SELECT 1 FROM automerge_github_outbox WHERE kind='reject_head' AND number=? "
                         "AND head_sha=? AND cancelled_at IS NULL LIMIT 1",
                         (parent, prerequisite_head)).fetchone():
-            return {"rejected_head": prerequisite_head}
-    observed = conn.execute("SELECT data_json FROM automerge_pr_inventory WHERE number=?", (parent,)).fetchone()
-    data = json.loads(observed[0]) if observed else {}
+            detail["rejected_head"] = prerequisite_head
+            break
+    observed = {row[0]: json.loads(row[1]) for row in conn.execute(
+        "SELECT number,data_json FROM automerge_pr_inventory WHERE number IN (?,?)", (number, parent))}
+    data = observed.get(parent, {})
     if (str(data.get("state") or "").lower() == "closed"
             and not (data.get("merged_at") or data.get("mergedAt") or data.get("merged") is True)):
-        return {"closed": True}
-    return {}
-
+        detail["closed"] = True
+        own_base = (observed.get(number, {}).get("base") or {}).get("ref")
+        if own_base and own_base == (data.get("head") or {}).get("ref"):
+            detail["stacked"] = own_base
+    return detail
 
 def _record_dependency_label(conn: sqlite3.Connection, number: int, present: bool) -> None:
     """Record the reconciled PR label without changing discovery or Git facts."""
@@ -948,9 +953,11 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
     supersessions = tuple(record for record in pr_dependencies.REVIEWED_SUPERSESSIONS
                           if record.replacement_number in items)
     histories = {number: history for number, (_, history) in cached.items()}
+    fresh = set()
 
     def remember(item):
         number = int(item['number'])
+        fresh.add(number)
         head = str((item.get('head') or {}).get('sha') or item.get('headRefOid') or '').lower()
         if not re.fullmatch(r'[0-9a-f]{40}', head):
             raise AutomergeError(f'invalid observed head for PR #{number}', reason='github_invalid_response')
@@ -1113,13 +1120,34 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
                 conn, retired, replacement, compare)
         return verified_supersessions[record]
 
-    graph = pr_dependencies.Graph(nodes, histories, actual_base, compare,
-                                  conn=conn, base_branch=BASE_BRANCH, targets=targets, gates=gates,
-                                  available_targets=available,
-                                  supersessions=supersessions,
-                                  verify_supersession=verify_supersession,
-                                  persist_comparisons=(not dry_run if persist_comparisons is None
-                                                       else persist_comparisons)).discover(roots)
+    def build():
+        return pr_dependencies.Graph(nodes, histories, actual_base, compare,
+                                     conn=conn, base_branch=BASE_BRANCH, targets=targets, gates=gates,
+                                     available_targets=available,
+                                     supersessions=supersessions,
+                                     verify_supersession=verify_supersession,
+                                     persist_comparisons=(not dry_run if persist_comparisons is None
+                                                          else persist_comparisons)).discover(roots)
+
+    graph = build()
+    # Absorption relies on a PR being closed and unmerged. A cached record of
+    # that state may be stale (reopened and merged into a campaign while
+    # unobserved), so batch rechecks, including the final landing recheck,
+    # read absorbed parents fresh. Queue selection keeps the cached record to
+    # bound GitHub reads; the recheck decides whether the batch may land.
+    while roots is not None and (
+            stale := sorted({dep.number for deps in graph.absorbed.values() for dep in deps} - fresh)):
+        for number in stale:
+            item = gh_json(['api', f'repos/{REPO_NAME}/pulls/{number}'])
+            items[number] = item
+            remember(item)
+            nodes[number] = _dependency_node(item, conn=conn, dry_run=dry_run)
+            rejected = item.get('_mm_rejection')
+            if rejected:
+                histories[number] = list(dict.fromkeys(histories[number] + [rejected['head_sha']]))
+        targets, gates, available, exclusions = _graph_targets(
+            conn, nodes, actual_base, selection_target=target_scope)
+        graph = build()
     graph.exclusions = exclusions
     graph.select(priority=False, target_ref=selection_target)  # Establish lane-local block reasons.
     if conn is not None and not dry_run:
@@ -1229,6 +1257,7 @@ def report_dependency_blocks(conn, transport, *, deliver=True):
 def dependency_block_comment(number: int, reason: str, detail: dict[str, Any] | None = None) -> str:
     pull = f"[PR #{number}](https://github.com/{REPO_NAME}/pull/{number})"
     changed = re.fullmatch(r'PR #(\d+) changed; its current head is absent from this PR', reason)
+    shared = re.fullmatch(r'ambiguous shared head with PR #(\d+)', reason)
     blocked = re.fullmatch(r'blocked by prerequisite PR #(\d+)', reason)
     if changed:
         parent = int(changed[1])
@@ -1237,26 +1266,31 @@ def dependency_block_comment(number: int, reason: str, detail: dict[str, Any] | 
                    f"It depends on {prerequisite}, but does not include that PR's latest commit.")
         action = (f"Action for the author: merge PR #{parent}'s latest branch into PR #{number}, "
                   "push the update, and mark the PR ready for merging.")
+    elif shared:
+        other = int(shared[1])
+        summary = (f"{pull} and [PR #{other}](https://github.com/{REPO_NAME}/pull/{other}) point at the "
+                   "same commit, so the queue cannot tell which one should land.")
+        action = (f"Action for the authors: close whichever of PR #{number} and PR #{other} should not "
+                  "land. The other then carries the work and is tested normally.")
     elif blocked:
         parent = int(blocked[1])
         prerequisite = f"[PR #{parent}](https://github.com/{REPO_NAME}/pull/{parent})"
         detail = detail or {}
-        not_cleared = (f"Closing PR #{parent}, deleting its branch, or editing PR descriptions "
-                       "does not clear this block.")
-        rebuild = (f"Alternatively, rebuild this PR on a fresh branch from master without PR #{parent}'s "
-                   "commits (cherry-pick or squash) and open it as a new PR.")
-        if detail.get("rejected_head"):
-            summary = (f"{pull} is waiting for prerequisite {prerequisite}. The merge queue rejected "
-                       f"PR #{parent}'s head `{str(detail['rejected_head'])[:12]}`, and this PR contains "
-                       "that commit.")
-            action = (f"Action for the authors: push a fix to PR #{parent}'s branch as a new commit, or "
-                      "an empty commit (`git commit --allow-empty`) if the rejection was wrong; a "
-                      f"rejection applies only to that exact commit. Reopen PR #{parent} if it was closed, "
-                      f"mark it ready, and merge its new head into this PR. {rebuild} {not_cleared}")
-        elif detail.get("closed"):
-            summary = (f"{pull} is waiting for prerequisite {prerequisite}, which was closed without "
-                       "merging. This PR contains its commits.")
-            action = f"Action for the authors: reopen PR #{parent} and mark it ready. {rebuild} {not_cleared}"
+        rejected = (f" The merge queue rejected its head `{str(detail['rejected_head'])[:12]}`, "
+                    "which this PR contains." if detail.get("rejected_head") else "")
+        if detail.get("closed") and detail.get("stacked"):
+            summary = (f"{pull} is based on the branch of {prerequisite}, which was closed without "
+                       f"merging, so this PR's diff does not show that work.{rejected}")
+            action = ("Action for the author: retarget this PR to the branch it should land in (usually "
+                      f"master). It then carries PR #{parent}'s commits in its own diff, and its merge "
+                      f"batch tests them with this PR. Alternatively, reopen PR #{parent} and mark it ready.")
+        elif detail.get("rejected_head"):
+            summary = f"{pull} is waiting for prerequisite {prerequisite}.{rejected}"
+            action = (f"Action for the authors: if this PR replaces PR #{parent}, close PR #{parent}; this "
+                      f"PR then carries that work in its own diff and its merge batch tests it. Otherwise "
+                      f"push a fix to PR #{parent}'s branch as a new commit, or an empty commit "
+                      "(`git commit --allow-empty`) if the rejection was wrong, and merge that new head "
+                      "into this PR. A rejection applies only to its exact commit.")
         else:
             summary = f"{pull} is waiting for prerequisite {prerequisite} to become eligible."
             action = (f"Action: check PR #{parent} and resolve its draft, rejection, or dependency block. "
@@ -4450,8 +4484,10 @@ def verify_source_ancestry(
                 continue
             repaired = next((p for p in included if p.number == entry['number']), None)
             if repaired is None or repaired.head_sha == head or not compare_commit_ancestry(head, repaired.head_sha):
-                importing = ([pull for pull in included if compare_commit_ancestry(head, pull.head_sha)]
-                             if have_gate_snapshots else [])
+                importing = [pull for pull in included if compare_commit_ancestry(head, pull.head_sha)]
+                if repaired is None and _rejected_pull_absorbed(conn, entry['number'], importing):
+                    continue
+                importing = importing if have_gate_snapshots else []
                 permitted = bool(importing)
                 for pull in importing:
                     if pull.number not in source_gates:
@@ -4464,6 +4500,19 @@ def verify_source_ancestry(
                     continue
                 return False, f"rejected prerequisite PR #{entry['number']} is imported without its eligible repaired head"
     return True, "all included and excluded source heads match the integration tree"
+
+
+def _rejected_pull_absorbed(conn, number: int, importing: list[PullRequest]) -> bool:
+    """Discovery's absorption of a closed rejected PR, from the same inventory record."""
+    if not importing or not pr_dependencies.has_table(conn, "automerge_pr_inventory"):
+        return False
+    observed = conn.execute("SELECT data_json FROM automerge_pr_inventory WHERE number=?", (number,)).fetchone()
+    detail = json.loads(observed[0]) if observed else {}
+    if (str(detail.get("state") or "").lower() != "closed"
+            or detail.get("merged_at") or detail.get("mergedAt") or detail.get("merged") is True):
+        return False
+    branch = (detail.get("head") or {}).get("ref")
+    return bool(branch) and all(pull.base_ref != branch for pull in importing)
 
 
 def _close_integration_pr(row: sqlite3.Row | dict[str, Any], reason: str) -> None:

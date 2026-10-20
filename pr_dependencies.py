@@ -202,6 +202,8 @@ class Graph:
             self._known_landed.update(row[0] for row in conn.execute(
                 'SELECT ancestor FROM automerge_commit_ancestry WHERE descendant=? AND present=1', (master,)))
         self.dependencies: dict[int, tuple[Dependency, ...]] = {}
+        # Closed unmerged PRs whose work an open PR carries in its own diff.
+        self.absorbed: dict[int, tuple[Dependency, ...]] = {}
         self.problems: dict[int, str] = {}
         self.blocked: dict[int, str] = {}
         self.captured = {}
@@ -329,6 +331,66 @@ class Graph:
         return tuple(normalized)
 
     @staticmethod
+    def _open(node):
+        return str(node.data.get('state')).lower() == 'open'
+
+    def _absorb(self, number, node, related, base_parent):
+        """Drop edges to closed unmerged work that this open PR's own diff carries.
+
+        Closing a PR never lands its head, so an edge to it could only block
+        forever. When the descendant is not stacked on the closed PR's branch,
+        its own diff shows that work and its batch tests it like any other
+        change, including a head the queue rejected earlier. The descendant
+        inherits the closed PR's own prerequisites, so absorbed work never skips
+        them. A stacked PR keeps the edge until it is retargeted. Two open PRs
+        at one unlanded head stay ambiguous. Returns parents removed here; the
+        caller still examines them so scoped polls load their fresh metadata.
+        """
+        absorbed, removed = [], []
+        pending = sorted(related.items())
+        while pending:
+            parent, captured_head = pending.pop(0)
+            prior = self.nodes.get(parent)
+            if prior is None or parent == number or related.get(parent) != captured_head:
+                continue
+            if self._open(prior):
+                if prior.head == node.head and not self.landed(prior.head, number):
+                    self.problems[number] = f'ambiguous shared head with PR #{parent}'
+                    del related[parent]
+                    removed.append(parent)
+                continue
+            if (str(prior.data.get('state')).lower() == 'closed' and not self._merged(prior.data)
+                    and parent != base_parent and not self.landed(captured_head, number)
+                    and self.ancestor(captured_head, node.head)):
+                absorbed.append(Dependency(parent, captured_head))
+                del related[parent]
+                removed.append(parent)
+                done = {dep.number for dep in absorbed}
+                for inherited in self._closed_prerequisites(prior, captured_head):
+                    if inherited.number not in {number, *related, *done}:
+                        related[inherited.number] = inherited.head_sha
+                        pending.append((inherited.number, inherited.head_sha))
+        if absorbed:
+            self.absorbed[number] = tuple(absorbed)
+        return removed
+
+    def _closed_prerequisites(self, prior, captured_head):
+        """A closed PR's captured edges and its base-branch PR, if any."""
+        inherited = {}
+        for head in dict.fromkeys((captured_head, prior.head)):
+            for dep in self.captured.get((prior.number, head), ()):
+                inherited.setdefault(dep.number, dep.head_sha)
+        if prior.base != self.target(prior.number)[0]:
+            matches = [n for n, candidate in self.nodes.items()
+                       if (candidate.repo.casefold(), candidate.branch) == (prior.base_repo.casefold(), prior.base)
+                       and n != prior.number]
+            open_matches = [n for n in matches if self._open(self.nodes[n])]
+            matches = open_matches or matches
+            if len(matches) == 1:
+                inherited.setdefault(matches[0], self.nodes[matches[0]].head)
+        return [Dependency(n, head) for n, head in sorted(inherited.items())]
+
+    @staticmethod
     def _merged(data):
         return bool(data.get('merged_at') or data.get('mergedAt')
                     or data.get('merged') is True
@@ -374,6 +436,7 @@ class Graph:
                     for dep in deps:
                         if dep.number not in related or self.landed(dep.head_sha, number):
                             related[dep.number] = dep.head_sha
+            base_parent = None
             if node.base != self.target(number)[0]:
                 matches = branches.get((node.base_repo.casefold(), node.base), [])
                 open_matches = [n for n in matches if str(self.nodes[n].data.get('state')).lower() == 'open']
@@ -382,6 +445,7 @@ class Graph:
                     self.problems[number] = f'ambiguous or unresolved prerequisite branch {node.base}'
                 else:
                     parent = matches[0]
+                    base_parent = parent
                     related.setdefault(parent, self.nodes[parent].head)
             # This closes the master-targeting bypass, including old rejected
             # heads retained by a repaired prerequisite through merge commits.
@@ -396,10 +460,13 @@ class Graph:
                     # before comparing a historical head to a moving master.
                     if not self.ancestor(head, node.head) or self.landed(head, number):
                         continue
-                    if head == node.head:
+                    if head == node.head and self._open(prior):
                         self.problems[number] = f'ambiguous shared head with PR #{parent}'
                     related.setdefault(parent, head)
                     break
+            # Removed parents stay in discovery so scoped polls load their
+            # fresh metadata; a stale closed/open state must not decide this.
+            removed = self._absorb(number, node, related, base_parent)
             captured = [Dependency(parent, captured_head)
                         for parent, captured_head in sorted(related.items())]
             exact_deps = self._normalize_dependencies(number, captured)
@@ -429,6 +496,7 @@ class Graph:
                 deps.append(Dependency(parent, required))
             self.dependencies[number] = tuple(dict.fromkeys(deps))
             pending.extend(d.number for d in self.dependencies[number])
+            pending.extend(removed)
         # Explicit relationships can be cyclic even before ancestry is valid.
         visited = set()
         def visit(number, path):
