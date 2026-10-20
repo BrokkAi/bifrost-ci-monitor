@@ -111,6 +111,175 @@ class TriageTests(TestCase):
                                          'local_policy_test', 'eatmydata cargo nextest run local_policy_test',
                                          'expected exit 2, got 1; settings and log /tmp/base.log', '2026-01-02')
 
+    def baseline_batch(self, batch_id='batch', status='completed', target=None, candidate=None):
+        with self.conn:
+            self.conn.execute("CREATE TABLE IF NOT EXISTS automerge_batches ("
+                              "batch_id TEXT PRIMARY KEY,status TEXT,target_ref TEXT,candidate_json TEXT)")
+            self.conn.execute("INSERT INTO automerge_batches VALUES (?,?,?,?)",
+                              (batch_id, status, target, json.dumps(candidate or {})))
+
+    def baseline_tick(self):
+        self.conn.commit()
+        self.patch(monitor, 'update_known_failures')
+        self.patch(triage, 'gh_api', side_effect=lambda endpoint, **kwargs:
+                   {'sha': 'b' * 40} if endpoint == f'commits/{monitor.BRANCH}'
+                   else self.github(endpoint, **kwargs))
+        self.patch(triage, 'launch')
+        triage.tick(self.conn)
+        jobs = self.conn.execute('SELECT observations_json FROM triage_jobs').fetchall()
+        self.assertFalse(self.github.calls)
+        self.slack.assert_not_called()
+        return json.loads(jobs[0][0]) if jobs else []
+
+    def test_baseline_ancestor_of_target_enters_job(self):
+        finding = self.add_local_finding()
+        self.git_head.return_value = 'b' * 40
+        cache = self.patch(monitor, 'git_cache').return_value
+        cache.ancestor.return_value = True
+        observations = self.baseline_tick()
+        self.assertEqual([o['local_finding_id'] for o in observations], [finding['id']])
+        cache.ancestor.assert_called_once_with('a' * 40, 'b' * 40, mock.ANY)
+        self.git_head.assert_called_once_with(monitor.REPO_NAME, monitor.BRANCH,
+                                             monitor.github_app_token, refresh_token=mock.ANY)
+        refresh = self.git_head.call_args.kwargs['refresh_token']
+        with mock.patch.object(monitor, 'github_app_token') as token:
+            refresh()
+            token.assert_called_once_with(force_refresh=True)
+
+    def test_baseline_without_landing_path_retires_quietly(self):
+        self.add_local_finding()
+        self.git_head.return_value = 'b' * 40
+        self.patch(monitor, 'git_cache').return_value.ancestor.return_value = False
+        self.assertEqual(self.baseline_tick(), [])
+        row = self.conn.execute('SELECT * FROM local_findings').fetchone()
+        self.assertEqual(row['status'], 'unlanded')
+        self.assertIn('a' * 40, row['diagnosis'])
+        self.assertIn(monitor.BRANCH, row['diagnosis'])
+        self.assertIn('no live batch', row['diagnosis'])
+        self.assertEqual(triage.pending(self.conn), [])
+        self.assertEqual(local_findings.observations(self.conn), [])
+
+    def test_live_candidate_or_verified_equivalent_defers_baseline(self):
+        self.add_local_finding()
+        self.git_head.return_value = 'b' * 40
+        cache = self.patch(monitor, 'git_cache').return_value
+        for status, candidate in (
+                ('launching', {'head': 'a' * 40}),
+                ('running', {'head': 'c' * 40}),
+                ('finishing', {'head': 'c' * 40, 'equivalent_heads': ['a' * 40]})):
+            with self.subTest(status=status):
+                self.conn.execute('DROP TABLE IF EXISTS automerge_batches')
+                self.baseline_batch(status=status, candidate=candidate)
+                cache.ancestor.side_effect = lambda a, b, fallback: b == 'c' * 40 and status == 'running'
+                self.assertEqual(self.baseline_tick(), [])
+                self.assertEqual(self.conn.execute('SELECT status FROM local_findings').fetchone()[0], 'open')
+
+    def test_terminal_candidate_cannot_keep_baseline_open(self):
+        self.add_local_finding()
+        self.git_head.return_value = 'b' * 40
+        self.patch(monitor, 'git_cache').return_value.ancestor.return_value = False
+        self.baseline_batch(status='failed', candidate={'head': 'a' * 40})
+        self.assertEqual(self.baseline_tick(), [])
+        self.assertEqual(self.conn.execute('SELECT status FROM local_findings').fetchone()[0], 'unlanded')
+
+    def test_baseline_missing_facts_do_not_block_other_observations(self):
+        self.add_local_finding()
+        self.add_failure()
+        self.add_branch_failure()
+        self.git_head.return_value = 'b' * 40
+        cache = self.patch(monitor, 'git_cache').return_value
+        errors = (triage.git_ancestry.Deferred('fetch pending'), monitor.CommandError('compare failed'),
+                  OSError('unavailable'), RuntimeError('incomplete'), None)
+        for error in errors:
+            with self.subTest(error=error):
+                self.conn.execute('DELETE FROM triage_jobs')
+                cache.ancestor.side_effect = error
+                cache.ancestor.return_value = None
+                observations = self.baseline_tick()
+                self.assertEqual(len(observations), 2)
+                self.assertFalse(any(o.get('local_finding_id') for o in observations))
+                self.assertEqual(self.conn.execute('SELECT status FROM local_findings').fetchone()[0], 'open')
+        self.conn.execute('DELETE FROM triage_jobs')
+        self.git_head.side_effect = triage.git_ancestry.RemoteReadError('transport')
+        self.assertEqual(len(self.baseline_tick()), 2)
+
+    def test_one_baseline_ref_failure_does_not_block_another_baseline(self):
+        finding = self.add_local_finding()
+        with self.conn:
+            other = local_findings.record(self.conn, 'other', 'merge-session', 'baseline', 'b' * 40,
+                                          'another_test', 'test another_test', 'failed', '2026-01-03')
+        self.git_head.side_effect = [triage.git_ancestry.RemoteReadError('transport'), 'a' * 40]
+        observations = self.baseline_tick()
+        self.assertEqual([o['local_finding_id'] for o in observations], [finding['id']])
+        self.assertEqual(self.conn.execute('SELECT status FROM local_findings WHERE id=?',
+                                          (other['id'],)).fetchone()[0], 'open')
+
+    def test_candidate_ancestry_failure_defers_instead_of_retiring(self):
+        self.add_local_finding()
+        self.add_failure()
+        self.baseline_batch(status='running', candidate={'head': 'c' * 40})
+        self.git_head.return_value = 'b' * 40
+        self.patch(monitor, 'git_cache').return_value.ancestor.side_effect = [
+            False, triage.git_ancestry.Deferred('candidate history pending')]
+        observations = self.baseline_tick()
+        self.assertEqual(len(observations), 1)
+        self.assertFalse(observations[0].get('local_finding_id'))
+        self.assertEqual(self.conn.execute('SELECT status FROM local_findings').fetchone()[0], 'open')
+
+    def test_campaign_baseline_uses_campaign_tip(self):
+        self.add_local_finding()
+        self.baseline_batch(target='stabilize/campaign')
+        self.assertEqual(len(self.baseline_tick()), 1)
+        self.assertEqual(self.git_head.call_args.args[1], 'stabilize/campaign')
+
+    def test_missing_campaign_branch_checks_master_only(self):
+        self.add_local_finding()
+        self.baseline_batch(target='stabilize/campaign')
+        self.git_head.side_effect = [triage.git_ancestry.RemoteReadError('missing_branch'), 'a' * 40]
+        self.assertEqual(len(self.baseline_tick()), 1)
+        self.assertEqual([c.args[1] for c in self.git_head.call_args_list],
+                         ['stabilize/campaign', monitor.BRANCH])
+
+    def test_flaky_and_triaged_or_claimed_baselines_are_not_gated(self):
+        self.add_local_finding('flaky')
+        baseline = self.add_local_finding()
+        digest = 'local:' + baseline['id']
+        with self.conn:
+            self.conn.execute("INSERT INTO triage_observations VALUES (?, 'old', 'product', NULL, 'now', NULL)",
+                              (digest,))
+        self.git_head.side_effect = AssertionError('out of scope finding read')
+        self.assertEqual(len(self.baseline_tick()), 1)
+        self.assertEqual({r[0] for r in self.conn.execute('SELECT status FROM local_findings')}, {'open'})
+        self.conn.execute('DELETE FROM triage_observations')
+        self.conn.execute("UPDATE triage_jobs SET observations_json=?",
+                          (json.dumps([{'fingerprint': digest}]),))
+        self.assertEqual(triage.gate_local_baselines(self.conn), set())
+        self.git_head.assert_not_called()
+
+    def test_check_does_not_gate_or_read_git(self):
+        self.add_local_finding()
+        gate = self.patch(triage, 'gate_local_baselines', side_effect=AssertionError('check gated'))
+        cache = self.patch(monitor, 'git_cache', side_effect=AssertionError('check read cache'))
+        self.patch(monitor, 'connect_db', return_value=self.conn)
+        with mock.patch('builtins.print') as output:
+            triage._main_locked(SimpleNamespace(check=True))
+        self.assertEqual(json.loads(output.call_args.args[0])['pending_observations'], 1)
+        gate.assert_not_called()
+        cache.assert_not_called()
+        self.git_head.assert_not_called()
+
+    def test_baseline_compare_fallback_rejects_incomplete_response(self):
+        cache = self.patch(monitor, 'git_cache').return_value
+        cache.ancestor.side_effect = lambda a, b, fallback: fallback(a, b)
+        api = self.patch(triage, 'gh_api')
+        for status, expected in [('ahead', True), ('identical', True), ('behind', False), ('diverged', False)]:
+            api.return_value = {'status': status}
+            self.assertEqual(triage.local_finding_ancestor('a' * 40, 'b' * 40), expected)
+        for incomplete in ({}, None, {'status': 'unknown'}):
+            api.return_value = incomplete
+            with self.assertRaises(monitor.CommandError):
+                triage.local_finding_ancestor('a' * 40, 'b' * 40)
+
     def add_branch_failure(self, campaign_id='campaign', sha='a' * 40):
         with self.conn:
             self.conn.execute(

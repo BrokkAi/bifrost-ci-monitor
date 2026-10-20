@@ -1251,6 +1251,10 @@ cached report thread IDs keep publication retries together even after the window
 Each reply includes the finding's job summary. Publication's existing fixer lock serializes
 thread selection. Local findings have no CI run URL; render their actual tested
 commit, command and batch/session provenance in the diagnostic reply instead.
+Before claiming new baseline findings, triage requires ancestry on the recording
+batch's current target (master if absent or the campaign branch is missing); unlanded
+commits defer while a live candidate can carry them or reads are unavailable,
+otherwise retire quietly as `unlanded`, leaving flaky and already-triaged findings unchanged.
 Infrastructure checkpoints
 handled observations in the existing `triage_observations` table. Handled
 infrastructure remains open in the CI ledger until normal completed-run upkeep

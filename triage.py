@@ -141,11 +141,91 @@ def branch_observations(conn) -> list[dict]:
             for row in stabilize_state.observations(conn)]
 
 
-def pending(conn) -> list[dict]:
+def claimed_fingerprints(conn) -> set[str]:
     # Cached publications own their observations even while GitHub/Slack is down.
-    claimed = {o['fingerprint'] for job in conn.execute(
+    return {o['fingerprint'] for job in conn.execute(
         "SELECT observations_json FROM triage_jobs WHERE status!='completed'")
         for o in json.loads(job['observations_json'])}
+
+
+def local_finding_ancestor(base, head) -> bool:
+    if base == head:
+        return True
+    def fallback(a, b):
+        result = gh_api(f'compare/{a}...{b}')
+        status = result.get('status') if isinstance(result, dict) else None
+        if status not in ('identical', 'ahead', 'behind', 'diverged'):
+            raise monitor.CommandError('Incomplete commit comparison')
+        return status in ('identical', 'ahead')
+    result = monitor.git_cache().ancestor(base, head, fallback)
+    if not isinstance(result, bool):
+        raise monitor.CommandError('Incomplete commit ancestry')
+    return result
+
+
+def gate_local_baselines(conn) -> set[str]:
+    """Exclude unlanded baselines until their tested commit reaches its target."""
+    claimed = claimed_fingerprints(conn)
+    has_batches = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='automerge_batches'").fetchone()
+    deferred = set()
+    tips = {}
+    def tip_of(ref):
+        # One fresh read per ref per tick; failures are not memoized.
+        if ref not in tips:
+            tips[ref] = git_ancestry.remote_head(
+                monitor.REPO_NAME, ref, monitor.github_app_token,
+                refresh_token=lambda: monitor.github_app_token(force_refresh=True))
+        return tips[ref]
+    for row in local_findings.observations(conn):
+        digest = fingerprint(row)
+        if (row['kind'] != 'baseline' or digest in claimed or conn.execute(
+                'SELECT 1 FROM triage_observations WHERE fingerprint=?', (digest,)).fetchone()):
+            continue
+        head = row['head_sha']
+        batch = conn.execute('SELECT target_ref FROM automerge_batches WHERE batch_id=?',
+                             (row['batch_id'],)).fetchone() if has_batches else None
+        target = (batch['target_ref'] if batch else None) or monitor.BRANCH
+        try:
+            try:
+                tip = tip_of(target)
+            except git_ancestry.RemoteReadError as exc:
+                if target == monitor.BRANCH or exc.category != 'missing_branch':
+                    raise
+                target = monitor.BRANCH
+                tip = tip_of(target)
+            if local_finding_ancestor(head, tip):
+                continue
+            # Checkpoints and verified equivalents live together in candidate_json.
+            # Terminal batches (completed/failed) cannot still land a candidate.
+            live = conn.execute("SELECT candidate_json FROM automerge_batches "
+                                "WHERE status IN ('launching','running','finishing')").fetchall() if has_batches else []
+            carried = False
+            for candidate_row in live:
+                candidate = json.loads(candidate_row['candidate_json'])
+                if not candidate:
+                    continue
+                heads = [candidate['head'], *candidate.get('equivalent_heads', [])]
+                if any(local_finding_ancestor(head, candidate_head) for candidate_head in heads):
+                    carried = True
+                    break
+            if carried:
+                deferred.add(digest)
+                continue
+        except (git_ancestry.Deferred, monitor.CommandError, OSError, RuntimeError,
+                ValueError, TypeError, KeyError):
+            # Missing facts concern only this finding, never the other intake lanes.
+            deferred.add(digest)
+            continue
+        with conn:
+            conn.execute("UPDATE local_findings SET status='unlanded',diagnosis=? "
+                         "WHERE id=? AND status='open'",
+                         (f'{head} is not a failure on {target}: no live batch can still land it.', row['id']))
+    return deferred
+
+
+def pending(conn, exclude=()) -> list[dict]:
+    claimed = claimed_fingerprints(conn) | set(exclude)
     rows = conn.execute("SELECT * FROM known_failures WHERE status='open' "
                         "ORDER BY last_seen_at DESC,workflow,job_name,identity").fetchall()
     rows = sorted([*rows, *local_findings.observations(conn), *branch_observations(conn),
@@ -1061,7 +1141,8 @@ def tick(conn) -> None:
         return
     performance_findings.tick(conn)
     if job is None:
-        observations = pending(conn)
+        deferred = gate_local_baselines(conn)
+        observations = pending(conn, exclude=deferred)
         if not observations:
             return
         sha = gh_api(f"commits/{monitor.BRANCH}")["sha"]
