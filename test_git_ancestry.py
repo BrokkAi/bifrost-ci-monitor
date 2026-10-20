@@ -71,6 +71,80 @@ class GitReads(unittest.TestCase):
             self.assertFalse(self.cache.ancestor(two, one, self.fail))
         self.assertEqual(self.cache.command('rev-parse', 'refs/pull/7/head').stdout.strip(), one)
 
+    def test_many_ancestry_pairs_share_one_complete_walk(self):
+        self.put('first.rs', 'first')
+        first = self.commit('first')
+        self.put('second.rs', 'second')
+        second = self.commit('second')
+        self.git('checkout', '-qb', 'diverged', self.base)
+        self.put('other.rs', 'other')
+        other = self.commit('other')
+        self.warm([first, second, other])
+        with mock.patch.object(self.cache, 'command', wraps=self.cache.command) as command:
+            self.assertTrue(self.cache.ancestor(first, second, self.fail))
+            self.assertTrue(self.cache.ancestor(self.base, second, self.fail))
+            self.assertFalse(self.cache.ancestor(other, second, self.fail))
+        self.assertEqual([call.args for call in command.call_args_list],
+                         [('rev-list', second, '--')])
+        # The same immutable receipts remain readable by a different process.
+        other_cache = g.Cache(self.root / 'cache', str(self.repo), lambda: None)
+        with mock.patch.object(other_cache, 'command', side_effect=AssertionError('recomputed pair')):
+            self.assertFalse(other_cache.ancestor(other, second, self.fail))
+
+    def test_reachability_matches_git_across_merge_and_divergent_history(self):
+        self.git('checkout', '-qb', 'feature')
+        self.put('feature.rs', 'feature')
+        feature = self.commit('feature')
+        self.git('checkout', '-q', 'master')
+        self.put('master.rs', 'master')
+        master = self.commit('master')
+        self.git('merge', '--no-ff', '-qm', 'merge feature', 'feature')
+        merged = self.git('rev-parse', 'HEAD')
+        self.git('checkout', '-qb', 'unmerged', self.base)
+        self.put('unmerged.rs', 'unmerged')
+        unmerged = self.commit('unmerged')
+        heads = [self.base, feature, master, merged, unmerged]
+        self.warm(heads)
+        for descendant in heads:
+            for ancestor in heads:
+                expected = subprocess.run(
+                    ['git', '-C', str(self.repo), 'merge-base', '--is-ancestor', ancestor, descendant],
+                    check=False).returncode == 0
+                with self.subTest(ancestor=ancestor, descendant=descendant):
+                    self.assertEqual(self.cache.ancestor(ancestor, descendant, self.fail), expected)
+        self.assertLessEqual(len(self.cache._reachable_commits), 4)
+
+    def test_failed_or_incomplete_walk_never_produces_a_negative_fact(self):
+        self.put('next.rs', 'next')
+        head = self.commit('next')
+        self.warm([self.base, head])
+        failures = [subprocess.CompletedProcess([], 128, head + '\n'),
+                    subprocess.CompletedProcess([], 0, self.base + '\n'),
+                    subprocess.CompletedProcess([], 0, head + '\ninvalid\n')]
+        for result in failures:
+            with self.subTest(result=result), mock.patch.object(self.cache, 'command', return_value=result):
+                with self.assertRaisesRegex(RuntimeError, 'ancestry could not be established'):
+                    self.cache.ancestor(self.base, head, self.fail)
+            self.assertNotIn(head, self.cache._reachable_commits)
+            self.assertFalse(list(self.cache.directory.glob('value-*.json')))
+        with mock.patch.object(self.cache, 'command', side_effect=g.Deferred('unfinished')):
+            with self.assertRaises(g.Deferred):
+                self.cache.ancestor(self.base, head, self.fail)
+        self.assertTrue(self.cache.ancestor(self.base, head, self.fail))
+
+    def test_positive_object_presence_is_cached_by_type_but_missing_is_not(self):
+        self.warm([self.base])
+        with mock.patch.object(self.cache, 'command', wraps=self.cache.command) as command:
+            self.assertEqual(self.cache.missing([self.base]), [])
+            self.assertEqual(self.cache.missing([self.base], kind='blob'), [self.base])
+            self.assertEqual(self.cache.missing([self.base], kind='blob'), [self.base])
+        self.assertEqual(len(command.call_args_list), 2)
+        self.put('later.rs', 'later')
+        later = self.commit('later')
+        self.assertEqual(self.cache.missing([later]), [later])
+        self.warm([later])
+        self.assertEqual(self.cache.missing([later]), [])
+
     def test_fresh_remote_head_and_behind_count_for_diverged_heads(self):
         self.git('checkout', '-qb', 'feature')
         self.put('feature', 'feature')

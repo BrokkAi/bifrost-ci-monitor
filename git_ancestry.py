@@ -6,6 +6,7 @@ only successful results about immutable objects are cached on disk.
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
 import fcntl
@@ -151,6 +152,8 @@ class Cache:
         self.token = token
         self.deadline = deadline
         self.worker = None
+        self._present_objects = {}
+        self._reachable_commits = OrderedDict()
         self.git_dir = self.directory / 'objects.git'
         if not _read_only.get():
             self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -193,6 +196,10 @@ class Cache:
             raise ValueError('invalid Git object identity')
         if not self.git_dir.exists():
             return heads
+        present = self._present_objects.setdefault(kind, set())
+        heads = [head for head in heads if head not in present]
+        if not heads:
+            return []
         result = self.command('cat-file', '--batch-check=%(objectname) %(objecttype)',
                               input='\n'.join(heads) + '\n')
         if result.returncode:
@@ -200,7 +207,8 @@ class Cache:
         lines = result.stdout.splitlines()
         if len(lines) != len(heads):
             raise RuntimeError('incomplete Git object response')
-        return [head for head, line in zip(heads, lines) if line != f'{head} {kind}']
+        present.update(head for head, line in zip(heads, lines) if line == f'{head} {kind}')
+        return [head for head in heads if head not in present]
 
     def prepare(self, heads, *, kind='commit'):
         self.full_history()
@@ -285,12 +293,34 @@ class Cache:
                 raise Deferred('fetching commit history for ancestry checks')
             if self.missing([a, b]):
                 return fallback(a, b)
-            result = self.command('merge-base', '--is-ancestor', a, b)
-            if result.returncode not in (0, 1):
-                raise RuntimeError('local commit ancestry could not be established')
-            return result.returncode == 0
+            return a in self.reachable_commits(b)
         self.full_history()
         return self.memo(['ancestor', a, b], compute)
+
+    def reachable_commits(self, head):
+        """One complete walk answers every historical-head query for this tip.
+
+        Queue discovery compares thousands of historical heads to each open PR.
+        Starting Git for each pair serializes process overhead. Reuse the walk
+        in this invocation, retaining only four tips to bound memory. Immutable
+        pair receipts still checkpoint individually through the normal owner.
+        """
+        self.full_history()
+        if head in self._reachable_commits:
+            self._reachable_commits.move_to_end(head)
+            return self._reachable_commits[head]
+        result = self.command('rev-list', head, '--')
+        commits = frozenset(result.stdout.splitlines())
+        if (result.returncode or head not in commits
+                or any(not re.fullmatch(r'[0-9a-f]{40}', commit) for commit in commits)):
+            raise RuntimeError('local commit ancestry could not be established')
+        # A successful full-history walk also proves these commit objects exist.
+        # Never remember missing objects: a later fetch can make them available.
+        self._present_objects.setdefault('commit', set()).update(commits)
+        self._reachable_commits[head] = commits
+        if len(self._reachable_commits) > 4:
+            self._reachable_commits.popitem(last=False)
+        return commits
 
     def tree(self, head, fallback=None):
         def compute():
