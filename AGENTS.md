@@ -51,8 +51,8 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   deduplicated failure issues and retirement of exact resolved observations.
 - `automerge.py`: queue selection, batch/direct/operator state machines,
   live-session supervision, local/CI gates, exact-head status and merge writes.
-- `speculation.py`: one-batch lookahead, candidate checkpoints, same-session
-  recovery and ordered promotion, shared by sync and async.
+- `speculation.py`: one-batch lookahead on actual master, candidate checkpoints,
+  landed-master promotion and ordered role handoff, shared by sync and async.
 - `supervisor.py`: durable action intents, ordered batch advancement, bounded
   observation, independent maintenance, and threaded idle queue summaries.
 - `git_ancestry.py`: shared full-history Git object/result cache and asynchronous
@@ -311,9 +311,9 @@ readiness, and the existing landing gates remain authoritative. A priority closu
 read earlier in a tick is discarded when any batch reaches a terminal state, and
 priority is checked again before successor reconciliation or primary selection
 uses it; a landing must never re-batch its own merged sources. Recovery and
-pending guidance precede priority checking; eligible immediate work still fences
-landing. Advance the primary before selecting/observing its successor. Promote
-and deliver its next instruction in the same tick. Observation uses short slices
+pending guidance precede priority checking; no priority fences, aborts or resets
+a batch. Advance the immediate lane, then the primary, then its successor, then
+the campaign lane. Promote and deliver the next instruction in the same tick. Observation uses short slices
 within the poll budget, with no agent work deadline or idleness gate. Deferred
 reads retain their action without an error alert; other independent actions may
 proceed. Repeated observations are new polls of the same action, not repeated
@@ -321,10 +321,11 @@ message writes. Maintenance and notification retries follow batch advancement.
 Priority dependency discovery checkpoints informational notices even while an
 existing batch has no candidate; delivery follows advancement through the same
 outbox and preserves retry backoff. Failed notice delivery never fences
-preemption or landing.
-When priority discovery returns eligible work, primary selection reuses that
-validated dependency closure within the same tick. Unrelated queue discovery
-must not delay admitting the work that caused preemption.
+selection or landing.
+When priority discovery returns eligible work, selection reuses that validated
+dependency closure within the same tick: immediate roots go to the immediate
+slot and high roots to the next free ordinary slot. Unrelated queue discovery
+must not delay admitting immediate work.
 An empty eligible queue with no active batch posts a categorized open-PR summary
 in the last primary thread (or a new idle thread); checkpoint accepted replies in
 `automerge_queue_summaries` and suppress unchanged snapshots. This needs Slack chat.
@@ -436,7 +437,7 @@ active, including idle waits and follow-up turns. A merger tick observes for
 at most 50 seconds, then leaves the session for the next tick. Do not restore
 the old one-hour turn cutoff or suspend/resume between attempts or CI polls.
 Legacy timeout helpers in `monitor.py` do not describe the current lifecycle.
-Manual abort and immediate-priority preemption deliberately interrupt work.
+Manual abort deliberately interrupts work; priority never does.
 After a verified terminal outcome, checkpoint/suspend through the existing
 cleanup path; supervision errors leave sessions available for later polls.
 Fixer terminal errors, stops and interruptions persist `issue_repairs.recovery_json`
@@ -760,15 +761,17 @@ rewrite author branches, rebase, or require authors to promote/poll their PRs.
 Priority labels are case-insensitive. `mergemarshall:high` and
 `mergemarshall-priority:high`, plus legacy `mergemarshall-priority`, select the
 high tier. `mergemarshall:immediate` and
-`mergemarshall-priority:immediate` select immediate. If either tier is ready,
-select all eligible high/immediate PRs and their prerequisite closure. Ordinary
-PRs enter that lane only as prerequisites. `high` waits for
-current work. A newly eligible immediate PR preempts an active batch through
-the durable abort path, even if the batch is high, unless already included;
-never preempt after success is posted or merging starts. A speculative
-successor follows the same rule when its predecessor lands: only such an
-immediate PR discards it; ready high-priority PRs wait for the promoted
-successor. Source PRs from an abort remain eligible. `ci-fix` is ordinary unless labeled explicitly.
+`mergemarshall-priority:immediate` select immediate. High is an ordering rule
+for the ordinary slots: when any high PR is ready at selection, that batch admits
+only high PRs and their prerequisite closure, and it waits for current work like
+any other batch. Immediate work runs in its own lane (see the lanes paragraph in
+the campaign section): the immediate batch admits only immediate PRs and their
+prerequisite closure, excludes every live reservation, never has a successor,
+and lands through the normal gates. Running batches are never aborted, discarded
+or reset for priority; they merge the landed result through promotion or the
+normal master update. A labeled PR already reserved by a live batch stays there,
+and an immediate PR whose prerequisite is held by another live batch waits for
+it. Source PRs from an abort remain eligible. `ci-fix` is ordinary unless labeled explicitly.
 
 A rebuild rescan removes changed or closed sources but never adds arrivals. New
 arrivals wait for the speculative successor or the next batch. The expansion
@@ -793,35 +796,43 @@ before expensive validation. This pushes only the recorded ref and atomically
 records head, tree, source revision and attempt generation; it creates no PR.
 Withdraw the checkpoint before further edits and register a replacement when
 ready. Repeated accepted registrations/withdrawals retain their identities.
-The supervisor permits one successor, selected with dependency closure against
-the pinned candidate, excluding every live batch's reservations. Dependency
-publication continues to use actual master. New batches persist current CI_MODE.
+The checkpoint is a milestone and a launch gate, not a base: once the primary
+has one, the supervisor permits one successor, selected with dependency closure
+against actual master, read freshly at launch, and excluding every live batch's
+reservations. The successor captures that master commit as its own base, exactly
+like a primary, so a dependent whose prerequisite is reserved by a live batch
+waits for it to land. Each batch has its own captured base; there is no shared
+epoch, and an independent landing between launches simply gives the later batch
+a newer base. New batches persist current CI_MODE.
 
-A successor's membership contains only its new source PRs. It may resolve,
-validate and independently reject those exact heads. An interaction with the
-unlanded predecessor does not establish a standalone defect. It records local
-pass and waits without publishing; the service and landing gates forbid
-publication/landing before landed ancestry incorporation. Source changes, priorities and aborts
-retain the normal policies. Never discard established rejection intents on
-reset, abort or failed launch.
+A successor's membership contains only its own source PRs, and its tree contains
+nothing of the primary. It resolves, validates and independently rejects those
+exact heads against its captured base, records local pass with `mm-db ready`,
+and waits without publishing; the service and landing gates forbid
+publication/landing while a predecessor is live. Nothing the primary does
+(ejection, rebuild, candidate withdrawal or replacement, failed tests, abort or
+terminal failure) invalidates, resets or restarts the successor. Source changes
+and aborts of the successor itself retain the normal policies. Never discard
+established rejection intents on abort or failed launch.
 
-When the predecessor lands, the successor takes the primary scheduling role
-immediately (`role_promoted`), even with validation still running. Prove the
-pinned predecessor tree landed; retain the same session, checkout, captured
-base, source revision, checkpoint, evidence and running work. Its checkpoint
-can now start the next speculative successor. Permit one primary and one
-speculative successor; an unpromoted successor cannot start another batch.
-`mm-db state` exposes `role`. A primary can still have `predecessor` metadata
-until ancestry incorporation: the agent continues its existing validation and
-uses `mm-db ready` as before. Passing evidence gates publication, not role
-promotion. A changed actual master tree uses the existing same-session recovery.
+When the predecessor ends, landed or not, the successor takes the primary
+scheduling role immediately (`role_promoted`), even with validation still
+running, retaining the same session, checkout, source revision, evidence and
+running work. If master moved, it incorporates current master through promotion
+(below); otherwise it continues as primary with no extra step. Permit one
+primary and one speculative successor; an unpromoted successor cannot start
+another batch, and the promoted batch's next checkpoint can. `mm-db state`
+exposes `role`. Passing evidence gates publication, not role promotion.
+On upgrade, a live successor still pinned to a predecessor candidate is reset
+once, through the existing recovery path, onto actual master; an in-flight
+legacy incorporation completes under its recorded promotion.
 
 Slack start headings are `*$project* new batch:`, `*$project* promoted batch:`,
 or `*$project* speculative batch:`. Derive `$project` from the repository part
 of `monitor.REPO_NAME` using `monitor.slack_project_prefix()`; never hardcode a
 display name. Triage and fixbot thread headings use the same project prefix.
-Omit model/harness boilerplate. Speculative headings explain that the preceding
-batch gates publication/merge. Batch and predecessor IDs belong in
+Omit model/harness boilerplate. Speculative headings explain that the batch runs
+alongside the current one on the same master and publishes after that batch ends. Batch and predecessor IDs belong in
 the first thread reply, alongside the PR list for multi-PR batches, rather than
 channel-level messages. Start replies use the existing durable reply retry;
 standalone alerts and outcomes attach diagnostic replies on a best-effort basis
@@ -836,7 +847,11 @@ Preserve transcript cursors and relay identities across the move. If the new
 root is unavailable, retain unrelayed progress for delivery after it is accepted;
 notification failure does not stop agent work or change its test evidence.
 
-Invalidation fences old mutations immediately. Persist a new attempt generation,
+Invalidation (a fresh attempt in the same environment) is never triggered by a
+sibling batch or by master moving; those are handled by promotion and the normal
+master update. It remains the protocol for the upgrade reset above, for
+operator-requested rebuilds from a different base, and for genuine recovery.
+When it runs: invalidation fences old mutations immediately. Persist a new attempt generation,
 stop queued prompts/turns/background tasks and child sessions. Cancellation
 accepts an already-ended turn; cleanup never infers turn
 activity or waits for session idleness. Parked children have no live worker:
@@ -849,23 +864,21 @@ same command; confirmed failed clears use a new ID. The session, container,
 checkout and caches survive. `mm-merge --restart` archives the old tip, pending
 source edits and progress note once, then assembles from the replacement base
 and original own heads. Preserve Git rerere with automatic staging disabled;
-review reused resolutions. Never transplant old merge commits or retain the
-invalidated predecessor's ancestry. No agent-written handoff or cache transfer
+review reused resolutions. Never transplant old merge commits from the
+invalidated attempt. No agent-written handoff or cache transfer
 is needed. Read final reports only after this attempt's context divider.
 
-After the passing handoff, recheck master and queue `mm-merge --promote` to
-incorporate the actual landed commit. Keep the checkpoint available while this
-approved ancestry incorporation is pending, provided its original source inputs
-and attempt generation still match. If the committed tree is unchanged, register
-the new head without withdrawing: the service verifies ancestry and preserves
-the logical checkpoint ID with its verified equivalent heads. A pinned successor
-can keep its work through this step. Different trees, source changes, exclusions,
-withdrawals and recovery invalidate it normally. Once landed, the parent's
-exact tested head must equal its current checkpoint head; a verified older
-equivalent head may remain the successor's pin. Evidence may
-be reused only with unchanged tree and applicable validation inputs/settings;
-always record a fresh assessment for the resulting committed HEAD/source set.
-A differing master tree starts a fresh attempt in the same environment. Normal
+After role promotion, and whenever current master differs from the captured
+base before landing, the supervisor queues `mm-merge --promote` (or the normal
+master update) to merge the fresh master tip into the committed candidate. The
+base becomes that master commit and the source revision changes, which
+invalidates the earlier handoff and withdraws the checkpoint; the agent
+registers the post-merge head. The agent resolves conflicts, chooses reruns from
+the actual diff against the last tested candidate under the validation policy,
+reusing unaffected results with their original tested SHAs and applicability
+reasons, and records a fresh assessment for the resulting HEAD. Promotion always
+revalidates by that policy: there is no unchanged-tree shortcut, no
+equivalent-head alias and no fresh attempt for a differing master tree. Normal
 sync/async freshness, CI and landing gates apply after promotion. Completed
 notification retries must not occupy the foreground selection slot.
 
@@ -1367,21 +1380,26 @@ normal lane; the "merge gate open" Slack notice still needs a `pr_ready` fix. Th
 merger checks it at selection only. Campaign batches persist
 `automerge_batches.target_ref` (NULL means master) and contain one target. They
 run in an independent campaign lane: at most one live campaign batch, alongside
-master's primary and speculative successor, with no ranking between lanes.
-`active_batch` is master-only; `active_campaign_batch` supplies the campaign
-slot. Each tick advances the master primary, then its successor, then the
-campaign lane; a deferred read, error or stall leaves only that batch's action
-pending. With no live campaign batch, master keeps the whole 50 s budget as
-before; with one, each batch not yet advanced keeps a 10 s reservation (one
-observation slice plus commands), reclaimed when unused. Successor guidance and
+master's primary, its speculative successor and the immediate lane, with no
+ranking between lanes. `automerge_batches.lane` (additive; NULL means ordinary)
+marks the immediate slot, which holds at most one live batch, admits only
+immediate PRs and their prerequisite closure, excludes every live reservation,
+and never has a successor; an up-to-date single PR may take its direct path.
+`active_batch` is ordinary-master-only; `active_immediate_batch` and
+`active_campaign_batch` supply the other slots. Each tick advances the immediate
+lane, then the master primary, then its successor, then the campaign lane; a
+deferred read, error or stall leaves only that batch's action pending. With one
+live row, master keeps the whole 50 s budget as before; with more, each batch
+not yet advanced keeps a 10 s reservation (one observation slice plus commands),
+reclaimed when unused. Successor guidance and
 recovery keep their place ahead of priority discovery. Per-PR comment and review
 reads run only for the lane's own source closure after structural partitioning;
 historical rejection, ancestry and supersession fences still read what they
 need, so an unrelated read failure in one lane cannot block the other's
 selection or landing recheck. Selection reservations stay global, so a source
-cannot enter both lanes if its base changes. Immediate preemption, the
-idle queue summary and `--land-now` are master-only; abort resolves either lane
-by batch ID, and `--check` shows both. Campaign batches always use async mode
+cannot enter two lanes if its base or labels change. The idle queue summary and
+`--land-now` are master-only; abort resolves any lane by batch ID, and `--check`
+shows every slot. Campaign batches always use async mode
 (one up-to-date PR may take the async direct path into the branch; the stage
 suites at the new tip are its check) and never have or follow a speculative
 successor. Base
