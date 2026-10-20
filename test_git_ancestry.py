@@ -62,6 +62,10 @@ class GitReads(unittest.TestCase):
         self.warm([two])
         self.assertEqual(self.cache.missing([one, two, self.base]), [])
         self.assertFalse((self.cache.git_dir / 'shallow').exists())
+        info = self.cache.git_dir / 'objects/info'
+        self.assertTrue((info / 'commit-graph').exists()
+                        or (info / 'commit-graphs/commit-graph-chain').exists())
+        self.assertEqual(self.cache.command('commit-graph', 'verify').returncode, 0)
         with mock.patch.object(g, 'launch_worker', side_effect=AssertionError('unexpected network read')):
             self.assertTrue(self.cache.ancestor(self.base, one, self.fail))
             self.assertFalse(self.cache.ancestor(two, one, self.fail))

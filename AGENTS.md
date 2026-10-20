@@ -241,8 +241,10 @@ Operator `--check` remains read-only and does not warm or write this cache.
 All commit-derived reads, including skill-service verification, use that cache.
 Fetch branch and PR refs together with full history and filtered blobs; fetch
 detached historical tips in batches only when still missing. This bare cache uses
-`fetch`, never `pull`, and never changes agent checkouts. Read current master and
-published batch heads freshly with `ls-remote`, including final landing gates.
+`fetch`, never `pull`, and never changes agent checkouts. Fetch workers maintain
+Git commit-graphs so repeated immutable ancestry comparisons stay inexpensive.
+Read current master and published batch heads freshly with `ls-remote`, including
+final landing gates.
 Current-ref failures expose only sanitized categories (authentication, repository
 access, transport, rate limit, missing branch or invalid/unknown response), never
 Git stderr. Explicit authentication failure permits one renewal through the same
@@ -278,6 +280,9 @@ Priority dependency discovery checkpoints informational notices even while an
 existing batch has no candidate; delivery follows advancement through the same
 outbox and preserves retry backoff. Failed notice delivery never fences
 preemption or landing.
+When priority discovery returns eligible work, primary selection reuses that
+validated dependency closure within the same tick. Unrelated queue discovery
+must not delay admitting the work that caused preemption.
 An empty eligible queue with no active batch posts a categorized open-PR summary
 in the last primary thread (or a new idle thread); checkpoint accepted replies in
 `automerge_queue_summaries` and suppress unchanged snapshots. This needs Slack chat.

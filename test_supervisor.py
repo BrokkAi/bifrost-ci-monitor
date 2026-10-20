@@ -168,10 +168,40 @@ class SupervisorTests(unittest.TestCase):
                              "terminal_status='aborted' WHERE batch_id=?", (row['batch_id'],))
         self.patch(a, 'abort_batch_locked', side_effect=abort)
         self.patch(a, 'process_batch')
+        self.patch(a, 'target_sha', return_value=BASE_SHA)
+        self.patch(a, 'create_selected_batch')
         supervisor.run(a, self.conn, self.transport)
         self.assertEqual(aborted, [master])
         self.assertEqual(self.row(campaign)['status'], 'launching')
         self.assertIsNone(a._priority_preemption_target(self.row(campaign), [incoming]))
+
+    def test_preempting_priority_closure_admitted_without_unrelated_discovery(self):
+        previous = self.batch()
+        prerequisite = a.PullRequest(98, 'prerequisite', HEAD_ONE, 'url')
+        incoming = a.PullRequest(99, 'urgent', HEAD_ONE, 'url', True, True,
+            dependencies=(a.pr_dependencies.Dependency(98, HEAD_ONE),))
+        self.patch(a, 'list_open_pull_requests', return_value=[
+            {'number': 99, 'labels': [{'name': 'mergemarshall:immediate'}]}])
+        def select(**kwargs):
+            if kwargs.get('priority_only'):
+                return [prerequisite, incoming]
+            raise git_ancestry.Deferred('unrelated history is cold')
+        self.select.side_effect = select
+        def abort(conn, transport, row, reason):
+            with conn:
+                conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal',"
+                             "terminal_status='aborted' WHERE batch_id=?", (row['batch_id'],))
+        self.patch(a, 'abort_batch_locked', side_effect=abort)
+        self.patch(a, 'target_sha', return_value=BASE_SHA)
+        self.patch(a, 'process_batch')
+        self.assertEqual(supervisor.run(a, self.conn, self.transport), 0)
+        self.assertEqual(self.row(previous)['terminal_status'], 'aborted')
+        selected = a.active_batch(self.conn)
+        self.assertIsNotNone(selected)
+        self.assertEqual([p.number for p in a.row_pulls(selected)], [98, 99])
+        self.select.assert_called_once_with(conn=self.conn, priority_only=True)
+        a.retry_github_outbox.assert_any_call(self.conn, self.transport)
+        monitor.update_known_failures.assert_called_once()
 
     def test_campaign_slot_and_gate_are_independent_of_master_and_successor(self):
         self.campaign()

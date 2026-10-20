@@ -286,7 +286,11 @@ def run(a, conn, transport):
                     a.process_batch(conn, transport, owner)
             elif kind == 'select_primary':
                 occupied = speculation.reserved(a, conn)
-                pulls = a.unreserved_pulls(a.select_eligible_pull_requests(conn=conn), occupied)
+                # Priority discovery already validated its dependency closure in
+                # this tick. Full discovery selects those same priority seeds;
+                # unrelated history must not delay admission after preemption.
+                pulls = a.unreserved_pulls(
+                    priority_pulls or a.select_eligible_pull_requests(conn=conn), occupied)
                 a.report_dependency_blocks(conn, transport)
                 if pulls:
                     a.create_selected_batch(conn, pulls, a.target_sha(a.pulls_target(conn, pulls)))

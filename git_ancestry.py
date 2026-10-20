@@ -364,7 +364,8 @@ def fetch_worker(request):
                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                       timeout=remaining, check=False)
 
-            fetch = ['-c', 'gc.auto=0', 'fetch', '--no-tags', '--no-write-fetch-head', '--filter=blob:none', url]
+            fetch = ['-c', 'gc.auto=0', 'fetch', '--no-tags', '--no-write-fetch-head',
+                     '--write-commit-graph', '--filter=blob:none', url]
             # A named promisor remote lets Git's connectivity checks accept
             # omitted blobs. Its saved URL contains no authentication material.
             for name, value in [('url', url), ('promisor', 'true'), ('partialclonefilter', 'blob:none')]:
