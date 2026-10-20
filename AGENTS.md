@@ -82,12 +82,23 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   to DeepSeek Flash, retaining the same session, container and execution evidence.
 - `merge_heartbeat.py`: threaded supervisor activity reports after five minutes
   without merger prose, then every five minutes until prose resumes. Counts
-  distinct tool calls and reports every observed pending/running call's age; never
-  retains or posts tool arguments, outputs, summaries or prompts. State and
-  attempts persist across restarts, failed sends retain counts, and paginated
-  catch-up must complete before reporting. Uses the existing merger lock and
+  distinct tool calls and lists pending/running calls with their ages and
+  redacted command/parameter previews, formatted as bounded code blocks. Only
+  active calls retain previews; outputs, prompts and credentials stay private.
+  `secret_filter.py` shares the web diagnostic scrub without importing web code.
+  State and attempts persist across restarts, failed sends retain counts, and
+  paginated catch-up must complete before reporting. Uses the existing merger lock and
   transcript observation, with bounded reads. Reports only building/fixing
   sessions before handoff; reporting never changes scheduling or verdicts.
+- `merge_updates.py`: threaded reports from accepted `automerge_skill_events`:
+  candidate checkpoints/withdrawals, exact-head rejections/removals, local test
+  assessments, integration publication and validated handoffs. A separate durable
+  cursor advances after accepted Slack delivery; attempts retain retry backoff.
+  Installation checkpoints existing history once, rather than replaying it.
+  Only reviewed fields and scrubbed, bounded summaries are exposed; evidence,
+  notes, prompts and raw tool payloads remain private. Maintenance retries include
+  completed batches so a fast landing cannot lose a handoff report. Notifications
+  never mutate a batch revision, scheduling, validation or landing gates.
 - `stabilize_state.py`: the shared campaign contract (tables and read API) used
   by the merger, fixer and triage. `stabilize.py`: the campaign engine, cron
   entry point and in-process API for the web UI.
