@@ -75,8 +75,9 @@ dependencies. Refresh the host's image cache after an image update:
 podman pull ghcr.io/brokkai/mjolnir/agent-dev:latest
 ```
 
-Bifrost validation also requires Go. The upstream image and a separately pinned
-Bedrock image may omit it; installing it in one session does not update future
+Bifrost validation also requires Go and ShellCheck for the workflow script
+checks. The upstream image and a separately pinned Bedrock image may omit
+them; installing them in one session does not update future
 sessions. Build the CI prerequisite layer for each target's actual image:
 
 ```sh
@@ -85,7 +86,7 @@ podman build --pull=never -f containers/Containerfile.ci-tools \
   --build-arg BASE_IMAGE=INSPECTED_IMAGE_ID --build-arg BASE_USER=INSPECTED_USER \
   -t localhost/mergemarshall-ci:DESCRIPTIVE_TAG .
 podman run --rm --network=none localhost/mergemarshall-ci:DESCRIPTIVE_TAG \
-  bash -lc 'go version && go env GOROOT && command -v gofmt'
+  bash -lc 'go version && go env GOROOT && command -v gofmt && shellcheck --version'
 ```
 
 Set the corresponding target's `image` in Mjolnir's `config.toml` to the verified
@@ -93,10 +94,12 @@ tag, retaining a private backup of the original configuration. Repeat for both
 `podman` and `bedrock-podman`; refreshing only the upstream image does not update
 the separate Bedrock image. New sessions use the new image. Preserve active
 sessions and coordinate repairs with their owners: the same checksum-verified
-`scripts/install-ci-go.sh` can run as container root at a validation boundary.
+`scripts/install-ci-go.sh` and `scripts/install-ci-shellcheck.sh` can run as
+container root at a validation boundary. Both refuse to replace another
+installation and are safe to repeat offline once installed.
 Recheck affected tests afterward; earlier missing-tool results remain evidence
 of the earlier environment.
-Keep AWS configuration and credentials out of the common image; the Go layer
+Keep AWS configuration and credentials out of the common image; the tools layer
 does not copy either. Bedrock-specific authentication stays separate.
 
 Default executable paths are `~/.cargo/bin/mj` and `/usr/bin/gh`. Override

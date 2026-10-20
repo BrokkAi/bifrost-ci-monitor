@@ -5,8 +5,10 @@ FROM ${BASE_IMAGE}
 ARG BASE_USER=hel
 USER root
 COPY scripts/install-ci-go.sh /usr/local/libexec/mergemarshall/install-ci-go.sh
+COPY scripts/install-ci-shellcheck.sh /usr/local/libexec/mergemarshall/install-ci-shellcheck.sh
 RUN sh /usr/local/libexec/mergemarshall/install-ci-go.sh \
+    && sh /usr/local/libexec/mergemarshall/install-ci-shellcheck.sh \
     && go env GOROOT \
-    && bash -lc 'go version && command -v gofmt'
+    && bash -lc 'go version && command -v gofmt && shellcheck --version'
 USER ${BASE_USER}
-RUN go version && bash -lc 'go version && command -v gofmt'
+RUN go version && bash -lc 'go version && command -v gofmt && shellcheck --version'
