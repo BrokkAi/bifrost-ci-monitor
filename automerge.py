@@ -607,16 +607,8 @@ def _prerequisite_block_detail(conn: sqlite3.Connection, number: int, head: str,
                         (parent, prerequisite_head)).fetchone():
             detail["rejected_head"] = prerequisite_head
             break
-    observed = {row[0]: json.loads(row[1]) for row in conn.execute(
-        "SELECT number,data_json FROM automerge_pr_inventory WHERE number IN (?,?)", (number, parent))}
-    data = observed.get(parent, {})
-    if (str(data.get("state") or "").lower() == "closed"
-            and not (data.get("merged_at") or data.get("mergedAt") or data.get("merged") is True)):
-        detail["closed"] = True
-        own_base = (observed.get(number, {}).get("base") or {}).get("ref")
-        if own_base and own_base == (data.get("head") or {}).get("ref"):
-            detail["stacked"] = own_base
     return detail
+
 
 def _record_dependency_label(conn: sqlite3.Connection, number: int, present: bool) -> None:
     """Record the reconciled PR label without changing discovery or Git facts."""
@@ -1164,6 +1156,9 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
                         rejected['head_sha'], {'reason': 'MergeMarshall recorded a trusted rejection.',
                                                'evidence': REJECTION_MARKER.sub('', rejected['evidence']).strip()})
                 deps = graph.dependencies[number]
+                # A stacked PR that absorbed a closed base PR is promoted here
+                # too, once its own head lands: the absorbed heads are then
+                # landed prerequisites.
                 if (promote and node.base != graph.target(number)[0] and str(node.data.get('state')).lower() == 'open'
                         and deps and number not in graph.problems
                         and all(graph.landed(dep.head_sha, number) for dep in deps)):
@@ -1278,16 +1273,10 @@ def dependency_block_comment(number: int, reason: str, detail: dict[str, Any] | 
         detail = detail or {}
         rejected = (f" The merge queue rejected its head `{str(detail['rejected_head'])[:12]}`, "
                     "which this PR contains." if detail.get("rejected_head") else "")
-        if detail.get("closed") and detail.get("stacked"):
-            summary = (f"{pull} is based on the branch of {prerequisite}, which was closed without "
-                       f"merging, so this PR's diff does not show that work.{rejected}")
-            action = ("Action for the author: retarget this PR to the branch it should land in (usually "
-                      f"master). It then carries PR #{parent}'s commits in its own diff, and its merge "
-                      f"batch tests them with this PR. Alternatively, reopen PR #{parent} and mark it ready.")
-        elif detail.get("rejected_head"):
+        if detail.get("rejected_head"):
             summary = f"{pull} is waiting for prerequisite {prerequisite}.{rejected}"
             action = (f"Action for the authors: if this PR replaces PR #{parent}, close PR #{parent}; this "
-                      f"PR then carries that work in its own diff and its merge batch tests it. Otherwise "
+                      f"PR then carries that work and its merge batch tests it. Otherwise "
                       f"push a fix to PR #{parent}'s branch as a new commit, or an empty commit "
                       "(`git commit --allow-empty`) if the rejection was wrong, and merge that new head "
                       "into this PR. A rejection applies only to its exact commit.")
@@ -4508,11 +4497,8 @@ def _rejected_pull_absorbed(conn, number: int, importing: list[PullRequest]) -> 
         return False
     observed = conn.execute("SELECT data_json FROM automerge_pr_inventory WHERE number=?", (number,)).fetchone()
     detail = json.loads(observed[0]) if observed else {}
-    if (str(detail.get("state") or "").lower() != "closed"
-            or detail.get("merged_at") or detail.get("mergedAt") or detail.get("merged") is True):
-        return False
-    branch = (detail.get("head") or {}).get("ref")
-    return bool(branch) and all(pull.base_ref != branch for pull in importing)
+    return (str(detail.get("state") or "").lower() == "closed"
+            and not (detail.get("merged_at") or detail.get("mergedAt") or detail.get("merged") is True))
 
 
 def _close_integration_pr(row: sqlite3.Row | dict[str, Any], reason: str) -> None:

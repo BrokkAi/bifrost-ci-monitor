@@ -334,17 +334,17 @@ class Graph:
     def _open(node):
         return str(node.data.get('state')).lower() == 'open'
 
-    def _absorb(self, number, node, related, base_parent):
-        """Drop edges to closed unmerged work that this open PR's own diff carries.
+    def _absorb(self, number, node, related):
+        """Drop edges to closed unmerged work that this open PR carries.
 
         Closing a PR never lands its head, so an edge to it could only block
-        forever. When the descendant is not stacked on the closed PR's branch,
-        its own diff shows that work and its batch tests it like any other
-        change, including a head the queue rejected earlier. The descendant
-        inherits the closed PR's own prerequisites, so absorbed work never skips
-        them. A stacked PR keeps the edge until it is retargeted. Two open PRs
-        at one unlanded head stay ambiguous. Returns parents removed here; the
-        caller still examines them so scoped polls load their fresh metadata.
+        forever. The descendant contains that work, stacked or not, and its
+        batch tests the full tree like any other change, including a head the
+        queue rejected earlier. The descendant inherits the closed PR's own
+        prerequisites, so absorbed work never skips them. A stacked PR is
+        retargeted only after its own head lands. Two open PRs at one unlanded
+        head stay ambiguous. Returns parents removed here; the caller still
+        examines them so scoped polls load their fresh metadata.
         """
         absorbed, removed = [], []
         pending = sorted(related.items())
@@ -359,8 +359,11 @@ class Graph:
                     del related[parent]
                     removed.append(parent)
                 continue
+            # A reviewed supersession record for this exact head is explicit
+            # operator authority and keeps its own fail-closed checks.
             if (str(prior.data.get('state')).lower() == 'closed' and not self._merged(prior.data)
-                    and parent != base_parent and not self.landed(captured_head, number)
+                    and (parent, captured_head) not in self.supersessions
+                    and not self.landed(captured_head, number)
                     and self.ancestor(captured_head, node.head)):
                 absorbed.append(Dependency(parent, captured_head))
                 del related[parent]
@@ -436,7 +439,6 @@ class Graph:
                     for dep in deps:
                         if dep.number not in related or self.landed(dep.head_sha, number):
                             related[dep.number] = dep.head_sha
-            base_parent = None
             if node.base != self.target(number)[0]:
                 matches = branches.get((node.base_repo.casefold(), node.base), [])
                 open_matches = [n for n in matches if str(self.nodes[n].data.get('state')).lower() == 'open']
@@ -445,7 +447,6 @@ class Graph:
                     self.problems[number] = f'ambiguous or unresolved prerequisite branch {node.base}'
                 else:
                     parent = matches[0]
-                    base_parent = parent
                     related.setdefault(parent, self.nodes[parent].head)
             # This closes the master-targeting bypass, including old rejected
             # heads retained by a repaired prerequisite through merge commits.
@@ -466,7 +467,7 @@ class Graph:
                     break
             # Removed parents stay in discovery so scoped polls load their
             # fresh metadata; a stale closed/open state must not decide this.
-            removed = self._absorb(number, node, related, base_parent)
+            removed = self._absorb(number, node, related)
             captured = [Dependency(parent, captured_head)
                         for parent, captured_head in sorted(related.items())]
             exact_deps = self._normalize_dependencies(number, captured)

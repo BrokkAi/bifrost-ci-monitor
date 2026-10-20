@@ -643,12 +643,15 @@ retries, direct landing, and `--land-now`. Changed, draft, rejected, withdrawn,
 or closed-unmerged prerequisites block descendants while unrelated work proceeds.
 A repair unblocks descendants after they contain the new eligible prerequisite
 head. Absorption is the exception for closed work: an open PR drops its edge to a
-closed unmerged PR (rejected heads included) when it contains that captured head,
-the head has not landed, and it is not stacked on the closed PR's branch. Its own
-diff then shows the work and its batch tests it; `Graph.absorbed` records the
-edge. The absorbing PR inherits the closed PR's captured and base-branch
-prerequisites, so absorbed work never skips them. A PR stacked on a closed branch
-stays blocked until retargeted. Absorbed and ambiguous parents stay in discovery.
+closed unmerged PR (rejected heads included) when it contains that captured head
+and the head has not landed, whether or not it is stacked on the closed PR's
+branch. Its batch tests the full tree; `Graph.absorbed` records the edge. A
+reviewed supersession record for that exact closed head takes precedence. The
+absorbing PR inherits the closed PR's captured and base-branch prerequisites, so
+absorbed work never skips them. The supervisor never retargets a stacked PR
+before it lands; afterwards the absorbed heads are landed prerequisites and the
+normal `promote_dependency` retarget records the merge. Absorbed and ambiguous
+parents stay in discovery.
 Batch rechecks (`roots`, including the final landing recheck) read absorbed parents
 fresh, because a cached closed record can be stale; queue selection keeps the
 cached record to bound GitHub reads. Two open PRs at one unlanded head report
@@ -657,11 +660,10 @@ Ambiguous branches/shared heads, cycles, and unresolved relationships are
 reported through `--check` and App-owned GitHub notices. The supervisor applies
 `mergemarshall:dependency-blocked` to ready PRs with ineligible prerequisites
 and comments on the blocked PR with links and the needed action. When the
-prerequisite's captured head has a recorded rejection, or the prerequisite is
-closed unmerged with the blocked PR stacked on its branch, the comment says so
-and gives the author routes (close a replaced prerequisite, push a new
-prerequisite head, or retarget off a closed branch); shared heads ask the authors
-to close one PR. It reads only recorded state and never changes eligibility. The existing
+prerequisite's captured head has a recorded rejection, the comment says so and
+gives the author routes (close a replaced prerequisite, or push a new prerequisite
+head); shared heads ask the authors to close one PR. It reads only recorded state
+and never changes eligibility. The existing
 inventory's current block reason owns label reconciliation; changed, closed,
 draft, or unblocked heads lose the label. Exact-head/reason outbox markers
 deduplicate comments after lost replies. Retry these informational writes only
@@ -677,8 +679,8 @@ standalone-broken prerequisite receives a rejection. Recheck captured dependency
 heads before landing. Global recorded rejections also prevent a candidate from
 importing a rejected head outside the batch; its eligible repaired PR must be
 included, that ancestry must already be in master, or the rejected PR must be
-closed and absorbed: its inventory record is closed unmerged and no importing
-source is stacked on its branch (`_rejected_pull_absorbed`).
+closed and absorbed: its inventory record is closed unmerged
+(`_rejected_pull_absorbed`).
 
 Queue `promote_dependency` intents when all captured prerequisites land, including
 combined integration merges. Verify prerequisite ancestry in current master and
