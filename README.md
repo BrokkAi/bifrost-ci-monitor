@@ -134,7 +134,8 @@ install -m 600 /dev/null ~/.config/bifrost-ci-monitor/mm-web-oauth.json
 Install or update, then check the service:
 
 ```sh
-python3 scripts/install-mm-web.py --listen <host-private-IP> \
+# uv and npm live in ~/.local/bin, which a non-interactive SSH shell omits.
+PATH=$HOME/.local/bin:$PATH python3 scripts/install-mm-web.py --listen <host-private-IP> \
   --github-cli /home/ubuntu/.local/bin/gh
 systemctl --user status mm-web.service
 journalctl --user -u mm-web.service
