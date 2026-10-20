@@ -33,6 +33,7 @@ import read_budget
 import execution_evidence
 import merge_failover
 import merge_heartbeat
+import merge_updates
 import stabilize_state
 import session_policy
 
@@ -1440,6 +1441,7 @@ def connect_db() -> sqlite3.Connection:
     supervisor.ensure_schema(conn)
     merge_failover.ensure_schema(conn)
     merge_heartbeat.ensure_schema(conn)
+    merge_updates.ensure_schema(conn)
     speculation.ensure_schema(conn, ensure_column)
     ensure_column(conn, "automerge_batches", "launch_attempted_at", "TEXT")
     ensure_column(conn, "automerge_batches", "agent_final_message", "TEXT NOT NULL DEFAULT ''")
@@ -2505,6 +2507,7 @@ def retry_pending_notifications(
         deliver_blocked_notice(
             conn, transport, str(row["batch_id"]), str(row["reason"])
         )
+    merge_updates.retry(sys.modules[__name__], conn, transport)
 
 
 def _read_transcript_page(session_id: str, cursor: int) -> tuple[list[dict[str, Any]], int]:
@@ -2593,6 +2596,7 @@ def drain_transcript(
             "UPDATE automerge_batches SET transcript_after_seq = ? WHERE batch_id = ?",
             (processed_cursor, batch_id),
         )
+    merge_updates.deliver(sys.modules[__name__], conn, transport, row)
     merge_heartbeat.observe(sys.modules[__name__], conn, transport, row, items)
     return texts
 

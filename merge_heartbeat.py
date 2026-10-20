@@ -2,16 +2,99 @@
 from __future__ import annotations
 
 from datetime import datetime
+import html
 import json
+import re
+import shlex
 import sqlite3
+import textwrap
 import time
 
 import monitor
 import read_budget
+from secret_filter import diagnostic
 
 INTERVAL_MS = 5 * 60 * 1000
 SCAN_RETRY_MS = 60 * 1000
 READ_SECONDS = 3
+DISPLAY_VERSION = 1
+DISPLAY_CHARS = 1000
+DISPLAY_LINES = 12
+TRUNCATED = '\n… (truncated)'
+
+
+def _shorten(text, characters=DISPLAY_CHARS):
+    lines = text.splitlines()
+    clipped = '\n'.join(lines[:DISPLAY_LINES])
+    if len(lines) > DISPLAY_LINES or len(clipped) > characters:
+        return clipped[:max(0, characters - len(TRUNCATED))].rstrip() + TRUNCATED
+    return clipped
+
+
+def _pretty_shell(text):
+    text = textwrap.dedent(text).strip()
+    if '\n' in text:
+        return text
+    # Keep quoted scripts and escaped semicolons intact. Only introduce a
+    # visual line break after an unquoted shell command separator.
+    result = []
+    quote = None
+    escaped = False
+    for character in text:
+        if escaped:
+            escaped = False
+        elif character == '\\' and quote != "'":
+            escaped = True
+        elif quote:
+            if character == quote:
+                quote = None
+        elif character in ('"', "'", '`'):
+            quote = character
+        elif character == ';':
+            result.append(';\n')
+            continue
+        if character == ' ' and result and result[-1].endswith('\n'):
+            continue
+        result.append(character)
+    return ''.join(result)
+
+
+def _call_display(item):
+    call = (item.get('body') or {}).get('call') or {}
+    args = call.get('rawInput')
+    if not isinstance(args, dict):
+        return ''
+    command = args.get('command')
+    if isinstance(command, list) and all(isinstance(part, str) for part in command):
+        command = shlex.join(command)
+    if isinstance(command, str):
+        display = _pretty_shell(diagnostic(command))
+    else:
+        # Other tools get structured parameters; private instructions and
+        # message bodies are not useful command diagnostics.
+        display = json.dumps(diagnostic(args), indent=2, ensure_ascii=False)
+    display = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', display)
+    return _shorten(display)
+
+
+def _call_bullets(active, now, available):
+    bullets = []
+    for index, call in enumerate(active):
+        remaining = len(active) - index
+        budget = (available - sum(map(len, bullets))) // remaining
+        if budget < 90:
+            bullets.append(f'\n• … {remaining} more calls')
+            break
+        state = 'pending, ' if call['status'] == 'pending' else ''
+        heading = f'\n• {state}{_duration(now - call["started_at_ms"])} elapsed\n```\n'
+        raw = call['display'] or 'Call details unavailable'
+        limit = min(DISPLAY_CHARS, budget - len(heading) - 6)
+        display = html.escape(_shorten(raw, limit), quote=False).replace('```', '`\u200b``')
+        while len(display) > budget - len(heading) - 6:
+            limit -= max(1, len(display) - (budget - len(heading) - 6))
+            display = html.escape(_shorten(raw, limit), quote=False).replace('```', '`\u200b``')
+        bullets.append(heading + display + '\n```')
+    return ''.join(bullets)
 
 
 def ensure_schema(conn):
@@ -24,6 +107,7 @@ def ensure_schema(conn):
         started_at_ms INTEGER NOT NULL, status TEXT NOT NULL,
         PRIMARY KEY (batch_id, session_id, stable_id)
     )""")
+    monitor.ensure_column(conn, 'automerge_activity_tools', 'display', "TEXT NOT NULL DEFAULT ''")
 
 
 def _save(conn, row, value):
@@ -86,9 +170,13 @@ def _ingest(conn, row, value, items, now):
         status = ((item.get('body') or {}).get('call') or {}).get('status')
         if status not in {'pending', 'in_progress', 'completed', 'failed', 'cancelled'}:
             status = 'unknown'
-        conn.execute('INSERT INTO automerge_activity_tools VALUES (?,?,?,?,?) '
-                     'ON CONFLICT(batch_id,session_id,stable_id) DO UPDATE SET status=excluded.status',
-                     (row['batch_id'], row['session_id'], identity, stamp, status))
+        display = _call_display(item) if status in {'pending', 'in_progress'} else ''
+        conn.execute('INSERT INTO automerge_activity_tools '
+                     '(batch_id,session_id,stable_id,started_at_ms,status,display) VALUES (?,?,?,?,?,?) '
+                     'ON CONFLICT(batch_id,session_id,stable_id) DO UPDATE SET status=excluded.status, '
+                     "display=CASE WHEN excluded.status NOT IN ('pending','in_progress') THEN '' "
+                     "WHEN excluded.display<>'' THEN excluded.display ELSE automerge_activity_tools.display END",
+                     (row['batch_id'], row['session_id'], identity, stamp, status, display))
 
 
 def _duration(milliseconds):
@@ -105,8 +193,8 @@ def _eligible(a, row):
 def observe(a, conn, transport, row, agent_items):
     """Called under the merger lock after normal transcript delivery.
 
-    Only IDs, timestamps and enum statuses enter our tables. No tool text,
-    arguments, outputs, prompts or connection material enters a heartbeat.
+    Only active calls retain a redacted, bounded command/parameter preview.
+    Outputs, prompts and connection credentials never enter a heartbeat.
     """
     if transport.kind != 'chat' or not _eligible(a, row):
         return
@@ -116,6 +204,10 @@ def observe(a, conn, transport, row, agent_items):
     try:
         now = int(time.time() * 1000)
         value = _state(conn, row, now)
+        if value.get('display_version') != DISPLAY_VERSION:
+            # Hydrate calls already running when display support was deployed.
+            # Replaying stable IDs cannot add to their counts.
+            value.update(cursor=0, display_version=DISPLAY_VERSION)
         _assistants(value, agent_items, now)
         with conn:
             _save(conn, row, value)
@@ -157,7 +249,7 @@ def observe(a, conn, transport, row, agent_items):
                                  'WHERE batch_id=? AND session_id=? AND started_at_ms>?',
                                  (*scope, value['assistant_ms'])).fetchone()[0]
             window = 'the last assistant update' if value['assistant_seq'] else 'session start'
-        active = conn.execute('SELECT started_at_ms,status FROM automerge_activity_tools '
+        active = conn.execute('SELECT started_at_ms,status,display FROM automerge_activity_tools '
                               'WHERE batch_id=? AND session_id=? '
                               "AND status IN ('pending','in_progress') "
                               'ORDER BY started_at_ms,stable_id', scope).fetchall()
@@ -166,17 +258,16 @@ def observe(a, conn, transport, row, agent_items):
         text = (f'*{label}* — no assistant update for {_duration(now - value["assistant_ms"])}. '
                 f'{count} new tool call{"s" if count != 1 else ""} since {window}.')
         if active:
-            text += f' {len(active)} concurrent pending/in-progress call{"s" if len(active) != 1 else ""}: '
-            details = []
-            for index, call in enumerate(active):
-                detail = f'{call["status"].replace("_", " ")} {_duration(now - call["started_at_ms"])}'
-                if len(text) + len('; '.join(details)) + len(detail) > monitor.SLACK_MESSAGE_LIMIT - 100:
-                    details.append(f'and {len(active) - index} more')
-                    break
-                details.append(detail)
-            text += '; '.join(details) + '.'
+            running = sum(call['status'] == 'in_progress' for call in active)
+            pending = len(active) - running
+            labels = []
+            for count, label in ((running, 'in-progress'), (pending, 'pending')):
+                if count:
+                    labels.append(f'{count} {label} call{"s" if count != 1 else ""}')
+            text += ' ' + ', '.join(labels) + ':'
+            text += _call_bullets(active, now, monitor.SLACK_MESSAGE_LIMIT - len(text) - 30)
         else:
-            text += ' No tool call currently pending/in progress in the observed transcript.'
+            text += ' No in-progress calls.'
         # Persist the attempt first: even an ambiguous Slack response cannot
         # create a burst of retries after a crash. Counts advance only on success.
         value['attempt_ms'] = now

@@ -24,10 +24,11 @@ def agent(seq=10, seconds=10):
             'text': PRIVATE, 'body': {'kind': 'agent', 'streaming': False}}
 
 
-def tool(identity, seq, seconds, status='completed'):
+def tool(identity, seq, seconds, status='completed', command='sleep 600; tail -20 /tmp/build.log'):
     return {'seq': seq, 'stable_id': f'tool:{identity}', 'role': 'tool',
             'created_at_ms': (START + seconds) * 1000,
-            'text': PRIVATE, 'body': {'call': {'status': status, 'rawInput': PRIVATE},
+            'text': PRIVATE, 'body': {'call': {'status': status, 'rawInput': {'command': command,
+                                                                          'token': PRIVATE}},
                                       'presentation': PRIVATE}}
 
 
@@ -87,7 +88,9 @@ class HeartbeatTests(unittest.TestCase):
         before = tuple(self.row())
         self.observe()
         self.assertIn('3 new tool calls since the last assistant update', self.text())
-        self.assertIn('2 concurrent pending/in-progress calls: in progress 8m; pending 5m', self.text())
+        self.assertIn('1 in-progress call, 1 pending call:', self.text())
+        self.assertIn('• 8m elapsed\n```\nsleep 600;\ntail -20 /tmp/build.log\n```', self.text())
+        self.assertIn('• pending, 5m elapsed', self.text())
         self.assertEqual(self.send.call_args.args[1], 'thread')
         self.assertNotIn(PRIVATE, self.text())
         stored = self.conn.execute('SELECT state_json FROM automerge_activity_heartbeats').fetchone()[0]
@@ -98,7 +101,10 @@ class HeartbeatTests(unittest.TestCase):
         self.page([tool('two', 55, 120), tool('four', 60, 890, 'in_progress')], 60)
         self.observe()
         self.assertIn('1 new tool call since the previous heartbeat', self.text())
-        self.assertIn('2 concurrent pending/in-progress calls: pending 10m; in progress 0m', self.text())
+        self.assertIn('1 in-progress call, 1 pending call:', self.text())
+        self.assertIn('• pending, 10m elapsed', self.text())
+        self.assertIn('• 0m elapsed', self.text())
+        self.assertEqual(self.conn.execute("SELECT display FROM automerge_activity_tools WHERE stable_id='tool:two'").fetchone()[0], '')
 
     def test_zero_new_calls_and_restart_do_not_repeat_or_invent_activity(self):
         self.page([agent(), tool('one', 20, 100, 'in_progress')])
@@ -112,7 +118,7 @@ class HeartbeatTests(unittest.TestCase):
         self.page([tool('one', 70, 100, 'in_progress')], 70)
         self.observe()
         self.assertIn('0 new tool calls since the previous heartbeat', self.text())
-        self.assertIn('in progress 13m', self.text())
+        self.assertIn('• 13m elapsed', self.text())
         self.assertEqual(self.conn.execute('SELECT count(*) FROM automerge_activity_tools').fetchone()[0], 1)
 
     def test_normal_transcript_drain_reports_activity_without_agent_prose(self):
@@ -122,7 +128,49 @@ class HeartbeatTests(unittest.TestCase):
                    tool('two', 30, 120, 'in_progress')])
         self.assertEqual(a.drain_transcript(self.conn, self.transport, self.batch, 'session'), [])
         self.assertIn('2 new tool calls', self.text())
-        self.assertIn('2 concurrent pending/in-progress calls', self.text())
+        self.assertIn('2 in-progress calls:', self.text())
+
+    def test_command_previews_redact_before_truncating_and_do_not_break_code_blocks(self):
+        command = ('GH_TOKEN=ghp_fixture API_KEY="unprefixed-private-value" '
+                   'curl -H "Authorization: Bearer header-private-value" https://example.test; '
+                   "echo 'quoted; still one line'; echo '<@U123> ```'; "
+                   + 'echo filler; ' * 1000)
+        self.page([agent(), tool('one', 20, 100, 'in_progress', command)])
+        self.observe()
+        shown = self.text()
+        for secret in ('ghp_fixture', 'unprefixed-private-value', 'header-private-value', '<@U123>'):
+            self.assertNotIn(secret, shown)
+        self.assertIn("echo 'quoted; still one line'", shown)
+        self.assertIn('… (truncated)', shown)
+        self.assertEqual(shown.count('```'), 2)
+        self.assertLessEqual(len(shown), monitor.SLACK_MESSAGE_LIMIT)
+
+    def test_display_migration_reloads_existing_running_calls_without_recounting(self):
+        self.page([agent(), tool('one', 20, 100, 'in_progress')])
+        self.observe()
+        with self.conn:
+            self.conn.execute('ALTER TABLE automerge_activity_tools DROP COLUMN display')
+            state = self.state()
+            state.pop('display_version')
+            self.conn.execute('UPDATE automerge_activity_heartbeats SET state_json=?', (json.dumps(state),))
+        self.conn.close()
+        self.conn = a.connect_db()
+        self.now += 300
+        self.page([agent(), tool('one', 70, 100, 'in_progress')], 70)
+        self.observe()
+        args = self.cli.call_args.args[0]
+        self.assertEqual(args[args.index('--after-seq') + 1], '0')
+        self.assertIn('0 new tool calls', self.text())
+        self.assertIn('tail -20 /tmp/build.log', self.text())
+
+    def test_structured_calls_filter_nested_credentials_and_private_instructions(self):
+        item = tool('one', 20, 100, 'in_progress')
+        item['body']['call']['rawInput'] = {'session_id': 'session', 'options': {
+            'password': PRIVATE, 'instructions': PRIVATE, 'api_key': PRIVATE, 'limit': 30}}
+        self.page([agent(), item])
+        self.observe()
+        self.assertNotIn(PRIVATE, self.text())
+        self.assertIn('"limit": 30', self.text())
 
     def test_assistant_message_resets_interval_and_count_window(self):
         self.page([agent(), tool('one', 20, 20)])
