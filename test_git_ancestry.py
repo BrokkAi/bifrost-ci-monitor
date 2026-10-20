@@ -286,6 +286,36 @@ class GitReads(unittest.TestCase):
             self.assertEqual(a.commit_tree_sha(self.base), self.git('rev-parse', self.base + '^{tree}'))
             self.assertTrue(a.compare_commit_ancestry(self.base, self.base))
 
+    def test_classifier_imports_transitive_helpers_from_base_not_candidate(self):
+        # Hard-won: the lookahead's pinned classifier imported a checksum
+        # helper, but only the entry module was materialized for Node.
+        self.put('scripts/public/ci-impact.mjs', '''
+            import { classifyChangeSet } from './helpers/export.mjs';
+            export { classifyChangeSet };
+        ''')
+        self.put('scripts/public/helpers/export.mjs',
+                 "export { classifyChangeSet } from '../sync-release-checksums.mjs';")
+        self.put('scripts/public/sync-release-checksums.mjs',
+                 "export function classifyChangeSet() { return {mode:'docs', selected:new Set()}; }")
+        base = self.commit('base imports helpers')
+        self.put('scripts/public/sync-release-checksums.mjs', 'throw new Error("candidate helper");')
+        head = self.commit('candidate changes helper')
+        self.warm([base, head])
+        for path in ['scripts/public/ci-impact.mjs', 'scripts/public/helpers/export.mjs',
+                     'scripts/public/sync-release-checksums.mjs']:
+            self.warm([self.git('rev-parse', base + ':' + path)], 'blob')
+        with mock.patch.object(a, '_ancestry_cache', return_value=self.cache):
+            self.assertEqual(a.run_ci_impact(base, [head])['mode'], 'docs')
+            with mock.patch.object(monitor, 'run_command', side_effect=AssertionError('reran Node')):
+                self.assertEqual(a.run_ci_impact(base, [head])['mode'], 'docs')
+
+        self.put('scripts/public/ci-impact.mjs', "import './missing.mjs';")
+        missing_base = self.commit('missing classifier dependency')
+        self.warm([missing_base])
+        self.warm([self.git('rev-parse', missing_base + ':scripts/public/ci-impact.mjs')], 'blob')
+        with mock.patch.object(a, '_ancestry_cache', return_value=self.cache):
+            self.assertEqual(a.run_ci_impact(missing_base, [missing_base])['mode'], 'unknown')
+
     def test_remote_auth_is_environment_only_and_error_output_is_withheld(self):
         result = subprocess.CompletedProcess([], 0, self.base + '\trefs/heads/master\n', '')
         with mock.patch.object(g.subprocess, 'run', side_effect=[mock.Mock(returncode=0), result]) as run:

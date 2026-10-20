@@ -495,6 +495,14 @@ validation; do not push more commits to a ready PR without making it draft first
 When standing down without a submitted repair, remove only YOUR agent-in-progress
 label and `{ASSIGNEE}` assignment. Leave a useful issue comment. Keep the claim
 while a submitted PR awaits merge; do not close the issue before the PR lands.
+If your investigation verifies that ALL of this issue's causes are already fixed
+on current {target}, post the current source/commit and applicable passing test
+evidence, recheck ownership, and close THIS issue as completed before releasing
+your claim and reporting resolved. Do not leave a verified resolved ticket open
+for the supervisor to close: new CI observations would admit another fixer.
+An old dossier report, an absent/skipped test, or a related PR link alone does
+not establish recovery. Do not close while another owner or unmerged repair
+still owns the work; report the actual remaining work or defer instead.
 No hard runtime limit applies. Finish this one issue's work and report the outcome.
 For infrastructure, escalation or a revert, include the Slack mention tokens
 {' '.join(f'<@{m}>' for m in monitor.ESCALATION_SLACK_MEMBER_IDS)} in your closing

@@ -88,8 +88,9 @@ class ClassifierTests(TestCase):
         ])
         self.assertEqual(cache.file_calls, [(BASE_SHA, 'scripts/public/ci-impact.mjs')])
         self.assertEqual(cache.memo_keys, [[
-            'ci-impact-v1', BASE_SHA, [HEAD_ONE, HEAD_TWO],
-            hashlib.sha256(CLASSIFIER.encode()).hexdigest(),
+            'ci-impact-v2', BASE_SHA, [HEAD_ONE, HEAD_TWO],
+            hashlib.sha256(json.dumps({'scripts/public/ci-impact.mjs': CLASSIFIER},
+                                      sort_keys=True).encode()).hexdigest(),
         ]])
 
     def test_mixed_sources_and_code_renamed_into_docs_do_not_skip_tests(self):

@@ -292,7 +292,9 @@ errors; these diagnostics never authorize authentication renewal or inline retry
 Cache immutable tree identities, behind counts, merge-base changed paths, and
 base-pinned classifier results across polls/batches. Changed-path reads include
 rename endpoints without loading file blobs; retrieve only the pinned classifier
-blob when needed. A cache request lock deduplicates fetch launches across cron
+and its literal relative module imports when needed, all from the same base.
+Missing imports retain the judgment policy and never cache a verdict. A cache
+request lock deduplicates fetch launches across cron
 and service clients. Missing objects or incomplete reads are never cached as
 negative facts. Authentication/network fetch failures defer without REST fanout;
 only confirmed unavailable historical tips permit the API fallback. Legacy
@@ -636,6 +638,12 @@ the user-approved label/comment claim when assignment is unavailable.
 `mergemarshall[bot]` cannot be assigned. Refresh ownership before claiming
 and publishing; a failed claim forbids beginning work. Standing down releases
 only its own claim.
+After verifying that every cause is already fixed on the current target, the
+fixer posts current source and applicable passing-test evidence, rechecks
+ownership, closes the issue as completed and releases its own claim. Reporting
+`resolved` while leaving the verified ticket open admits redundant sessions as
+CI observations change. Prior reports, skipped tests and PR links alone never
+authorize closure; pending repairs and other owners remain authoritative.
 
 Prefer a straightforward production fix or mechanical test update; otherwise
 revert the introducing change. A nontrivial revert or irreconcilable task is

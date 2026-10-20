@@ -12,6 +12,7 @@ import hmac
 import html
 import json
 import os
+import posixpath
 import re
 import sqlite3
 import sys
@@ -1728,9 +1729,10 @@ def run_ci_impact(base_sha: str, heads: list[str]) -> dict[str, Any]:
         paths: set[str] = set()
         for head in identity["heads"]:
             paths.update(cache.changed_paths(base_sha, head))
-        script = cache.file(base_sha, 'scripts/public/ci-impact.mjs')
-        key = ['ci-impact-v1', base_sha, identity['heads'], hashlib.sha256(script.encode()).hexdigest()]
-        return cache.memo(key, lambda: _classify_ci_impact(script, paths, identity))
+        modules = _ci_impact_modules(cache, base_sha)
+        digest = hashlib.sha256(json.dumps(modules, sort_keys=True).encode()).hexdigest()
+        key = ['ci-impact-v2', base_sha, identity['heads'], digest]
+        return cache.memo(key, lambda: _classify_ci_impact(modules, paths, identity))
     except (AutomergeError, monitor.CommandError, OSError, ValueError, TypeError, KeyError) as exc:
         # Classification is an optimization; unfinished fetches defer, actual
         # errors use normal validation and never cache an unknown verdict.
@@ -1738,11 +1740,34 @@ def run_ci_impact(base_sha: str, heads: list[str]) -> dict[str, Any]:
         return {**identity, "mode": "unknown"}
 
 
-def _classify_ci_impact(script, paths, identity):
+def _ci_impact_modules(cache, base_sha):
+    """Materialize only literal relative imports, all from the captured base."""
+    pending = ['scripts/public/ci-impact.mjs']
+    modules = {}
+    while pending:
+        path = pending.pop()
+        if path in modules:
+            continue
+        source = modules[path] = cache.file(base_sha, path)
+        # Node remains the parser: unsupported/missing dependencies use the
+        # judgment policy, and incomplete closures never cache a verdict.
+        for relative in re.findall(r'''(?:\bfrom\s*|\bimport\s*(?:\(\s*)?)["'](\.[^"']*)["']''', source):
+            dependency = posixpath.normpath(posixpath.join(posixpath.dirname(path), relative))
+            if dependency == '..' or dependency.startswith('../') or '\\' in dependency:
+                raise ValueError('classifier import escapes the repository')
+            pending.append(dependency)
+    return modules
+
+
+def _classify_ci_impact(modules, paths, identity):
     with tempfile.TemporaryDirectory(prefix="bifrost-ci-impact-") as directory:
-        script_path = Path(directory) / "ci-impact.mjs"
+        root = Path(directory)
+        script_path = root / 'scripts/public/ci-impact.mjs'
         input_path = Path(directory) / "input.json"
-        script_path.write_text(script, encoding="utf-8")
+        for name, source in modules.items():
+            destination = root / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(source, encoding='utf-8')
         input_path.write_text(json.dumps({"eventName": "pull_request",
                                           "changedPaths": sorted(paths)}), encoding="utf-8")
         output = monitor.run_command([
