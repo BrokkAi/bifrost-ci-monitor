@@ -80,6 +80,14 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   Benchmark evidence never authorizes a merge or changes a CI gate.
 - `merge_failover.py`: consecutive Bedrock 503 detection and durable native Move
   to DeepSeek Flash, retaining the same session, container and execution evidence.
+- `merge_heartbeat.py`: threaded supervisor activity reports after five minutes
+  without merger prose, then every five minutes until prose resumes. Counts
+  distinct tool calls and reports every observed pending/running call's age; never
+  retains or posts tool arguments, outputs, summaries or prompts. State and
+  attempts persist across restarts, failed sends retain counts, and paginated
+  catch-up must complete before reporting. Uses the existing merger lock and
+  transcript observation, with bounded reads. Reports only building/fixing
+  sessions before handoff; reporting never changes scheduling or verdicts.
 - `stabilize_state.py`: the shared campaign contract (tables and read API) used
   by the merger, fixer and triage. `stabilize.py`: the campaign engine, cron
   entry point and in-process API for the web UI.
