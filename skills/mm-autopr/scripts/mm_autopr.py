@@ -36,6 +36,10 @@ def publish(client, *, rebuild=False, notes=""):
         if git("merge-base", "--is-ancestor", p["head_sha"], head, check=False).returncode:
             raise ValueError(f"included PR #{p['number']} is absent")
     for p in state["excluded"]:
+        # A head already in the captured base (for example, a source that
+        # landed before this batch) cannot be removed by any rebuild.
+        if not git("merge-base", "--is-ancestor", p["head_sha"], state["base_sha"], check=False).returncode:
+            continue
         if not git("merge-base", "--is-ancestor", p["head_sha"], head, check=False).returncode:
             raise ValueError(f"excluded PR #{p['number']} is still present")
     ref = "refs/heads/" + branch

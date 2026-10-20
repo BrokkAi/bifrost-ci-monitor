@@ -773,6 +773,24 @@ class ClientPublicationTests(GitFixture):
             with self.assertRaisesRegex(ValueError, "exact HEAD"):
                 autopr.publish(client)
 
+    def test_excluded_head_already_in_the_base_does_not_block_publication(self):
+        # Hard-won: batch 4cb9a662 re-selected sources that had just landed in its base.
+        landed = self.base
+        self.source(1, "one", "one\n")
+        result = self.assemble()
+        self.state.update(tests={"head": result["head"], "verdict": "pass"}, revision="rev",
+                          excluded=[{"number": 9, "head_sha": landed, "kind": "removed"}])
+        client = mock.Mock()
+        client.call.side_effect = [self.state, {"publication": "recorded"}]
+        with mock.patch.object(autopr, "git", side_effect=lambda *a, **kw: db.git(*a, cwd=self.repo, **kw)):
+            autopr.publish(client)
+        client.call.assert_called_with("publish", revision="rev", head=result["head"], notes="")
+        self.state["excluded"] = [{"number": 1, "head_sha": self.state["sources"][0]["head_sha"], "kind": "rejected"}]
+        client.call.side_effect = [self.state]
+        with mock.patch.object(autopr, "git", side_effect=lambda *a, **kw: db.git(*a, cwd=self.repo, **kw)):
+            with self.assertRaisesRegex(ValueError, "still present"):
+                autopr.publish(client)
+
 
 class HttpTests(unittest.TestCase):
     def test_pending_git_read_retries_identical_request_inside_tool_timeout(self):
