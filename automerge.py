@@ -112,6 +112,12 @@ MERGE_DELEGATION_GUIDANCE = (
     "The supervisor's next-batch lookahead is an intentional independent useful build."
 )
 SKILLS_GUIDANCE = (
+    "Keep people informed in ordinary assistant messages, which are relayed to Slack. "
+    "After reading batch state, post a brief plan; report meaningful milestones "
+    "such as source assembly, conflict decisions, and validation results. During "
+    "extended command waits, post the current check, its observed progress or "
+    "blocker, and the next step. Tool calls and private progress notes alone do "
+    "not reach Slack. Keep updates concise and evidence-based. "
     "Use the installed mm-merge, mm-db, mm-autopr, and mm-compare skills for "
     "batch mechanics. Use mm-db pr/issue for GitHub reads and mm-db exclude/comment "
     "for comments, labels, and source PR state changes. Do not run gh commands "

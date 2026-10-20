@@ -494,6 +494,13 @@ and publication; subagents edit assigned files. Work against the captured base
 until the supervisor requests an update; it owns final master/source freshness
 checks. Follow the batch skills and revision checks.
 
+Merger agents post a brief plan after reading batch state and concise ordinary
+assistant messages at meaningful milestones: source assembly, conflict decisions,
+and validation results. During extended command waits, report the current check,
+its observed progress or blocker, and the next step. These messages are relayed
+to Slack; tool calls and private progress notes alone do not reach it. Keep updates
+evidence-based and omit routine tool noise and credentials.
+
 Keep a short private progress note in the Git directory with HEAD, pending edits,
 decisions and evidence/log paths, unresolved work, running command/session IDs,
 and the next action. Update it at meaningful milestones. After compaction or an
