@@ -812,8 +812,9 @@ head inspection implicates, every head it cannot distinguish between, or the hea
 whose diffs reach the failing code. Evidence names the failing tests, candidate
 and base results, implicated paths/commits and mechanism, and says when
 attribution is by inspection only. A failure that persists after the rebuild is
-attributed again against the remaining heads. Rejection comments tell authors that
-a new head re-enters the queue; that is the recourse for a wrong rejection.
+attributed again against the remaining heads. Rejection comments tell authors to
+push an empty commit for a wrong rejection: the new head re-enters the queue and is
+retested in a batch, whereas merging master could take the untested direct path.
 Record fix/eject conclusions in the progress note.
 
 When validation fails, preserve the failing committed candidate and logs while

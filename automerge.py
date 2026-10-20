@@ -187,9 +187,11 @@ FIX_VS_EJECT_GUIDANCE = (
     "them while preserving both sides' intent."
 )
 REJECTION_RECOURSE = (
-    "If this rejection is wrong, push a new commit to this branch (for example, "
-    "merge current master). The new head re-enters the merge queue. Removing the "
-    "label alone does not."
+    "If this rejection is wrong, push an empty commit to this branch "
+    "(`git commit --allow-empty`). The new head re-enters the merge queue and "
+    "is tested again in a batch. Removing the label alone does not clear the "
+    "rejection. Merging master instead can let a lone up-to-date PR land "
+    "without a new test run."
 )
 REJECTION_TOOL_GUIDANCE = (
     "For each rejected source head, record `mm-db exclude --kind rejected` "

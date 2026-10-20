@@ -364,7 +364,7 @@ class GithubOutboxTests(TestCase):
         comment, label = write.call_args_list
         self.assertIn(f'mergemarshall:rejected-head: {HEAD_ONE}', comment.args[2]['body'])
         self.assertNotIn('automerge-rejected-head:', comment.args[2]['body'])
-        self.assertIn('push a new commit to this branch', comment.args[2]['body'])
+        self.assertIn('git commit --allow-empty', comment.args[2]['body'])
         self.assertTrue(comment.args[2]['body'].endswith(f'mergemarshall:rejected-head: {HEAD_ONE}'))
         self.assertEqual(label.args, ('issues/7/labels', 'POST', {'labels': ['mergemarshall:rejected']}))
         self.assertEqual(self.ensure_label.call_args.args[0], 'mergemarshall:rejected')
