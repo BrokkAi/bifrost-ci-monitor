@@ -335,6 +335,19 @@ Historical `invocations`
 remain readable. An active legacy invocation blocks new issue repairs until
 it is retired. Never replace or discard the live database to fix scheduling.
 
+An accepted fixer `deferred` report can checkpoint `issue_repair_deferrals` when
+its complete captured issue requirements, observed source identities and PR head
+still match fresh reads. These receipts record hashes only and never claim PR
+ownership or prove resolution. While the exact PR head remains open, ready and
+unrejected, another run of the same reviewed inputs or retirement/reappearance
+of covered ledger rows does not launch another fixer. New source/identity/platform
+or local command inputs, changed issue requirements, and changed PR head, target,
+draft/rejection/closed/merged state admit a fresh review. A lifecycle review gets
+its own durable work key even without a new CI run. Missing/truncated historical
+inputs cannot establish coverage; ordinary issue/PR links alone never suppress
+work. Retain the original reports, sessions and validation; do not close issues
+or alter merge/test gates when recording a deferral.
+
 `local_findings` retains merge-agent baseline and flaky product-test observations
 with their actual tested commit, command, evidence, and originating batch/session.
 Use `mm-db findings` to inspect them and `mm-db finding --revision REV --kind

@@ -65,6 +65,11 @@ def ensure_schema(conn):
             created_at TEXT NOT NULL, prior_state_json TEXT NOT NULL,
             PRIMARY KEY (job_id, triage_job_id)
         );
+        CREATE TABLE IF NOT EXISTS issue_repair_deferrals (
+            job_id TEXT PRIMARY KEY, issue_number INTEGER NOT NULL,
+            pr_number INTEGER NOT NULL, pr_head_sha TEXT NOT NULL,
+            inputs_json TEXT NOT NULL, created_at TEXT NOT NULL
+        );
     """)
     monitor.ensure_column(conn, 'issue_repairs', 'recovery_json', "TEXT NOT NULL DEFAULT '{}'")
     monitor.ensure_column(conn, 'issue_repairs', 'report_after_seq', 'INTEGER NOT NULL DEFAULT 0')
@@ -143,6 +148,91 @@ def initial_work_key(issue, rows, *, target_branch=None):
     return f"issue:{issue['number']}:{digest}"
 
 
+def deferral_inputs(issue, rows, target_branch=None):
+    """Reviewed requirements and source identities, without observation-run churn."""
+    requirements = hashlib.sha256(json.dumps(
+        [issue['title'], issue.get('body')], sort_keys=True).encode()).hexdigest()
+    # Keep platform, exact source and local command identity. A new run of the
+    # same inputs, or retirement of an observation, does not revoke coverage.
+    sources = sorted({hashlib.sha256(json.dumps([row.get(k) for k in (
+        'workflow', 'job_name', 'identity_kind', 'identity', 'last_seen_sha',
+        'stabilize_campaign_id', 'local_finding_id', 'command')]).encode()).hexdigest()
+                      for row in rows})
+    return dict(requirements=requirements, sources=sources, target=target_branch or 'master')
+
+
+def record_verified_deferral(conn, job, pr):
+    """Checkpoint an accepted agent deferral only while its captured inputs match."""
+    report = json.loads(job['report_json'] or '{}')
+    if report.get('outcome') != 'deferred' or report.get('pr') != pr.get('number'):
+        return False
+    target = job['target_branch'] or 'master'
+    if (pr.get('state') != 'open' or pr.get('draft') is not False
+            or automerge.REJECTED_LABELS & labels(pr)
+            or pr.get('base', {}).get('ref', 'master') != target
+            or pr.get('head', {}).get('repo', {}).get('full_name') != monitor.REPO_NAME):
+        return False
+    try:
+        context = json.loads(job['prompt'].rpartition('\n## Issue dossier\n')[2])
+        captured_issue = context['target_issue']
+        body = captured_issue['body']
+        if body['truncated']:
+            return False
+        captured_issue = dict(captured_issue, body=body['text'])
+        captured_pr = next(p for p in context['open_pr_inventory'] if p['number'] == pr['number'])
+        if (captured_pr['head_sha'] != pr['head']['sha']
+                or not re.fullmatch(r'[0-9a-f]{40}', pr['head']['sha'])
+                or any(not re.fullmatch(r'[0-9a-f]{40}', row.get('last_seen_sha') or '')
+                       for row in context['observed_failures'])):
+            return False
+        captured = deferral_inputs(captured_issue, context['observed_failures'], target)
+    except (KeyError, TypeError, ValueError, StopIteration):
+        return False  # Old/incomplete dossiers cannot establish a waiting receipt.
+    current_issue = api(f"issues/{job['issue_number']}")
+    current = deferral_inputs(current_issue, observations(conn, job['issue_url']), target)
+    if (current['requirements'] != captured['requirements']
+            or not set(current['sources']) <= set(captured['sources'])):
+        return False
+    with conn:
+        conn.execute('INSERT OR IGNORE INTO issue_repair_deferrals VALUES (?,?,?,?,?,?)',
+                     (job['id'], job['issue_number'], pr['number'], pr['head']['sha'],
+                      json.dumps(captured), monitor.utc_now()))
+    return True
+
+
+def deferred_work(conn, issue, rows, prs, target_branch=None):
+    """Reuse the latest verified deferral; metadata alone never establishes one."""
+    saved = conn.execute("""
+        SELECT d.* FROM issue_repair_deferrals d JOIN issue_repairs r ON r.id=d.job_id
+        WHERE r.issue_number=? AND r.status='completed' AND r.cleanup_done=1
+          AND json_extract(r.report_json, '$.outcome')='deferred'
+          AND NOT EXISTS (SELECT 1 FROM issue_repairs newer
+                          WHERE newer.issue_number=r.issue_number AND newer.rowid>r.rowid)
+    """, (issue['number'],)).fetchone()
+    if saved is None:
+        return False, None
+    current = deferral_inputs(issue, rows, target_branch)
+    recorded = json.loads(saved['inputs_json'])
+    pr = next((p for p in prs if p['number'] == saved['pr_number']), None)
+    if pr is None:
+        # Closed/merged PRs disappear from the open inventory. An unavailable
+        # read defers the poll, rather than inventing a closed or unchanged PR.
+        pr = api(f"pulls/{saved['pr_number']}")
+    pr_state = [pr['number'], pr.get('state'), pr.get('merged', False), pr.get('draft'),
+                pr.get('head', {}).get('sha'), pr.get('base', {}).get('ref', 'master'),
+                bool(automerge.REJECTED_LABELS & labels(pr))]
+    covered = (current['requirements'] == recorded['requirements']
+               and current['target'] == recorded['target']
+               and set(current['sources']) <= set(recorded['sources'])
+               and pr_state[1:4] == ['open', False, False]
+               and pr_state[4] == saved['pr_head_sha']
+               and pr_state[5] == current['target'] and not pr_state[6])
+    # A PR lifecycle change must admit a review even if no CI run/body changed
+    # and the original work_key has already completed.
+    changed = hashlib.sha256(json.dumps([saved['job_id'], pr_state]).encode()).hexdigest()
+    return covered, changed
+
+
 def select_work(conn, issues, prs):
     by_number = {i["number"]: i for i in issues}
     priorities = stabilize_state.issue_priorities(conn)
@@ -182,6 +272,11 @@ def select_work(conn, issues, prs):
         # Links describe possible related work, not proof that it covers the
         # issue. The agent verifies relevance against Git and test evidence.
         key = initial_work_key(issue, rows, target_branch=target_branch)
+        covered, changed = deferred_work(conn, issue, rows, prs, target_branch)
+        if covered:
+            continue
+        if changed:
+            key += ':deferral:' + changed
         candidates.append(dict(issue=issue, pr=None, rejection=None, work_key=key,
                                rejected_repair=0, issue_number=issue["number"]))
     for candidate in candidates:
@@ -799,6 +894,8 @@ def finish(conn, job):
             raise ValueError("escalation handoff is incomplete: add Escalated, assign David, and release own claim")
     if report["outcome"] in {"submitted", "deferred"} and type(report.get("pr")) is int:
         pr = api(f"pulls/{report['pr']}")
+    if report['outcome'] == 'deferred' and pr:
+        record_verified_deferral(conn, job, pr)
     if report["outcome"] == "submitted":
         if (pr["head"]["ref"] != job["branch"] or pr["head"]["repo"]["full_name"] != monitor.REPO_NAME
                 or (pr["state"] != "open" and not pr.get("merged")) or pr.get("draft")
