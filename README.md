@@ -96,6 +96,8 @@ sessions and coordinate repairs with their owners: the same checksum-verified
 `scripts/install-ci-go.sh` can run as container root at a validation boundary.
 Recheck affected tests afterward; earlier missing-tool results remain evidence
 of the earlier environment.
+Keep AWS configuration and credentials out of the common image; the Go layer
+does not copy either. Bedrock-specific authentication stays separate.
 
 Default executable paths are `~/.cargo/bin/mj` and `/usr/bin/gh`. Override
 them in cron and the skill service when installed elsewhere, for example:
@@ -465,6 +467,7 @@ The engine needs its own cron entry. It relies on the crontab's existing
 | Verdict or merge write refused | Read the top-level Slack alert and GitHub rules. Retries wait 1, 2, 4, 8, then 10 minutes, continuing every 10 minutes. Repair credentials/rules or use emergency access below. |
 | Missing executable or App token | Check the cron user's paths and Mjolnir App configuration. Keep production jobs on App authentication. |
 | Skill service unreachable | Check its journal, private IP and container route; after correcting the cause, run `systemctl --user restart mm-skills.service`. |
+| Session history reports an index version mismatch | Install the SessionWiki CLI version linked by the running Mjolnir release. Preserve a consistent SQLite backup of the index and verify its durable summaries, tags, notes and archive before migration. Validate `sessionwiki stats` on a private copy first, then use it to run the supported upgrade on the live index. The daemon rebuilds derived search rows in the background. Never delete the index or change its schema-version pragma by hand. |
 | Source PR changed during a batch | The changed head is made draft. Finish its update and mark it ready again. |
 | Exact head rejected | The bot comments and labels that head. Rejections favor unblocking the batch, so attribution may be by inspection rather than a standalone reproduction; the evidence says which. Fix the existing branch, or if the rejection is wrong push an empty commit (`git commit --allow-empty`). A new head re-enters without a draft-state change and is tested again in a batch; merging master instead can let a lone up-to-date PR take the direct path without a new test run. Removing the label alone does not clear the rejection. |
 | PR has `mergemarshall:dependency-blocked` | Read the bot's comment on that PR for the prerequisite link and needed action. The label clears automatically when the dependency is eligible or the PR changes readiness/head. Dependency blocks do not create Slack threads. |
