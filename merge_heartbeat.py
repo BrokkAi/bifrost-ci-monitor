@@ -17,10 +17,13 @@ from secret_filter import diagnostic
 INTERVAL_MS = 5 * 60 * 1000
 SCAN_RETRY_MS = 60 * 1000
 READ_SECONDS = 3
-DISPLAY_VERSION = 1
+DISPLAY_VERSION = 2
 DISPLAY_CHARS = 1000
 DISPLAY_LINES = 12
 TRUNCATED = '\n… (truncated)'
+TURN_BOUNDARIES = ('context-cleared:', 'system:turn-interrupted:',
+                   'system:work-interrupted:', 'system:session-restarted:')
+NO_FOREGROUND = {'idle', 'background', 'expecting', 'goal', 'checking-continuation', 'retry', 'closed'}
 
 
 def _shorten(text, characters=DISPLAY_CHARS):
@@ -85,9 +88,12 @@ def _call_bullets(active, now, available):
         if budget < 90:
             bullets.append(f'\n• … {remaining} more calls')
             break
-        state = 'pending, ' if call['status'] == 'pending' else ''
-        heading = f'\n• {state}{_duration(now - call["started_at_ms"])} elapsed\n```\n'
-        raw = call['display'] or 'Call details unavailable'
+        state = call['status'] + ', ' if call['status'] in {'pending', 'background'} else ''
+        started = call['started_at_ms']
+        age = f'{_duration(now - started)} elapsed' if started is not None else 'age unavailable'
+        heading = f'\n• {state}{age}\n```\n'
+        raw = call['display'] or ('Task details unavailable' if call['status'] == 'background'
+                                  else 'Call details unavailable')
         limit = min(DISPLAY_CHARS, budget - len(heading) - 6)
         display = html.escape(_shorten(raw, limit), quote=False).replace('```', '`\u200b``')
         while len(display) > budget - len(heading) - 6:
@@ -108,6 +114,7 @@ def ensure_schema(conn):
         PRIMARY KEY (batch_id, session_id, stable_id)
     )""")
     monitor.ensure_column(conn, 'automerge_activity_tools', 'display', "TEXT NOT NULL DEFAULT ''")
+    monitor.ensure_column(conn, 'automerge_activity_tools', 'position', 'INTEGER NOT NULL DEFAULT 0')
 
 
 def _save(conn, row, value):
@@ -145,7 +152,7 @@ def _assistants(value, items, now):
 
 def _page(session, cursor):
     result = monitor.mj_command(['transcript', '--session', session, '--role', 'agent',
-                                 '--role', 'tool', '--after-seq', str(cursor),
+                                 '--role', 'tool', '--role', 'system', '--after-seq', str(cursor),
                                  '--limit', '200', '--json'], timeout=READ_SECONDS)
     if result.returncode:
         # CLI diagnostics can contain private material; report only the category.
@@ -159,9 +166,66 @@ def _page(session, cursor):
     return page
 
 
+def _session(session):
+    result = monitor.mj_command(['sessions', '--session', session, '--json'], timeout=READ_SECONDS)
+    if result.returncode:
+        raise monitor.MjError('activity session read failed')
+    data = json.loads(result.stdout)
+    if not isinstance(data, dict) or data.get('id') != session:
+        raise ValueError('invalid activity session')
+    return data
+
+
+def _retire(conn, row, value):
+    # Mj #1311: interrupted calls can retain an in_progress transcript status.
+    # Reporting state only: native history stays intact, and no command is
+    # cancelled. Lifecycle boundaries supersede an unclosed historical status.
+    conn.execute("UPDATE automerge_activity_tools SET status='not_current',display='' "
+                 "WHERE batch_id=? AND session_id=? AND position>0 AND position<=? "
+                 "AND status IN ('pending','in_progress')",
+                 (row['batch_id'], row['session_id'], value.get('closed_through', 0)))
+
+
+def _reconcile(conn, row, value, session):
+    outcome = session.get('last_turn_outcome') or {}
+    start, end = outcome.get('turn_start_position'), outcome.get('completed_ordinal')
+    # A rejected queued prompt never started and cannot discharge another
+    # turn's useful calls. Steers likewise aren't completion boundaries.
+    if type(start) is int and type(end) is int and 0 < start <= end:
+        value['closed_through'] = max(value.get('closed_through', 0), end)
+    activity = session.get('activity_state') or {}
+    state = activity.get('state')
+    known = state in NO_FOREGROUND or state in {'turn', 'tool'}
+    if state in NO_FOREGROUND:
+        value['closed_through'] = max(value.get('closed_through', 0), value['cursor'])
+    _retire(conn, row, value)
+    if not known:
+        # A disconnected worker's last-known activity is not live evidence.
+        return False, []
+    work = session.get('background_work')
+    tasks = (work.get('tasks') if isinstance(work, dict) else session.get('background_tasks')) or []
+    if not isinstance(tasks, list):
+        raise ValueError('invalid background task list')
+    background, seen = [], set()
+    for task in tasks:
+        if not isinstance(task, dict) or not isinstance(task.get('id'), str):
+            continue
+        if task['id'] in seen:
+            continue
+        seen.add(task['id'])
+        stamp = task.get('started_at_ms')
+        background.append({'status': 'background',
+                           'started_at_ms': stamp if type(stamp) is int else None,
+                           'display': _call_display({'body': {'call': {'rawInput': {
+                               'command': task.get('command', '')}}}})})
+    return True, background
+
+
 def _ingest(conn, row, value, items, now):
     _assistants(value, [i for i in items if i.get('role') == 'agent'], now)
     for item in items:
+        if item.get('role') == 'system' and item.get('stable_id', '').startswith(TURN_BOUNDARIES):
+            value['closed_through'] = max(value.get('closed_through', 0), int(item['position']))
         if item.get('role') != 'tool':
             continue
         identity = item['stable_id']
@@ -172,11 +236,13 @@ def _ingest(conn, row, value, items, now):
             status = 'unknown'
         display = _call_display(item) if status in {'pending', 'in_progress'} else ''
         conn.execute('INSERT INTO automerge_activity_tools '
-                     '(batch_id,session_id,stable_id,started_at_ms,status,display) VALUES (?,?,?,?,?,?) '
+                     '(batch_id,session_id,stable_id,started_at_ms,status,display,position) VALUES (?,?,?,?,?,?,?) '
                      'ON CONFLICT(batch_id,session_id,stable_id) DO UPDATE SET status=excluded.status, '
+                     'position=excluded.position, '
                      "display=CASE WHEN excluded.status NOT IN ('pending','in_progress') THEN '' "
                      "WHEN excluded.display<>'' THEN excluded.display ELSE automerge_activity_tools.display END",
-                     (row['batch_id'], row['session_id'], identity, stamp, status, display))
+                     (row['batch_id'], row['session_id'], identity, stamp, status, display, int(item['position'])))
+    _retire(conn, row, value)
 
 
 def _duration(milliseconds):
@@ -205,8 +271,9 @@ def observe(a, conn, transport, row, agent_items):
         now = int(time.time() * 1000)
         value = _state(conn, row, now)
         if value.get('display_version') != DISPLAY_VERSION:
-            # Hydrate calls already running when display support was deployed.
-            # Replaying stable IDs cannot add to their counts.
+            # Hydrate creation positions and lifecycle markers on upgrade.
+            # Replaying stable IDs cannot add to their counts or reopen calls
+            # already superseded by a persisted lifecycle boundary.
             value.update(cursor=0, display_version=DISPLAY_VERSION)
         _assistants(value, agent_items, now)
         with conn:
@@ -237,6 +304,12 @@ def observe(a, conn, transport, row, agent_items):
         if (not _eligible(a, current) or current['session_id'] != row['session_id']
                 or current['thread_ts'] != row['thread_ts']):
             return
+        session = _session(row['session_id'])
+        with conn:
+            known, background = _reconcile(conn, row, value, session)
+            _save(conn, row, value)
+        if read_budget.expired():
+            return
         scope = (row['batch_id'], row['session_id'])
         total = conn.execute('SELECT count(*) FROM automerge_activity_tools '
                              'WHERE batch_id=? AND session_id=?', scope).fetchone()[0]
@@ -253,19 +326,27 @@ def observe(a, conn, transport, row, agent_items):
                               'WHERE batch_id=? AND session_id=? '
                               "AND status IN ('pending','in_progress') "
                               'ORDER BY started_at_ms,stable_id', scope).fetchall()
+        if not known:
+            active = []
         label = ('Speculative supervisor heartbeat' if a.speculation.is_speculative(current)
                  else 'Supervisor heartbeat')
         text = (f'*{label}* — no assistant update for {_duration(now - value["assistant_ms"])}. '
                 f'{count} new tool call{"s" if count != 1 else ""} since {window}.')
-        if active:
+        if not known:
+            text += ' Current call status unavailable.'
+        elif active or background:
             running = sum(call['status'] == 'in_progress' for call in active)
             pending = len(active) - running
             labels = []
             for count, label in ((running, 'in-progress'), (pending, 'pending')):
                 if count:
                     labels.append(f'{count} {label} call{"s" if count != 1 else ""}')
+            if not active:
+                text += ' No in-progress calls.'
+            if background:
+                labels.append(f'{len(background)} background task{"s" if len(background) != 1 else ""}')
             text += ' ' + ', '.join(labels) + ':'
-            text += _call_bullets(active, now, monitor.SLACK_MESSAGE_LIMIT - len(text) - 30)
+            text += _call_bullets([*active, *background], now, monitor.SLACK_MESSAGE_LIMIT - len(text) - 30)
         else:
             text += ' No in-progress calls.'
         # Persist the attempt first: even an ambiguous Slack response cannot

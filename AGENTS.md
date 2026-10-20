@@ -90,6 +90,12 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   paginated catch-up must complete before reporting. Uses the existing merger lock and
   transcript observation, with bounded reads. Reports only building/fixing
   sessions before handoff; reporting never changes scheduling or verdicts.
+  Historical pending/running statuses do not prove current activity. Reconcile
+  call creation positions against durable turn endings, interruption/clear/restart
+  markers and the live session activity before reporting. Keep counts/history,
+  retire only the reporting entry, and report surviving native background tasks
+  separately. Unknown/disconnected activity is unavailable, not confirmed running
+  or idle. No age cutoff, cancellation, or session-idleness gate participates.
 - `merge_updates.py`: threaded reports from accepted `automerge_skill_events`:
   candidate checkpoints/withdrawals, exact-head rejections/removals, local test
   assessments, integration publication and validated handoffs. A separate durable

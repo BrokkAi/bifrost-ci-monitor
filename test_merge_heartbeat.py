@@ -24,8 +24,9 @@ def agent(seq=10, seconds=10):
             'text': PRIVATE, 'body': {'kind': 'agent', 'streaming': False}}
 
 
-def tool(identity, seq, seconds, status='completed', command='sleep 600; tail -20 /tmp/build.log'):
-    return {'seq': seq, 'stable_id': f'tool:{identity}', 'role': 'tool',
+def tool(identity, seq, seconds, status='completed', command='sleep 600; tail -20 /tmp/build.log', position=None):
+    return {'seq': seq, 'position': position if position is not None else seq,
+            'stable_id': f'tool:{identity}', 'role': 'tool',
             'created_at_ms': (START + seconds) * 1000,
             'text': PRIVATE, 'body': {'call': {'status': status, 'rawInput': {'command': command,
                                                                           'token': PRIVATE}},
@@ -52,6 +53,8 @@ class HeartbeatTests(unittest.TestCase):
         self.clock.start()
         self.addCleanup(self.clock.stop)
         self.pages = []
+        self.session = {'id': 'session', 'activity_state': {'state': 'turn',
+                         'started_at_ms': START * 1000}, 'background_work': {'tasks': []}}
         self.read = mock.patch.object(monitor, 'mj_command', side_effect=self.response)
         self.cli = self.read.start()
         self.addCleanup(self.read.stop)
@@ -60,6 +63,8 @@ class HeartbeatTests(unittest.TestCase):
         self.addCleanup(self.post.stop)
 
     def response(self, args, **kwargs):
+        if args[0] == 'sessions':
+            return subprocess.CompletedProcess(args, 0, json.dumps(self.session), '')
         if not self.pages:
             self.fail('unexpected transcript read')
         return subprocess.CompletedProcess(args, 0, json.dumps(self.pages.pop(0)), '')
@@ -150,6 +155,7 @@ class HeartbeatTests(unittest.TestCase):
         self.observe()
         with self.conn:
             self.conn.execute('ALTER TABLE automerge_activity_tools DROP COLUMN display')
+            self.conn.execute('ALTER TABLE automerge_activity_tools DROP COLUMN position')
             state = self.state()
             state.pop('display_version')
             self.conn.execute('UPDATE automerge_activity_heartbeats SET state_json=?', (json.dumps(state),))
@@ -158,7 +164,7 @@ class HeartbeatTests(unittest.TestCase):
         self.now += 300
         self.page([agent(), tool('one', 70, 100, 'in_progress')], 70)
         self.observe()
-        args = self.cli.call_args.args[0]
+        args = [call.args[0] for call in self.cli.call_args_list if call.args[0][0] == 'transcript'][-1]
         self.assertEqual(args[args.index('--after-seq') + 1], '0')
         self.assertIn('0 new tool calls', self.text())
         self.assertIn('tail -20 /tmp/build.log', self.text())
@@ -220,7 +226,7 @@ class HeartbeatTests(unittest.TestCase):
         self.page([tool('three', 250, 250)], 500)
         self.observe()
         self.assertIn('3 new tool calls', self.text())
-        args = self.cli.call_args.args[0]
+        args = [call.args[0] for call in self.cli.call_args_list if call.args[0][0] == 'transcript'][-1]
         self.assertEqual(args[args.index('--after-seq') + 1], '200')
 
     def test_new_session_does_not_inherit_previous_calls_or_rate_limit(self):
@@ -230,9 +236,98 @@ class HeartbeatTests(unittest.TestCase):
             self.conn.execute("UPDATE automerge_batches SET session_id='replacement' WHERE batch_id=?",
                               (self.batch,))
         self.page([agent(), tool('new', 30, 30)], 30)
+        self.session['id'] = 'replacement'
         self.observe()
         self.assertIn('1 new tool call since the last assistant update', self.text())
         self.assertNotIn('previous heartbeat', self.text())
+
+    def test_interrupted_turn_calls_are_retired_and_late_status_updates_cannot_revive_them(self):
+        self.page([agent(), tool('old', 20, 20, 'in_progress')])
+        self.observe()
+        self.now += 300
+        self.session['last_turn_outcome'] = {'turn_start_position': 1, 'completed_ordinal': 60,
+                                            'outcome': {'kind': 'interrupted'}}
+        self.page([tool('new1', 80, 800, 'in_progress'),
+                   tool('new2', 90, 810, 'in_progress')], 90)
+        self.observe()
+        self.assertIn('2 new tool calls', self.text())
+        self.assertIn('2 in-progress calls:', self.text())
+        old = self.conn.execute("SELECT status,display FROM automerge_activity_tools WHERE stable_id='tool:old'").fetchone()
+        self.assertEqual(tuple(old), ('not_current', ''))
+        self.conn.close()
+        self.conn = a.connect_db()
+        self.now += 300
+        self.page([tool('old', 100, 20, 'in_progress', position=20)], 100)
+        self.observe()
+        self.assertIn('0 new tool calls', self.text())
+        self.assertIn('2 in-progress calls:', self.text())
+
+    def test_clear_and_restart_boundaries_survive_backfill_and_preserve_real_concurrency(self):
+        for prefix in heartbeat.TURN_BOUNDARIES:
+            with self.subTest(prefix=prefix):
+                with self.conn:
+                    self.conn.execute('DELETE FROM automerge_activity_heartbeats')
+                    self.conn.execute('DELETE FROM automerge_activity_tools')
+                self.page([agent(), tool('old', 20, 20, 'in_progress'),
+                           {'role': 'system', 'stable_id': prefix + 'id', 'position': 30, 'seq': 30,
+                            'text': PRIVATE}, tool('current1', 40, 40, 'in_progress'),
+                           tool('current2', 45, 45, 'in_progress')])
+                before = tuple(self.row())
+                self.observe()
+                self.assertIn('3 new tool calls', self.text())
+                self.assertIn('2 in-progress calls:', self.text())
+                self.assertNotIn(PRIVATE, self.text())
+                self.assertEqual(tuple(self.row()), before)
+
+    def test_ended_foreground_calls_do_not_hide_a_surviving_background_build(self):
+        self.page([agent(), tool('old', 20, 20, 'in_progress')])
+        self.session.update(activity_state={'state': 'background'}, background_work={'tasks': [
+            {'id': 'build', 'started_at_ms': (START + 40) * 1000,
+             'command': 'GH_TOKEN=ghp_fixture cargo nextest run --workspace'},
+            {'id': 'build', 'started_at_ms': (START + 40) * 1000, 'command': 'duplicate'}]})
+        self.observe()
+        self.assertIn('No in-progress calls. 1 background task:', self.text())
+        self.assertIn('cargo nextest run --workspace', self.text())
+        self.assertNotIn('ghp_fixture', self.text())
+        self.assertNotIn('sleep 600', self.text())
+        self.assertNotIn('duplicate', self.text())
+        self.now += 300
+        self.session['activity_state'] = {'state': 'idle'}
+        self.session['background_work']['tasks'] = []
+        self.page([], 50)
+        self.observe()
+        self.assertIn('No in-progress calls.', self.text())
+        self.assertNotIn('background task', self.text())
+
+    def test_disconnected_or_unknown_session_never_claims_old_calls_are_live(self):
+        self.page([agent(), tool('old', 20, 20, 'in_progress')])
+        self.session['activity_state'] = {'state': 'unknown', 'last_known': {'state': 'turn'}}
+        self.observe()
+        self.assertIn('1 new tool call', self.text())
+        self.assertIn('Current call status unavailable.', self.text())
+        self.assertNotIn('1 in-progress call', self.text())
+        self.assertNotIn('No in-progress calls.', self.text())
+
+    def test_rejected_queued_prompt_and_steered_turn_do_not_retire_useful_old_calls(self):
+        self.session['activity_state']['started_at_ms'] = (START + 500) * 1000
+        self.session['last_turn_outcome'] = {'turn_start_position': None, 'completed_ordinal': 40,
+                                            'outcome': {'kind': 'rejected'}}
+        self.page([agent(), tool('live1', 20, 20, 'in_progress'),
+                   tool('live2', 30, 30, 'in_progress')])
+        self.observe()
+        self.assertIn('2 in-progress calls:', self.text())
+        self.assertIn('9m elapsed', self.text())
+
+    def test_unavailable_live_session_read_never_posts_historical_status_as_current(self):
+        self.page([agent(), tool('old', 20, 20, 'in_progress')])
+        response = self.response
+        def fail_session(args, **kwargs):
+            if args[0] == 'sessions':
+                raise monitor.MjError('private diagnostic')
+            return response(args, **kwargs)
+        self.cli.side_effect = fail_session
+        self.observe()
+        self.send.assert_not_called()
 
     def test_transcript_failure_never_posts_a_guessed_heartbeat_or_breaks_supervision(self):
         self.cli.side_effect = monitor.MjError('private error detail')
