@@ -297,9 +297,9 @@ class DependencyTests(TestCase):
         batch = automerge.create_batch(self.conn, self.selected('stabilize/test'), self.base)
         self.add_pr(52, 'campaign-third', self.base, base='stabilize/test')
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
-        self.assertTrue(automerge._request_rebuild(self.conn, row, automerge.row_pulls(row), 'expand', only_if_expanded=True))
+        self.assertFalse(automerge._request_rebuild(self.conn, row, automerge.row_pulls(row), 'expand', only_if_expanded=True))
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
-        self.assertEqual([p.number for p in automerge.row_pulls(row)], [50, 51, 52])
+        self.assertEqual([p.number for p in automerge.row_pulls(row)], [50, 51])
 
     def test_finished_campaign_is_quiet_and_visible_as_an_exclusion(self):
         self.campaign(status='aborted')
@@ -352,7 +352,7 @@ class DependencyTests(TestCase):
         self.assertEqual([p.number for p in selected], [50])
         self.assertNotIn(60, {d.number for d in selected[0].dependencies})
 
-    def test_campaign_expansion_respects_gate_and_target(self):
+    def test_campaign_rebuild_does_not_admit_arrivals_when_gate_changes(self):
         self.campaign()
         self.add_pr(50, 'campaign-first', self.base, base='stabilize/test')
         selected = self.selected('stabilize/test')
@@ -364,9 +364,9 @@ class DependencyTests(TestCase):
         self.assertFalse(automerge._request_rebuild(self.conn, row, selected, 'expand', only_if_expanded=True))
         with self.conn:
             self.conn.execute("UPDATE stabilize_issues SET state='pr_ready'")
-        self.assertTrue(automerge._request_rebuild(self.conn, row, selected, 'expand', only_if_expanded=True))
+        self.assertFalse(automerge._request_rebuild(self.conn, row, selected, 'expand', only_if_expanded=True))
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
-        self.assertEqual([p.number for p in automerge.row_pulls(row)], [50, 51])
+        self.assertEqual([p.number for p in automerge.row_pulls(row)], [50])
         self.assertEqual(row['target_ref'], 'stabilize/test')
 
     def gate_repair_fixture(self):
@@ -1440,24 +1440,24 @@ class DependencyTests(TestCase):
                          {30: 'rejected', 20: 'blocked', 10: 'blocked'})
         self.assertEqual([r[0] for r in self.conn.execute("SELECT number FROM automerge_github_outbox WHERE kind='reject_head'")], [30])
 
-    def test_expansion_includes_priority_prerequisite_and_rejects_orphaned_arrival(self):
+    def test_rebuild_does_not_admit_priority_arrivals_or_orphaned_dependencies(self):
         batch = automerge.create_batch(self.conn, [automerge.PullRequest(40, 'w', self.w, 'url', priority=True)],
                                       self.base, batch_id='expansion')
         self.items[20]['labels'] = [{'name': 'mergemarshall:high'}]
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
         self.assertTrue(automerge._request_rebuild(self.conn, row, automerge.row_pulls(row), 'new arrivals'))
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
-        self.assertEqual([p.number for p in automerge.row_pulls(row)], [40, 30, 20])
-        self.assertEqual(row['expansion_count'], 1)
+        self.assertEqual([p.number for p in automerge.row_pulls(row)], [40])
+        self.assertEqual(row['expansion_count'], 0)
         automerge._persist_excluded_source_heads(self.conn, row, [{'number': 30, 'head_sha': self.x, 'kind': 'removed'}])
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
         self.items[10]['labels'] = [{'name': 'mergemarshall:high'}]
         self.assertTrue(automerge._request_rebuild(self.conn, row, automerge.row_pulls(row), 'removed prerequisite'))
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
         self.assertEqual([p.number for p in automerge.row_pulls(row)], [40])
-        self.assertEqual(row['expansion_count'], 1)
+        self.assertEqual(row['expansion_count'], 0)
 
-    def test_expansion_limit_does_not_admit_a_new_dependency_after_three_rescans(self):
+    def test_rebuild_does_not_admit_arrivals_for_historical_expansion_count(self):
         batch = automerge.create_batch(self.conn, [automerge.PullRequest(40, 'w', self.w, 'url')], self.base)
         self.conn.execute('UPDATE automerge_batches SET expansion_count=3 WHERE batch_id=?', (batch,))
         self.conn.commit()

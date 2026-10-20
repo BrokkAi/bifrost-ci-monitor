@@ -659,6 +659,16 @@ class InspectionTests(TestCase):
             select.assert_called_once_with(dry_run=True)
             self.assertFalse(database.exists())
 
+    def test_check_only_reports_historical_expansion_limit(self):
+        output = StringIO()
+        active = {"batch_id": "existing", "expansions": 2, "expansion_limit": 0}
+        with (mock.patch.object(automerge, "read_active_batch_for_check",
+                                side_effect=[active, None]),
+              redirect_stdout(output)):
+            self.assertEqual(automerge.check_only(), 0)
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["active_batch"]["expansion_limit"], 0)
+
 
 class IdentityAndPromptTests(TestCase):
     def setUp(self):
@@ -731,6 +741,7 @@ class IdentityAndPromptTests(TestCase):
 
     def test_agent_prompt_uses_integration_pr_and_safe_eject_contract(self):
         prompt = automerge.build_prompt("abc123", [pull(7), pull(9, HEAD_TWO)], BASE_SHA)
+        self.assertIn("ejection alone never justifies the full suite", prompt)
         for expected in (
             "mergemarshall/batch-abc123",
             "Merge batch: #7 #9",
@@ -965,7 +976,7 @@ class IdentityAndPromptTests(TestCase):
         self.assertEqual(row_for(conn)['agent_configuration'], 'multi-pr')
 
     @unchanged_queue()
-    def test_configuration_survives_expansion_and_source_removal(self):
+    def test_configuration_survives_rebuild_without_new_arrivals(self):
         for initial in ([pull()], [pull(), pull(8, HEAD_TWO)]):
             with self.subTest(initial_count=len(initial)):
                 conn = make_db(ci_mode="async", pulls=initial)
@@ -973,17 +984,19 @@ class IdentityAndPromptTests(TestCase):
                 expected = "opus-high-dsf-high"
                 additions = initial + [pull(9, HEAD_THREE)]
                 with (mock.patch.object(automerge, "_recheck_sources", side_effect=lambda pulls, **kw: (pulls, [])),
-                      mock.patch.object(automerge, "select_eligible_pull_requests", return_value=additions)):
-                    self.assertTrue(automerge._request_rebuild(conn, row_for(conn), initial, "expanded"))
-                expanded = row_for(conn)
-                self.assertEqual(len(automerge._active_sources(expanded)), len(initial) + 1)
-                self.assertEqual(expanded['agent_configuration'], expected)
-                self.assertTrue(automerge._batch_subagents(expanded))
-                self.assertIn("There are no subtle subagents", expanded['pending_prompt'])
-                self.assertNotIn("Luna", expanded['pending_prompt'])
+                      mock.patch.object(automerge, "select_eligible_pull_requests", return_value=additions) as scan):
+                    self.assertTrue(automerge._request_rebuild(conn, row_for(conn), initial, "rebuild"))
+                rebuilt = row_for(conn)
+                self.assertEqual(len(automerge._active_sources(rebuilt)), len(initial))
+                self.assertEqual(rebuilt['expansion_count'], 0)
+                self.assertEqual(rebuilt['agent_configuration'], expected)
+                self.assertTrue(automerge._batch_subagents(rebuilt))
+                self.assertIn("There are no subtle subagents", rebuilt['pending_prompt'])
+                self.assertNotIn("Luna", rebuilt['pending_prompt'])
+                scan.assert_not_called()
                 with (mock.patch.object(automerge, "_recheck_sources", side_effect=lambda pulls, **kw: (pulls, [])),
                       mock.patch.object(automerge, "select_eligible_pull_requests", return_value=[])):
-                    self.assertTrue(automerge._request_rebuild(conn, expanded, [initial[0]], "removed"))
+                    self.assertTrue(automerge._request_rebuild(conn, rebuilt, [initial[0]], "removed"))
                 reduced = row_for(conn)
                 self.assertEqual(len(automerge._active_sources(reduced)), 1)
                 argv = automerge.new_session_argv(reduced, "/tmp/prompt")

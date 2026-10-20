@@ -116,20 +116,21 @@ class MembershipLabelTests(TestCase):
         self.assertEqual({row["number"] for row in self.intents()
                           if not json.loads(row["payload_json"])["selected"]}, {7, 8})
 
-    def test_expansion_records_new_source_in_same_membership_transaction(self):
+    def test_rebuild_preserves_membership_without_scanning_for_new_sources(self):
         self.create()
         self.patch(automerge, "_source_pr_state", side_effect=lambda p: direct_view(head_sha=p.head_sha))
         self.patch(automerge, "list_pull_comments", return_value=[])
         self.patch(automerge, "check_source_dependencies", side_effect=lambda sources, *a, **k: (sources, {}))
-        self.patch(automerge, "select_eligible_pull_requests", return_value=[pull(8, HEAD_TWO)])
+        scan = self.patch(automerge, "select_eligible_pull_requests", return_value=[pull(8, HEAD_TWO)])
         self.patch(automerge, "run_ci_impact", return_value={"mode": "impact"})
         self.assertTrue(automerge._request_rebuild(self.conn, self.row(), [pull()], "retry"))
-        self.assertEqual({row["number"] for row in self.intents()}, {7, 8})
-        self.assertEqual(self.row()["expansion_count"], 1)
+        self.assertEqual({row["number"] for row in self.intents()}, {7})
+        self.assertEqual(self.row()["expansion_count"], 0)
+        scan.assert_not_called()
         self.write.assert_not_called()
         self.details[8] = {"state": "open", "head": {"sha": HEAD_TWO}, "labels": []}
         self.drain()
-        self.assertEqual(self.tagged(), {7, 8})
+        self.assertEqual(self.tagged(), {7})
 
     def test_merged_direct_and_integration_records_queue_cleanup(self):
         for kind in ("batch", "direct"):

@@ -679,16 +679,16 @@ class StateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no longer"):
             self.assessment()
 
-    def test_rebuild_cannot_overwrite_an_exclusion_recorded_during_rescan(self):
+    def test_rebuild_cannot_overwrite_an_exclusion_recorded_during_preparation(self):
         original = row_for(self.conn)
 
-        def rescan(**_kwargs):
+        def impact(*_args, **_kwargs):
             automerge._persist_excluded_source_heads(self.conn, original,
                                                      [{"number": 7, "head_sha": HEAD_ONE, "kind": "removed"}])
-            return []
+            return {"mode": "impact"}
 
         with (mock.patch.object(automerge, "_recheck_sources", return_value=([pull(7), pull(8, HEAD_TWO)], [])),
-              mock.patch.object(automerge, "select_eligible_pull_requests", side_effect=rescan)):
+              mock.patch.object(automerge, "_validation_impact", side_effect=impact)):
             with self.assertRaisesRegex(automerge.AutomergeError, "membership changed"):
                 automerge._request_rebuild(self.conn, original, [pull(7), pull(8, HEAD_TWO)], "rebuild")
         self.assertEqual([p["number"] for p in self.state()["sources"]], [8])

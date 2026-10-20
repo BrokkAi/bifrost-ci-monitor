@@ -81,21 +81,11 @@ class MergeRetryTests(TestCase):
         self.patch(automerge, "post_verdict_status")
         self.patch(automerge, "finish_batch")
 
-    def test_three_expansions_persist_across_restart_then_membership_freezes(self):
-        for number in (8, 9, 10):
-            self.select.return_value = [pull(number, f"{number:040x}")]
-            self.assertTrue(self.retry())
-            self.reopen()
-            row = self.row()
-            self.assertEqual(row["expansion_count"], number - 7)
-            self.assertIn(f"PR #{number}", row["pending_prompt"])
-            self.assertEqual(row["phase"], "fixing")
-            self.assertEqual(row["prompt_delivered"], 0)
-        self.select.reset_mock()
-        self.select.return_value = [pull(11, "b" * 40)]
+    def test_rebuild_does_not_scan_or_add_newly_eligible_sources(self):
+        self.select.return_value = [pull(8, HEAD_TWO)]
         self.assertTrue(self.retry())
-        self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [7, 8, 9, 10])
-        self.assertEqual(self.row()["expansion_count"], 3)
+        self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [7])
+        self.assertEqual(self.row()["expansion_count"], 0)
         self.select.assert_not_called()
 
     def test_empty_rescan_does_not_consume_expansion_or_retest_passed_tree(self):
@@ -103,28 +93,34 @@ class MergeRetryTests(TestCase):
         self.assertEqual(self.row()["expansion_count"], 0)
         self.assertIsNone(self.row()["pending_prompt"])
 
-    def test_expansion_records_all_sources_for_ancestry_and_final_accounting(self):
-        self.select.return_value = [pull(8, HEAD_TWO), pull(9, HEAD_THREE)]
-        self.retry()
-        self.assertEqual(self.row()["expansion_count"], 1)
-        self.assertEqual([p.number for p in automerge._all_batch_pulls(self.row())], [7, 8, 9])
-        self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [7, 8, 9])
+    def test_rebuild_removes_changed_and_closed_sources_without_adding_arrivals(self):
+        sources = [pull(), pull(8, HEAD_TWO), pull(9, HEAD_THREE)]
+        self.states[7] = direct_view(head_sha=HEAD_TWO)
+        self.states[8] = direct_view(state="CLOSED", head_sha=HEAD_TWO)
+        self.states[9] = direct_view(head_sha=HEAD_THREE)
+        self.select.return_value = [pull(10, "a" * 40)]
+        self.assertTrue(automerge._request_rebuild(self.conn, self.row(), sources, "source refresh"))
+        self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [9])
+        self.assertEqual(self.row()["expansion_count"], 0)
+        self.assertTrue(self.row()["pending_prompt"])
+        self.select.assert_not_called()
 
     def test_removed_pr_does_not_reenter_even_at_a_new_head(self):
         self.add_source()
         automerge._append_removed(self.conn, "retry", ["PR #7 Change 7: head changed"])
         self.select.return_value = [pull(7, HEAD_TWO), pull(9, HEAD_THREE)]
         self.assertTrue(self.retry())
-        self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [8, 9])
-        self.assertEqual([p.number for p in automerge._all_batch_pulls(self.row())], [7, 8, 9])
+        self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [8])
+        self.assertEqual([p.number for p in automerge._all_batch_pulls(self.row())], [7, 8])
         self.assertEqual(json.loads(self.row()["excluded_source_heads_json"])[0]["head_sha"], HEAD_ONE)
 
-    def test_priority_expansion_only_admits_priority_prs(self):
+    def test_priority_batch_rebuild_does_not_add_new_priority_prs(self):
         with self.conn:
             self.conn.execute("UPDATE automerge_batches SET priority=1")
-        self.select.return_value = [pull(8, HEAD_TWO), pull(9, HEAD_THREE, priority=True)]
-        self.retry()
-        self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [7, 9])
+        self.select.return_value = [pull(9, HEAD_THREE, priority=True)]
+        self.assertTrue(self.retry())
+        self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [7])
+        self.select.assert_not_called()
 
     def test_normal_batch_does_not_absorb_new_priority_pr(self):
         self.select.return_value = [pull(8, HEAD_TWO, priority=True)]
@@ -145,7 +141,7 @@ class MergeRetryTests(TestCase):
         self.select.assert_not_called()
         self.suspend.assert_called_once_with(self.conn, self.transport, "retry", "live-session")
 
-    def test_last_source_removed_at_expansion_cap_finishes_without_reintroducing_it(self):
+    def test_last_source_removed_finishes_without_reintroducing_it(self):
         with self.conn:
             self.conn.execute("UPDATE automerge_batches SET expansion_count=3")
         self.states[7] = direct_view(head_sha=HEAD_TWO)
@@ -327,30 +323,26 @@ class MergeRetryTests(TestCase):
         self.assertEqual([p.number for p in automerge.row_pulls(fresh)], [8])
         self.assertEqual(self.row()["phase"], "terminal")
 
-    def test_interrupted_turn_queues_same_session_with_new_arrivals(self):
+    def test_interrupted_turn_does_not_add_new_arrivals(self):
         self.select.return_value = [pull(8, HEAD_TWO)]
         self.patch(automerge, "supervise_turn", return_value=monitor.TurnResult("cancelled", "cancelled"))
         suspend = self.patch(automerge, "request_suspend")
         self.assertFalse(automerge._wait_agent_turn(self.conn, self.transport, self.row(), "live-session"))
         self.assertEqual(self.row()["session_id"], "live-session")
         self.assertEqual(self.row()["phase"], "fixing")
-        self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [7, 8])
+        self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [7])
+        self.select.assert_not_called()
         suspend.assert_not_called()
 
-    def test_ejection_rescan_survives_github_failure_and_restart(self):
+    def test_ejection_rebuilds_remainder_without_scanning_for_arrivals(self):
         self.add_source()
         final = async_local_report("fail") + f"\nautomerge-ejected-pr: 7 {HEAD_ONE}\n"
-        self.select.side_effect = monitor.CommandError("GitHub offline")
-        with self.assertRaises(monitor.CommandError):
-            automerge._finish_async_agent_turn(self.conn, self.transport, self.row(), final)
-        self.assertEqual(self.row()["retry_rescan_pending"], 1)
-        self.reopen()
-        self.select.side_effect = None
         self.select.return_value = [pull(9, HEAD_THREE)]
         automerge._finish_async_agent_turn(self.conn, self.transport, self.row(), final)
         self.assertEqual(self.row()["retry_rescan_pending"], 0)
-        self.assertEqual(self.row()["expansion_count"], 1)
-        self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [8, 9])
+        self.assertEqual(self.row()["expansion_count"], 0)
+        self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [8])
+        self.select.assert_not_called()
 
     def test_interrupted_turn_excludes_rejection_published_before_interruption(self):
         self.add_source()
@@ -362,4 +354,4 @@ class MergeRetryTests(TestCase):
         self.select.return_value = [pull(9, HEAD_THREE)]
         self.patch(automerge, "supervise_turn", return_value=monitor.TurnResult("cancelled", "cancelled"))
         automerge._wait_agent_turn(self.conn, self.transport, self.row(), "live-session")
-        self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [8, 9])
+        self.assertEqual([p.number for p in automerge.row_pulls(self.row())], [8])

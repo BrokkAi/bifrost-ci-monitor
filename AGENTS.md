@@ -372,10 +372,10 @@ Keep local findings out of the master CI ledger and sync baseline authorization;
 do not invent run IDs, workflow/job mappings, or proof of recovery.
 
 The tooling owns `mergemarshall:in-progress` on selected source PRs, including
-batch expansions and direct/operator records. Membership changes checkpoint
-label intents atomically; removal, completion, abort, and failed launches queue
-cleanup. Delivery reconciles against current live membership and the current
-open head, so delayed cleanup cannot untag a reselected PR. The worker creates
+batch membership changes and direct/operator records. Membership changes
+checkpoint label intents atomically; removal, completion, abort, and failed
+launches queue cleanup. Delivery reconciles against current live membership and
+the open head, so delayed cleanup cannot untag a reselected PR. The worker creates
 the repository label if absent. This label is informational: failures retain
 backoff/retries without blocking selection, validation, landing, or changing
 agent revisions. These tooling intents are omitted from agent pending writes.
@@ -500,7 +500,7 @@ Every new integration and issue-fixer session uses Opus (`opus`) at high effort
 on `bedrock-podman`, with Mjolnir straightforward subagents using DeepSeek Flash
 (`deepseek-flash`) at high effort. There are no subtle subagents. This applies
 regardless of source count or lane, including speculative successors. Persist
-`opus-high-dsf-high` in `automerge_batches.agent_configuration`; expansion,
+`opus-high-dsf-high` in `automerge_batches.agent_configuration`; rebuild,
 exclusion, recovery and promotion retain it. Existing live rows keep their
 `single-pr`, `multi-pr`, `flash-none`, `flash-luna` or `flash-max` policy and prompt
 delegation guidance. Do not Move or reconfigure active sessions for this change.
@@ -705,9 +705,10 @@ descendant head retains prior relationships; unrelated replacement work does not
 
 Admit each source only when every prerequisite is in current master by actual
 commit ancestry, or is ready at its exact captured head and included earlier in
-the same batch. Apply the closure at selection, priority/preemption, expansion,
-retries, direct landing, and `--land-now`. Changed, draft, rejected, withdrawn,
-or closed-unmerged prerequisites block descendants while unrelated work proceeds.
+the same batch. Apply the closure at selection, priority/preemption, rebuild
+rechecks, retries, direct landing, and `--land-now`. Changed, draft, rejected,
+withdrawn or closed-unmerged prerequisites block descendants while unrelated
+work proceeds.
 A repair unblocks descendants after they contain the new eligible prerequisite
 head. Absorption is the exception for closed work: an open PR drops its edge to a
 closed unmerged PR (rejected heads included) when it contains that captured head
@@ -769,11 +770,10 @@ successor follows the same rule when its predecessor lands: only such an
 immediate PR discards it; ready high-priority PRs wait for the promoted
 successor. Source PRs from an abort remain eligible. `ci-fix` is ordinary unless labeled explicitly.
 
-On interruption, removals, or rebuild/retest requests, rescan membership.
-Allow three expansions per batch; an empty scan consumes none. Priority
-batches admit only priority PRs and their prerequisites; removed heads never reenter the same
-batch. Commit membership/counter with the follow-up prompt so restarts cannot
-reset the limit. A finished passing tree is not rebuilt just for new arrivals.
+A rebuild rescan removes changed or closed sources but never adds arrivals. New
+arrivals wait for the speculative successor or the next batch. The expansion
+counter remains in the schema for historical rows. A finished passing tree is
+not rebuilt just for new arrivals.
 A source head changed during processing is made draft. Remove changed/closed
 sources without rejection and let the author ready the new head. If removal or
 ejection leaves no sources, end the batch; never fill an empty batch with arrivals.
@@ -941,7 +941,16 @@ between individual exclusions from the same diagnosis pass. Build blockers can
 hide more failures; record blocked checks and reassess after the combined rebuild.
 
 After exclusions, fixes, conflict resolutions, or base updates, choose reruns from
-the actual diff against the last tested candidate. Cover affected behavior,
+the actual diff against the last tested candidate. After ejecting sources from a
+fully tested candidate, the default is a narrow rerun: rebuild the remainder,
+rerun the checks that failed and the tests of the crates the ejected diffs touched,
+reuse every other result from the tested candidate with its original tested SHA
+and an applicability reason, record the fresh assessment for the rebuilt HEAD,
+and publish. An ejection's diff is bounded by construction (it is the ejected
+heads' changes, reversed), so an ejection alone never justifies the full suite;
+expand only for a specific concern, and state it. Interactions that the rebuild
+would have exposed are covered by the build and the touched-crate tests; this is
+an accepted trade for queue latency. Cover affected behavior,
 shared dependencies/interactions, and previously failing checks addressed by the
 changes. A membership or HEAD change alone does not require another full suite.
 Reuse results for areas whose covered code, dependencies, test inputs, and settings
@@ -1355,7 +1364,7 @@ The round gate (`merge_gate_open`) opens when the campaign is running and no iss
 at or before the current stage is `open`. It does not require a `pr_ready` issue,
 so branch PRs with no campaign issue (such as workflow changes) merge through the
 normal lane; the "merge gate open" Slack notice still needs a `pr_ready` fix. The
-merger checks it at selection and expansion only. Campaign batches persist
+merger checks it at selection only. Campaign batches persist
 `automerge_batches.target_ref` (NULL means master) and contain one target. They
 run in an independent campaign lane: at most one live campaign batch, alongside
 master's primary and speculative successor, with no ranking between lanes.

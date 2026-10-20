@@ -45,8 +45,8 @@ Configure Mjolnir's `CI` workspace, `bifrost` bundle, and the `podman` and
 session uses Opus (`opus`) at high effort on `bedrock-podman`, with straightforward
 DeepSeek Flash (`deepseek-flash`) subagents at high effort and no subtle
 subagents, including campaign batches and speculative successors. Each batch
-retains its configuration through expansion and recovery. Existing live sessions
-keep their model and delegation settings. Opus merger sessions still move
+retains its configuration through membership changes and recovery. Existing live
+sessions keep their model and delegation settings. Opus merger sessions still move
 automatically to DeepSeek Flash after two consecutive Bedrock 503 provider
 errors, retaining the session, container, work, validation evidence and
 delegation. Successful agent or tool progress resets the error count. A threaded
@@ -120,7 +120,7 @@ Create these repository labels: `ci-fix`, `buildfailure`, `agent-in-progress`,
 `mergemarshall:immediate`, and `known-ci-failures`.
 
 MergeMarshall creates and manages `mergemarshall:in-progress` automatically.
-It marks source PRs selected for a batch (including expansions and direct
+It marks source PRs selected for a batch (including membership changes and direct
 landing), then removes the label when they leave the batch or the batch ends.
 Updates are asynchronous and retry after GitHub outages; the label is
 informational and never gates a merge. The labels listed above require initial setup.

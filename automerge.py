@@ -89,7 +89,7 @@ LOCAL_GATE_MARKER = re.compile(r"(?mi)^(?:mergemarshall:local|automerge-local):\
 INTERRUPTION_GRACE_SECONDS = 60
 AMBIGUOUS_LAUNCH_GRACE_SECONDS = 10 * 60
 MAX_CI_ROUNDS = 4
-MAX_BATCH_EXPANSIONS = 3
+MAX_BATCH_EXPANSIONS = 0
 CI_WORKFLOW = "ci.yml"
 BASELINE_DISPATCH_GRACE_SECONDS = 10 * 60
 GITHUB_WRITE_RETRY_MAX_SECONDS = 10 * 60
@@ -1917,18 +1917,28 @@ def _validation_guidance(
         "failures; record blocked checks and reassess them after the combined rebuild.\n\n"
         "Validation after changes: after source exclusions, fixes, conflict resolutions, "
         "or base updates, choose reruns from the actual diff against the last tested "
-        "candidate. Cover affected behavior, shared dependencies and interactions, "
-        "and previously failing checks addressed by the changes. A membership or "
-        "HEAD change alone does not require repeating the full suite. Reuse earlier "
-        "results for areas whose covered code, dependencies, test inputs, and settings "
-        "remain unaffected, unless new evidence contradicts them. If impact cannot "
-        "be bounded or a specific concern warrants broader checks, expand and record "
-        "the reason. Keep the original tested SHAs, commands, logs, and reuse reasons "
-        "in the progress note. Fixture/golden generation is an editing step; validate "
-        "the affected checks on the resulting committed tree without blessing enabled. "
-        "Record a fresh assessment for the resulting HEAD and current source set, "
-        "distinguishing checks run there from earlier results reused with their "
-        "original tested SHAs and applicability reasons.\n\n"
+        "candidate. After ejecting sources from a fully tested candidate, the default "
+        "is a narrow rerun: rebuild the remainder, rerun the checks that failed and "
+        "the tests of the crates the ejected diffs touched, reuse every other result "
+        "from the tested candidate with its original tested SHA and an applicability "
+        "reason, record the fresh assessment for the rebuilt HEAD, and publish. An "
+        "ejection's diff is bounded by construction (it is the ejected heads' changes, "
+        "reversed), so an ejection alone never justifies the full suite; expand only "
+        "for a specific concern, and state it. Interactions that the rebuild would "
+        "have exposed are covered by the build and the touched-crate tests; this is "
+        "an accepted trade for queue latency. Cover affected behavior, shared "
+        "dependencies and interactions, and previously failing checks addressed by "
+        "the changes. A membership or HEAD change alone does not require repeating "
+        "the full suite. Reuse earlier results for areas whose covered code, "
+        "dependencies, test inputs, and settings remain unaffected, unless new "
+        "evidence contradicts them. If impact cannot be bounded or a specific concern "
+        "warrants broader checks, expand and record the reason. Keep the original "
+        "tested SHAs, commands, logs, and reuse reasons in the progress note. "
+        "Fixture/golden generation is an editing step; validate the affected checks "
+        "on the resulting committed tree without blessing enabled. Record a fresh "
+        "assessment for the resulting HEAD and current source set, distinguishing "
+        "checks run there from earlier results reused with their original tested SHAs "
+        "and applicability reasons.\n\n"
         "Baseline from existing evidence: classify only failures observed in the "
         "candidate's selected checks; passing tests and ledger failures absent from "
         "the candidate need no baseline work. A candidate failure is baseline "
@@ -4658,7 +4668,7 @@ def _finish_async_agent_turn(
     # A passing report covers the rebuilt remainder after any ejections.
     # New arrivals belong to the next batch once that candidate is finished.
     if local_result != "pass" and row["retry_rescan_pending"] and _request_rebuild(
-        conn, row, _active_sources(row), "a source PR was ejected; include newly ready PRs",
+        conn, row, _active_sources(row), "a source PR was ejected; rebuild the remaining sources",
         only_if_expanded=True,
     ):
         return
@@ -4736,7 +4746,7 @@ def _agent_turn_finished(conn: sqlite3.Connection, transport: monitor.SlackTrans
         _end_empty_batch(conn, transport, row, "No source PRs remain after the agent's report.")
         return
     if row["retry_rescan_pending"] and _request_rebuild(
-        conn, row, _active_sources(row), "a source PR was ejected; include newly ready PRs",
+        conn, row, _active_sources(row), "a source PR was ejected; rebuild the remaining sources",
         only_if_expanded=True,
     ):
         return
@@ -4883,7 +4893,7 @@ def _poll_ci(conn: sqlite3.Connection, transport: monitor.SlackTransport,
     row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                        (row["batch_id"],)).fetchone()
     if _request_rebuild(conn, row, _active_sources(row),
-                        "CI failed; retry with newly ready PRs", only_if_expanded=True):
+                        "CI failed; retry the reported checks", only_if_expanded=True):
         return
     impact = _validation_impact(row, heads=[head])
     queue_agent_prompt(conn, row, build_ci_feedback(
@@ -5040,55 +5050,19 @@ def _request_rebuild(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]
         _append_removed(conn, str(row["batch_id"]), removed)
         row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                            (row["batch_id"],)).fetchone()
-    # An empty batch has no work to preserve. New arrivals get their own batch
-    # and session through normal selection, regardless of the expansion budget.
+    # An empty batch has no work to preserve. Arrivals are admitted by normal
+    # batch selection, not by a rebuild of existing membership.
     if not pulls:
         return False
     original = _all_batch_pulls(row)
-    seen = {pull.number for pull in original}
-    additions = []
-    if int(row["expansion_count"]) < MAX_BATCH_EXPANSIONS:
-        selected = select_eligible_pull_requests(conn=conn, target_ref=batch_target(row)) if batch_target(row) != BASE_BRANCH else select_eligible_pull_requests(conn=conn)
-        selected = [p for p in selected if pulls_target(conn, [p]) == batch_target(row)]
-        campaign_lane = batch_target(row) != BASE_BRANCH
-        lane_matches = campaign_lane or bool(any(p.priority for p in selected)) == _batch_priority(row)
-        if lane_matches and _batch_priority(row) and not campaign_lane:
-            by_number = {p.number: p for p in selected}
-            closure = {p.number for p in selected if p.priority}
-            pending = list(closure)
-            while pending:
-                number = pending.pop()
-                for dep in by_number[number].dependencies:
-                    if dep.number in by_number and dep.number not in closure:
-                        closure.add(dep.number)
-                        pending.append(dep.number)
-            selected = [p for p in selected if p.number in closure]
-        occupied = speculation.reserved(sys.modules[__name__], conn, except_batch=row['batch_id'])
-        additions = [pull for pull in selected if pull.number not in seen and pull.number not in occupied] if lane_matches else []
-        # A priority seed may require an ordinary prerequisite. Exclusions and
-        # the expansion cap still govern the whole dependency closure.
-        candidate = {p.number: p for p in pulls + additions}
-        changed = True
-        while changed:
-            changed = False
-            for number, pull in list(candidate.items()):
-                if any(not compare_commit_ancestry(dep.head_sha, str(row['base_sha']))
-                       and (dep.number not in candidate or candidate[dep.number].head_sha != dep.head_sha)
-                       for dep in pull.dependencies):
-                    del candidate[number]
-                    changed = True
-        additions = [p for p in additions if p.number in candidate and p.number not in excluded]
-    if only_if_expanded and not additions and not removed:
+    if only_if_expanded and not removed:
         with conn:
             conn.execute("UPDATE automerge_batches SET retry_rescan_pending=0 WHERE batch_id=?",
                          (row["batch_id"],))
         return False
-    pulls += additions
     pulls = dependency_order(pulls)
     if not pulls:
         return False
-    if additions:
-        reason += "; added newly ready " + ", ".join(f"#{p.number}" for p in additions)
     pull_lines = "\n".join(f"- PR #{p.number} {p.title} at {p.head_sha}" for p in pulls) or "- no source PRs remain"
     impact = _validation_impact(row, heads=[p.head_sha for p in pulls])
     ledger_context = _format_known_failure_prompt(_known_failures_prompt(conn))
@@ -5128,18 +5102,15 @@ Do not merge the integration PR. Reason for rebuild: {reason}.
             raise AutomergeError("batch membership changed while preparing rebuild; retry with current state",
                                  reason="batch_state_changed")
         conn.execute("UPDATE automerge_batches SET active_pull_requests_json=?, ci_head_sha=?, "
-                     "pull_requests_json=?, expansion_count=expansion_count+?, "
+                     "pull_requests_json=?, "
                      "retry_rescan_pending=0, validation_impact_json=?, "
                      "phase='fixing', pending_prompt=?, prompt_delivered=0, turn_started_at=NULL, "
                      "ready_json='{}', prompt_command_id=? "
                      "WHERE batch_id=?", (json.dumps([p.as_json() for p in pulls]),
-                                           row["ci_head_sha"], json.dumps([p.as_json() for p in original + additions]),
-                                           int(bool(additions)), json.dumps(impact), prompt,
+                                           row["ci_head_sha"], json.dumps([p.as_json() for p in original]),
+                                           json.dumps(impact), prompt,
                                            "mm-followup-" + uuid.uuid4().hex, row["batch_id"]))
         enqueue_membership_labels(conn, str(row["batch_id"]))
-    if additions:
-        log(f"batch {row['batch_id']} expansion {int(row['expansion_count']) + 1}/{MAX_BATCH_EXPANSIONS}: "
-            + ", ".join(f"#{p.number}" for p in additions))
     return True
 
 
@@ -5185,7 +5156,7 @@ def _queue_master_update(
     latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                           (row["batch_id"],)).fetchone()
     if _request_rebuild(conn, latest, _active_sources(latest),
-                        f"{batch_target(row)} advanced; retry with newly ready PRs", only_if_expanded=True):
+                        f"{batch_target(row)} advanced; retry the remaining sources", only_if_expanded=True):
         return
     queue_agent_prompt(conn, latest, prompt)
 
