@@ -1,5 +1,6 @@
 """Supervisor ordering and retries operate on isolated state, never the live queue."""
 import json
+import sqlite3
 import contextlib
 import io
 from pathlib import Path
@@ -88,6 +89,119 @@ class SupervisorTests(unittest.TestCase):
     def immediate(self):
         return a.create_batch(self.conn, [a.PullRequest(99, 'urgent', HEAD_ONE, 'url', True, True)],
                               BASE_SHA, lane='immediate', ci_mode='async')
+
+    def test_landing_rejection_scan_releases_snapshot_before_ancestry_checkpoint(self):
+        identifier = self.batch()
+        with self.conn:
+            for number, head in ((90, HEAD_TWO), (91, HEAD_THREE)):
+                a.enqueue_github_write(self.conn, identifier, 'reject_head', number, head,
+                                       {'reason': 'rejected', 'evidence': 'failure'})
+        writer = sqlite3.connect(a.DB_PATH, timeout=10)
+        self.addCleanup(writer.close)
+        self.assertEqual(writer.execute('PRAGMA journal_mode').fetchone()[0], 'wal')
+        self.patch(a, 'ANCESTRY_CONNECTION', self.conn)
+        committed = []
+
+        def ancestor(ancestor, descendant, fallback):
+            if ancestor == HEAD_TWO and not committed:
+                # Runs while the rejection SELECT still has a second row pending.
+                with writer:
+                    writer.execute("UPDATE automerge_batches SET agent_final_message='concurrent' "
+                                   "WHERE batch_id=?", (identifier,))
+                committed.append(True)
+            return ancestor == HEAD_ONE
+
+        cache = mock.Mock()
+        cache.ancestor.side_effect = ancestor
+        self.patch(a, '_ancestry_cache', return_value=cache)
+        allowed, _ = a.verify_source_ancestry(self.row(identifier), 'd' * 40, conn=self.conn)
+        self.assertTrue(allowed)
+        self.assertEqual(committed, [True])
+        self.assertEqual(self.conn.execute(
+            'SELECT present FROM automerge_commit_ancestry WHERE ancestor=? AND descendant=?',
+            (HEAD_TWO, 'd' * 40)).fetchone()[0], 0)
+        self.assertFalse(self.conn.in_transaction)
+
+    def test_action_lock_errors_retry_durably_and_alert_on_third_consecutive_attempt(self):
+        identifier = self.batch()
+        self.patch(supervisor, 'plan', return_value=[(20, 'lock-action', 'advance_batch', identifier, {})])
+        process = self.patch(a, 'process_batch', side_effect=sqlite3.OperationalError('database is locked'))
+        for attempt in range(1, 4):
+            # Reopen the DB to prove the streak survives supervisor restarts.
+            self.conn.close()
+            self.conn = a.connect_db()
+            self.assertEqual(supervisor.run(a, self.conn, self.transport), 4 if attempt == 3 else 0)
+            saved = self.conn.execute('SELECT * FROM automerge_supervisor_actions WHERE action_id=?',
+                                      ('lock-action',)).fetchone()
+            self.assertEqual(saved['status'], 'pending')
+            self.assertEqual(saved['lock_failures'], attempt)
+            self.assertEqual(saved['attempts'], attempt)
+            self.assertEqual(self.alert.call_count, int(attempt == 3))
+        self.assertIn('3 consecutive attempts', self.alert.call_args.args[-1])
+        process.side_effect = None
+        self.assertEqual(supervisor.run(a, self.conn, self.transport), 0)
+        saved = self.conn.execute('SELECT * FROM automerge_supervisor_actions WHERE action_id=?',
+                                  ('lock-action',)).fetchone()
+        self.assertEqual(saved['status'], 'complete')
+        self.assertEqual(saved['lock_failures'], 0)
+
+    def test_non_lock_outcomes_reset_consecutive_lock_streak(self):
+        identifier = self.batch()
+        self.patch(supervisor, 'plan', return_value=[(20, 'lock-action', 'advance_batch', identifier, {})])
+        process = self.patch(a, 'process_batch')
+        for outcome in (git_ancestry.Deferred('history pending'), RuntimeError('other failure'),
+                        sqlite3.OperationalError('no such table: missing'), None):
+            with self.subTest(outcome=outcome):
+                process.side_effect = sqlite3.OperationalError('database table is locked')
+                supervisor.run(a, self.conn, self.transport)
+                process.side_effect = outcome
+                supervisor.run(a, self.conn, self.transport)
+                saved = self.conn.execute('SELECT * FROM automerge_supervisor_actions WHERE action_id=?',
+                                          ('lock-action',)).fetchone()
+                self.assertEqual(saved['lock_failures'], 0)
+                with self.conn:
+                    self.conn.execute('UPDATE automerge_supervisor_actions SET next_attempt_at=0')
+                self.alert.reset_mock()
+                process.side_effect = sqlite3.OperationalError('database table is locked')
+                self.assertEqual(supervisor.run(a, self.conn, self.transport), 0)
+                self.alert.assert_not_called()
+
+    def test_lock_retry_rolls_back_unfinished_manual_transaction(self):
+        identifier = self.batch()
+        self.patch(supervisor, 'plan', return_value=[(20, 'lock-action', 'advance_batch', identifier, {})])
+        original = self.row(identifier)['agent_final_message']
+        def fail(conn, transport, owner):
+            conn.execute('BEGIN IMMEDIATE')
+            conn.execute("UPDATE automerge_batches SET agent_final_message='partial' WHERE batch_id=?", (owner,))
+            raise sqlite3.OperationalError('database is locked')
+        self.patch(a, 'process_batch', side_effect=fail)
+        self.assertEqual(supervisor.run(a, self.conn, self.transport), 0)
+        self.assertEqual(self.row(identifier)['agent_final_message'], original)
+        self.assertFalse(self.conn.in_transaction)
+        self.alert.assert_not_called()
+
+    def test_lock_retry_schema_migrates_existing_action_history(self):
+        identifier = self.batch()
+        with self.conn:
+            self.conn.execute("INSERT INTO automerge_supervisor_actions "
+                              "(action_id,kind,batch_id,input_json,attempts,updated_at) "
+                              "VALUES ('old','advance_batch',?,'{}',9,'now')", (identifier,))
+            self.conn.execute('ALTER TABLE automerge_supervisor_actions DROP COLUMN lock_failures')
+        self.conn.close()
+        self.conn = a.connect_db()
+        row = self.conn.execute("SELECT * FROM automerge_supervisor_actions WHERE action_id='old'").fetchone()
+        self.assertEqual(row['attempts'], 9)
+        self.assertEqual(row['lock_failures'], 0)
+
+    def test_verdict_database_lock_reaches_action_retry_without_github_backoff(self):
+        identifier = self.batch()
+        error = sqlite3.OperationalError('database is locked')
+        self.patch(a, 'post_verdict_status', side_effect=error)
+        backoff = self.patch(a, '_schedule_github_write_retry')
+        with self.assertRaises(sqlite3.OperationalError):
+            a._try_post_verdict_status(self.conn, self.transport, self.row(identifier), HEAD_ONE, 'success', 'pass')
+        backoff.assert_not_called()
+        self.alert.assert_not_called()
 
     def test_immediate_migration_preserves_existing_live_rows(self):
         identifier = self.batch()

@@ -310,6 +310,7 @@ its client retries the identical payload within the original command timeout.
 Ordinary transport/service errors and revision conflicts are not auto-retried.
 
 `automerge_supervisor_actions` records intents bound to current batch inputs.
+Database lock errors leave an action pending without an alert until three consecutive lock attempts; any other outcome resets the lock streak.
 Recompute actions after each transition and obsolete changed inputs; batch phases,
 readiness, and the existing landing gates remain authoritative. A priority closure
 read earlier in a tick is discarded when any batch reaches a terminal state, and

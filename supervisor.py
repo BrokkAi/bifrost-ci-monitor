@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import time
 
 import git_ancestry
@@ -32,10 +33,17 @@ def ensure_schema(conn):
         attempts INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
         last_error TEXT, next_attempt_at REAL NOT NULL DEFAULT 0
     )""")
+    monitor.ensure_column(conn, 'automerge_supervisor_actions', 'lock_failures',
+                          'INTEGER NOT NULL DEFAULT 0')
     conn.execute("""CREATE TABLE IF NOT EXISTS automerge_queue_summaries (
         summary_id TEXT PRIMARY KEY, thread_ts TEXT, messages_json TEXT NOT NULL,
         next_message INTEGER NOT NULL DEFAULT 0, completed_at TEXT, created_at TEXT NOT NULL
     )""")
+
+
+def is_lock_error(exc):
+    return (isinstance(exc, sqlite3.OperationalError)
+            and str(exc).lower() in {'database is locked', 'database table is locked'})
 
 
 def snapshot(row):
@@ -339,22 +347,38 @@ def run(a, conn, transport):
                     a.finish_batch(conn, transport, completed)
                 maintenance_done = True
         except git_ancestry.Deferred as exc:
+            conn.rollback()
             deferred.add(identifier)
             with conn:
-                conn.execute("UPDATE automerge_supervisor_actions SET status='pending',last_error=?,updated_at=? WHERE action_id=?",
+                conn.execute("UPDATE automerge_supervisor_actions SET status='pending',lock_failures=0,last_error=?,updated_at=? WHERE action_id=?",
                              (str(exc), a.utc_now(), identifier))
             a.log(f'{kind} deferred: {exc}')
             # Other independent actions can advance while history fetches run.
             continue
         except (a.AutomergeError, monitor.CommandError, monitor.MjError,
                 OSError, RuntimeError, ValueError, a.sqlite3.Error) as exc:
+            # Discard any unfinished manual transaction before retry bookkeeping.
+            conn.rollback()
+            if is_lock_error(exc):
+                with conn:
+                    conn.execute("UPDATE automerge_supervisor_actions SET status='pending',"
+                                 "lock_failures=lock_failures+1,last_error=?,updated_at=? WHERE action_id=?",
+                                 (str(exc), a.utc_now(), identifier))
+                failures = conn.execute('SELECT lock_failures FROM automerge_supervisor_actions WHERE action_id=?',
+                                        (identifier,)).fetchone()[0]
+                a.log(f'{kind} deferred: {exc} (consecutive lock attempts: {failures})')
+                if failures >= 3:
+                    a.notify_blocked_once(conn, transport, owner, 'automerge_failed',
+                                          f'{kind}: database lock error on {failures} consecutive attempts: {exc}')
+                    result = 4
+                continue
             reason = exc.reason if isinstance(exc, (a.AutomergeError, monitor.MjError)) else 'automerge_failed'
             details = str(exc)
             if kind in {'observe_provider_errors', 'advance_provider_failover'}:
                 reason = 'mj_provider_failover_failed'
                 details = f"Bedrock failover supervision for session {row['session_id']}: {exc}"
             with conn:
-                conn.execute("UPDATE automerge_supervisor_actions SET status='pending',last_error=?,updated_at=?,"
+                conn.execute("UPDATE automerge_supervisor_actions SET status='pending',lock_failures=0,last_error=?,updated_at=?,"
                              "next_attempt_at=? WHERE action_id=?",
                              (str(exc), a.utc_now(), time.time() + 60, identifier))
             a.notify_blocked_once(conn, transport, owner, reason, details)
@@ -381,6 +405,6 @@ def run(a, conn, transport):
             if token is not None:
                 read_budget.deadline.reset(token)
         with conn:
-            conn.execute("UPDATE automerge_supervisor_actions SET status='complete',last_error=NULL,next_attempt_at=0,"
+            conn.execute("UPDATE automerge_supervisor_actions SET status='complete',lock_failures=0,last_error=NULL,next_attempt_at=0,"
                          "updated_at=? WHERE action_id=?", (a.utc_now(), identifier))
     return result

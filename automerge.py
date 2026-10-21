@@ -3240,6 +3240,8 @@ def _try_post_verdict_status(
     try:
         post_verdict_status(conn, row, head_sha, state, description)
     except (AutomergeError, monitor.CommandError, sqlite3.Error) as exc:
+        if supervisor.is_lock_error(exc):
+            raise  # The action owns lock retries, rather than GitHub backoff/alerts.
         reason = exc.reason if isinstance(exc, AutomergeError) else "verdict_status_failed"
         if state == "success" or retry_on_failure:
             _schedule_github_write_retry(conn, transport, row, reason, str(exc))
@@ -4644,8 +4646,11 @@ def verify_source_ancestry(
         source_gates, repair_details = {}, {}
         have_gate_snapshots = (pr_dependencies.has_table(conn, 'stabilize_gate_merges')
                                and conn.execute('SELECT 1 FROM stabilize_gate_merges LIMIT 1').fetchone())
+        # Ancestry callbacks checkpoint immutable pairs on this connection.
+        # Exhaust the read snapshot first: a concurrent WAL commit would make
+        # its upgrade to a writer fail immediately with SQLITE_BUSY_SNAPSHOT.
         for entry in conn.execute("SELECT DISTINCT number,head_sha FROM automerge_github_outbox "
-                                  "WHERE kind='reject_head' AND cancelled_at IS NULL"):
+                                  "WHERE kind='reject_head' AND cancelled_at IS NULL").fetchall():
             head = entry['head_sha']
             if not compare_commit_ancestry(head, integration_head) or compare_commit_ancestry(head, base_sha or str(row['base_sha'])):
                 continue
