@@ -75,10 +75,11 @@ dependencies. Refresh the host's image cache after an image update:
 podman pull ghcr.io/brokkai/mjolnir/agent-dev:latest
 ```
 
-Bifrost validation also requires Go and ShellCheck for the workflow script
-checks. The upstream image and a separately pinned Bedrock image may omit
-them; installing them in one session does not update future
-sessions. Build the CI prerequisite layer for each target's actual image:
+Bifrost validation also requires Go, ShellCheck and the project's Rust 1.99.1
+toolchain with rustfmt and Clippy. A separately pinned Bedrock image can lag the
+ordinary image; installing prerequisites in one session does not update future
+sessions. The CI layer adds the Rust toolchain alongside existing defaults.
+Build it for each target's actual image that lacks these prerequisites:
 
 ```sh
 podman image inspect BASE_IMAGE --format '{{.Id}} {{.Config.User}}'
@@ -86,7 +87,10 @@ podman build --pull=never -f containers/Containerfile.ci-tools \
   --build-arg BASE_IMAGE=INSPECTED_IMAGE_ID --build-arg BASE_USER=INSPECTED_USER \
   -t localhost/mergemarshall-ci:DESCRIPTIVE_TAG .
 podman run --rm --network=none localhost/mergemarshall-ci:DESCRIPTIVE_TAG \
-  bash -lc 'go version && go env GOROOT && command -v gofmt && shellcheck --version'
+  bash -lc 'go version && go env GOROOT && command -v gofmt && shellcheck --version \
+    && rustup run 1.99.1 rustc --version \
+    && rustup run 1.99.1 rustfmt --version \
+    && rustup run 1.99.1 cargo-clippy --version'
 ```
 
 Set the corresponding target's `image` in Mjolnir's `config.toml` to the verified

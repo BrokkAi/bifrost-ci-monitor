@@ -116,9 +116,11 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   are covered by `test_automerge.py`.
 - `containers/Containerfile.ci-tools`, `scripts/install-ci-go.sh` and
   `scripts/install-ci-shellcheck.sh`: the pinned, checksum-verified Go and
-  ShellCheck prerequisites for both CI target images. Preserve
-  the base image's user and Rust/harness versions. Per-session installations do
-  not repair future launches; operator deployment procedures are in README.
+  ShellCheck prerequisites for both CI target images, plus Bifrost's pinned
+  Rust 1.99.1 toolchain with rustfmt and Clippy. Add it alongside existing
+  toolchains; preserve the base image's user, default Rust and harness versions.
+  Per-session installations do not repair future launches; operator deployment
+  procedures are in README.
 - `mm_web/` and `web/`: the dashboard service (`mm-web.service`, FastAPI in the
   uv environment from `pyproject.toml`) and its React UI. Cron entry points and
   `mm_service.py` stay stdlib-only and must not import `mm_web`.

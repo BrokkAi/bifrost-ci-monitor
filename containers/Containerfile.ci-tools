@@ -1,5 +1,5 @@
 # Layer CI prerequisites onto the existing target image without changing its
-# Rust/harness versions. Pin BASE_IMAGE to its locally inspected image ID.
+# default Rust/harness versions. Pin BASE_IMAGE to its locally inspected image ID.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 ARG BASE_USER=hel
@@ -11,4 +11,11 @@ RUN sh /usr/local/libexec/mergemarshall/install-ci-go.sh \
     && go env GOROOT \
     && bash -lc 'go version && command -v gofmt && shellcheck --version'
 USER ${BASE_USER}
+ARG BIFROST_RUST_TOOLCHAIN=1.99.1
+# Bedrock can retain an older base than the ordinary Podman target. Install the
+# project's pinned toolchain alongside its existing defaults so fresh sessions
+# have the formatter and Clippy as well as rustc/Cargo.
+RUN bash -lc 'rustup toolchain install "${BIFROST_RUST_TOOLCHAIN}" --profile minimal --component clippy --component rustfmt \
+    && rustup run "${BIFROST_RUST_TOOLCHAIN}" rustfmt --version \
+    && rustup run "${BIFROST_RUST_TOOLCHAIN}" cargo-clippy --version'
 RUN go version && bash -lc 'go version && command -v gofmt && shellcheck --version'
