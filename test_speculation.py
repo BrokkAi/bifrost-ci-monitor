@@ -150,6 +150,10 @@ class StateTests(unittest.TestCase):
         self.ancestry_patch = mock.patch.object(a, 'compare_commit_ancestry', return_value=True)
         self.ancestry_patch.start()
         self.addCleanup(self.ancestry_patch.stop)
+        # Landing tests reach the async quick policy gate; test_automerge covers the lookup.
+        self.quick_policy_patch = mock.patch.object(a, 'check_quick_policy', return_value=('success', ''))
+        self.quick_policy_patch.start()
+        self.addCleanup(self.quick_policy_patch.stop)
         self.conn = make_db(ci_mode='async', integration_pr_number=None)
         self.addCleanup(self.conn.close)
         service.ensure_schema(self.conn)

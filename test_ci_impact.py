@@ -8,7 +8,8 @@ from unittest import TestCase, mock
 
 import automerge
 import monitor
-from test_automerge import BASE_SHA, HEAD_ONE, HEAD_TWO, HEAD_THREE, make_db, pull, row_for, unchanged_queue
+from test_automerge import (BASE_SHA, HEAD_ONE, HEAD_TWO, HEAD_THREE, make_db, pull,
+                            quick_policy_passed_fixture, row_for, unchanged_queue)
 
 
 # A small exported-function fixture tests the Node import/input contract; path
@@ -247,6 +248,7 @@ class ValidationPolicyTests(TestCase):
         self.assertIn('Do not run tests, builds, or baseline reproductions', prompt)
 
     def test_docs_merge_uses_confirmed_candidate_without_running_tests_or_reclassifying(self):
+        quick_policy = quick_policy_passed_fixture(self)
         conn = make_db(phase='merging', ci_mode='async', ci_head_sha=HEAD_TWO)
         self.addCleanup(conn.close)
         store_impact(conn, impact(heads=[HEAD_TWO]))
@@ -271,6 +273,8 @@ class ValidationPolicyTests(TestCase):
         gh.assert_called_once()
         self.assertEqual(gh.call_args.args[0][:3], ['pr', 'merge', '211'])
         self.assertIn('local tests skipped', verdict.call_args.args[5])
+        # Documentation can still add an unclassified path, so docs batches keep the gate.
+        quick_policy.assert_called_once_with(HEAD_TWO)
 
     def test_stale_docs_classification_cannot_authorize_no_tests_at_new_base(self):
         conn = make_db(ci_mode='async')

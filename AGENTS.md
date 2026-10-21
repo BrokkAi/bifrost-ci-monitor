@@ -1107,8 +1107,15 @@ supervisor-confirmed docs candidate; baseline/test summaries remain required.
 Any new failure must be fixed or the exact responsible
 head removed/rejected; a baseline needs a local base-side run or existing master
 evidence under the baseline rules above, never a candidate rerun.
-The supervisor does not wait for/query CI or dispatch baseline runs. There is
-no sync-style CI-round limit. Master CI after landing is handled by triage
+The supervisor dispatches no baseline runs and reads one CI result: the
+integration PR's `quick policy` job (`QUICK_POLICY_CHECK`) at the tested head.
+It holds the merge while that job is pending and lands only after success;
+any other conclusion, including skipped or cancelled, returns the batch to its
+live session with the job URL and failed step names. That job holds Bifrost's
+open-core classification and projection dry run, which the release gate
+repeats on master (bifrost-dev#6083). Docs batches keep the gate. The direct
+path has no integration PR and source PRs get no CI, so it is not gated.
+There is no sync-style CI-round limit. Master CI after landing is handled by triage
 and the issue fixer. Agent reports and PR-produced tests are trusted evidence
 under the project's current contributor policy.
 

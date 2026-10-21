@@ -26,6 +26,8 @@ class SupervisorTests(unittest.TestCase):
         self.patch(a, 'DB_PATH', Path(directory.name) / 'state.db')
         self.patch(a, 'OBSERVATION_DEADLINE', None)
         self.patch(a, 'SPECULATIVE_LOOKAHEAD', True)
+        # Landing tests reach the async quick policy gate; test_automerge covers the lookup.
+        self.patch(a, 'check_quick_policy', return_value=('success', ''))
         self.conn = a.connect_db()
         self.addCleanup(self.conn.close)
         self.transport = monitor.SlackTransport('chat', token='unused', channel='unused')

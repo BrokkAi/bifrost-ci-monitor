@@ -336,7 +336,9 @@ Each session still owns one issue. Ambiguous launches and unfinished suspension
 reserve capacity; a failed repair does not stop supervision of the other repairs.
 
 The default mode is **async**: integration agents run targeted local tests;
-GitHub CI need not finish before landing. One eligible PR already current with
+GitHub CI need not finish before landing, except the integration PR's
+`quick policy` job (open-core classification and projection dry run), which
+must pass. A red one goes back to the batch agent. One eligible PR already current with
 master can land directly without an agent or a new local test run. **Sync**
 waits for verified PR CI and permits failures proven no worse than the captured
 master baseline. `CI_MODE` in `automerge.py` controls new batches; existing
