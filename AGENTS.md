@@ -287,6 +287,10 @@ access, transport, rate limit, missing branch or invalid/unknown response), neve
 Git stderr. Explicit authentication failure permits one renewal through the same
 App-token provider and a fresh probe within the original read budget. Other
 failures are not retried inline and never supply a stale head or negative fact.
+Current-ref reads capture redacted curl headers privately, with response bodies
+disabled, because Git can hide an HTTP 401 behind a credential-prompt error.
+Only received numeric status lines participate in classification; trace text
+never leaves the subprocess error handler or enters logs, receipts or state.
 Failed current-ref reads retain only the numeric process exit and recognized
 curl/HTTP error codes alongside their category. RPC/HTTP2 failures are transport
 errors; these diagnostics never authorize authentication renewal or inline retry.

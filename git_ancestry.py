@@ -24,6 +24,7 @@ import read_budget
 
 
 _read_only = ContextVar('git_cache_read_only', default=False)
+_CURL_TRACE_PREFIX = r'^(?:\d{2}:\d{2}:\d{2}\.\d+\s+)?http\.c:\d+\s+'
 
 
 @contextmanager
@@ -73,24 +74,39 @@ class RemoteReadError(OSError):
                 match = re.search(pattern, result.stderr or '', re.IGNORECASE)
                 if match:
                     self.diagnostics[key] = int(match[1])
+            status = remote_http_status(result)
+            if status is not None:
+                self.diagnostics['http'] = status
         suffix = (' [' + ', '.join(f'{k}={v}' for k, v in self.diagnostics.items()) + ']'
                   if self.diagnostics else '')
         super().__init__(f'remote Git branch could not be read ({category})' + suffix)
 
 
+def remote_http_status(result):
+    # Only curl's received status lines are evidence, never arbitrary body text.
+    statuses = re.findall(_CURL_TRACE_PREFIX + r'<= Recv header: HTTP/\S+ ([1-5][0-9]{2})\b',
+                          result.stderr or '', re.MULTILINE)
+    return int(statuses[-1]) if statuses else None
+
+
 def remote_error_category(result):
-    detail = (result.stderr or '').casefold()
+    status = remote_http_status(result)
+    # Informational/header trace contains "connection" on successful requests too.
+    detail = '\n'.join(line for line in (result.stderr or '').splitlines()
+                       if not re.match(_CURL_TRACE_PREFIX, line)).casefold()
+    if status == 401:
+        return 'authentication'
     if any(marker in detail for marker in (
             'authentication failed', 'invalid username or password',
             'bad credentials', 'returned error: 401')):
         return 'authentication'
-    if 'rate limit' in detail:
+    if status == 429 or 'rate limit' in detail:
         return 'rate_limit'
-    if any(marker in detail for marker in (
+    if status in {403, 404} or any(marker in detail for marker in (
             'repository not found', 'returned error: 403', 'returned error: 404',
             'permission denied')):
         return 'repository_access'
-    if any(marker in detail for marker in (
+    if (status is not None and status >= 500) or any(marker in detail for marker in (
             'could not resolve', 'failed to connect', 'connection', 'timed out',
             'ssl', 'tls', 'returned error: 50', 'rpc failed', 'http/2 stream',
             'empty reply from server', 'remote end hung up', 'early eof')):
@@ -114,10 +130,14 @@ def remote_head(repository, branch, token, *, refresh_token=None):
             remaining = end - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired('remote Git read', 30)
+            env = authenticated_env(current_token)
+            # Git can hide a 401 behind a generic credential-prompt error. Capture
+            # redacted headers privately; never log or persist the trace or body.
+            env.update(GIT_TRACE_CURL='1', GIT_TRACE_CURL_NO_DATA='1', GIT_TRACE_REDACT='1')
             result = subprocess.run(['git', 'ls-remote', '--exit-code', '--refs',
                                      repository_url(repository), ref], text=True,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    env=authenticated_env(current_token),
+                                    env=env,
                                     timeout=read_budget.timeout(remaining), check=False)
         except subprocess.TimeoutExpired as exc:
             if read_budget.expired():
