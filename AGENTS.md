@@ -876,10 +876,10 @@ passing validation or a handoff; deliver through the durable same-session messag
 path without cancelling ongoing work. Each target tip is checkpointed once.
 The base becomes that master commit and the source revision changes, which
 invalidates the earlier handoff and withdraws the checkpoint; the agent
-registers the post-merge head. The agent resolves conflicts, chooses reruns from
-the actual diff against the last tested candidate under the validation policy,
-reusing unaffected results with their original tested SHAs and applicability
-reasons, and records a fresh assessment for the resulting HEAD. Promotion always
+registers the post-merge head. The agent resolves conflicts, reruns by the
+master-merge narrow default in the validation policy (below), reusing unaffected
+results with their original tested SHAs and applicability reasons, and records a
+fresh assessment for the resulting HEAD. Promotion always
 revalidates by that policy: there is no unchanged-tree shortcut, no
 equivalent-head alias and no fresh attempt for a differing master tree. Normal
 sync/async freshness, CI and landing gates apply after promotion. Completed
@@ -966,7 +966,16 @@ and publish. An ejection's diff is bounded by construction (it is the ejected
 heads' changes, reversed), so an ejection alone never justifies the full suite;
 expand only for a specific concern, and state it. Interactions that the rebuild
 would have exposed are covered by the build and the touched-crate tests; this is
-an accepted trade for queue latency. Cover affected behavior,
+an accepted trade for queue latency. After merging master into a tested candidate
+(promotion or a master update), the default is also a narrow rerun: rebuild,
+rerun the tests of the crates the incoming master diff touches (old captured base
+to new base), the areas of any conflict resolutions, and checks that failed on
+the last tested candidate; reuse every other result with its original tested SHA
+and an applicability reason, record the fresh assessment, and publish. Master's
+changes were validated before they landed, so a master merge alone never
+justifies the full suite, and a master diff touching a widely used crate calls
+for that crate's tests, not every suite; expand only for a specific concern, and
+state it. Checks the candidate has never run follow the normal policy. Cover affected behavior,
 shared dependencies/interactions, and previously failing checks addressed by the
 changes. A membership or HEAD change alone does not require another full suite.
 Reuse results for areas whose covered code, dependencies, test inputs, and settings

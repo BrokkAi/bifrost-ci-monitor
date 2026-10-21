@@ -292,7 +292,10 @@ class PromotionTests(GitFixture):
             with self.subTest(skill=skill):
                 text = " ".join((ROOT / "skills" / skill / "SKILL.md").read_text().split())
                 self.assertIn("captured base is actual master; nothing is shared with", text)
-                self.assertIn("reruns from the diff against the last tested candidate under the validation policy", text)
+                if skill == "mm-merge":
+                    self.assertIn("A master merge alone never justifies the full suite", text)
+                else:
+                    self.assertIn("reruns from the diff against the last tested candidate under the validation policy", text)
                 self.assertIn("fresh assessment", text)
                 self.assertIn("re-register the candidate", text)
                 self.assertNotIn("pinned", text)

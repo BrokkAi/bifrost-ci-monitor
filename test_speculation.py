@@ -428,7 +428,7 @@ class StateTests(unittest.TestCase):
                 withdrawal = service.latest(self.conn, self.child, 'candidate_withdrawal')
                 self.assertEqual(withdrawal['candidate']['id'], before['candidate']['id'])
                 self.assertEqual(withdrawal['source_revision'], before['source_revision'])
-                self.assertIn('diff-based reruns', self.row()['pending_prompt'])
+                self.assertIn('a master merge alone never justifies the full suite', self.row()['pending_prompt'])
                 self.assertIn('fresh assessment', self.row()['pending_prompt'])
                 self.assertIn('re-register', self.row()['pending_prompt'])
 
@@ -803,6 +803,8 @@ class StateTests(unittest.TestCase):
         withdrawal = service.latest(self.conn, self.child, 'candidate_withdrawal')
         self.assertEqual(withdrawal['candidate']['head'], HEAD_TWO)
         self.assertIn('mm-merge --promote', row['pending_prompt'])
+        self.assertIn('A master merge alone never justifies the full suite', row['pending_prompt'])
+        self.assertIn('the crate list mm-merge --promote prints', row['pending_prompt'])
 
     def test_active_promotion_withdraws_latest_concurrently_registered_checkpoint(self):
         self.assess()

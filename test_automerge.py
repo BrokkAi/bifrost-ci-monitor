@@ -744,6 +744,7 @@ class IdentityAndPromptTests(TestCase):
     def test_agent_prompt_uses_integration_pr_and_safe_eject_contract(self):
         prompt = automerge.build_prompt("abc123", [pull(7), pull(9, HEAD_TWO)], BASE_SHA)
         self.assertIn("ejection alone never justifies the full suite", prompt)
+        self.assertIn("a master merge alone never justifies the full suite", prompt)
         for expected in (
             "mergemarshall/batch-abc123",
             "Merge batch: #7 #9",
@@ -789,6 +790,9 @@ class IdentityAndPromptTests(TestCase):
                 row_for(async_conn), HEAD_THREE, HEAD_TWO,
             )
             prompts.append(str(row_for(async_conn)["pending_prompt"]))
+            for update_prompt in prompts[-2:]:
+                self.assertIn("master-merge narrow default", update_prompt)
+                self.assertIn("a master merge alone never justifies the full suite", update_prompt)
             automerge._queue_async_local_recheck(
                 async_conn, monitor.SlackTransport("webhook", webhook="x"),
                 row_for(async_conn), HEAD_THREE, "head moved",
