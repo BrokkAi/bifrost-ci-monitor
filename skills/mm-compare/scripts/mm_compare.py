@@ -27,8 +27,7 @@ def compare(repo, a, b, script, output, *, sequential=False, client=None):
     commits = {name: git(repo, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}")
                for name, ref in [("a", a), ("b", b)]}
     state = client.call("state") if client else None
-    if state and (state["phase"] not in {"building", "fixing"} or state.get("ready")
-                  or (state.get("predecessor") and not state["predecessor"]["current"])):
+    if state and (state["phase"] not in {"building", "fixing"} or state.get("ready")):
         raise ValueError("batch is not accepting new checks; wait for the supervisor")
     worktrees = []
     try:

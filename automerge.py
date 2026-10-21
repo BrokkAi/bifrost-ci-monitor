@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -942,13 +942,12 @@ def _verify_supersession_rejections(conn, retired, replacement, compare):
 
 
 def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roots=None,
-                     persist_comparisons=None, priority_only=False, selection_target=None):
+                     persist_comparisons=None, priority_only=False, immediate_only=False, selection_target=None):
     """Refresh open heads and durable prerequisites, then verify their ancestry."""
     if conn is not None and (not dry_run or persist_comparisons):
         with conn:
             pr_dependencies.ensure_schema(conn)
-    scoped = (selection_target is not None or roots is not None
-              and bool(lane_discovery_scope(conn, BASE_BRANCH)))
+    scoped = priority_only or immediate_only or selection_target is not None or roots is not None
     cached = pr_dependencies.inventory(conn)
     items = {int(p['number']): p for p in list_open_pull_requests() if not _is_integration_pull(p)}
     supersessions = tuple(record for record in pr_dependencies.REVIEWED_SUPERSESSIONS
@@ -1007,8 +1006,9 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
                                  '_mm_metadata_missing': True}
     nodes = {number: _dependency_node(item, conn=conn, dry_run=dry_run, read_ready=not scoped)
              for number, item in items.items() if not _is_integration_pull(item)}
-    if priority_only:
-        roots = [number for number, node in nodes.items() if node.priority]
+    if priority_only or immediate_only:
+        roots = [number for number, node in nodes.items()
+                 if (node.immediate if immediate_only else node.priority and not node.immediate)]
     # A non-master base may point to a closed PR never observed by this host.
     searched = set()
     def discover_bases(numbers):
@@ -1064,7 +1064,8 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
     if selection_target is not None:
         roots = [n for n, node in nodes.items() if targets[n][0] == selection_target
                  and (not scoped or str(node.data.get('state')).lower() == 'open')
-                 and (not priority_only or node.priority)]
+                 and (selection_target != BASE_BRANCH or (node.immediate if immediate_only else
+                      not node.immediate and (not priority_only or node.priority)))]
     if SUPERVISOR_RUNNING:
         # Fetch live tips together. Their full commit history usually contains
         # almost every historical head, without downloading repository blobs.
@@ -1150,7 +1151,7 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
             conn, nodes, actual_base, selection_target=target_scope)
         graph = build()
     graph.exclusions = exclusions
-    graph.select(priority=False, target_ref=selection_target)  # Establish lane-local block reasons.
+    graph.select(priority=False, target_ref=selection_target, immediate_only=immediate_only)  # Establish lane-local block reasons.
     if conn is not None and not dry_run:
         with conn:
             pr_dependencies.ensure_schema(conn)
@@ -1221,24 +1222,25 @@ CAMPAIGN_EXCLUSIONS = []
 
 
 def lane_discovery_scope(conn, target_ref):
-    # Preserve the established no-campaign discovery and read sequence.
-    if (pr_dependencies.has_table(conn, 'stabilize_campaigns')
-            and conn.execute('SELECT 1 FROM stabilize_campaigns LIMIT 1').fetchone()):
-        return {'selection_target': target_ref}
-    return {}
+    # Partition selection before mutable readiness/comment reads.
+    return {'selection_target': target_ref}
 
 
 def select_eligible_pull_requests(*, dry_run: bool = False,
                                   conn: sqlite3.Connection | None = None,
                                   priority_only: bool = False,
+                                  immediate_only: bool = False,
                                   target_ref: str | None = None) -> list[PullRequest]:
     global DEPENDENCY_BLOCKS, CAMPAIGN_EXCLUSIONS
-    graph = dependency_graph(conn, dry_run=dry_run, priority_only=priority_only,
+    graph = dependency_graph(conn, dry_run=dry_run, priority_only=priority_only, immediate_only=immediate_only,
                              **lane_discovery_scope(conn, target_ref or BASE_BRANCH))
     CAMPAIGN_EXCLUSIONS = graph.exclusions
     DEPENDENCY_BLOCKS = [{'number': n, 'head_sha': graph.nodes[n].head, 'reason': reason}
                          for n, reason in sorted(graph.blocked.items()) if graph.nodes[n].ready]
-    pulls = [dependency_pull(graph, number) for number in graph.select(target_ref=target_ref, priority_only=priority_only)]
+    occupied = speculation.reserved(sys.modules[__name__], conn) if conn is not None else set()
+    graph.nodes = {n: replace(node, ready=False) if n in occupied else node for n, node in graph.nodes.items()}
+    graph._eligibility.clear()
+    pulls = [dependency_pull(graph, number) for number in graph.select(target_ref=target_ref, priority_only=priority_only, immediate_only=immediate_only)]
     return pulls if not priority_only or any(p.priority for p in pulls) else []
 
 
@@ -1459,6 +1461,7 @@ def connect_db() -> sqlite3.Connection:
         ("agent_configuration", "TEXT NOT NULL DEFAULT 'multi-pr'"),
         ("source", "TEXT NOT NULL DEFAULT 'queue'"),
         ("priority", "INTEGER NOT NULL DEFAULT 0"),
+        ("lane", "TEXT"),
         ("suspend_pending", "INTEGER NOT NULL DEFAULT 0"),
         ("suspend_verify_failures", "INTEGER NOT NULL DEFAULT 0"),
         ("suspend_retry_after", "REAL NOT NULL DEFAULT 0"),
@@ -1587,13 +1590,23 @@ def create_batch(
     source: str = "queue",
     predecessor_id: str | None = None,
     predecessor_candidate: dict[str, Any] | None = None,
+    lane: str | None = None,
 ) -> str:
     speculation.ensure_schema(conn, ensure_column)
     ensure_column(conn, "automerge_batches", "target_ref", "TEXT")
+    ensure_column(conn, "automerge_batches", "lane", "TEXT")
+    if lane not in {None, 'immediate'}:
+        raise ValueError("unsupported automerge lane")
+    if predecessor_id:
+        predecessor = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (predecessor_id,)).fetchone()
+        if lane == 'immediate' or predecessor is not None and batch_lane(predecessor) == 'immediate':
+            raise ValueError("immediate batches cannot have or be predecessors")
     if not pulls:
         raise ValueError("cannot create an empty automerge batch")
     identifier = batch_id or _new_batch_id()
     target = pulls_target(conn, pulls)
+    if lane == 'immediate' and target != BASE_BRANCH:
+        raise ValueError("immediate batches must target master")
     selected_mode = ('async' if target != BASE_BRANCH else
                      _validate_ci_mode(CI_MODE if ci_mode is None else ci_mode))
     if kind not in {"batch", "direct"}:
@@ -1616,8 +1629,8 @@ def create_batch(
                 (batch_id, kind, agent_configuration, source, priority, status, base_sha,
                  pull_requests_json, title, branch, created_at,
                  active_pull_requests_json, phase, ci_mode, integration_pr_number,
-                 integration_pr_url, ci_head_sha, predecessor_id, predecessor_candidate_json, target_ref)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 integration_pr_url, ci_head_sha, predecessor_id, predecessor_candidate_json, target_ref, lane)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 identifier,
@@ -1640,6 +1653,7 @@ def create_batch(
                 predecessor_id,
                 json.dumps(predecessor_candidate or {}),
                 target if target != BASE_BRANCH else None,
+                lane,
             ),
         )
         enqueue_membership_labels(conn, identifier)
@@ -1654,6 +1668,7 @@ def create_selected_batch(
     ci_mode: str | None = None,
     batch_id: str | None = None,
     source: str | None = None,
+    lane: str | None = None,
 ) -> str:
     """Use direct landing for one PR whose head already contains its target."""
     kind = "batch"
@@ -1666,7 +1681,7 @@ def create_selected_batch(
             log(f"could not verify whether PR #{pulls[0].number} is up to date; using batch path: {exc}")
     return create_batch(
         conn, pulls, base_sha, batch_id=batch_id, ci_mode=ci_mode, kind=kind,
-        source=source or ("priority" if any(pull.priority for pull in pulls) else "queue"),
+        source=source or ("priority" if any(pull.priority for pull in pulls) else "queue"), lane=lane,
     )
 
 
@@ -1926,7 +1941,18 @@ def _validation_guidance(
         "reversed), so an ejection alone never justifies the full suite; expand only "
         "for a specific concern, and state it. Interactions that the rebuild would "
         "have exposed are covered by the build and the touched-crate tests; this is "
-        "an accepted trade for queue latency. Cover affected behavior, shared "
+        "an accepted trade for queue latency. After merging master into a tested "
+        "candidate (promotion or a master update), the default is also a narrow "
+        "rerun: rebuild, rerun the tests of the crates the incoming master diff "
+        "touches (old captured base to new base), the areas of any conflict "
+        "resolutions, and checks that failed on the last tested candidate; reuse "
+        "every other result from the last tested candidate with its original tested "
+        "SHA and an applicability reason, record the fresh assessment, and publish. "
+        "Master's changes were validated before they landed, so a master merge alone "
+        "never justifies the full suite, and a master diff that touches a widely used "
+        "crate calls for that crate's tests, not every suite; expand only for a "
+        "specific concern, and state it. Checks the candidate has never run are chosen "
+        "by the normal policy. Cover affected behavior, shared "
         "dependencies and interactions, and previously failing checks addressed by "
         "the changes. A membership or HEAD change alone does not require repeating "
         "the full suite. Reuse earlier results for areas whose covered code, "
@@ -2213,7 +2239,11 @@ def lookup_batch_session(row: sqlite3.Row | dict[str, Any]) -> str | None:
 
 def batch_speculation_guidance(row):
     if batch_target(row) == BASE_BRANCH:
-        return speculation.GUIDANCE
+        if batch_lane(row) != 'immediate':
+            return speculation.GUIDANCE
+        return ("Candidate checkpoints: register before validation and withdraw before edits. "
+                "This immediate batch is primary, has no successor, and publishes its passing "
+                "assessment through mm-autopr. Preserve normal exact-head and fresh-master gates.")
     return ("Candidate checkpoints: mm-db candidate records and pushes only the batch branch. "
             "Withdraw a checkpoint before changing it and register the replacement when ready. "
             "This stabilize batch has no speculative successor. After local pass, record the "
@@ -2393,7 +2423,9 @@ def send_start_notification(
     predecessor = speculation.get(row, "predecessor_id") if speculation.is_speculative(row) else None
     heading = ("speculative batch:" if predecessor else
                "promoted batch:" if speculation.get(row, "role_promoted", 0) else "new batch:")
-    if batch_target(row) != BASE_BRANCH:
+    if batch_lane(row) == 'immediate':
+        heading = "immediate batch:"
+    elif batch_target(row) != BASE_BRANCH:
         heading = "stabilize batch:"
     qualifiers = [lane] if lane else []
     if _batch_kind(row) == "direct":
@@ -5170,8 +5202,10 @@ def _queue_master_update(
                   f"{ledger_context} Push only `{row['branch']}` and update the same integration PR. Do not "
                   "force-push unless rebuilding after ejection; do not merge the PR. CI must run again.")
     prompt += (f" Compare the resulting committed HEAD against the last tested candidate {tested_head}. "
-               "Choose diff-based reruns under the validation policy, retaining original tested SHAs and "
-               "applicability reasons for reused results. Record a fresh assessment for the resulting HEAD "
+               "Rerun by the master-merge narrow default in the validation policy (tests of the crates "
+               "the master diff touches, conflict-resolution areas and earlier failures), retaining original "
+               "tested SHAs and applicability reasons for reused results; a master merge alone never "
+               "justifies the full suite. Record a fresh assessment for the resulting HEAD "
                "and current source revision, re-register with mm-db candidate, then publish through mm-autopr. "
                "There is no unchanged-tree shortcut or equivalent-head alias.")
     import mm_service
@@ -6180,7 +6214,7 @@ def process_batch(conn: sqlite3.Connection, transport: monitor.SlackTransport,
     if phase not in {"building", "fixing"}:
         raise AutomergeError(f"unknown automerge phase {phase}", reason="database_state_invalid")
 
-    if phase == "building" and not row["session_id"]:
+    if phase in {"building", "fixing"} and not row["session_id"]:
         try:
             session_id = launch_batch_session(row, row_pulls(row), conn=conn,
                                               allow_new=not bool(row["launch_attempted"]))
@@ -6246,6 +6280,8 @@ def active_batch(conn: sqlite3.Connection) -> sqlite3.Row | None:
     """The master primary, including a landed parent with a live successor."""
     columns = {c[1] for c in conn.execute("PRAGMA table_info(automerge_batches)")}
     lane = "COALESCE(b.target_ref, ?) = ?" if "target_ref" in columns else "1=1"
+    if "lane" in columns:
+        lane += " AND COALESCE(b.lane, '') <> 'immediate'"
     args = (BASE_BRANCH, BASE_BRANCH) if "target_ref" in columns else ()
     if "predecessor_id" in columns:
         primary = "(predecessor_id IS NULL OR role_promoted=1)" if "role_promoted" in columns else "predecessor_id IS NULL"
@@ -6264,6 +6300,21 @@ def active_batch(conn: sqlite3.Connection) -> sqlite3.Row | None:
         "AND COALESCE(terminal_status, '') <> 'aborted')) "
         "ORDER BY created_at, batch_id LIMIT 1", args
     ).fetchone()
+
+
+def batch_lane(row) -> str | None:
+    return speculation.get(row, 'lane')
+
+
+def active_immediate_batch(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """The independent master slot; legacy rows remain ordinary."""
+    columns = {c[1] for c in conn.execute("PRAGMA table_info(automerge_batches)")}
+    if 'lane' not in columns:
+        return None
+    return conn.execute(
+        "SELECT * FROM automerge_batches WHERE lane='immediate' "
+        "AND status IN ('launching','running','finishing') "
+        "ORDER BY created_at,batch_id LIMIT 1").fetchone()
 
 
 def active_campaign_batch(conn: sqlite3.Connection) -> sqlite3.Row | None:
@@ -6309,32 +6360,6 @@ def select_campaign_pull_requests(conn, *, dry_run=False):
     return []
 
 
-def _batch_is_in_publish_phase(row: sqlite3.Row | dict[str, Any]) -> bool:
-    phase = str(row["phase"] or "")
-    return (
-        phase in {"merging", "direct_merging"}
-        or str(row["verdict_status_state"] or "") == "success"
-    )
-
-
-def _priority_preemption_target(
-    row: sqlite3.Row | dict[str, Any], pulls: list[PullRequest],
-) -> PullRequest | None:
-    """Return an immediate PR that can preempt this not-yet-publishing batch."""
-    if (batch_target(row) != BASE_BRANCH
-            or _batch_kind(row) not in {"batch", "direct"}
-            or _batch_source(row) == "operator"
-            or _batch_is_in_publish_phase(row)
-            or str(row["phase"] or "") in {"aborting", "terminal"}):
-        return None
-    already_in_batch = {pull.number for pull in _all_batch_pulls(row)}
-    candidates = [pull for pull in pulls
-                  if pull.immediate and (pull.target_ref or BASE_BRANCH) == BASE_BRANCH and (
-                      pull.number not in already_in_batch or not _batch_priority(row)
-                  )]
-    return min(candidates, key=lambda pull: pull.number) if candidates else None
-
-
 def abort_batch_locked(
     conn: sqlite3.Connection,
     transport: monitor.SlackTransport,
@@ -6362,22 +6387,7 @@ def abort_batch_locked(
     _complete_abort(conn, transport, latest)
 
 
-def preempt_batch_for_priority(
-    conn: sqlite3.Connection,
-    transport: monitor.SlackTransport,
-    row: sqlite3.Row | dict[str, Any],
-    pulls: list[PullRequest],
-) -> bool:
-    target = _priority_preemption_target(row, pulls)
-    if target is None:
-        return False
-    abort_batch_locked(
-        conn, transport, row, f"preempted by immediate PR #{target.number}",
-    )
-    return True
-
-
-def read_active_batch_for_check(*, campaign=False) -> dict[str, Any] | None:
+def read_active_batch_for_check(*, campaign=False, immediate=False) -> dict[str, Any] | None:
     """Read durable queue state without creating or migrating database tables."""
     if not DB_PATH.is_file():
         return None
@@ -6390,7 +6400,8 @@ def read_active_batch_for_check(*, campaign=False) -> dict[str, Any] | None:
         ).fetchone()
         if exists is None:
             return None
-        row = active_campaign_batch(conn) if campaign else active_batch(conn)
+        row = (active_immediate_batch(conn) if immediate else
+               active_campaign_batch(conn) if campaign else active_batch(conn))
         if row is None:
             return None
         return {
@@ -6437,15 +6448,17 @@ def check_only() -> int:
     try:
         active = read_active_batch_for_check()
         campaign_active = read_active_batch_for_check(campaign=True)
+        immediate_active = read_active_batch_for_check(immediate=True)
     except (OSError, sqlite3.Error) as exc:
         print(json.dumps({"state": "blocked", "reason": "database_unreadable",
                           "details": str(exc)}, indent=2))
         return 3
-    if active is not None or campaign_active is not None:
+    if active is not None or campaign_active is not None or immediate_active is not None:
         print(json.dumps({
             "state": "active_batch",
             "active_batch": active,
             "campaign_batch": campaign_active,
+            "immediate_batch": immediate_active,
             "would_do": "continue the persisted batch phase",
         }, indent=2, sort_keys=True))
         return 0
@@ -6459,6 +6472,7 @@ def check_only() -> int:
         }, indent=2, sort_keys=True))
         return 3
     campaign_pulls = []
+    immediate_pulls = []
     try:
         monitor.github_app_token()
         if DB_PATH.is_file():
@@ -6469,12 +6483,15 @@ def check_only() -> int:
                 pulls = select_eligible_pull_requests(dry_run=True, conn=check_conn)
                 master_blocks, master_exclusions = DEPENDENCY_BLOCKS, CAMPAIGN_EXCLUSIONS
                 campaign_pulls = select_campaign_pull_requests(check_conn, dry_run=True)
+                immediate_pulls = select_eligible_pull_requests(dry_run=True, conn=check_conn,
+                                                               priority_only=True, immediate_only=True)
                 DEPENDENCY_BLOCKS[:] = master_blocks
                 CAMPAIGN_EXCLUSIONS[:] = master_exclusions
             finally:
                 check_conn.close()
         else:
             pulls = select_eligible_pull_requests(dry_run=True)
+            immediate_pulls = select_eligible_pull_requests(dry_run=True, priority_only=True, immediate_only=True)
         base_sha = target_sha(pulls[0].target_ref or BASE_BRANCH) if pulls else None
     except (monitor.GitHubAuthError, AutomergeError,
             monitor.CommandError, monitor.MjError, OSError, ValueError) as exc:
@@ -6482,10 +6499,11 @@ def check_only() -> int:
                           "details": str(exc)}, indent=2, sort_keys=True))
         return 3
     print(json.dumps({
-        "state": "ready" if pulls or campaign_pulls else "idle",
+        "state": "ready" if pulls or campaign_pulls or immediate_pulls else "idle",
         "mode": CI_MODE,
         "base_sha": base_sha,
         "selected_prs": [pull.as_json() for pull in pulls],
+        "immediate_lane": {"selected_prs": [p.as_json() for p in immediate_pulls]},
         "campaign_lane": {"selected_prs": [p.as_json() for p in campaign_pulls],
                           "target_ref": campaign_pulls[0].target_ref if campaign_pulls else None,
                           "mode": "async"},
@@ -6494,7 +6512,7 @@ def check_only() -> int:
         "target_ref": (pulls[0].target_ref or BASE_BRANCH) if pulls else None,
         "would_do": (
             "create a direct landing or integration batch for the selected PRs"
-            if pulls or campaign_pulls else "wait for eligible PRs"
+            if pulls or campaign_pulls or immediate_pulls else "wait for eligible PRs"
         ),
     }, indent=2, sort_keys=True))
     return 0

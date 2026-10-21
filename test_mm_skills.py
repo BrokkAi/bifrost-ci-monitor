@@ -292,7 +292,10 @@ class PromotionTests(GitFixture):
             with self.subTest(skill=skill):
                 text = " ".join((ROOT / "skills" / skill / "SKILL.md").read_text().split())
                 self.assertIn("captured base is actual master; nothing is shared with", text)
-                self.assertIn("reruns from the diff against the last tested candidate under the validation policy", text)
+                if skill == "mm-merge":
+                    self.assertIn("A master merge alone never justifies the full suite", text)
+                else:
+                    self.assertIn("reruns from the diff against the last tested candidate under the validation policy", text)
                 self.assertIn("fresh assessment", text)
                 self.assertIn("re-register the candidate", text)
                 self.assertNotIn("pinned", text)
@@ -381,6 +384,17 @@ class ExecutionTests(GitFixture):
         result = db.mm_execution.execute(["bash", "-c", "kill -TERM $$"], self.repo, self.root / "signal")
         self.assertEqual(result["status"], "interrupted")
         self.assertEqual(result["exit_code"], -15)
+
+    def test_checks_run_whether_or_not_the_predecessor_is_live(self):
+        # Batch 1d3646f3 on 2026-10-20: its predecessor landed and every check
+        # was refused, so no assessment or handoff could start its promotion.
+        for live in (True, False):
+            client = self.client()
+            client.call.return_value = dict(self.context(),
+                                            predecessor={"batch_id": "parent", "current": live})
+            with mock.patch.object(db.mm_execution, "execute", return_value={"exit_code": 0}) as execute:
+                db.mm_execution.run(client, command=["true"])
+            execute.assert_called_once()
 
     def test_wrapper_refuses_new_checks_after_handoff(self):
         client = self.client()

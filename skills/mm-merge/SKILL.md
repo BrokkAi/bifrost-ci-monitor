@@ -50,10 +50,12 @@ does not stop checks or change your checkout.
 
 When the supervisor requests promotion, run `--promote` to merge the exact
 recorded master base into your committed candidate. Resolve conflicts and commit
-with the prepared trailer. Choose reruns from the diff against the last tested
-candidate under the validation policy, then record a fresh assessment and
-re-register the candidate with `mm-db candidate`. The helper summarizes changed
-paths and crates. Reuse unaffected results only with their original tested SHAs
+with the prepared trailer. The default rerun is narrow: the tests of the crates
+the helper's changed-crate summary lists (the master diff plus your conflict
+resolutions) and checks that failed before. A master merge alone never justifies
+the full suite; expand only for a specific concern, and state it. Then record a
+fresh assessment and re-register the candidate with `mm-db candidate`. Reuse
+unaffected results only with their original tested SHAs
 and applicability reasons; promotion always requires a fresh assessment. The
 supervisor withdraws the old checkpoint when it updates the base. Withdraw any
 new checkpoint before further edits. Publish through mm-autopr after validation.

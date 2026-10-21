@@ -270,23 +270,23 @@ class DependencyTests(TestCase):
         self.assertEqual([p.number for p in selected], [50])
         self.assertEqual(automerge.pulls_target(self.conn, selected), 'stabilize/test')
 
-    def test_campaign_selection_is_independent_of_master_priority_and_never_preempts(self):
+    def test_campaign_selection_is_independent_of_master_priority(self):
         self.campaign()
         self.add_pr(50, 'campaign-fix', self.base, base='stabilize/test')
         self.items[40]['labels'] = [{'name': 'mergemarshall:high'}]
         self.assertEqual([p.number for p in self.selected()], [40])
         self.assertEqual([p.number for p in self.selected('stabilize/test')], [50])
         self.items[40]['labels'] = [{'name': 'mergemarshall:immediate'}]
-        self.assertEqual([p.number for p in self.selected()], [40])
+        self.assertEqual([p.number for p in self.selected()], [30, 20, 10])
         self.items[50]['labels'] = [{'name': 'mergemarshall:immediate'}]
-        priority = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True)
+        priority = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True, immediate_only=True)
         self.assertEqual([p.number for p in priority], [40])
         self.items[40]['labels'] = []
         selected = self.selected('stabilize/test')
         batch = automerge.create_batch(self.conn, [automerge.dependency_pull(
             automerge.dependency_graph(self.conn), 40)], self.base)
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
-        self.assertIsNone(automerge._priority_preemption_target(row, selected))
+        self.assertEqual([p.number for p in selected], [50])
 
     def test_campaign_lane_includes_all_ready_heads_regardless_of_priority_labels(self):
         self.campaign()
@@ -491,7 +491,7 @@ class DependencyTests(TestCase):
 
     def test_priority_discovery_omits_unrelated_ready_prs(self):
         self.items[20]['labels'] = [{'name': 'mergemarshall:immediate'}]
-        selected = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True)
+        selected = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True, immediate_only=True)
         self.assertEqual([p.number for p in selected], [30, 20])
 
     def test_successful_pairs_survive_an_interrupted_discovery(self):
@@ -911,16 +911,19 @@ class DependencyTests(TestCase):
         self.items[10]['head']['sha'] = self.git('rev-parse', 'HEAD')
         self.assertEqual([p.number for p in self.selected()], [30, 20, 10, 40])
 
-    def test_priority_lane_includes_ordinary_prerequisite_closure(self):
-        for label in ['mergemarshall:high', 'mergemarshall:immediate']:
-            with self.subTest(label=label):
+    def test_priority_lanes_include_ordinary_prerequisite_closure(self):
+        for immediate in (False, True):
+            with self.subTest(immediate=immediate):
+                label = 'mergemarshall:immediate' if immediate else 'mergemarshall:high'
                 self.items[20]['labels'] = [{'name': label}]
-                selected = self.selected()
+                selected = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True,
+                                                                   immediate_only=immediate)
                 self.assertEqual([p.number for p in selected], [30, 20])
                 self.assertFalse(selected[0].priority)
                 self.assertTrue(selected[1].priority)
                 self.reject(30)
-                self.assertEqual([p.number for p in self.selected()], [40])
+                self.assertEqual(automerge.select_eligible_pull_requests(
+                    conn=self.conn, priority_only=True, immediate_only=immediate), [])
                 self.conn.execute('DELETE FROM automerge_github_outbox')
                 self.conn.commit()
 
@@ -930,17 +933,47 @@ class DependencyTests(TestCase):
         self.assertNotIn(20, [p.number for p in self.selected()])
         self.assertTrue(any('ambiguous' in item['reason'] for item in automerge.DEPENDENCY_BLOCKS))
 
-    def test_immediate_preemption_requires_eligible_dependency_closure(self):
+    def test_ordinary_dependent_of_immediate_waits_for_landing(self):
+        self.items[30]['labels'] = [{'name': 'mergemarshall:immediate'}]
+        self.assertEqual([p.number for p in self.selected()], [40])
+        urgent = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True, immediate_only=True)
+        self.assertEqual([p.number for p in urgent], [30])
+        batch = automerge.create_batch(self.conn, urgent, self.base, lane='immediate')
+        self.assertEqual([p.number for p in self.selected()], [40])
+        self.assertEqual(automerge.select_eligible_pull_requests(
+            conn=self.conn, priority_only=True, immediate_only=True), [])
+        self.git('checkout', '-q', 'master')
+        self.git('merge', '-q', '--no-ff', '-m', 'land immediate', self.x)
+        self.items[30].update(state='closed', merged_at='now')
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal' WHERE batch_id=?", (batch,))
+        self.assertEqual([p.number for p in self.selected()], [20, 10, 40])
+
+    def test_immediate_only_discovery_omits_unrelated_high_roots_and_reads(self):
         self.items[20]['labels'] = [{'name': 'mergemarshall:immediate'}]
-        batch = automerge.create_batch(self.conn, [automerge.PullRequest(40, 'w', self.w, 'url')], self.base)
-        row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
-        with mock.patch.object(automerge, '_complete_abort') as abort:
-            self.assertTrue(automerge.preempt_batch_for_priority(self.conn, monitor.SlackTransport('chat'), row, self.selected()))
-            abort.assert_called_once()
+        self.items[40]['labels'] = [{'name': 'mergemarshall:high'}]
+        def comments(number):
+            self.assertNotEqual(number, 40)
+            return []
+        with mock.patch.object(automerge, 'list_pull_comments', side_effect=comments):
+            selected = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True, immediate_only=True)
+        self.assertEqual([p.number for p in selected], [30, 20])
+        self.assertEqual([p.number for p in self.selected()], [40])
+
+    def test_reserved_high_root_does_not_hide_other_eligible_ordinary_work(self):
+        self.items[40]['labels'] = [{'name': 'mergemarshall:high'}]
+        selected = self.selected()
+        self.assertEqual([p.number for p in selected], [40])
+        automerge.create_batch(self.conn, selected, self.base)
+        self.assertEqual([p.number for p in self.selected()], [30, 20, 10])
+
+    def test_immediate_slot_requires_eligible_dependency_closure(self):
+        self.items[20]['labels'] = [{'name': 'mergemarshall:immediate'}]
+        selected = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True, immediate_only=True)
+        self.assertEqual([p.number for p in selected], [30, 20])
         self.reject(30)
-        with mock.patch.object(automerge, '_complete_abort') as abort:
-            self.assertFalse(automerge.preempt_batch_for_priority(self.conn, monitor.SlackTransport('chat'), row, self.selected()))
-            abort.assert_not_called()
+        self.assertEqual(automerge.select_eligible_pull_requests(
+            conn=self.conn, priority_only=True, immediate_only=True), [])
 
     def test_retargeting_and_restart_do_not_erase_captured_prerequisite(self):
         self.selected()
@@ -1372,6 +1405,8 @@ class DependencyTests(TestCase):
 
     def test_gate_satisfied_repair_is_not_reinterpreted_as_unmerged_supersession(self):
         row, rejected, _, landed = self.gate_repair_fixture()
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal'")
         record = pr_dependencies.ReviewedSupersession(automerge.REPO_NAME, 50, rejected, 60, landed)
         with self.conn:
             self.conn.execute('INSERT INTO automerge_pr_dependencies VALUES (60,?,50,?)', (landed, rejected))

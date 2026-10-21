@@ -110,13 +110,13 @@ def verify_candidate(a, current, head, conn):
 
 GUIDANCE = """Candidate checkpoints and lookahead: after completing your merges and fixes, before starting expensive validation, run mm-db candidate --revision <current revision> (add --rebuild for a rebuilt branch). This pushes only your recorded batch branch and records the committed candidate; it opens no PR. Before making further edits, withdraw it with mm-db candidate --revision <current revision> --withdraw. Register the replacement when ready. The supervisor may run the next batch's useful checks concurrently through existing mbx.
 
-Read mm-db state: your captured base is actual master at launch. Your batch shares no source membership or unlanded work with the current primary. Merge, fix, validate and reject your own exact heads independently against that base. After local pass, record mm-db tests and mm-db ready --revision <current revision>, then wait without publishing while the predecessor is live. When it ends, you take the primary role with the same checkout and running work. If master has not moved, continue readiness and publication normally. If the supervisor queues promotion, run mm-merge --promote, resolve conflicts, and choose reruns from the actual diff against the last tested candidate under the validation policy. Reuse unaffected evidence only with its original tested SHA and an applicability reason. Record a fresh assessment for the resulting HEAD and re-register the post-merge candidate before publication. There is no unchanged-tree shortcut.
+Read mm-db state: your captured base is actual master at launch. Your batch shares no source membership or unlanded work with the current primary. Merge, fix, validate and reject your own exact heads independently against that base. After local pass, record mm-db tests and mm-db ready --revision <current revision>, then wait without publishing while the predecessor is live. When it ends, you take the primary role with the same checkout and running work. If master has not moved, continue readiness and publication normally. If the supervisor queues promotion, run mm-merge --promote, resolve conflicts, and rerun by the master-merge narrow default in the validation policy; a master merge alone never justifies the full suite. Reuse unaffected evidence only with its original tested SHA and an applicability reason. Record a fresh assessment for the resulting HEAD and re-register the post-merge candidate before publication. There is no unchanged-tree shortcut.
 
 """
 
 
 def selection(a, conn, parent, *, master=None):
-    if a.batch_target(parent) != a.BASE_BRANCH:
+    if a.batch_target(parent) != a.BASE_BRANCH or a.batch_lane(parent) == 'immediate':
         return []
     actual = a.dependency_graph(conn, master=master or a.current_master_sha(),
                                 **a.lane_discovery_scope(conn, a.BASE_BRANCH))
@@ -129,7 +129,7 @@ def selection(a, conn, parent, *, master=None):
 
 
 def launch_child(a, conn, parent):
-    if (a.batch_target(parent) != a.BASE_BRANCH or not a.SPECULATIVE_LOOKAHEAD or is_speculative(parent)
+    if (a.batch_lane(parent) == 'immediate' or a.batch_target(parent) != a.BASE_BRANCH or not a.SPECULATIVE_LOOKAHEAD or is_speculative(parent)
             or not candidate(a, parent) or child(conn, parent["batch_id"])):
         return
     master = a.current_master_sha()
@@ -142,7 +142,7 @@ def launch_child(a, conn, parent):
         conn.execute('BEGIN IMMEDIATE')
         fresh = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (parent['batch_id'],)).fetchone()
         current = candidate(a, fresh)
-        if (is_speculative(fresh) or not current or current['id'] != checkpoint['id']
+        if (a.batch_lane(fresh) == 'immediate' or is_speculative(fresh) or not current or current['id'] != checkpoint['id']
                 or child(conn, parent['batch_id'])):
             return
         a.create_batch(conn, pulls, master, ci_mode=a.CI_MODE,
@@ -429,8 +429,12 @@ def promote_role(a, conn, row, parent):
 
 
 def promote(a, conn, transport, row, parent):
-    """Queue master incorporation after the agent's passing handoff."""
-    if (row['phase'] != 'waiting_parent' or not a.ready_candidate(row)
+    """Queue fresh-master incorporation without waiting for validation/handoff."""
+    # A previous tick (or an ambiguous delivery retry) may already have queued
+    # this target. The captured base is the durable per-tip checkpoint.
+    row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
+    if (row is None or row['phase'] not in {'building', 'fixing', 'waiting_parent'}
+            or row['terminal_status'] or not a._active_sources(row)
             or (get(row, 'predecessor_id') and parent_current(a, conn, row))):
         return
     master = landed_base(a, conn, row, parent)
@@ -439,18 +443,26 @@ def promote(a, conn, transport, row, parent):
             conn.execute("UPDATE automerge_batches SET predecessor_id=NULL,role_promoted=1 WHERE batch_id=?",
                          (row['batch_id'],))
         return
-    evidence = latest_tests(conn, row["batch_id"])
-    checkpoint = json.loads(row['candidate_json'])
-    promotion = {"stage": "incorporating", "base": master, "old_base": row["base_sha"],
-                 "previous_tests": evidence, "old_candidate": checkpoint}
     impact = a.run_ci_impact(master, [p.head_sha for p in a.row_pulls(row)])
-    prompt = f"""Your batch is now primary. Read mm-db state and run mm-merge --promote to merge fresh master {master}. Resolve conflicts and choose reruns from the actual diff against the last tested candidate under the validation policy. Reuse unaffected results only with original tested SHAs and applicability reasons. Record a fresh assessment for the resulting committed HEAD and re-register the post-merge head with mm-db candidate. Then publish through mm-autopr (use --rebuild if its push needs a lease) and finish with mm-db report. Normal {_mode(a, row)} gates apply. There is no unchanged-tree shortcut.
+    prompt = f"""Your batch is now primary. Preserve ongoing work and logs; reconcile running checks and commit pending edits before incorporation. Do not finish a full stale-base validation before acting on this instruction. Read mm-db state and run mm-merge --promote to merge fresh master {master}. Resolve conflicts, then rerun by the master-merge narrow default in the validation policy below: the tests of the crates the master diff touches (the crate list mm-merge --promote prints), conflict-resolution areas and earlier failures. A master merge alone never justifies the full suite; expand only for a specific concern, and state it. Reuse every other result with its original tested SHA and an applicability reason. Record a fresh assessment for the resulting committed HEAD and re-register the post-merge head with mm-db candidate. Then publish through mm-autopr (use --rebuild if its push needs a lease) and finish with mm-db report. Normal {_mode(a, row)} gates apply. There is no unchanged-tree shortcut.
 {a._validation_guidance(master, impact, subagents=a._batch_subagents(row), configuration=a._batch_configuration(row))}
 {GUIDANCE}
 """
     import mm_service  # Lazy: the service imports the relationship engine.
     with conn:
-        # Match service candidate withdrawal receipts, retaining the old identity.
+        conn.execute('BEGIN IMMEDIATE')
+        current = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
+        if (current is None or current['phase'] not in {'building', 'fixing', 'waiting_parent'}
+                or current['terminal_status'] or not a._active_sources(current)
+                or source_revision(a, current) != source_revision(a, row)
+                or (get(current, 'predecessor_id') and parent_current(a, conn, current))):
+            return  # Active agent mutations changed the inputs; reconcile their new snapshot.
+        row = current
+        checkpoint = json.loads(row['candidate_json'])
+        promotion = {"stage": "incorporating", "base": master, "old_base": row["base_sha"],
+                     "previous_tests": latest_tests(conn, row["batch_id"]), "old_candidate": checkpoint}
+        # Match service candidate withdrawal receipts, retaining the latest identity
+        # even when an active agent registered it while CI impact was being read.
         withdrawal = {"id": a.uuid.uuid4().hex, "revision": mm_service.state(conn, row["batch_id"])["revision"],
                       "source_revision": source_revision(a, row), "candidate": checkpoint or None}
         event_id = digest(['candidate_withdrawal', withdrawal])
@@ -458,7 +470,7 @@ def promote(a, conn, transport, row, parent):
                      (row['batch_id'], event_id, 'candidate_withdrawal', json.dumps(withdrawal), a.utc_now()))
         conn.execute("UPDATE automerge_batches SET predecessor_id=NULL,role_promoted=1,base_sha=?,"
                      "promotion_json=?,phase='fixing',pending_prompt=?,prompt_delivered=0,"
-                     "candidate_json='{}',ready_json='{}',prompt_command_id=?,turn_started_at=NULL,"
+                     "candidate_json='{}',ready_json='{}',prompt_command_id=?,"
                      "validation_impact_json=? WHERE batch_id=?",
                      (master, json.dumps(promotion), prompt, 'mm-promote-' + a.uuid.uuid4().hex,
                       json.dumps(impact), row["batch_id"]))
@@ -487,8 +499,11 @@ def reconcile(a, conn, transport, row, *, priority_pulls=None):
                 conn.execute('UPDATE automerge_batches SET recovery_json=? WHERE batch_id=?',
                              (json.dumps(saved), row['batch_id']))
             return True
-    if not parent_current(a, conn, row) and not get(row, 'role_promoted', 0):
-        promote_role(a, conn, row, parent)
+    released = not get(row, 'predecessor_id') or not parent_current(a, conn, row)
+    if released:
+        if not get(row, 'role_promoted', 0):
+            promote_role(a, conn, row, parent)
+        promote(a, conn, transport, row, parent)
     return True
 
 
