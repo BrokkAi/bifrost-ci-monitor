@@ -51,20 +51,21 @@ agent. Async direct landing performs source/freshness checks without a new
 local test run; sync also verifies PR CI. An operator fast-track is an explicit
 direct async landing. These paths and their tradeoffs are documented in README.
 
-`mergemarshall:high` gives next-batch priority; `mergemarshall:immediate` can
-preempt active work before landing. Both select the eligible high/immediate set
-and any ordinary prerequisites needed by those PRs.
+`mergemarshall:high` gives next-batch priority: that batch selects the eligible
+high PRs and any prerequisites they need. `mergemarshall:immediate` runs in a
+separate lane next to ordinary work and never aborts it; ordinary batches merge
+its result when it lands.
 CI repair PRs have no automatic priority. Current master has no special human
 review hold for changes to CI workflow/action files.
 
 The scheduler can prepare one successor batch while the current batch validates.
-It starts from the current candidate, preserving that work, and lands in order.
-Once the current batch lands, its successor becomes primary while keeping its
-running checks. That batch's checkpoint can start the next successor immediately;
-passing validation still gates publication and landing.
-A changed predecessor restarts the successor in its existing environment so
-build caches and reusable conflict resolutions survive. Independent exact-head
-rejections remain recorded across recovery and aborts.
+It starts from current master with its own PRs, so nothing the current batch
+does (ejecting, rebuilding or aborting) restarts it. Once the current batch ends,
+its successor becomes primary while keeping its running checks; if master moved,
+it merges the new master and reruns the checks that change affects. That
+batch's checkpoint can start the next successor immediately; passing validation
+still gates publication and landing. Independent exact-head rejections remain
+recorded across recovery and aborts.
 
 GitHub verdict/merge write failures retain the open candidate and retry with
 persisted backoff instead of losing completed work. Operators can abort a

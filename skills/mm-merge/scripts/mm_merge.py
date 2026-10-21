@@ -80,8 +80,35 @@ def restart(state):
     return {"archive": str(archive), "old_head": snapshot["head"], "already_reset": False}
 
 
+def promotion_diff(tested, head):
+    """Bounded path/crate summary of committed changes since the last assessment."""
+    paths = git("diff", "--name-only", "--no-renames", "-z", tested, head, check=False)
+    if paths.returncode:
+        return {"from": tested, "to": head, "available": False}
+    changed = sorted(set(filter(None, paths.stdout.split("\0"))))
+    manifests = set()
+    for revision in {tested, head}:
+        files = git("ls-tree", "-r", "--name-only", "-z", revision, check=False)
+        if files.returncode:
+            return {"from": tested, "to": head, "available": False}
+        manifests.update(str(Path(name).parent) for name in files.stdout.split("\0")
+                         if Path(name).name == "Cargo.toml")
+    crates = set()
+    for name in changed:
+        for directory in Path(name).parents:
+            if str(directory) in manifests:
+                crates.add(str(directory))
+                break
+    return {"from": tested, "to": head, "available": True,
+            "changed_paths": [name[:240] for name in changed[:100]],
+            "changed_path_count": len(changed),
+            "crates": [name[:240] for name in sorted(crates)[:50]], "crate_count": len(crates),
+            "truncated": len(changed) > 100 or len(crates) > 50
+                         or any(len(name) > 240 for name in changed)}
+
+
 def promote(state):
-    if state.get("predecessor") or not state.get("promotion"):
+    if (state.get("predecessor") and state["predecessor"]["current"]) or not state.get("promotion"):
         raise ValueError("no supervisor-approved promotion is pending")
     if git("branch", "--show-current").stdout.strip() != state["branch"]:
         raise ValueError("not on the recorded integration branch")
@@ -89,23 +116,27 @@ def promote(state):
         raise ValueError("commit pending changes before promoting")
     fetch_base(state)
     before = git("rev-parse", "HEAD").stdout.strip()
-    tree = git("rev-parse", "HEAD^{tree}").stdout.strip()
-    evidence = state["promotion"].get("previous_tests")
-    tested_tree = git('rev-parse', evidence['head'] + '^{tree}', check=False) if evidence else None
-    reusable = bool(evidence and evidence['verdict'] == 'pass' and tested_tree.returncode == 0
-                    and tested_tree.stdout.strip() == tree)
+    promotion = state["promotion"]
+    evidence = promotion.get("previous_tests") or state.get("tests") or {}
+    checkpoint = promotion.get("old_candidate") or state.get("candidate") or {}
+    tested = evidence.get("head") or checkpoint.get("head") or before
+    manual = False
+    output = ""
     if not ancestor(state["base_sha"]):
-        result = git("merge", "--no-ff", "--no-edit", "-m", "Incorporate landed predecessor",
+        result = git("merge", "--no-ff", "--no-edit", "-m", "Incorporate recorded master base",
                      "-m", "Automerge-Batch: " + state["batch_id"], state["base_sha"], check=False)
-        if result.returncode:
-            return {"manual_required": True, "merge_output": result.stdout + result.stderr,
-                    "evidence_reusable": False,
-                    "next": "Resolve, commit, reassess affected checks and record a fresh assessment."}
-    unchanged = git("rev-parse", "HEAD^{tree}").stdout.strip() == tree
-    return {"manual_required": False, "head": git("rev-parse", "HEAD").stdout.strip(),
-            "previous_head": before, "tree_unchanged": unchanged,
-            "evidence_reusable": reusable and unchanged, "previous_tests": evidence,
-            "next": "Record a fresh assessment; cite old SHA/settings for reusable evidence, otherwise validate affected checks."}
+        manual = bool(result.returncode)
+        output = result.stdout + result.stderr
+    head = git("rev-parse", "HEAD").stdout.strip()
+    result = {"manual_required": manual, "head": head, "previous_head": before,
+              "diff": promotion_diff(tested, head), "fresh_assessment_required": True,
+              "previous_tests": evidence or None,
+              "next": "Resolve and commit any conflicts; choose reruns from the diff under the validation policy, "
+                      "record a fresh assessment and re-register the candidate with mm-db candidate."}
+    if manual:
+        result["merge_output"] = output
+        result["diff"]["pending_merge"] = True
+    return result
 
 
 def assemble(state, *, manual=False, rebuild=False):
@@ -177,7 +208,7 @@ def main():
     parser.add_argument("--manual", action="store_true")
     parser.add_argument("--rebuild", action="store_true")
     parser.add_argument("--restart", action="store_true", help="save old attempt's pending work and reset once")
-    parser.add_argument("--promote", action="store_true", help="incorporate the supervisor's landed predecessor")
+    parser.add_argument("--promote", action="store_true", help="merge the supervisor's recorded master base and reassess")
     parser.add_argument("--state-file", type=Path, help="use an explicit saved state instead of mm-db")
     args = parser.parse_args()
     state = json.loads(args.state_file.read_text()) if args.state_file else Client().call("state")

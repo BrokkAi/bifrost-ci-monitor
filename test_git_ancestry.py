@@ -1,8 +1,11 @@
 """Git-only reads against disposable repositories; no GitHub or credentials."""
+import base64
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -341,6 +344,64 @@ class GitReads(unittest.TestCase):
         self.assertNotEqual(run.call_args_list[1].kwargs['env'][key], run.call_args_list[2].kwargs['env'][key])
         self.assertNotIn('private-new-token', str(run.call_args.args))
 
+    def test_git_http_401_without_a_prompt_renews_once_and_withholds_the_trace(self):
+        tokens = {base64.b64encode(('x-access-token:' + token).encode()).decode(): name
+                  for token, name in [('private-old-token', 'old'), ('private-new-token', 'new')]}
+        requests = []
+        head = self.base
+        def packet(value):
+            return f'{len(value) + 4:04x}'.encode() + value
+        class GitHTTP(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_GET(self):
+                name = tokens.get(self.headers.get('Authorization', '').removeprefix('basic '), 'missing')
+                requests.append(name)
+                if name != 'new':
+                    self.send_response(401)
+                    self.send_header('WWW-Authenticate', 'Basic realm="fixture"')
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+                    return
+                body = (packet(b'# service=git-upload-pack\n') + b'0000'
+                        + packet((head + ' refs/heads/master\0agent=fixture\n').encode()) + b'0000')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/x-git-upload-pack-advertisement')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        server = ThreadingHTTPServer(('127.0.0.1', 0), GitHTTP)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.shutdown)
+        original_env = g.authenticated_env
+        original_run = subprocess.run
+        traces = []
+        def env(token):
+            value = original_env(token)
+            value['GIT_CONFIG_KEY_' + str(int(value['GIT_CONFIG_COUNT']) - 1)] = 'http.extraHeader'
+            return value
+        def run(*args, **kwargs):
+            result = original_run(*args, **kwargs)
+            if 'ls-remote' in args[0]:
+                traces.append(result.stderr)
+            return result
+        refresh = mock.Mock(return_value='private-new-token')
+        with (mock.patch.object(g, 'repository_url', return_value=f'http://127.0.0.1:{server.server_port}/repo.git'),
+              mock.patch.object(g, 'authenticated_env', side_effect=env),
+              mock.patch.object(g.subprocess, 'run', side_effect=run)):
+            self.assertEqual(g.remote_head('fixture/repo', 'master', lambda: 'private-old-token',
+                                           refresh_token=refresh), head)
+        self.assertEqual(requests, ['old', 'new'])
+        refresh.assert_called_once_with()
+        self.assertEqual([g.remote_http_status(subprocess.CompletedProcess([], 0, '', t))
+                          for t in traces], [401, 200])
+        for trace in traces:
+            for secret in ['private-old-token', 'private-new-token', *tokens]:
+                self.assertNotIn(secret, trace)
+
     def test_remote_failure_categories_withhold_secrets_and_retry_only_authentication(self):
         cases = [('Authentication failed', 'authentication'),
                  ('The requested URL returned error: 401', 'authentication'),
@@ -351,6 +412,15 @@ class GitReads(unittest.TestCase):
                  ('GnuTLS connection terminated', 'transport'),
                  ('RPC failed; curl 92 HTTP/2 stream 3 was not closed cleanly: INTERNAL_ERROR', 'transport'),
                  ('Empty reply from server', 'transport'),
+                 ('http.c:1 == Info: Connection left intact\nhttp.c:1 <= Recv header: HTTP/2 401\n'
+                  'fatal: could not read Username: terminal prompts disabled', 'authentication'),
+                 ('http.c:1 <= Recv header: HTTP/2 401\nhttp.c:1 <= Recv header: HTTP/2 404',
+                  'repository_access'),
+                 ('http.c:1 <= Recv header: HTTP/2 429', 'rate_limit'),
+                 ('http.c:1 <= Recv header: HTTP/2 503', 'transport'),
+                 ('http.c:1 == Info: Connection left intact\nhttp.c:1 <= Recv header: HTTP/2 200\n'
+                  'unexpected failure', 'unknown'),
+                 ('remote: <= Recv header: HTTP/2 401', 'unknown'),
                  ('unexpected failure', 'unknown')]
         for detail, category in cases:
             with self.subTest(category=category, detail=detail):

@@ -190,6 +190,118 @@ class MergeTests(GitFixture):
         self.assertTrue((self.repo / "two").exists())
 
 
+class PromotionTests(GitFixture):
+    def prepare(self, *, conflict=False):
+        self.source(1, "marker" if conflict else "own", "candidate\n")
+        tested = self.assemble()["head"]
+        self.run_git("reset", "--hard", self.base)
+        name = "marker" if conflict else "crates/product/src/lib.rs"
+        (self.repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (self.repo / name).write_text("master\n")
+        if not conflict:
+            (self.repo / "crates/product/Cargo.toml").write_text('[package]\nname = "product"\n')
+        self.run_git("add", name, *([] if conflict else ["crates/product/Cargo.toml"]))
+        self.run_git("commit", "-m", "Master advances independently")
+        master = self.run_git("rev-parse", "HEAD")
+        self.run_git("update-ref", "refs/heads/master", master)
+        self.run_git("reset", "--hard", tested)
+        self.state.update(base_sha=master, predecessor=None,
+                          promotion={"previous_tests": {"head": tested, "verdict": "pass"}})
+        return tested, master
+
+    def promote_cli(self):
+        state_file = self.root / "state.json"
+        state_file.write_text(json.dumps(self.state))
+        result = subprocess.run([sys.executable, str(ROOT / "skills/mm-merge/scripts/mm_merge.py"),
+                                 "--promote", "--state-file", str(state_file)], cwd=self.repo,
+                                text=True, capture_output=True)
+        self.assertIn(result.returncode, (0, 2), result.stderr)
+        return result, json.loads(result.stdout)
+
+    def test_promote_merges_recorded_master_and_prints_tested_diff(self):
+        tested, master = self.prepare()
+        # An even newer local master must not replace the exact recorded base.
+        newer = self.run_git("commit-tree", self.run_git("rev-parse", master + "^{tree}"),
+                             "-p", master, "-m", "Master advances again")
+        self.run_git("update-ref", "refs/heads/master", newer)
+        result, data = self.promote_cli()
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(data["manual_required"])
+        self.assertEqual(self.run_git("rev-list", "--parents", "-n", "1", "HEAD").split()[1:],
+                         [tested, master])
+        self.assertIn("Automerge-Batch: batch-test", self.run_git("log", "-1", "--format=%B"))
+        self.assertEqual(data["diff"]["from"], tested)
+        self.assertEqual(data["diff"]["to"], self.run_git("rev-parse", "HEAD"))
+        self.assertEqual(data["diff"]["changed_paths"],
+                         ["crates/product/Cargo.toml", "crates/product/src/lib.rs"])
+        self.assertEqual(data["diff"]["crates"], ["crates/product"])
+        self.assertTrue(data["fresh_assessment_required"])
+        self.assertNotIn("tree_unchanged", data)
+        self.assertNotIn("evidence_reusable", data)
+        again, retried = self.promote_cli()
+        self.assertEqual(again.returncode, 0)
+        self.assertEqual(retried["head"], data["head"])
+        self.assertEqual(retried["diff"], data["diff"])
+        self.assertTrue(retried["fresh_assessment_required"])
+
+    def test_promote_conflict_preserves_merge_for_manual_resolution(self):
+        tested, master = self.prepare(conflict=True)
+        result, data = self.promote_cli()
+        self.assertEqual(result.returncode, 2)
+        self.assertTrue(data["manual_required"])
+        self.assertTrue(data["fresh_assessment_required"])
+        self.assertTrue(data["diff"]["pending_merge"])
+        self.assertEqual(self.run_git("rev-parse", "MERGE_HEAD"), master)
+        self.assertEqual(self.run_git("rev-parse", "HEAD"), tested)
+        self.assertNotIn("evidence_reusable", data)
+        (self.repo / "marker").write_text("both intents\n")
+        self.run_git("add", "marker")
+        self.run_git("commit", "--no-edit")
+        result, resolved = self.promote_cli()
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(resolved["diff"]["changed_paths"], ["marker"])
+        self.assertTrue(resolved["fresh_assessment_required"])
+
+    def test_promote_same_tree_still_requires_fresh_assessment(self):
+        tested, _ = self.prepare()
+        tree = self.run_git("rev-parse", tested + "^{tree}")
+        master = self.run_git("commit-tree", tree, "-p", self.base, "-m", "Equivalent tree on master")
+        self.state["base_sha"] = master
+        result, data = self.promote_cli()
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(data["diff"]["changed_paths"], [])
+        self.assertTrue(data["fresh_assessment_required"])
+        self.assertNotIn("evidence_reusable", data)
+        self.assertNotIn("tree_unchanged", data)
+
+    def test_promotion_diff_is_bounded_and_unavailable_history_is_explicit(self):
+        tested, _ = self.prepare()
+        for number in range(105):
+            (self.repo / f"extra-{number}").write_text("changed\n")
+        self.run_git("add", ".")
+        self.run_git("commit", "-m", "Many changes")
+        with mock.patch.object(merge, "git", side_effect=lambda *a, **kw: db.git(*a, cwd=self.repo, **kw)):
+            summary = merge.promotion_diff(tested, "HEAD")
+            self.assertEqual(len(summary["changed_paths"]), 100)
+            self.assertEqual(summary["changed_path_count"], 105)
+            self.assertTrue(summary["truncated"])
+            self.assertFalse(merge.promotion_diff("f" * 40, "HEAD")["available"])
+
+    def test_skills_describe_master_base_and_diff_based_promotion(self):
+        for skill in ("mm-merge", "mm-db", "mm-autopr"):
+            with self.subTest(skill=skill):
+                text = " ".join((ROOT / "skills" / skill / "SKILL.md").read_text().split())
+                self.assertIn("captured base is actual master; nothing is shared with", text)
+                if skill == "mm-merge":
+                    self.assertIn("A master merge alone never justifies the full suite", text)
+                else:
+                    self.assertIn("reruns from the diff against the last tested candidate under the validation policy", text)
+                self.assertIn("fresh assessment", text)
+                self.assertIn("re-register the candidate", text)
+                self.assertNotIn("pinned", text)
+                self.assertNotIn("unchanged tree", text)
+
+
 class CompareTests(GitFixture):
     def test_parallel_and_sequential_capture_failures_and_leave_checkout_untouched(self):
         b = self.source(1, "marker", "candidate\n")
@@ -272,6 +384,17 @@ class ExecutionTests(GitFixture):
         result = db.mm_execution.execute(["bash", "-c", "kill -TERM $$"], self.repo, self.root / "signal")
         self.assertEqual(result["status"], "interrupted")
         self.assertEqual(result["exit_code"], -15)
+
+    def test_checks_run_whether_or_not_the_predecessor_is_live(self):
+        # Batch 1d3646f3 on 2026-10-20: its predecessor landed and every check
+        # was refused, so no assessment or handoff could start its promotion.
+        for live in (True, False):
+            client = self.client()
+            client.call.return_value = dict(self.context(),
+                                            predecessor={"batch_id": "parent", "current": live})
+            with mock.patch.object(db.mm_execution, "execute", return_value={"exit_code": 0}) as execute:
+                db.mm_execution.run(client, command=["true"])
+            execute.assert_called_once()
 
     def test_wrapper_refuses_new_checks_after_handoff(self):
         client = self.client()
@@ -419,6 +542,97 @@ class StateTests(unittest.TestCase):
                   "duration_seconds": 1.0, "head_after": head, "tree_after": "c" * 40,
                   "tracked_source_changed": False, "stdout": {"path": "/logs/out"}, "stderr": {"path": "/logs/err"}}
         return dict(result, **changes)
+
+    def predecessor(self):
+        parent = dict(row_for(self.conn))
+        parent.update(batch_id="parent-test", branch="mergemarshall/batch-parent", title="Parent")
+        with self.conn:
+            self.conn.execute("INSERT INTO automerge_batches (" + ",".join(parent) + ") VALUES ("
+                              + ",".join("?" for _ in parent) + ")", tuple(parent.values()))
+            self.conn.execute("UPDATE automerge_batches SET predecessor_id='parent-test' WHERE batch_id='batch-test'")
+
+    def end_predecessor(self):
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal',terminal_status='failed' "
+                              "WHERE batch_id='parent-test'")
+
+    def checkpoint(self, head=HEAD_ONE, **kwargs):
+        with mock.patch.object(mm_service.speculation, "verify_candidate", return_value="c" * 40):
+            return self.call("candidate", revision=self.state()["revision"], head=head, **kwargs)
+
+    def test_publication_waits_only_for_live_predecessor_without_incorporation(self):
+        self.predecessor()
+        self.checkpoint()
+        current = self.assessment()
+        self.assertEqual(current["predecessor"], {"batch_id": "parent-test", "current": True})
+        self.assertEqual(current["role"], "speculative")
+        with self.assertRaisesRegex(ValueError, "predecessor is live"):
+            self.call("publish", revision=current["revision"], head=HEAD_ONE)
+        self.end_predecessor()
+        current = self.state()
+        self.assertEqual(current["predecessor"], {"batch_id": "parent-test", "current": False})
+        # Legacy promotion metadata is no longer a separate publication gate.
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET promotion_json=? WHERE batch_id='batch-test'",
+                              (json.dumps({"stage": "incorporating"}),))
+        publication = {"number": 211, "url": "https://example.invalid/211", "head": HEAD_ONE}
+        with mock.patch.object(mm_service, "reconcile_publication", return_value=publication):
+            published = self.call("publish", revision=self.state()["revision"], head=HEAD_ONE)
+        self.assertEqual(published["publication"], publication)
+
+    def test_candidate_and_withdrawal_retries_ignore_predecessor_liveness(self):
+        self.predecessor()
+        revision = self.state()["revision"]
+        registered = self.checkpoint()["candidate"]
+        self.end_predecessor()
+        with mock.patch.object(mm_service.speculation, "verify_candidate", side_effect=AssertionError("retry verified twice")):
+            retry = self.call("candidate", revision=revision, head=HEAD_ONE)
+        self.assertEqual(retry["candidate"], registered)
+        revision = retry["revision"]
+        withdrawn = self.call("candidate", revision=revision, withdraw=True)
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET status='running',phase='building',terminal_status=NULL "
+                              "WHERE batch_id='parent-test'")
+        self.assertIsNone(self.call("candidate", revision=revision, withdraw=True)["candidate"])
+        self.assertIsNone(withdrawn["candidate"])
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM automerge_skill_events "
+                                           "WHERE kind='candidate_withdrawal'").fetchone()[0], 1)
+
+    def test_ready_retry_ignores_predecessor_liveness_but_keeps_mutation_fence(self):
+        self.predecessor()
+        self.checkpoint()
+        current = self.assessment()
+        with mock.patch.object(automerge, "remote_branch_sha", return_value=HEAD_ONE):
+            ready = self.call("ready", revision=current["revision"], head=HEAD_ONE)["ready"]
+        self.end_predecessor()
+        retry = self.call("ready", revision=current["revision"], head=HEAD_ONE)
+        self.assertEqual(retry["ready"], ready)
+        with self.assertRaisesRegex(ValueError, "handed to supervisor"):
+            self.call("comment", revision=retry["revision"], number=7, body="late mutation")
+
+    def test_post_promotion_head_gets_new_checkpoint_identity_and_fresh_assessment(self):
+        old = self.checkpoint()["candidate"]
+        self.assessment()
+        promotion = {"stage": "incorporating", "old_base": BASE_SHA, "base": "b" * 40,
+                     "old_candidate": old}
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET base_sha=?,promotion_json=? WHERE batch_id='batch-test'",
+                              ("b" * 40, json.dumps(promotion)))
+        current = self.state()
+        self.assertIsNone(current["tests"])
+        with self.assertRaisesRegex(ValueError, "passing assessment"):
+            self.call("publish", revision=current["revision"], head=HEAD_TWO)
+        # Even a same-tree descendant verified by the ancestry service has a new identity.
+        with mock.patch.object(automerge, "compare_commit_ancestry", return_value=True):
+            updated = self.checkpoint(HEAD_TWO)
+        self.assertNotEqual(updated["candidate"]["id"], old["id"])
+        self.assertEqual(updated["candidate"]["tree"], old["tree"])
+        self.assertNotIn("equivalent_heads", updated["candidate"])
+        self.assertEqual(updated["promotion"]["stage"], "incorporated")
+        self.assertIsNone(updated["tests"])
+        assessed = self.call("tests", revision=updated["revision"], head=HEAD_TWO,
+                             verdict="pass", tests="affected checks", baseline="none")
+        self.assertEqual(assessed["tests"]["head"], HEAD_TWO)
 
     def test_execution_intake_is_idempotent_and_preserves_revision_and_assessment(self):
         before = self.assessment()
@@ -679,16 +893,16 @@ class StateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no longer"):
             self.assessment()
 
-    def test_rebuild_cannot_overwrite_an_exclusion_recorded_during_rescan(self):
+    def test_rebuild_cannot_overwrite_an_exclusion_recorded_during_preparation(self):
         original = row_for(self.conn)
 
-        def rescan(**_kwargs):
+        def impact(*_args, **_kwargs):
             automerge._persist_excluded_source_heads(self.conn, original,
                                                      [{"number": 7, "head_sha": HEAD_ONE, "kind": "removed"}])
-            return []
+            return {"mode": "impact"}
 
         with (mock.patch.object(automerge, "_recheck_sources", return_value=([pull(7), pull(8, HEAD_TWO)], [])),
-              mock.patch.object(automerge, "select_eligible_pull_requests", side_effect=rescan)):
+              mock.patch.object(automerge, "_validation_impact", side_effect=impact)):
             with self.assertRaisesRegex(automerge.AutomergeError, "membership changed"):
                 automerge._request_rebuild(self.conn, original, [pull(7), pull(8, HEAD_TWO)], "rebuild")
         self.assertEqual([p["number"] for p in self.state()["sources"]], [8])
@@ -772,6 +986,22 @@ class ClientPublicationTests(GitFixture):
         with mock.patch.object(autopr, "git", side_effect=lambda *a, **kw: db.git(*a, cwd=self.repo, **kw)):
             with self.assertRaisesRegex(ValueError, "exact HEAD"):
                 autopr.publish(client)
+
+    def test_client_blocks_live_predecessor_and_publishes_after_it_ends(self):
+        self.source(1, "one", "one\n")
+        result = self.assemble()
+        self.state.update(tests={"head": result["head"], "verdict": "pass"}, revision="rev",
+                          predecessor={"batch_id": "parent", "current": True})
+        client = mock.Mock()
+        client.call.return_value = self.state
+        with mock.patch.object(autopr, "git", side_effect=AssertionError("must not push")):
+            with self.assertRaisesRegex(ValueError, "predecessor is live"):
+                autopr.publish(client)
+        self.state["predecessor"]["current"] = False
+        client.call.side_effect = [self.state, {"publication": "recorded"}]
+        with mock.patch.object(autopr, "git", side_effect=lambda *a, **kw: db.git(*a, cwd=self.repo, **kw)):
+            autopr.publish(client)
+        client.call.assert_called_with("publish", revision="rev", head=result["head"], notes="")
 
     def test_excluded_head_already_in_the_base_does_not_block_publication(self):
         # Hard-won: batch 4cb9a662 re-selected sources that had just landed in its base.

@@ -270,23 +270,23 @@ class DependencyTests(TestCase):
         self.assertEqual([p.number for p in selected], [50])
         self.assertEqual(automerge.pulls_target(self.conn, selected), 'stabilize/test')
 
-    def test_campaign_selection_is_independent_of_master_priority_and_never_preempts(self):
+    def test_campaign_selection_is_independent_of_master_priority(self):
         self.campaign()
         self.add_pr(50, 'campaign-fix', self.base, base='stabilize/test')
         self.items[40]['labels'] = [{'name': 'mergemarshall:high'}]
         self.assertEqual([p.number for p in self.selected()], [40])
         self.assertEqual([p.number for p in self.selected('stabilize/test')], [50])
         self.items[40]['labels'] = [{'name': 'mergemarshall:immediate'}]
-        self.assertEqual([p.number for p in self.selected()], [40])
+        self.assertEqual([p.number for p in self.selected()], [30, 20, 10])
         self.items[50]['labels'] = [{'name': 'mergemarshall:immediate'}]
-        priority = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True)
+        priority = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True, immediate_only=True)
         self.assertEqual([p.number for p in priority], [40])
         self.items[40]['labels'] = []
         selected = self.selected('stabilize/test')
         batch = automerge.create_batch(self.conn, [automerge.dependency_pull(
             automerge.dependency_graph(self.conn), 40)], self.base)
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
-        self.assertIsNone(automerge._priority_preemption_target(row, selected))
+        self.assertEqual([p.number for p in selected], [50])
 
     def test_campaign_lane_includes_all_ready_heads_regardless_of_priority_labels(self):
         self.campaign()
@@ -297,9 +297,9 @@ class DependencyTests(TestCase):
         batch = automerge.create_batch(self.conn, self.selected('stabilize/test'), self.base)
         self.add_pr(52, 'campaign-third', self.base, base='stabilize/test')
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
-        self.assertTrue(automerge._request_rebuild(self.conn, row, automerge.row_pulls(row), 'expand', only_if_expanded=True))
+        self.assertFalse(automerge._request_rebuild(self.conn, row, automerge.row_pulls(row), 'expand', only_if_expanded=True))
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
-        self.assertEqual([p.number for p in automerge.row_pulls(row)], [50, 51, 52])
+        self.assertEqual([p.number for p in automerge.row_pulls(row)], [50, 51])
 
     def test_finished_campaign_is_quiet_and_visible_as_an_exclusion(self):
         self.campaign(status='aborted')
@@ -352,7 +352,7 @@ class DependencyTests(TestCase):
         self.assertEqual([p.number for p in selected], [50])
         self.assertNotIn(60, {d.number for d in selected[0].dependencies})
 
-    def test_campaign_expansion_respects_gate_and_target(self):
+    def test_campaign_rebuild_does_not_admit_arrivals_when_gate_changes(self):
         self.campaign()
         self.add_pr(50, 'campaign-first', self.base, base='stabilize/test')
         selected = self.selected('stabilize/test')
@@ -364,9 +364,9 @@ class DependencyTests(TestCase):
         self.assertFalse(automerge._request_rebuild(self.conn, row, selected, 'expand', only_if_expanded=True))
         with self.conn:
             self.conn.execute("UPDATE stabilize_issues SET state='pr_ready'")
-        self.assertTrue(automerge._request_rebuild(self.conn, row, selected, 'expand', only_if_expanded=True))
+        self.assertFalse(automerge._request_rebuild(self.conn, row, selected, 'expand', only_if_expanded=True))
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
-        self.assertEqual([p.number for p in automerge.row_pulls(row)], [50, 51])
+        self.assertEqual([p.number for p in automerge.row_pulls(row)], [50])
         self.assertEqual(row['target_ref'], 'stabilize/test')
 
     def gate_repair_fixture(self):
@@ -491,7 +491,7 @@ class DependencyTests(TestCase):
 
     def test_priority_discovery_omits_unrelated_ready_prs(self):
         self.items[20]['labels'] = [{'name': 'mergemarshall:immediate'}]
-        selected = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True)
+        selected = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True, immediate_only=True)
         self.assertEqual([p.number for p in selected], [30, 20])
 
     def test_successful_pairs_survive_an_interrupted_discovery(self):
@@ -840,8 +840,8 @@ class DependencyTests(TestCase):
             speculation.launch_child(automerge, self.conn, row)
             speculation.launch_child(automerge, self.conn, row)
         child = speculation.child(self.conn, identifier)
-        self.assertEqual([p.number for p in automerge.row_pulls(child)], [20, 10, 40])
-        self.assertEqual(child['base_sha'], self.x)
+        self.assertEqual([p.number for p in automerge.row_pulls(child)], [40])
+        self.assertEqual(child['base_sha'], self.base)
         self.assertEqual(child['ci_mode'], 'async')
         self.assertEqual(self.git('rev-parse', 'master'), before)
         self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM automerge_batches').fetchone()[0], 2)
@@ -911,16 +911,19 @@ class DependencyTests(TestCase):
         self.items[10]['head']['sha'] = self.git('rev-parse', 'HEAD')
         self.assertEqual([p.number for p in self.selected()], [30, 20, 10, 40])
 
-    def test_priority_lane_includes_ordinary_prerequisite_closure(self):
-        for label in ['mergemarshall:high', 'mergemarshall:immediate']:
-            with self.subTest(label=label):
+    def test_priority_lanes_include_ordinary_prerequisite_closure(self):
+        for immediate in (False, True):
+            with self.subTest(immediate=immediate):
+                label = 'mergemarshall:immediate' if immediate else 'mergemarshall:high'
                 self.items[20]['labels'] = [{'name': label}]
-                selected = self.selected()
+                selected = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True,
+                                                                   immediate_only=immediate)
                 self.assertEqual([p.number for p in selected], [30, 20])
                 self.assertFalse(selected[0].priority)
                 self.assertTrue(selected[1].priority)
                 self.reject(30)
-                self.assertEqual([p.number for p in self.selected()], [40])
+                self.assertEqual(automerge.select_eligible_pull_requests(
+                    conn=self.conn, priority_only=True, immediate_only=immediate), [])
                 self.conn.execute('DELETE FROM automerge_github_outbox')
                 self.conn.commit()
 
@@ -930,17 +933,47 @@ class DependencyTests(TestCase):
         self.assertNotIn(20, [p.number for p in self.selected()])
         self.assertTrue(any('ambiguous' in item['reason'] for item in automerge.DEPENDENCY_BLOCKS))
 
-    def test_immediate_preemption_requires_eligible_dependency_closure(self):
+    def test_ordinary_dependent_of_immediate_waits_for_landing(self):
+        self.items[30]['labels'] = [{'name': 'mergemarshall:immediate'}]
+        self.assertEqual([p.number for p in self.selected()], [40])
+        urgent = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True, immediate_only=True)
+        self.assertEqual([p.number for p in urgent], [30])
+        batch = automerge.create_batch(self.conn, urgent, self.base, lane='immediate')
+        self.assertEqual([p.number for p in self.selected()], [40])
+        self.assertEqual(automerge.select_eligible_pull_requests(
+            conn=self.conn, priority_only=True, immediate_only=True), [])
+        self.git('checkout', '-q', 'master')
+        self.git('merge', '-q', '--no-ff', '-m', 'land immediate', self.x)
+        self.items[30].update(state='closed', merged_at='now')
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal' WHERE batch_id=?", (batch,))
+        self.assertEqual([p.number for p in self.selected()], [20, 10, 40])
+
+    def test_immediate_only_discovery_omits_unrelated_high_roots_and_reads(self):
         self.items[20]['labels'] = [{'name': 'mergemarshall:immediate'}]
-        batch = automerge.create_batch(self.conn, [automerge.PullRequest(40, 'w', self.w, 'url')], self.base)
-        row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
-        with mock.patch.object(automerge, '_complete_abort') as abort:
-            self.assertTrue(automerge.preempt_batch_for_priority(self.conn, monitor.SlackTransport('chat'), row, self.selected()))
-            abort.assert_called_once()
+        self.items[40]['labels'] = [{'name': 'mergemarshall:high'}]
+        def comments(number):
+            self.assertNotEqual(number, 40)
+            return []
+        with mock.patch.object(automerge, 'list_pull_comments', side_effect=comments):
+            selected = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True, immediate_only=True)
+        self.assertEqual([p.number for p in selected], [30, 20])
+        self.assertEqual([p.number for p in self.selected()], [40])
+
+    def test_reserved_high_root_does_not_hide_other_eligible_ordinary_work(self):
+        self.items[40]['labels'] = [{'name': 'mergemarshall:high'}]
+        selected = self.selected()
+        self.assertEqual([p.number for p in selected], [40])
+        automerge.create_batch(self.conn, selected, self.base)
+        self.assertEqual([p.number for p in self.selected()], [30, 20, 10])
+
+    def test_immediate_slot_requires_eligible_dependency_closure(self):
+        self.items[20]['labels'] = [{'name': 'mergemarshall:immediate'}]
+        selected = automerge.select_eligible_pull_requests(conn=self.conn, priority_only=True, immediate_only=True)
+        self.assertEqual([p.number for p in selected], [30, 20])
         self.reject(30)
-        with mock.patch.object(automerge, '_complete_abort') as abort:
-            self.assertFalse(automerge.preempt_batch_for_priority(self.conn, monitor.SlackTransport('chat'), row, self.selected()))
-            abort.assert_not_called()
+        self.assertEqual(automerge.select_eligible_pull_requests(
+            conn=self.conn, priority_only=True, immediate_only=True), [])
 
     def test_retargeting_and_restart_do_not_erase_captured_prerequisite(self):
         self.selected()
@@ -1098,6 +1131,30 @@ class DependencyTests(TestCase):
         self.assertEqual((payload['base_ref'], payload['target_ref']), ('flip-batch', 'master'))
         master = self.git('rev-parse', 'master')
         self.assertTrue(all(self.ancestor(dep['head_sha'], master) for dep in payload['dependencies']))
+
+    def test_landed_inherited_prerequisites_do_not_retarget_unlanded_absorbed_work(self):
+        """PR #5110 on 2026-10-20: retargeted while closed base #4775 was unlanded."""
+        self.patch(automerge, 'SUPERVISOR_RUNNING', False)
+        self.items = {}
+        inherited = self.add_pr(4676, 'pack-contract', self.base)
+        self.add_pr(4775, 'preparation', inherited, base='pack-contract')
+        stacked = self.add_pr(5110, 'activation-receipts', self.items[4775]['head']['sha'],
+                              base='preparation')
+        automerge.dependency_graph(self.conn, promote=False)  # captures 4775's edge to 4676
+        self.git('checkout', '-q', 'master')
+        self.git('merge', '-q', '--no-ff', '-m', 'land 4676', inherited)
+        self.items[4676].update(state='closed', merged_at='now')
+        self.items[4775]['state'] = 'closed'
+        graph = automerge.dependency_graph(self.conn)
+        self.assertEqual({dep.number for dep in graph.absorbed[5110]}, {4775})
+        self.assertTrue(all(graph.landed(dep.head_sha, 5110) for dep in graph.dependencies[5110]))
+        self.assertIsNone(self.conn.execute("SELECT 1 FROM automerge_github_outbox "
+                                            "WHERE kind='promote_dependency' AND number=5110").fetchone())
+        self.git('merge', '-q', '--no-ff', '-m', 'land 5110', stacked)
+        automerge.dependency_graph(self.conn)
+        row = self.conn.execute("SELECT payload_json FROM automerge_github_outbox "
+                                "WHERE kind='promote_dependency' AND number=5110").fetchone()
+        self.assertEqual(json.loads(row['payload_json'])['base_ref'], 'preparation')
 
     def test_reviewed_supersession_replaces_exact_retired_head_and_keeps_external_edges(self):
         record = self.reviewed_pair()
@@ -1348,6 +1405,8 @@ class DependencyTests(TestCase):
 
     def test_gate_satisfied_repair_is_not_reinterpreted_as_unmerged_supersession(self):
         row, rejected, _, landed = self.gate_repair_fixture()
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET status='completed',phase='terminal'")
         record = pr_dependencies.ReviewedSupersession(automerge.REPO_NAME, 50, rejected, 60, landed)
         with self.conn:
             self.conn.execute('INSERT INTO automerge_pr_dependencies VALUES (60,?,50,?)', (landed, rejected))
@@ -1396,10 +1455,9 @@ class DependencyTests(TestCase):
         with (mock.patch.object(pr_dependencies, 'REVIEWED_SUPERSESSIONS', (record,)),
               mock.patch.object(automerge, 'list_pull_comments', return_value=[]) as reads):
             selected = speculation.selection(automerge, self.conn, row)
-        self.assertEqual([p.number for p in selected], [record.replacement_number, 20])
-        self.assertTrue(all(p.target_ref == 'master' for p in selected))
-        # The speculative view derives from this same discovery and shares
-        # its authenticated proof without another pair of comment requests.
+        self.assertEqual(selected, [])
+        # Both otherwise eligible heads require reserved PR #40 to land.
+        # Supersession is still authenticated once within actual-master discovery.
         self.assertEqual(reads.call_args_list,
                          [mock.call(record.retired_number), mock.call(record.replacement_number)])
 
@@ -1416,24 +1474,24 @@ class DependencyTests(TestCase):
                          {30: 'rejected', 20: 'blocked', 10: 'blocked'})
         self.assertEqual([r[0] for r in self.conn.execute("SELECT number FROM automerge_github_outbox WHERE kind='reject_head'")], [30])
 
-    def test_expansion_includes_priority_prerequisite_and_rejects_orphaned_arrival(self):
+    def test_rebuild_does_not_admit_priority_arrivals_or_orphaned_dependencies(self):
         batch = automerge.create_batch(self.conn, [automerge.PullRequest(40, 'w', self.w, 'url', priority=True)],
                                       self.base, batch_id='expansion')
         self.items[20]['labels'] = [{'name': 'mergemarshall:high'}]
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
         self.assertTrue(automerge._request_rebuild(self.conn, row, automerge.row_pulls(row), 'new arrivals'))
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
-        self.assertEqual([p.number for p in automerge.row_pulls(row)], [40, 30, 20])
-        self.assertEqual(row['expansion_count'], 1)
+        self.assertEqual([p.number for p in automerge.row_pulls(row)], [40])
+        self.assertEqual(row['expansion_count'], 0)
         automerge._persist_excluded_source_heads(self.conn, row, [{'number': 30, 'head_sha': self.x, 'kind': 'removed'}])
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
         self.items[10]['labels'] = [{'name': 'mergemarshall:high'}]
         self.assertTrue(automerge._request_rebuild(self.conn, row, automerge.row_pulls(row), 'removed prerequisite'))
         row = self.conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch,)).fetchone()
         self.assertEqual([p.number for p in automerge.row_pulls(row)], [40])
-        self.assertEqual(row['expansion_count'], 1)
+        self.assertEqual(row['expansion_count'], 0)
 
-    def test_expansion_limit_does_not_admit_a_new_dependency_after_three_rescans(self):
+    def test_rebuild_does_not_admit_arrivals_for_historical_expansion_count(self):
         batch = automerge.create_batch(self.conn, [automerge.PullRequest(40, 'w', self.w, 'url')], self.base)
         self.conn.execute('UPDATE automerge_batches SET expansion_count=3 WHERE batch_id=?', (batch,))
         self.conn.commit()

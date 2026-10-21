@@ -45,8 +45,8 @@ Configure Mjolnir's `CI` workspace, `bifrost` bundle, and the `podman` and
 session uses Opus (`opus`) at high effort on `bedrock-podman`, with straightforward
 DeepSeek Flash (`deepseek-flash`) subagents at high effort and no subtle
 subagents, including campaign batches and speculative successors. Each batch
-retains its configuration through expansion and recovery. Existing live sessions
-keep their model and delegation settings. Opus merger sessions still move
+retains its configuration through membership changes and recovery. Existing live
+sessions keep their model and delegation settings. Opus merger sessions still move
 automatically to DeepSeek Flash after two consecutive Bedrock 503 provider
 errors, retaining the session, container, work, validation evidence and
 delegation. Successful agent or tool progress resets the error count. A threaded
@@ -75,8 +75,9 @@ dependencies. Refresh the host's image cache after an image update:
 podman pull ghcr.io/brokkai/mjolnir/agent-dev:latest
 ```
 
-Bifrost validation also requires Go. The upstream image and a separately pinned
-Bedrock image may omit it; installing it in one session does not update future
+Bifrost validation also requires Go and ShellCheck for the workflow script
+checks. The upstream image and a separately pinned Bedrock image may omit
+them; installing them in one session does not update future
 sessions. Build the CI prerequisite layer for each target's actual image:
 
 ```sh
@@ -85,7 +86,7 @@ podman build --pull=never -f containers/Containerfile.ci-tools \
   --build-arg BASE_IMAGE=INSPECTED_IMAGE_ID --build-arg BASE_USER=INSPECTED_USER \
   -t localhost/mergemarshall-ci:DESCRIPTIVE_TAG .
 podman run --rm --network=none localhost/mergemarshall-ci:DESCRIPTIVE_TAG \
-  bash -lc 'go version && go env GOROOT && command -v gofmt'
+  bash -lc 'go version && go env GOROOT && command -v gofmt && shellcheck --version'
 ```
 
 Set the corresponding target's `image` in Mjolnir's `config.toml` to the verified
@@ -93,10 +94,12 @@ tag, retaining a private backup of the original configuration. Repeat for both
 `podman` and `bedrock-podman`; refreshing only the upstream image does not update
 the separate Bedrock image. New sessions use the new image. Preserve active
 sessions and coordinate repairs with their owners: the same checksum-verified
-`scripts/install-ci-go.sh` can run as container root at a validation boundary.
+`scripts/install-ci-go.sh` and `scripts/install-ci-shellcheck.sh` can run as
+container root at a validation boundary. Both refuse to replace another
+installation and are safe to repeat offline once installed.
 Recheck affected tests afterward; earlier missing-tool results remain evidence
 of the earlier environment.
-Keep AWS configuration and credentials out of the common image; the Go layer
+Keep AWS configuration and credentials out of the common image; the tools layer
 does not copy either. Bedrock-specific authentication stays separate.
 
 Default executable paths are `~/.cargo/bin/mj` and `/usr/bin/gh`. Override
@@ -117,7 +120,7 @@ Create these repository labels: `ci-fix`, `buildfailure`, `agent-in-progress`,
 `mergemarshall:immediate`, and `known-ci-failures`.
 
 MergeMarshall creates and manages `mergemarshall:in-progress` automatically.
-It marks source PRs selected for a batch (including expansions and direct
+It marks source PRs selected for a batch (including membership changes and direct
 landing), then removes the label when they leave the batch or the batch ends.
 Updates are asynchronous and retry after GitHub outages; the label is
 informational and never gates a merge. The labels listed above require initial setup.
@@ -362,37 +365,39 @@ to upload the saved result without rerunning the check. Recording does not chang
 test selection or merge policy, and older assessments remain accepted.
 
 The scheduler permits one speculative successor while the foreground batch
-validates. It starts from the foreground's pushed candidate and owns only newly
-selected PRs. `python3 automerge.py --check` shows the candidate, successor and
-recovery generation. A successor publishes and lands only after promotion,
-incorporating the actual landed base and recording a fresh assessment. Both CI
-modes use this lifecycle.
+validates, once the foreground has checkpointed a candidate. The successor
+starts from a fresh read of master, not from the foreground's candidate, and
+owns only newly selected PRs; a PR whose prerequisite is in a live batch waits
+for it to land. `python3 automerge.py --check` shows every slot. A successor
+records readiness and does not publish while its predecessor is live. Nothing
+the predecessor does (ejection, rebuild, candidate withdrawal, failed tests or
+abort) restarts or aborts the successor.
 
-When the foreground lands, its successor becomes primary immediately and keeps
-any running checks. Promotion opens a new top-level Slack thread for the primary
-batch; subsequent progress and its outcome appear there. The speculative thread
-retains the earlier history. Its checkpoint can start a new speculative successor before
-validation finishes. After a passing handoff it incorporates the landed merge
-commit and records a fresh assessment; unchanged trees can reuse applicable
-evidence and preserve the next successor's work.
+When the predecessor ends, landed or not, the successor becomes primary
+immediately and keeps any running checks. Promotion opens a new top-level Slack
+thread for the primary batch; subsequent progress and its outcome appear there.
+The speculative thread retains the earlier history. If master moved, the
+supervisor sends the agent an `mm-merge --promote` instruction in the same
+session, without interrupting it and without waiting for its validation to
+finish. The agent merges current master, chooses reruns from the diff, and
+records a fresh assessment. If master did not move, there is no extra step. The
+promoted batch's checkpoint can start the next successor.
 
-If the predecessor changes, the supervisor stops the successor's work, clears
-its native conversation, and sends a generated restart brief in the same
-session/container. Its helper saves pending source work and the old tip in the
-Git directory; caches, logs and reviewed rerere resolutions remain available.
-No agent-written handoff is required. Set `BIFROST_CI_SPECULATIVE_LOOKAHEAD=0`
-in the cron environment to disable new successors; existing ones still finish
-or recover. Lookahead requires mj's prompt command IDs and `clear-queue` API;
-missing controls leave selection pending rather than starting an unrecoverable
-successor. Existing sessions acquire lookahead only when they checkpoint a
-candidate.
+Set `BIFROST_CI_SPECULATIVE_LOOKAHEAD=0` in the cron environment to disable new
+successors; existing ones still finish. Lookahead requires mj's prompt command
+IDs and `clear-queue` API; missing controls leave selection pending rather than
+starting an unrecoverable successor. A successor deployed under the older
+candidate-based design is reset once onto master in its existing session.
 
 ### Prioritize, fast-track, or abort
 
-Apply `mergemarshall:high` to enter the next priority batch after current work
-finishes. `mergemarshall:immediate` aborts active work before landing, then
-selects all eligible high/immediate PRs. A batch already merging or carrying
-a success verdict finishes first. `mergemarshall-priority:high` and
+Apply `mergemarshall:high` to enter the next ordinary batch after current work
+finishes; while any high PR is ready, that batch admits only high PRs and their
+prerequisites. `mergemarshall:immediate` runs in its own lane alongside the
+ordinary batches: one immediate batch at a time admits all eligible immediate
+PRs and their prerequisites, never has a successor, and never aborts other work.
+Ordinary batches merge the landed result when they reach it. A PR already in a
+live batch stays there when relabeled. `mergemarshall-priority:high` and
 `mergemarshall-priority:immediate` are aliases; the old
 `mergemarshall-priority` label counts as high. `ci-fix` alone is not priority.
 Draft and rejected heads remain ineligible.
@@ -418,8 +423,9 @@ python3 automerge.py --abort-batch <batch-id> --reason 'Operator intervention: .
 Abort interrupts/suspends the agent, closes the integration PR, records a
 failure verdict, and leaves the branch for inspection. It rejects no source
 PRs. Established exact-head rejections remain recorded and their delivery is
-retried; other source heads become eligible again. Aborting a predecessor also
-aborts its speculative successor. For a direct attempt, the source PR stays open.
+retried; other source heads become eligible again. Aborting a predecessor does
+not abort its speculative successor, which becomes primary. For a direct
+attempt, the source PR stays open.
 
 If suspension fails, the terminal batch retains its cleanup request and the
 original session. The supervisor continues checking for completion; retries of

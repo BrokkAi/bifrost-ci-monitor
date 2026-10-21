@@ -12,8 +12,8 @@ from mm_db import Client, git
 
 def publish(client, *, rebuild=False, notes=""):
     state = client.call("state")
-    if state.get("predecessor"):
-        raise ValueError("publication is blocked until the predecessor lands and the supervisor promotes this batch")
+    if state.get("predecessor") and state["predecessor"]["current"]:
+        raise ValueError("publication is blocked while the predecessor is live")
     branch = state["branch"]
     if git("branch", "--show-current").stdout.strip() != branch:
         raise ValueError("not on the recorded integration branch")

@@ -42,12 +42,13 @@ def snapshot(row):
     return {key: digest(row[key]) if key.endswith('_json') else row[key] for key in (
         'status', 'phase', 'attempt_generation', 'pull_requests_json', 'active_pull_requests_json',
         'excluded_source_heads_json',
-        'base_sha', 'target_ref', 'session_id', 'predecessor_id', 'role_promoted', 'candidate_json',
+        'base_sha', 'target_ref', 'lane', 'session_id', 'predecessor_id', 'role_promoted', 'candidate_json',
         'ready_json', 'prompt_command_id', 'prompt_delivered', 'recovery_json',
         'integration_pr_number', 'terminal_status')}
 
 
-def plan(a, conn, *, priority_checked, queue_checked, maintenance_done, reconciled, campaign_checked=False):
+def plan(a, conn, *, priority_checked, queue_checked, maintenance_done, reconciled,
+         campaign_checked=False, immediate_pending=False, high_pending=False):
     actions = []
     primary = a.active_batch(conn)
     rows = conn.execute("SELECT * FROM automerge_batches WHERE status IN ('launching','running','finishing') "
@@ -61,8 +62,9 @@ def plan(a, conn, *, priority_checked, queue_checked, maintenance_done, reconcil
         if row is not None:
             if a.batch_target(row) != a.BASE_BRANCH:
                 priority += 70
-            elif speculation.is_speculative(row) and priority > 8:
-                priority += 40
+            elif priority > 8:
+                priority += (-10 if a.batch_lane(row) == 'immediate' else
+                             40 if speculation.is_speculative(row) else 10)
         actions.append((priority, identifier, kind, owner, inputs))
 
     for row in rows:
@@ -80,7 +82,7 @@ def plan(a, conn, *, priority_checked, queue_checked, maintenance_done, reconcil
         # Message acceptance is independent of queue discovery and turn idleness.
         if row['session_id'] and row['pending_prompt'] and not row['prompt_delivered']:
             add(2, 'deliver_guidance', row)
-        if row['predecessor_id'] and not row['role_promoted']:
+        if row['predecessor_id'] or row['role_promoted']:
             parent = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?',
                                   (row['predecessor_id'],)).fetchone()
             add(15, 'reconcile_predecessor', row,
@@ -93,9 +95,14 @@ def plan(a, conn, *, priority_checked, queue_checked, maintenance_done, reconcil
                 'advance_batch', row)
     if not priority_checked:
         add(8, 'check_priority')
+    if immediate_pending and a.active_immediate_batch(conn) is None:
+        add(9, 'select_immediate')
+    if high_pending:
+        add(45, 'check_high_priority')
     if primary is None and not queue_checked:
-        add(40, 'select_primary')
+        add(50, 'select_primary')
     if (primary is not None and a.batch_target(primary) == a.BASE_BRANCH
+            and a.batch_lane(primary) != 'immediate'
             and a.SPECULATIVE_LOOKAHEAD and speculation.candidate(a, primary)):
         if speculation.child(conn, primary['batch_id']) is None:
             add(50, 'select_successor', primary)
@@ -133,6 +140,8 @@ def queue_groups(a, conn, *, master_only=False) -> dict[str, list[tuple[int, str
 
 
 def idle_summary(a, conn, transport):
+    if a.active_immediate_batch(conn) is not None:
+        return
     if transport.kind != 'chat':
         a.log('idle PR summary needs the threaded Slack chat transport')
         return
@@ -191,6 +200,7 @@ def run(a, conn, transport):
     deferred = set()
     priority_checked = queue_checked = campaign_checked = maintenance_done = False
     priority_dependencies_checked = False
+    immediate_pending = high_pending = False
     served = set()
     priority_pulls = []
     priority_action = None
@@ -201,7 +211,8 @@ def run(a, conn, transport):
             break
         options = plan(a, conn, priority_checked=priority_checked, queue_checked=queue_checked,
                        maintenance_done=maintenance_done, reconciled=reconciled,
-                       campaign_checked=campaign_checked)
+                       campaign_checked=campaign_checked, immediate_pending=immediate_pending,
+                       high_pending=high_pending)
         wanted = {item[1] for item in options}
         with conn:
             for _, identifier, kind, owner, inputs in options:
@@ -212,8 +223,6 @@ def run(a, conn, transport):
                 if old[0] not in wanted:
                     conn.execute("UPDATE automerge_supervisor_actions SET status='obsolete',updated_at=? WHERE action_id=?",
                                  (a.utc_now(), old[0]))
-        if not priority_checked:
-            options = [item for item in options if item[0] <= 8 or item[0] >= 70]
         selected = next((item for item in options if item[1] not in attempted and
                          conn.execute('SELECT next_attempt_at FROM automerge_supervisor_actions WHERE action_id=?',
                                       (item[1],)).fetchone()[0] <= time.time()), None)
@@ -236,15 +245,15 @@ def run(a, conn, transport):
         outer_deadline = a.OBSERVATION_DEADLINE
         token = None
         budget_owner = owner
-        if kind in {'check_priority', 'select_primary'}:
+        if kind in {'check_high_priority', 'select_primary'}:
             primary = a.active_batch(conn)
             budget_owner = primary['batch_id'] if primary is not None else '__master_queue__'
-        if outer_deadline is not None and a.active_campaign_batch(conn) is not None:
-            # With no campaign batch, preserve HEAD's entire remaining master
-            # budget. A real campaign reserves only the next observation slice
-            # for each other unserved batch. Unused time is immediately reusable.
-            waiting = {r[0] for r in conn.execute(
-                "SELECT batch_id FROM automerge_batches WHERE status IN ('launching','running','finishing')")}
+        live = {r[0] for r in conn.execute(
+            "SELECT batch_id FROM automerge_batches WHERE status IN ('launching','running','finishing')")}
+        if outer_deadline is not None and len(live) > 1:
+            # Every other unserved row retains one observation/command slice.
+            # This applies equally to immediate, primary, successor and campaign.
+            waiting = set(live)
             waiting.difference_update(served | {budget_owner})
             remaining = max(0, outer_deadline - time.monotonic())
             reserve = (UNSERVED_BATCH_SECONDS if budget_owner in served else
@@ -264,40 +273,46 @@ def run(a, conn, transport):
                 merge_failover.advance(a, conn, row)
             elif kind == 'check_priority':
                 priority_action = identifier
-                # One cheap listing avoids global discovery on an ordinary tick.
-                if any(a._priority_flags(a._labels(item))[0] for item in a.list_open_pull_requests()
-                       if not a._is_integration_pull(item)):
-                    priority_pulls = a.select_eligible_pull_requests(conn=conn, priority_only=True)
-                    # Checkpoint notices now, but keep their network delivery
-                    # after batch advancement in this poll.
-                    a.report_dependency_blocks(conn, transport, deliver=False)
-                    priority_dependencies_checked = True
-                    campaign = a.active_campaign_batch(conn)
-                    if campaign is not None:
-                        priority_pulls = a.unreserved_pulls(priority_pulls, {p.number for p in a._active_sources(campaign)})
-                primary = a.active_batch(conn)
-                if primary is not None:
-                    a.preempt_batch_for_priority(conn, transport, primary, priority_pulls)
+                # Cheap label discovery never fences another lane's advancement.
+                flags = [a._priority_flags(a._labels(item)) for item in a.list_open_pull_requests()
+                         if not a._is_integration_pull(item)]
+                immediate_pending = any(immediate for _, immediate in flags)
+                high_pending = any(high and not immediate for high, immediate in flags)
                 priority_checked = True
+            elif kind == 'select_immediate':
+                # Discover only immediate roots, reuse that exact validated
+                # closure for admission, and leave unrelated high reads separate.
+                pulls = a.select_eligible_pull_requests(conn=conn, priority_only=True, immediate_only=True)
+                pulls = a.unreserved_pulls(pulls, speculation.reserved(a, conn))
+                a.report_dependency_blocks(conn, transport, deliver=False)
+                priority_dependencies_checked = True
+                if pulls and a.active_immediate_batch(conn) is None:
+                    a.create_selected_batch(conn, pulls, a.current_master_sha(), lane='immediate')
+                immediate_pending = False
+            elif kind == 'check_high_priority':
+                priority_pulls = a.select_eligible_pull_requests(conn=conn, priority_only=True)
+                priority_pulls = a.unreserved_pulls(priority_pulls, speculation.reserved(a, conn))
+                a.report_dependency_blocks(conn, transport, deliver=False)
+                priority_dependencies_checked = True
+                high_pending = False
             elif kind == 'reconcile_predecessor':
                 if speculation.reconcile(a, conn, transport, row, priority_pulls=priority_pulls):
                     reconciled.add(owner)
             elif kind == 'advance_batch':
-                if speculation.is_speculative(row) and row['phase'] == 'waiting_parent':
+                if (speculation.is_speculative(row) and row['phase'] == 'waiting_parent'
+                        and speculation.parent_current(a, conn, row)):
                     speculation.recheck_waiting(a, conn, transport, row)
                 else:
                     a.process_batch(conn, transport, owner)
             elif kind == 'select_primary':
                 occupied = speculation.reserved(a, conn)
-                # Priority discovery already validated its dependency closure in
-                # this tick. Full discovery selects those same priority seeds;
-                # unrelated history must not delay admission after preemption.
+                # Reuse the ordinary high closure validated in this tick.
                 pulls = a.unreserved_pulls(
                     priority_pulls or a.select_eligible_pull_requests(conn=conn), occupied)
                 a.report_dependency_blocks(conn, transport)
                 if pulls:
                     a.create_selected_batch(conn, pulls, a.target_sha(a.pulls_target(conn, pulls)))
-                else:
+                elif a.active_immediate_batch(conn) is None:
                     idle_summary(a, conn, transport)
                 queue_checked = True
             elif kind == 'select_campaign':
@@ -357,7 +372,11 @@ def run(a, conn, transport):
                     # and unreserved. Recheck before reconcile/selection reuse it.
                     priority_pulls = []
                     priority_checked = False
+                    immediate_pending = high_pending = False
                     attempted.discard(priority_action)
+                    for action in conn.execute("SELECT action_id FROM automerge_supervisor_actions "
+                                               "WHERE kind IN ('select_immediate','check_high_priority','reconcile_predecessor')"):
+                        attempted.discard(action[0])
             a.OBSERVATION_DEADLINE = outer_deadline
             if token is not None:
                 read_budget.deadline.reset(token)

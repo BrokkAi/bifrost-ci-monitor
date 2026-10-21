@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -89,7 +89,7 @@ LOCAL_GATE_MARKER = re.compile(r"(?mi)^(?:mergemarshall:local|automerge-local):\
 INTERRUPTION_GRACE_SECONDS = 60
 AMBIGUOUS_LAUNCH_GRACE_SECONDS = 10 * 60
 MAX_CI_ROUNDS = 4
-MAX_BATCH_EXPANSIONS = 3
+MAX_BATCH_EXPANSIONS = 0
 CI_WORKFLOW = "ci.yml"
 # Async batches land before most of ci.yml finishes, but not before this job:
 # it holds Bifrost's open-core classification and projection dry run, which
@@ -947,13 +947,12 @@ def _verify_supersession_rejections(conn, retired, replacement, compare):
 
 
 def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roots=None,
-                     persist_comparisons=None, priority_only=False, selection_target=None):
+                     persist_comparisons=None, priority_only=False, immediate_only=False, selection_target=None):
     """Refresh open heads and durable prerequisites, then verify their ancestry."""
     if conn is not None and (not dry_run or persist_comparisons):
         with conn:
             pr_dependencies.ensure_schema(conn)
-    scoped = (selection_target is not None or roots is not None
-              and bool(lane_discovery_scope(conn, BASE_BRANCH)))
+    scoped = priority_only or immediate_only or selection_target is not None or roots is not None
     cached = pr_dependencies.inventory(conn)
     items = {int(p['number']): p for p in list_open_pull_requests() if not _is_integration_pull(p)}
     supersessions = tuple(record for record in pr_dependencies.REVIEWED_SUPERSESSIONS
@@ -1012,8 +1011,9 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
                                  '_mm_metadata_missing': True}
     nodes = {number: _dependency_node(item, conn=conn, dry_run=dry_run, read_ready=not scoped)
              for number, item in items.items() if not _is_integration_pull(item)}
-    if priority_only:
-        roots = [number for number, node in nodes.items() if node.priority]
+    if priority_only or immediate_only:
+        roots = [number for number, node in nodes.items()
+                 if (node.immediate if immediate_only else node.priority and not node.immediate)]
     # A non-master base may point to a closed PR never observed by this host.
     searched = set()
     def discover_bases(numbers):
@@ -1069,7 +1069,8 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
     if selection_target is not None:
         roots = [n for n, node in nodes.items() if targets[n][0] == selection_target
                  and (not scoped or str(node.data.get('state')).lower() == 'open')
-                 and (not priority_only or node.priority)]
+                 and (selection_target != BASE_BRANCH or (node.immediate if immediate_only else
+                      not node.immediate and (not priority_only or node.priority)))]
     if SUPERVISOR_RUNNING:
         # Fetch live tips together. Their full commit history usually contains
         # almost every historical head, without downloading repository blobs.
@@ -1155,7 +1156,7 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
             conn, nodes, actual_base, selection_target=target_scope)
         graph = build()
     graph.exclusions = exclusions
-    graph.select(priority=False, target_ref=selection_target)  # Establish lane-local block reasons.
+    graph.select(priority=False, target_ref=selection_target, immediate_only=immediate_only)  # Establish lane-local block reasons.
     if conn is not None and not dry_run:
         with conn:
             pr_dependencies.ensure_schema(conn)
@@ -1172,10 +1173,13 @@ def dependency_graph(conn=None, *, dry_run=False, master=None, promote=True, roo
                 deps = graph.dependencies[number]
                 # A stacked PR that absorbed a closed base PR is promoted here
                 # too, once its own head lands: the absorbed heads are then
-                # landed prerequisites.
+                # landed prerequisites. Absorption replaces their edges with
+                # inherited ones that may already have landed (#5110), so
+                # check its own head explicitly.
                 if (promote and node.base != graph.target(number)[0] and str(node.data.get('state')).lower() == 'open'
                         and deps and number not in graph.problems
-                        and all(graph.landed(dep.head_sha, number) for dep in deps)):
+                        and all(graph.landed(dep.head_sha, number) for dep in deps)
+                        and (number not in graph.absorbed or graph.landed(node.head, number))):
                     enqueue_github_write(conn, '__dependencies__', 'promote_dependency', number, node.head,
                                          {'base_ref': node.base, 'target_ref': graph.target(number)[0], 'dependencies': [dep.as_json() for dep in deps]})
     return graph
@@ -1223,24 +1227,25 @@ CAMPAIGN_EXCLUSIONS = []
 
 
 def lane_discovery_scope(conn, target_ref):
-    # Preserve the established no-campaign discovery and read sequence.
-    if (pr_dependencies.has_table(conn, 'stabilize_campaigns')
-            and conn.execute('SELECT 1 FROM stabilize_campaigns LIMIT 1').fetchone()):
-        return {'selection_target': target_ref}
-    return {}
+    # Partition selection before mutable readiness/comment reads.
+    return {'selection_target': target_ref}
 
 
 def select_eligible_pull_requests(*, dry_run: bool = False,
                                   conn: sqlite3.Connection | None = None,
                                   priority_only: bool = False,
+                                  immediate_only: bool = False,
                                   target_ref: str | None = None) -> list[PullRequest]:
     global DEPENDENCY_BLOCKS, CAMPAIGN_EXCLUSIONS
-    graph = dependency_graph(conn, dry_run=dry_run, priority_only=priority_only,
+    graph = dependency_graph(conn, dry_run=dry_run, priority_only=priority_only, immediate_only=immediate_only,
                              **lane_discovery_scope(conn, target_ref or BASE_BRANCH))
     CAMPAIGN_EXCLUSIONS = graph.exclusions
     DEPENDENCY_BLOCKS = [{'number': n, 'head_sha': graph.nodes[n].head, 'reason': reason}
                          for n, reason in sorted(graph.blocked.items()) if graph.nodes[n].ready]
-    pulls = [dependency_pull(graph, number) for number in graph.select(target_ref=target_ref, priority_only=priority_only)]
+    occupied = speculation.reserved(sys.modules[__name__], conn) if conn is not None else set()
+    graph.nodes = {n: replace(node, ready=False) if n in occupied else node for n, node in graph.nodes.items()}
+    graph._eligibility.clear()
+    pulls = [dependency_pull(graph, number) for number in graph.select(target_ref=target_ref, priority_only=priority_only, immediate_only=immediate_only)]
     return pulls if not priority_only or any(p.priority for p in pulls) else []
 
 
@@ -1461,6 +1466,7 @@ def connect_db() -> sqlite3.Connection:
         ("agent_configuration", "TEXT NOT NULL DEFAULT 'multi-pr'"),
         ("source", "TEXT NOT NULL DEFAULT 'queue'"),
         ("priority", "INTEGER NOT NULL DEFAULT 0"),
+        ("lane", "TEXT"),
         ("suspend_pending", "INTEGER NOT NULL DEFAULT 0"),
         ("suspend_verify_failures", "INTEGER NOT NULL DEFAULT 0"),
         ("suspend_retry_after", "REAL NOT NULL DEFAULT 0"),
@@ -1589,13 +1595,23 @@ def create_batch(
     source: str = "queue",
     predecessor_id: str | None = None,
     predecessor_candidate: dict[str, Any] | None = None,
+    lane: str | None = None,
 ) -> str:
     speculation.ensure_schema(conn, ensure_column)
     ensure_column(conn, "automerge_batches", "target_ref", "TEXT")
+    ensure_column(conn, "automerge_batches", "lane", "TEXT")
+    if lane not in {None, 'immediate'}:
+        raise ValueError("unsupported automerge lane")
+    if predecessor_id:
+        predecessor = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (predecessor_id,)).fetchone()
+        if lane == 'immediate' or predecessor is not None and batch_lane(predecessor) == 'immediate':
+            raise ValueError("immediate batches cannot have or be predecessors")
     if not pulls:
         raise ValueError("cannot create an empty automerge batch")
     identifier = batch_id or _new_batch_id()
     target = pulls_target(conn, pulls)
+    if lane == 'immediate' and target != BASE_BRANCH:
+        raise ValueError("immediate batches must target master")
     selected_mode = ('async' if target != BASE_BRANCH else
                      _validate_ci_mode(CI_MODE if ci_mode is None else ci_mode))
     if kind not in {"batch", "direct"}:
@@ -1618,8 +1634,8 @@ def create_batch(
                 (batch_id, kind, agent_configuration, source, priority, status, base_sha,
                  pull_requests_json, title, branch, created_at,
                  active_pull_requests_json, phase, ci_mode, integration_pr_number,
-                 integration_pr_url, ci_head_sha, predecessor_id, predecessor_candidate_json, target_ref)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 integration_pr_url, ci_head_sha, predecessor_id, predecessor_candidate_json, target_ref, lane)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 identifier,
@@ -1642,6 +1658,7 @@ def create_batch(
                 predecessor_id,
                 json.dumps(predecessor_candidate or {}),
                 target if target != BASE_BRANCH else None,
+                lane,
             ),
         )
         enqueue_membership_labels(conn, identifier)
@@ -1656,6 +1673,7 @@ def create_selected_batch(
     ci_mode: str | None = None,
     batch_id: str | None = None,
     source: str | None = None,
+    lane: str | None = None,
 ) -> str:
     """Use direct landing for one PR whose head already contains its target."""
     kind = "batch"
@@ -1668,7 +1686,7 @@ def create_selected_batch(
             log(f"could not verify whether PR #{pulls[0].number} is up to date; using batch path: {exc}")
     return create_batch(
         conn, pulls, base_sha, batch_id=batch_id, ci_mode=ci_mode, kind=kind,
-        source=source or ("priority" if any(pull.priority for pull in pulls) else "queue"),
+        source=source or ("priority" if any(pull.priority for pull in pulls) else "queue"), lane=lane,
     )
 
 
@@ -1928,18 +1946,39 @@ def _validation_guidance(
         "failures; record blocked checks and reassess them after the combined rebuild.\n\n"
         "Validation after changes: after source exclusions, fixes, conflict resolutions, "
         "or base updates, choose reruns from the actual diff against the last tested "
-        "candidate. Cover affected behavior, shared dependencies and interactions, "
-        "and previously failing checks addressed by the changes. A membership or "
-        "HEAD change alone does not require repeating the full suite. Reuse earlier "
-        "results for areas whose covered code, dependencies, test inputs, and settings "
-        "remain unaffected, unless new evidence contradicts them. If impact cannot "
-        "be bounded or a specific concern warrants broader checks, expand and record "
-        "the reason. Keep the original tested SHAs, commands, logs, and reuse reasons "
-        "in the progress note. Fixture/golden generation is an editing step; validate "
-        "the affected checks on the resulting committed tree without blessing enabled. "
-        "Record a fresh assessment for the resulting HEAD and current source set, "
-        "distinguishing checks run there from earlier results reused with their "
-        "original tested SHAs and applicability reasons.\n\n"
+        "candidate. After ejecting sources from a fully tested candidate, the default "
+        "is a narrow rerun: rebuild the remainder, rerun the checks that failed and "
+        "the tests of the crates the ejected diffs touched, reuse every other result "
+        "from the tested candidate with its original tested SHA and an applicability "
+        "reason, record the fresh assessment for the rebuilt HEAD, and publish. An "
+        "ejection's diff is bounded by construction (it is the ejected heads' changes, "
+        "reversed), so an ejection alone never justifies the full suite; expand only "
+        "for a specific concern, and state it. Interactions that the rebuild would "
+        "have exposed are covered by the build and the touched-crate tests; this is "
+        "an accepted trade for queue latency. After merging master into a tested "
+        "candidate (promotion or a master update), the default is also a narrow "
+        "rerun: rebuild, rerun the tests of the crates the incoming master diff "
+        "touches (old captured base to new base), the areas of any conflict "
+        "resolutions, and checks that failed on the last tested candidate; reuse "
+        "every other result from the last tested candidate with its original tested "
+        "SHA and an applicability reason, record the fresh assessment, and publish. "
+        "Master's changes were validated before they landed, so a master merge alone "
+        "never justifies the full suite, and a master diff that touches a widely used "
+        "crate calls for that crate's tests, not every suite; expand only for a "
+        "specific concern, and state it. Checks the candidate has never run are chosen "
+        "by the normal policy. Cover affected behavior, shared "
+        "dependencies and interactions, and previously failing checks addressed by "
+        "the changes. A membership or HEAD change alone does not require repeating "
+        "the full suite. Reuse earlier results for areas whose covered code, "
+        "dependencies, test inputs, and settings remain unaffected, unless new "
+        "evidence contradicts them. If impact cannot be bounded or a specific concern "
+        "warrants broader checks, expand and record the reason. Keep the original "
+        "tested SHAs, commands, logs, and reuse reasons in the progress note. "
+        "Fixture/golden generation is an editing step; validate the affected checks "
+        "on the resulting committed tree without blessing enabled. Record a fresh "
+        "assessment for the resulting HEAD and current source set, distinguishing "
+        "checks run there from earlier results reused with their original tested SHAs "
+        "and applicability reasons.\n\n"
         "Baseline from existing evidence: classify only failures observed in the "
         "candidate's selected checks; passing tests and ledger failures absent from "
         "the candidate need no baseline work. A candidate failure is baseline "
@@ -2214,7 +2253,11 @@ def lookup_batch_session(row: sqlite3.Row | dict[str, Any]) -> str | None:
 
 def batch_speculation_guidance(row):
     if batch_target(row) == BASE_BRANCH:
-        return speculation.GUIDANCE
+        if batch_lane(row) != 'immediate':
+            return speculation.GUIDANCE
+        return ("Candidate checkpoints: register before validation and withdraw before edits. "
+                "This immediate batch is primary, has no successor, and publishes its passing "
+                "assessment through mm-autopr. Preserve normal exact-head and fresh-master gates.")
     return ("Candidate checkpoints: mm-db candidate records and pushes only the batch branch. "
             "Withdraw a checkpoint before changing it and register the replacement when ready. "
             "This stabilize batch has no speculative successor. After local pass, record the "
@@ -2394,7 +2437,9 @@ def send_start_notification(
     predecessor = speculation.get(row, "predecessor_id") if speculation.is_speculative(row) else None
     heading = ("speculative batch:" if predecessor else
                "promoted batch:" if speculation.get(row, "role_promoted", 0) else "new batch:")
-    if batch_target(row) != BASE_BRANCH:
+    if batch_lane(row) == 'immediate':
+        heading = "immediate batch:"
+    elif batch_target(row) != BASE_BRANCH:
         heading = "stabilize batch:"
     qualifiers = [lane] if lane else []
     if _batch_kind(row) == "direct":
@@ -4112,7 +4157,7 @@ def _queue_missing_handoff(conn, row, reason, *, observed_turn=None):
     prefix = "The supervisor has no valid candidate handoff because "
     prompt = f"""{prefix}{reason}.
 Continue in this same checkout. Read mm-db state and reconcile your progress note, HEAD, pending edits and running checks. Preserve useful work and reuse applicable execution evidence; a missing handoff alone does not require rebuilding or rerunning checks.
-Complete the current supervisor instruction and resolve any remaining validation or publication problem. Record a fresh passing local assessment for the current committed HEAD and source revision. Checkpoint the candidate with mm-db candidate, then hand it back through mm-db ready while it has predecessor metadata, or mm-autopr otherwise. If it was already published, reconcile that same PR through mm-autopr. Do not merge. If blocked, explain the concrete blocker and required next action.
+Complete the current supervisor instruction and resolve any remaining validation or publication problem. Record a fresh passing local assessment for the current committed HEAD and source revision. Checkpoint the candidate with mm-db candidate, then hand it back through mm-db ready while its predecessor is live, or mm-autopr otherwise. If it was already published, reconcile that same PR through mm-autopr. Do not merge. If blocked, explain the concrete blocker and required next action.
 """
     previous = str(row['pending_prompt'] or '')
     if previous and row['phase'] == 'fixing':
@@ -4140,10 +4185,10 @@ def ready_candidate(row):
         return None
     if receipt["kind"] == "publish":
         publication = receipt.get("publication") or {}
-        if (speculation.get(row, "predecessor_id") or publication.get("head") != receipt["head"]
+        if (publication.get("head") != receipt["head"]
                 or publication.get("number") != row["integration_pr_number"]):
             return None
-    elif receipt["kind"] != "ready" or not speculation.get(row, "predecessor_id"):
+    elif receipt["kind"] != "ready":
         return None
     checkpoint = json.loads(speculation.get(row, "candidate_json", "{}"))
     if receipt.get("candidate_id") and (checkpoint.get("id") != receipt["candidate_id"]
@@ -4185,7 +4230,7 @@ def _restore_publication_handoffs(conn):
                     or evidence["source_revision"] != speculation.source_revision(sys.modules[__name__], row)):
                 continue
             publication = None
-            if speculation.get(row, "predecessor_id"):
+            if row["phase"] == "waiting_parent":
                 checkpoint = speculation.candidate(sys.modules[__name__], row)
                 if row["phase"] != "waiting_parent" or not checkpoint or checkpoint["head"] != evidence["head"]:
                     continue
@@ -4225,6 +4270,31 @@ def ready_report(receipt):
     ]).strip()
 
 
+def _publish_ready_candidate(conn, row):
+    """Publish a parked passing handoff after same-base role release."""
+    import mm_service
+    receipt = ready_candidate(row)
+    if not receipt or receipt["kind"] != "ready":
+        return
+    current = mm_service.state(conn, row["batch_id"])
+    publication = mm_service.reconcile_publication(current, receipt["head"], receipt.get("notes", ""))
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (row["batch_id"],)).fetchone()
+        accepted = ready_candidate(latest)
+        if (not accepted or accepted["id"] != receipt["id"]
+                or mm_service.state(conn, row["batch_id"])["revision"] != current["revision"]
+                or (speculation.get(latest, "predecessor_id")
+                    and speculation.parent_current(sys.modules[__name__], conn, latest))):
+            raise AutomergeError("parked publication inputs changed", reason="predecessor_pending")
+        mm_service.record(conn, row["batch_id"], "publication", publication)
+        enqueue_github_write(conn, row["batch_id"], "integration_metadata", publication["number"],
+                             receipt["head"], mm_service.integration_metadata(current, receipt["head"], receipt.get("notes", "")))
+        conn.execute("UPDATE automerge_batches SET integration_pr_number=?,integration_pr_url=? WHERE batch_id=?",
+                     (publication["number"], publication["url"], row["batch_id"]))
+        mm_service.handoff(conn, current, "publish", publication=publication, notes=receipt.get("notes", ""))
+
+
 def _consume_ready_candidate(conn, transport, row):
     receipt = ready_candidate(row)
     if not receipt or row["phase"] not in {"building", "fixing"}:
@@ -4238,7 +4308,8 @@ def _consume_ready_candidate(conn, transport, row):
         if not accepted or accepted["id"] != receipt["id"]:
             return False
         ci_round = int(current["ci_round"] or 0)
-        if speculation.get(current, "predecessor_id"):
+        if receipt["kind"] == "ready" or (speculation.get(current, "predecessor_id")
+                and speculation.parent_current(sys.modules[__name__], conn, current)):
             phase = "waiting_parent"
         elif current["ci_mode"] == "async":
             phase = "merging"
@@ -4707,7 +4778,7 @@ def _finish_async_agent_turn(
     # A passing report covers the rebuilt remainder after any ejections.
     # New arrivals belong to the next batch once that candidate is finished.
     if local_result != "pass" and row["retry_rescan_pending"] and _request_rebuild(
-        conn, row, _active_sources(row), "a source PR was ejected; include newly ready PRs",
+        conn, row, _active_sources(row), "a source PR was ejected; rebuild the remaining sources",
         only_if_expanded=True,
     ):
         return
@@ -4760,10 +4831,10 @@ def _agent_turn_finished(conn: sqlite3.Connection, transport: monitor.SlackTrans
     row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                        (row["batch_id"],)).fetchone()
     if speculation.get(row, "predecessor_id"):
-        if speculation.parent_current(sys.modules[__name__], conn, row):
-            speculation.finished(sys.modules[__name__], conn, transport, row, final)
-        else:
-            speculation.invalidate(sys.modules[__name__], conn, row)
+        speculation.finished(sys.modules[__name__], conn, transport, row, final)
+        latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (row["batch_id"],)).fetchone()
+        if latest["phase"] == "waiting_parent":
+            speculation.reconcile(sys.modules[__name__], conn, transport, latest)
         return
     keep, removed = _recheck_sources(_active_sources(row), conn=conn, batch_id=str(row["batch_id"]))
     row = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (row['batch_id'],)).fetchone()
@@ -4785,7 +4856,7 @@ def _agent_turn_finished(conn: sqlite3.Connection, transport: monitor.SlackTrans
         _end_empty_batch(conn, transport, row, "No source PRs remain after the agent's report.")
         return
     if row["retry_rescan_pending"] and _request_rebuild(
-        conn, row, _active_sources(row), "a source PR was ejected; include newly ready PRs",
+        conn, row, _active_sources(row), "a source PR was ejected; rebuild the remaining sources",
         only_if_expanded=True,
     ):
         return
@@ -4932,7 +5003,7 @@ def _poll_ci(conn: sqlite3.Connection, transport: monitor.SlackTransport,
     row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                        (row["batch_id"],)).fetchone()
     if _request_rebuild(conn, row, _active_sources(row),
-                        "CI failed; retry with newly ready PRs", only_if_expanded=True):
+                        "CI failed; retry the reported checks", only_if_expanded=True):
         return
     impact = _validation_impact(row, heads=[head])
     queue_agent_prompt(conn, row, build_ci_feedback(
@@ -4974,10 +5045,7 @@ def _recheck_sources(pulls: list[PullRequest], *, conn: sqlite3.Connection | Non
         else:
             keep.append(pull)
     if keep:
-        owner = conn.execute('SELECT * FROM automerge_batches WHERE batch_id=?', (batch_id,)).fetchone() if conn is not None and batch_id else None
-        pinned_base = owner['base_sha'] if owner is not None and speculation.get(owner, 'predecessor_id') else None
-        verified, blocked = (check_source_dependencies(keep, conn, master=pinned_base) if pinned_base
-                             else check_source_dependencies(keep, conn))
+        verified, blocked = check_source_dependencies(keep, conn)
         for pull in keep:
             if pull.number in blocked:
                 removed.append(f'PR #{pull.number} {pull.title}: {blocked[pull.number]}')
@@ -5089,55 +5157,19 @@ def _request_rebuild(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]
         _append_removed(conn, str(row["batch_id"]), removed)
         row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                            (row["batch_id"],)).fetchone()
-    # An empty batch has no work to preserve. New arrivals get their own batch
-    # and session through normal selection, regardless of the expansion budget.
+    # An empty batch has no work to preserve. Arrivals are admitted by normal
+    # batch selection, not by a rebuild of existing membership.
     if not pulls:
         return False
     original = _all_batch_pulls(row)
-    seen = {pull.number for pull in original}
-    additions = []
-    if int(row["expansion_count"]) < MAX_BATCH_EXPANSIONS:
-        selected = select_eligible_pull_requests(conn=conn, target_ref=batch_target(row)) if batch_target(row) != BASE_BRANCH else select_eligible_pull_requests(conn=conn)
-        selected = [p for p in selected if pulls_target(conn, [p]) == batch_target(row)]
-        campaign_lane = batch_target(row) != BASE_BRANCH
-        lane_matches = campaign_lane or bool(any(p.priority for p in selected)) == _batch_priority(row)
-        if lane_matches and _batch_priority(row) and not campaign_lane:
-            by_number = {p.number: p for p in selected}
-            closure = {p.number for p in selected if p.priority}
-            pending = list(closure)
-            while pending:
-                number = pending.pop()
-                for dep in by_number[number].dependencies:
-                    if dep.number in by_number and dep.number not in closure:
-                        closure.add(dep.number)
-                        pending.append(dep.number)
-            selected = [p for p in selected if p.number in closure]
-        occupied = speculation.reserved(sys.modules[__name__], conn, except_batch=row['batch_id'])
-        additions = [pull for pull in selected if pull.number not in seen and pull.number not in occupied] if lane_matches else []
-        # A priority seed may require an ordinary prerequisite. Exclusions and
-        # the expansion cap still govern the whole dependency closure.
-        candidate = {p.number: p for p in pulls + additions}
-        changed = True
-        while changed:
-            changed = False
-            for number, pull in list(candidate.items()):
-                if any(not compare_commit_ancestry(dep.head_sha, str(row['base_sha']))
-                       and (dep.number not in candidate or candidate[dep.number].head_sha != dep.head_sha)
-                       for dep in pull.dependencies):
-                    del candidate[number]
-                    changed = True
-        additions = [p for p in additions if p.number in candidate and p.number not in excluded]
-    if only_if_expanded and not additions and not removed:
+    if only_if_expanded and not removed:
         with conn:
             conn.execute("UPDATE automerge_batches SET retry_rescan_pending=0 WHERE batch_id=?",
                          (row["batch_id"],))
         return False
-    pulls += additions
     pulls = dependency_order(pulls)
     if not pulls:
         return False
-    if additions:
-        reason += "; added newly ready " + ", ".join(f"#{p.number}" for p in additions)
     pull_lines = "\n".join(f"- PR #{p.number} {p.title} at {p.head_sha}" for p in pulls) or "- no source PRs remain"
     impact = _validation_impact(row, heads=[p.head_sha for p in pulls])
     ledger_context = _format_known_failure_prompt(_known_failures_prompt(conn))
@@ -5177,18 +5209,15 @@ Do not merge the integration PR. Reason for rebuild: {reason}.
             raise AutomergeError("batch membership changed while preparing rebuild; retry with current state",
                                  reason="batch_state_changed")
         conn.execute("UPDATE automerge_batches SET active_pull_requests_json=?, ci_head_sha=?, "
-                     "pull_requests_json=?, expansion_count=expansion_count+?, "
+                     "pull_requests_json=?, "
                      "retry_rescan_pending=0, validation_impact_json=?, "
                      "phase='fixing', pending_prompt=?, prompt_delivered=0, turn_started_at=NULL, "
                      "ready_json='{}', prompt_command_id=? "
                      "WHERE batch_id=?", (json.dumps([p.as_json() for p in pulls]),
-                                           row["ci_head_sha"], json.dumps([p.as_json() for p in original + additions]),
-                                           int(bool(additions)), json.dumps(impact), prompt,
+                                           row["ci_head_sha"], json.dumps([p.as_json() for p in original]),
+                                           json.dumps(impact), prompt,
                                            "mm-followup-" + uuid.uuid4().hex, row["batch_id"]))
         enqueue_membership_labels(conn, str(row["batch_id"]))
-    if additions:
-        log(f"batch {row['batch_id']} expansion {int(row['expansion_count']) + 1}/{MAX_BATCH_EXPANSIONS}: "
-            + ", ".join(f"#{p.number}" for p in additions))
     return True
 
 
@@ -5224,7 +5253,23 @@ def _queue_master_update(
                   f"{FIX_VS_EJECT_GUIDANCE} "
                   f"{ledger_context} Push only `{row['branch']}` and update the same integration PR. Do not "
                   "force-push unless rebuilding after ejection; do not merge the PR. CI must run again.")
+    prompt += (f" Compare the resulting committed HEAD against the last tested candidate {tested_head}. "
+               "Rerun by the master-merge narrow default in the validation policy (tests of the crates "
+               "the master diff touches, conflict-resolution areas and earlier failures), retaining original "
+               "tested SHAs and applicability reasons for reused results; a master merge alone never "
+               "justifies the full suite. Record a fresh assessment for the resulting HEAD "
+               "and current source revision, re-register with mm-db candidate, then publish through mm-autopr. "
+               "There is no unchanged-tree shortcut or equivalent-head alias.")
+    import mm_service
     with conn:
+        checkpoint = json.loads(speculation.get(row, "candidate_json", "{}"))
+        if row["base_sha"] != master_sha:
+            withdrawal = {"id": uuid.uuid4().hex, "revision": mm_service.state(conn, row["batch_id"])["revision"],
+                          "source_revision": speculation.source_revision(sys.modules[__name__], row),
+                          "candidate": checkpoint or None}
+            mm_service.record(conn, row["batch_id"], "candidate_withdrawal", withdrawal)
+            conn.execute("UPDATE automerge_batches SET candidate_json='{}',ready_json='{}' WHERE batch_id=?",
+                         (row["batch_id"],))
         conn.execute(
             "UPDATE automerge_batches SET base_sha=?, base_failed_jobs_json='[]', "
             "base_failure_details_json='{}', base_ci_source=NULL, base_ci_run_id=NULL, "
@@ -5234,7 +5279,7 @@ def _queue_master_update(
     latest = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
                           (row["batch_id"],)).fetchone()
     if _request_rebuild(conn, latest, _active_sources(latest),
-                        f"{batch_target(row)} advanced; retry with newly ready PRs", only_if_expanded=True):
+                        f"{batch_target(row)} advanced; retry the remaining sources", only_if_expanded=True):
         return
     queue_agent_prompt(conn, latest, prompt)
 
@@ -5368,8 +5413,9 @@ def _sync_ci_gate_allows_merge(
 
 def _merge_integration(conn: sqlite3.Connection, transport: monitor.SlackTransport,
                        row: sqlite3.Row | dict[str, Any]) -> None:
-    if speculation.get(row, "predecessor_id"):
-        raise AutomergeError("speculative batch cannot land before promotion", reason="predecessor_pending")
+    if (speculation.get(row, "predecessor_id")
+            and speculation.parent_current(sys.modules[__name__], conn, row)):
+        raise AutomergeError("batch cannot land while the predecessor is live", reason="predecessor_pending")
     receipt = ready_candidate(row)
     number = int(row["integration_pr_number"])
     retry_pending = _github_write_retry_pending(row)
@@ -5884,9 +5930,6 @@ def _complete_abort(
 ) -> None:
     batch_id = str(row["batch_id"])
     terminal_status = "no_sources_remain" if row["terminal_status"] == "no_sources_remain" else "aborted"
-    descendant = speculation.child(conn, batch_id)
-    if descendant is not None:
-        abort_batch_locked(conn, transport, descendant, "predecessor aborted: " + str(row['abort_reason'] or 'operator abort'))
     session_id = str(row["session_id"] or "")
     if not session_id and row["launch_attempted"] and _batch_kind(row) == "batch":
         session_id = lookup_batch_session(row) or ""
@@ -6180,13 +6223,27 @@ def process_batch(conn: sqlite3.Connection, transport: monitor.SlackTransport,
                 conn, row, "the candidate handoff became stale while waiting for the predecessor",
             )
             return
-        if speculation.get(row, "role_promoted", 0):
-            parent = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
-                                  (row["predecessor_id"],)).fetchone()
-            if parent is None or parent["terminal_status"] != "merged":
-                raise AutomergeError("primary predecessor has no confirmed landing", reason="predecessor_pending")
-            speculation.promote(sys.modules[__name__], conn, transport, row, parent)
-        return
+        speculation.recheck_waiting(sys.modules[__name__], conn, transport, row)
+        row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+        if row["phase"] != "waiting_parent" or not ready_candidate(row):
+            return
+        if (speculation.get(row, "predecessor_id")
+                and speculation.parent_current(sys.modules[__name__], conn, row)):
+            return
+        parent = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?",
+                              (row["predecessor_id"],)).fetchone()
+        speculation.promote(sys.modules[__name__], conn, transport, row, parent)
+        row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+        if row["phase"] != "waiting_parent":
+            return  # Incorporation instruction is delivered by the supervisor this tick.
+        _publish_ready_candidate(conn, row)
+        row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+        with conn:
+            conn.execute("UPDATE automerge_batches SET phase='building' WHERE batch_id=?", (batch_id,))
+        row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+        _consume_ready_candidate(conn, transport, row)
+        row = conn.execute("SELECT * FROM automerge_batches WHERE batch_id=?", (batch_id,)).fetchone()
+        phase = str(row["phase"])
     if phase in {"building", "fixing", "waiting_ci"}:
         # A running turn can still produce useful work for a retained remainder.
         # When every source is ineligible, stop immediately instead of waiting
@@ -6241,7 +6298,7 @@ def process_batch(conn: sqlite3.Connection, transport: monitor.SlackTransport,
     if phase not in {"building", "fixing"}:
         raise AutomergeError(f"unknown automerge phase {phase}", reason="database_state_invalid")
 
-    if phase == "building" and not row["session_id"]:
+    if phase in {"building", "fixing"} and not row["session_id"]:
         try:
             session_id = launch_batch_session(row, row_pulls(row), conn=conn,
                                               allow_new=not bool(row["launch_attempted"]))
@@ -6307,6 +6364,8 @@ def active_batch(conn: sqlite3.Connection) -> sqlite3.Row | None:
     """The master primary, including a landed parent with a live successor."""
     columns = {c[1] for c in conn.execute("PRAGMA table_info(automerge_batches)")}
     lane = "COALESCE(b.target_ref, ?) = ?" if "target_ref" in columns else "1=1"
+    if "lane" in columns:
+        lane += " AND COALESCE(b.lane, '') <> 'immediate'"
     args = (BASE_BRANCH, BASE_BRANCH) if "target_ref" in columns else ()
     if "predecessor_id" in columns:
         primary = "(predecessor_id IS NULL OR role_promoted=1)" if "role_promoted" in columns else "predecessor_id IS NULL"
@@ -6325,6 +6384,21 @@ def active_batch(conn: sqlite3.Connection) -> sqlite3.Row | None:
         "AND COALESCE(terminal_status, '') <> 'aborted')) "
         "ORDER BY created_at, batch_id LIMIT 1", args
     ).fetchone()
+
+
+def batch_lane(row) -> str | None:
+    return speculation.get(row, 'lane')
+
+
+def active_immediate_batch(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """The independent master slot; legacy rows remain ordinary."""
+    columns = {c[1] for c in conn.execute("PRAGMA table_info(automerge_batches)")}
+    if 'lane' not in columns:
+        return None
+    return conn.execute(
+        "SELECT * FROM automerge_batches WHERE lane='immediate' "
+        "AND status IN ('launching','running','finishing') "
+        "ORDER BY created_at,batch_id LIMIT 1").fetchone()
 
 
 def active_campaign_batch(conn: sqlite3.Connection) -> sqlite3.Row | None:
@@ -6370,32 +6444,6 @@ def select_campaign_pull_requests(conn, *, dry_run=False):
     return []
 
 
-def _batch_is_in_publish_phase(row: sqlite3.Row | dict[str, Any]) -> bool:
-    phase = str(row["phase"] or "")
-    return (
-        phase in {"merging", "direct_merging"}
-        or str(row["verdict_status_state"] or "") == "success"
-    )
-
-
-def _priority_preemption_target(
-    row: sqlite3.Row | dict[str, Any], pulls: list[PullRequest],
-) -> PullRequest | None:
-    """Return an immediate PR that can preempt this not-yet-publishing batch."""
-    if (batch_target(row) != BASE_BRANCH
-            or _batch_kind(row) not in {"batch", "direct"}
-            or _batch_source(row) == "operator"
-            or _batch_is_in_publish_phase(row)
-            or str(row["phase"] or "") in {"aborting", "terminal"}):
-        return None
-    already_in_batch = {pull.number for pull in _all_batch_pulls(row)}
-    candidates = [pull for pull in pulls
-                  if pull.immediate and (pull.target_ref or BASE_BRANCH) == BASE_BRANCH and (
-                      pull.number not in already_in_batch or not _batch_priority(row)
-                  )]
-    return min(candidates, key=lambda pull: pull.number) if candidates else None
-
-
 def abort_batch_locked(
     conn: sqlite3.Connection,
     transport: monitor.SlackTransport,
@@ -6423,22 +6471,7 @@ def abort_batch_locked(
     _complete_abort(conn, transport, latest)
 
 
-def preempt_batch_for_priority(
-    conn: sqlite3.Connection,
-    transport: monitor.SlackTransport,
-    row: sqlite3.Row | dict[str, Any],
-    pulls: list[PullRequest],
-) -> bool:
-    target = _priority_preemption_target(row, pulls)
-    if target is None:
-        return False
-    abort_batch_locked(
-        conn, transport, row, f"preempted by immediate PR #{target.number}",
-    )
-    return True
-
-
-def read_active_batch_for_check(*, campaign=False) -> dict[str, Any] | None:
+def read_active_batch_for_check(*, campaign=False, immediate=False) -> dict[str, Any] | None:
     """Read durable queue state without creating or migrating database tables."""
     if not DB_PATH.is_file():
         return None
@@ -6451,7 +6484,8 @@ def read_active_batch_for_check(*, campaign=False) -> dict[str, Any] | None:
         ).fetchone()
         if exists is None:
             return None
-        row = active_campaign_batch(conn) if campaign else active_batch(conn)
+        row = (active_immediate_batch(conn) if immediate else
+               active_campaign_batch(conn) if campaign else active_batch(conn))
         if row is None:
             return None
         return {
@@ -6498,15 +6532,17 @@ def check_only() -> int:
     try:
         active = read_active_batch_for_check()
         campaign_active = read_active_batch_for_check(campaign=True)
+        immediate_active = read_active_batch_for_check(immediate=True)
     except (OSError, sqlite3.Error) as exc:
         print(json.dumps({"state": "blocked", "reason": "database_unreadable",
                           "details": str(exc)}, indent=2))
         return 3
-    if active is not None or campaign_active is not None:
+    if active is not None or campaign_active is not None or immediate_active is not None:
         print(json.dumps({
             "state": "active_batch",
             "active_batch": active,
             "campaign_batch": campaign_active,
+            "immediate_batch": immediate_active,
             "would_do": "continue the persisted batch phase",
         }, indent=2, sort_keys=True))
         return 0
@@ -6520,6 +6556,7 @@ def check_only() -> int:
         }, indent=2, sort_keys=True))
         return 3
     campaign_pulls = []
+    immediate_pulls = []
     try:
         monitor.github_app_token()
         if DB_PATH.is_file():
@@ -6530,12 +6567,15 @@ def check_only() -> int:
                 pulls = select_eligible_pull_requests(dry_run=True, conn=check_conn)
                 master_blocks, master_exclusions = DEPENDENCY_BLOCKS, CAMPAIGN_EXCLUSIONS
                 campaign_pulls = select_campaign_pull_requests(check_conn, dry_run=True)
+                immediate_pulls = select_eligible_pull_requests(dry_run=True, conn=check_conn,
+                                                               priority_only=True, immediate_only=True)
                 DEPENDENCY_BLOCKS[:] = master_blocks
                 CAMPAIGN_EXCLUSIONS[:] = master_exclusions
             finally:
                 check_conn.close()
         else:
             pulls = select_eligible_pull_requests(dry_run=True)
+            immediate_pulls = select_eligible_pull_requests(dry_run=True, priority_only=True, immediate_only=True)
         base_sha = target_sha(pulls[0].target_ref or BASE_BRANCH) if pulls else None
     except (monitor.GitHubAuthError, AutomergeError,
             monitor.CommandError, monitor.MjError, OSError, ValueError) as exc:
@@ -6543,10 +6583,11 @@ def check_only() -> int:
                           "details": str(exc)}, indent=2, sort_keys=True))
         return 3
     print(json.dumps({
-        "state": "ready" if pulls or campaign_pulls else "idle",
+        "state": "ready" if pulls or campaign_pulls or immediate_pulls else "idle",
         "mode": CI_MODE,
         "base_sha": base_sha,
         "selected_prs": [pull.as_json() for pull in pulls],
+        "immediate_lane": {"selected_prs": [p.as_json() for p in immediate_pulls]},
         "campaign_lane": {"selected_prs": [p.as_json() for p in campaign_pulls],
                           "target_ref": campaign_pulls[0].target_ref if campaign_pulls else None,
                           "mode": "async"},
@@ -6555,7 +6596,7 @@ def check_only() -> int:
         "target_ref": (pulls[0].target_ref or BASE_BRANCH) if pulls else None,
         "would_do": (
             "create a direct landing or integration batch for the selected PRs"
-            if pulls or campaign_pulls else "wait for eligible PRs"
+            if pulls or campaign_pulls or immediate_pulls else "wait for eligible PRs"
         ),
     }, indent=2, sort_keys=True))
     return 0
