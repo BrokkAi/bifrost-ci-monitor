@@ -339,6 +339,25 @@ restart. Lowering it lets existing repairs finish before admitting more work.
 Each session still owns one issue. Ambiguous launches and unfinished suspension
 reserve capacity; a failed repair does not stop supervision of the other repairs.
 
+When the assigned maintainer returns a completed escalation to implementation
+while retaining assignment, review that decision and its current issue thread,
+then queue continuation in the original repair session:
+
+```sh
+python3 monitor.py --resume-escalated-issue ISSUE_NUMBER --decision-comment COMMENT_ID
+```
+
+The selected comment must belong to that issue and its sole retained assignee,
+who must currently have repository write permission. The issue must be open,
+have `buildfailure`, and have neither `Escalated` nor `agent-in-progress`.
+This operator path handles a suspended master escalation with no published
+repair PR and respects the live concurrency limit. It archives the completion
+privately and queues the existing same-session recovery, preserving the branch,
+checkout, edits, caches and logs. Cron advances the recovery; the JSON receipt
+means queued, not delivered. Retrying the same comment cannot reset work again.
+Assignment and priority remain intact. Ordinary selection continues to respect
+human assignments; comments do not automatically authorize new repair sessions.
+
 The default mode is **async**: integration agents run targeted local tests;
 GitHub CI need not finish before landing, except the integration PR's
 `quick policy` job (open-core classification and projection dry run), which

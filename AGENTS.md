@@ -631,6 +631,22 @@ existing cancellation/typed-clear path with its report boundary. Preserve the
 session, checkout and evidence. Deduplicate each investigation's handoff, respect
 fixer slots, and isolate follow-up read failures from unrelated admission.
 
+An operator may explicitly return a completed master escalation with
+`monitor.py --resume-escalated-issue N --decision-comment ID`. This is not an
+automatic comment parser or a new-ticket ownership exception. Authenticate the
+selected comment against the same issue, its sole current assignee and current
+write permission; require the escalation label removed, no other agent claim,
+no published repair PR, a suspended original session and a free fixer slot.
+Retain assignment and priority. The operator reviews the actual implementation
+decision; the command does not infer authorization from arbitrary prose.
+Atomically archive the original private row in `issue_repair_operator_returns`
+and checkpoint recovery on the same job/session/branch. That archive includes
+stored prompts and must never be web-allowlisted. Native mutations use the
+existing cancellation/typed-clear/restart boundary and report fence on later
+supervision. Duplicate comment IDs return the accepted receipt without another
+reset, even if work has completed. Ordinary selection and human ownership
+fences remain unchanged. Operator commands do not record cron heartbeats.
+
 The dossier contains the issue, recent comments, its own ledger observations
 and diagnosis provenance, an open-PR inventory, and up to three completed
 reports for this exact issue. Prior reports project only job/session identity,

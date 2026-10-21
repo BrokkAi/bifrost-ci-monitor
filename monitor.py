@@ -3931,6 +3931,27 @@ def _run_monitor_tick(heartbeat) -> int:
         conn.close()
 
 
+def resume_escalated_issue(issue_number: int, decision_comment_id: int) -> int:
+    """Queue an explicitly reviewed decision under the fixer's existing lock."""
+    import issue_fixer
+    import triage
+
+    with triage.lock(LOCK_PATH) as acquired:
+        if not acquired:
+            raise RuntimeError('fixer supervisor is busy; retry the same operator return')
+        conn = connect_db()
+        try:
+            issue_fixer.ensure_schema(conn)
+            job, queued = issue_fixer.resume_escalated_repair(conn, issue_number, decision_comment_id)
+            result = dict(issue=issue_number, job_id=job['id'], session_id=job['session_id'],
+                          branch=job['branch'], status=job['status'],
+                          decision_comment_id=decision_comment_id, recovery_queued=queued)
+        finally:
+            conn.close()
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 def check_only() -> int:
     global GH_AUTH_FAILURE_HANDLER
     transport = load_slack_transport()
@@ -3988,7 +4009,15 @@ def parse_args() -> argparse.Namespace:
     actions.add_argument("--test-slack", action="store_true")
     actions.add_argument("--check", action="store_true")
     actions.add_argument("--init-db", action="store_true")
-    return parser.parse_args()
+    actions.add_argument("--resume-escalated-issue", type=int, metavar="N")
+    parser.add_argument("--decision-comment", type=int, metavar="ID")
+    args = parser.parse_args()
+    if args.resume_escalated_issue is not None:
+        if args.resume_escalated_issue < 1 or args.decision_comment is None or args.decision_comment < 1:
+            parser.error('--resume-escalated-issue needs a positive issue and --decision-comment ID')
+    elif args.decision_comment is not None:
+        parser.error('--decision-comment requires --resume-escalated-issue')
+    return args
 
 
 def test_slack() -> int:
@@ -4026,6 +4055,8 @@ def main() -> int:
             conn.close()
             print(f"Initialized {DB_PATH}")
             return 0
+        if getattr(args, 'resume_escalated_issue', None) is not None:
+            return resume_escalated_issue(args.resume_escalated_issue, args.decision_comment)
         return run_monitor()
     except (CommandError, OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
         log(f"fatal: {exc}")

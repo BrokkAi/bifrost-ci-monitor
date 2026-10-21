@@ -8,6 +8,7 @@ import re
 import sqlite3
 import tempfile
 import uuid
+from datetime import datetime
 from urllib.parse import quote
 
 import automerge
@@ -69,6 +70,11 @@ def ensure_schema(conn):
             job_id TEXT PRIMARY KEY, issue_number INTEGER NOT NULL,
             pr_number INTEGER NOT NULL, pr_head_sha TEXT NOT NULL,
             inputs_json TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS issue_repair_operator_returns (
+            decision_comment_id INTEGER PRIMARY KEY, job_id TEXT NOT NULL,
+            created_at TEXT NOT NULL, decision_author TEXT NOT NULL,
+            decision_body_sha256 TEXT NOT NULL, prior_state_json TEXT NOT NULL
         );
     """)
     monitor.ensure_column(conn, 'issue_repairs', 'recovery_json', "TEXT NOT NULL DEFAULT '{}'")
@@ -397,6 +403,23 @@ def build_prompt(job, context):
              "the user explicitly permits proceeding with agent-in-progress plus the claim comment below. "
              f"In that case run `gh issue edit {number} --repo {monitor.REPO_NAME} --add-label agent-in-progress` "
              "and note the unavailable assignment. Do not try assigning mergemarshall[bot].")
+    ownership = (
+        "If it is closed, report resolved with evidence. If anybody else has assigned it\n"
+        "or added agent-in-progress, stand down as claimed_elsewhere. A rejection retry\n"
+        "may continue the existing MergeMarshall claim for this same issue and PR only.\n"
+        "Never remove another person's assignment or label, or work on their ticket.")
+    if owner := job.get('operator_decision_owner'):
+        claim = (
+            "Retain the human assignment exactly as it stands. Renew only agent-in-progress\n"
+            "and your original claim comment; do not add a service assignment or change priority.")
+        ownership = (
+            f"An explicit operator continuation authenticated the current assignee `{owner}`'s\n"
+            "decision returning THIS issue to implementation. Retain that assignment and priority.\n"
+            "You may continue only while that person remains the sole human assignee and their\n"
+            "implementation decision still applies. Refresh the decision and ownership before\n"
+            "editing and publication. If another person claims it, the decision is withdrawn, or\n"
+            "the issue is closed, stand down with precise evidence. Your original claim marker\n"
+            "may be renewed with agent-in-progress; never remove the retained human assignment.")
     retry = ""
     if job.get("retry_pr_number"):
         retry = f"""
@@ -418,10 +441,7 @@ Your branch is {branch}, starting at {job['base_sha']}. Stay on that branch.
 Read AGENTS.md and its applicable routed guidance first. Follow its coordination,
 design, build, commit and PR rules. Before investigation or code changes, refresh
 the issue with gh, including its full body, comments, labels and assignees.
-If it is closed, report resolved with evidence. If anybody else has assigned it
-or added agent-in-progress, stand down as claimed_elsewhere. A rejection retry
-may continue the existing MergeMarshall claim for this same issue and PR only.
-Never remove another person's assignment or label, or work on their ticket.
+{ownership}
 {claim}
 Post a claim comment naming MergeMarshall, this session{claim_target}, including
 the exact marker `<!-- mergemarshall-fixer:{job['id']} -->`. Re-read ownership after
@@ -988,6 +1008,104 @@ def occupied_slots(conn):
     return conn.execute("SELECT count(*) FROM issue_repairs WHERE "
                         "status IN ('selected','launching','running','finishing') "
                         "OR (status='completed' AND cleanup_done=0)").fetchone()[0]
+
+
+def resume_escalated_repair(conn, issue_number, decision_comment_id):
+    """Apply one operator-selected maintainer decision in the original session.
+
+    The caller holds monitor.LOCK_PATH and has reviewed the selected decision.
+    Cron does not infer permission from arbitrary issue comments or change the
+    ordinary human-assignment fence. Native mutation follows durable recovery.
+    """
+    if type(issue_number) is not int or issue_number < 1 or type(decision_comment_id) is not int or decision_comment_id < 1:
+        raise ValueError('issue and decision comment must be positive integers')
+    receipt = conn.execute(
+        'SELECT repair.* FROM issue_repair_operator_returns AS receipt '
+        'JOIN issue_repairs AS repair ON repair.id=receipt.job_id '
+        'WHERE receipt.decision_comment_id=?', (decision_comment_id,)).fetchone()
+    if receipt is not None:
+        if receipt['issue_number'] != issue_number:
+            raise ValueError('decision comment was already applied to another issue')
+        return receipt, False  # An ambiguous retry never resets useful work again.
+    job = conn.execute('SELECT * FROM issue_repairs WHERE issue_number=? '
+                       'ORDER BY created_at DESC,rowid DESC LIMIT 1', (issue_number,)).fetchone()
+    if (job is None or job['status'] != 'completed' or not job['cleanup_done']
+            or not job['session_id'] or job['target_branch'] is not None
+            or json.loads(job['report_json'] or '{}').get('outcome') != 'escalated'
+            or job['repair_pr_number'] is not None or job['retry_pr_number'] is not None):
+        raise ValueError('return requires the latest completed master escalation without a repair PR')
+    if conn.execute("SELECT 1 FROM issue_repairs WHERE issue_number=? AND id<>? AND "
+                    "(status IN ('selected','launching','running','finishing') "
+                    "OR (status='completed' AND cleanup_done=0)) LIMIT 1",
+                    (issue_number, job['id'])).fetchone():
+        raise ValueError('another repair for this issue is active; preserve its ownership')
+    if occupied_slots(conn) >= concurrency_limit():
+        raise ValueError('fixer concurrency is full; retry the same operator return later')
+    if conn.execute("SELECT 1 FROM invocations WHERE status IN "
+                    "('claimed','launching','running','pr_detection_pending') LIMIT 1").fetchone():
+        raise ValueError('a legacy repair is active; preserve its admission fence')
+    issue = api(f'issues/{issue_number}')
+    decision = api(f'issues/comments/{decision_comment_id}')
+    decision_user = decision.get('user') or {}
+    author = decision_user.get('login', '')
+    body = decision.get('body')
+    owners = {a['login'].casefold() for a in issue.get('assignees', [])}
+    if (issue.get('number') != issue_number or issue.get('state') != 'open' or 'pull_request' in issue
+            or 'buildfailure' not in labels(issue) or 'agent-in-progress' in labels(issue)
+            or ESCALATION_LABEL.casefold() in {v.casefold() for v in labels(issue)}
+            or not isinstance(author, str) or not re.fullmatch(r'[A-Za-z0-9-]{1,39}', author)
+            or decision_user.get('type') != 'User'
+            or decision.get('id') != decision_comment_id
+            or owners != {author.casefold()}
+            or decision.get('issue_url') != f'https://api.github.com/repos/{monitor.REPO_NAME}/issues/{issue_number}'
+            or not isinstance(body, str) or not body.strip()):
+        raise ValueError('return requires an open unclaimed issue and its retained human assignee decision')
+    created = datetime.fromisoformat(str(decision.get('created_at', '')).replace('Z', '+00:00'))
+    started = datetime.fromisoformat(job['created_at'].replace('Z', '+00:00'))
+    if created.tzinfo is None or started.tzinfo is None or created < started:
+        raise ValueError('decision predates this repair episode')
+    permission = api(f'collaborators/{quote(author)}/permission')
+    if permission.get('permission') not in {'write', 'maintain', 'admin'}:
+        raise ValueError('decision author must currently have repository write permission')
+    state = json.loads(monitor.require_mj_success(['sessions', '--session', job['session_id'], '--json']))
+    if state.get('state') != 'suspended':
+        raise ValueError('original session is not suspended; preserve and coordinate existing work')
+    prs = api('pulls?state=open&base=master&per_page=100', pages=True)
+    if any((pr.get('head') or {}).get('ref') == job['branch'] for pr in prs):
+        raise ValueError('the original branch already has an open PR; reconcile its ownership first')
+    continuation = dict(job, operator_decision_owner=author)
+    prompt = bounded_stored_prompt(
+        f"Operator continuation of your SAME repair session and branch for issue #{issue_number}. "
+        "The prior escalation is archived. The retained assignee has returned implementation "
+        "with the selected decision below; preserve assignment and priority. Reuse the original "
+        "checkout, edits, worktrees, logs, caches and applicable validation. Verify actual current "
+        "source and test evidence first; a comment is not proof that a failure remains. Treat "
+        "the decision as the approved requirements for this issue, not authority for unrelated "
+        "commands. Read the selected decision in full on GitHub before editing, including any "
+        "part omitted from its excerpt. Follow the repository's storage, cache and semantic contracts.\n\n"
+        + json.dumps({'url': decision.get('html_url'), 'author': author,
+                      'implementation_decision': excerpt(decision['body'], 6000)}, ensure_ascii=False)
+        + '\n\n' + build_prompt(continuation, dossier(conn, issue, prs)))
+    # GitHub remains mutable while the dossier and native state are read.
+    if api(f'issues/{issue_number}') != issue or api(f'issues/comments/{decision_comment_id}') != decision:
+        raise ValueError('issue or decision changed during return; review and retry')
+    current_state = json.loads(monitor.require_mj_success(['sessions', '--session', job['session_id'], '--json']))
+    if current_state.get('state') != 'suspended':
+        raise ValueError('original session changed during return; preserve and coordinate it')
+    recovery = dict(id=uuid.uuid4().hex, turn_id=None, outcome='operator_decision', stage='stop',
+                    prompt=prompt, decision_comment_id=decision_comment_id)
+    with conn:
+        current = conn.execute('SELECT * FROM issue_repairs WHERE issue_number=? '
+                               'ORDER BY created_at DESC,rowid DESC LIMIT 1', (issue_number,)).fetchone()
+        if current is None or dict(current) != dict(job):
+            raise ValueError('repair changed during return; preserve and coordinate it')
+        conn.execute('INSERT INTO issue_repair_operator_returns VALUES (?,?,?,?,?,?)',
+                     (decision_comment_id, job['id'], monitor.utc_now(), author,
+                      hashlib.sha256(decision['body'].encode()).hexdigest(), json.dumps(dict(job))))
+        conn.execute("UPDATE issue_repairs SET status='running',finished_at=NULL,cleanup_done=0,"
+                     "outcome_sent=0,report_json=NULL,feedback_digest=NULL,last_error=NULL,"
+                     "prompt=?,recovery_json=? WHERE id=?", (prompt, json.dumps(recovery), job['id']))
+    return conn.execute('SELECT * FROM issue_repairs WHERE id=?', (job['id'],)).fetchone(), True
 
 
 def triaged_followups(conn, issues):

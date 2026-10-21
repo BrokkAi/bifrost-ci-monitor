@@ -60,6 +60,250 @@ class IssueFixerTests(TestCase):
             self.conn.execute("UPDATE issue_repairs SET status='completed',cleanup_done=1,repair_pr_number=30 WHERE id=?", (job["id"],))
         return job
 
+    def escalated_return(self):
+        job = self.job()
+        report = dict(issue=12, outcome='escalated', pr=None, summary='Need compilation decision')
+        with self.conn:
+            self.conn.execute("UPDATE issue_repairs SET status='completed',session_id='original',"
+                              "created_at='2026-10-16T01:00:00+00:00',"
+                              "finished_at='2026-10-16T02:00:00+00:00',cleanup_done=1,outcome_sent=1,"
+                              "report_json=? WHERE id=?", (json.dumps(report), job['id']))
+        return self.conn.execute('SELECT * FROM issue_repairs WHERE id=?', (job['id'],)).fetchone()
+
+    def return_github(self, *, target=None, decision=None, permission='write', prs=None,
+                      changed_issue=False, changed_decision=False):
+        target = target if target is not None else issue(assignees=(fixer.ESCALATION_ASSIGNEE,))
+        decision = decision if decision is not None else dict(
+            id=77, user=dict(login=fixer.ESCALATION_ASSIGNEE, type='User'),
+            issue_url=f'https://api.github.com/repos/{monitor.REPO_NAME}/issues/12',
+            html_url=target['html_url']+'#issuecomment-77', created_at='2026-10-16T03:00:00Z',
+            body='Implement explicit compilation membership; retain assignment and priority.')
+        calls = {}
+
+        def github(endpoint, **kwargs):
+            calls[endpoint] = calls.get(endpoint, 0) + 1
+            if endpoint == 'issues/12':
+                if changed_issue and calls[endpoint] > 1:
+                    return dict(target, assignees=[dict(login='another-person')])
+                return target
+            if endpoint == 'issues/comments/77':
+                if changed_decision and calls[endpoint] > 1:
+                    return dict(decision, body='Withdraw the implementation return')
+                return decision
+            if endpoint == f'collaborators/{fixer.ESCALATION_ASSIGNEE}/permission':
+                return dict(permission=permission)
+            if endpoint == 'pulls?state=open&base=master&per_page=100':
+                return prs or []
+            if endpoint == 'issues/12/comments?per_page=100':
+                return [decision]
+            self.fail(f'Unexpected GitHub endpoint: {endpoint}')
+        return github
+
+    def test_operator_return_archives_and_reuses_session_before_native_recovery(self):
+        job = self.escalated_return()
+        target = issue(assignees=(fixer.ESCALATION_ASSIGNEE,))
+        with mock.patch.object(fixer, 'api', side_effect=self.return_github(target=target)), \
+             mock.patch.object(monitor, 'require_mj_success', return_value='{"state":"suspended"}') as mj:
+            resumed, queued = fixer.resume_escalated_repair(self.conn, 12, 77)
+        self.assertTrue(queued)
+        self.assertEqual(mj.call_args_list, [mock.call(['sessions', '--session', 'original', '--json'])]*2)
+        for key in ('id', 'session_id', 'branch', 'work_key', 'base_sha'):
+            self.assertEqual(resumed[key], job[key])
+        self.assertEqual(resumed['status'], 'running')
+        self.assertIsNone(resumed['report_json'])
+        self.assertIsNone(resumed['finished_at'])
+        self.assertEqual(resumed['cleanup_done'], 0)
+        self.assertEqual(resumed['outcome_sent'], 0)
+        self.assertIn('explicit compilation membership', resumed['prompt'])
+        self.assertIn('Retain the human assignment exactly', resumed['prompt'])
+        self.assertNotIn('If anybody else has assigned it', resumed['prompt'])
+        self.assertTrue(fixer.prompt_fits(resumed['prompt']))
+        recovery = json.loads(resumed['recovery_json'])
+        self.assertEqual(recovery['stage'], 'stop')
+        self.assertEqual(recovery['decision_comment_id'], 77)
+        saved = self.conn.execute('SELECT * FROM issue_repair_operator_returns').fetchone()
+        self.assertEqual(json.loads(saved['prior_state_json']), dict(job))
+        self.assertEqual(saved['decision_author'], fixer.ESCALATION_ASSIGNEE)
+        self.assertFalse(fixer.available(target))  # Default human ownership rules still apply.
+        with mock.patch.object(fixer, 'api') as api:
+            self.assertIsNone(fixer.select_work(self.conn, [target], []))
+            api.assert_not_called()  # No automatic comment/decision admission.
+        with mock.patch.object(fixer, 'recover_session') as recover, \
+             mock.patch.object(monitor, 'wait_once') as wait:
+            fixer.collect_step(self.conn, self.transport, resumed)
+        recover.assert_called_once()
+        wait.assert_not_called()  # The old escalated report is fenced by recovery.
+
+    def test_operator_return_retry_never_resets_resumed_work_again(self):
+        self.escalated_return()
+        with mock.patch.object(fixer, 'api', side_effect=self.return_github()), \
+             mock.patch.object(monitor, 'require_mj_success', return_value='{"state":"suspended"}'):
+            first, _ = fixer.resume_escalated_repair(self.conn, 12, 77)
+        for status in ('running', 'completed'):
+            with self.conn:
+                self.conn.execute('UPDATE issue_repairs SET status=? WHERE id=?', (status, first['id']))
+            with mock.patch.object(fixer, 'api') as api, \
+                 mock.patch.object(monitor, 'require_mj_success') as mj:
+                again, queued = fixer.resume_escalated_repair(self.conn, 12, 77)
+            self.assertFalse(queued)
+            self.assertEqual(again['recovery_json'], first['recovery_json'])
+            api.assert_not_called()
+            mj.assert_not_called()
+        with self.assertRaisesRegex(ValueError, 'another issue'):
+            fixer.resume_escalated_repair(self.conn, 13, 77)
+
+    def test_operator_return_rejects_untrusted_or_changed_handoffs(self):
+        job = self.escalated_return()
+        for options in (
+            dict(target=issue(assignees=('someone-else',))),
+            dict(target=issue(assignees=(fixer.ESCALATION_ASSIGNEE, 'someone-else'))),
+            dict(target=issue(assignees=(fixer.ESCALATION_ASSIGNEE,), progress=True)),
+            dict(target=dict(issue(assignees=(fixer.ESCALATION_ASSIGNEE,)), state='closed')),
+            dict(target=dict(issue(assignees=(fixer.ESCALATION_ASSIGNEE,)), labels=[])),
+            dict(target=dict(issue(assignees=(fixer.ESCALATION_ASSIGNEE,)),
+                             labels=[dict(name='buildfailure'), dict(name='eScAlAtEd')])),
+            dict(permission='read'),
+            dict(changed_issue=True),
+            dict(changed_decision=True),
+        ):
+            with self.subTest(options=options), \
+                 mock.patch.object(fixer, 'api', side_effect=self.return_github(**options)), \
+                 mock.patch.object(monitor, 'require_mj_success', return_value='{"state":"suspended"}'):
+                with self.assertRaises(ValueError):
+                    fixer.resume_escalated_repair(self.conn, 12, 77)
+            current = self.conn.execute('SELECT * FROM issue_repairs WHERE id=?', (job['id'],)).fetchone()
+            self.assertEqual(dict(current), dict(job))
+            self.assertEqual(self.conn.execute('SELECT count(*) FROM issue_repair_operator_returns').fetchone()[0], 0)
+
+    def test_operator_return_rejects_foreign_bot_empty_and_old_decisions(self):
+        job = self.escalated_return()
+        decision = dict(id=77, user=dict(login=fixer.ESCALATION_ASSIGNEE, type='User'),
+                        issue_url=f'https://api.github.com/repos/{monitor.REPO_NAME}/issues/12',
+                        html_url=job['issue_url']+'#issuecomment-77',
+                        created_at='2026-10-16T03:00:00Z', body='Approved implementation')
+        for fields in (
+            dict(id=78), dict(issue_url='https://api.github.com/repos/other/repo/issues/12'),
+            dict(user=dict(login=fixer.ESCALATION_ASSIGNEE, type='Bot')),
+            dict(user=dict(login=None, type='User')), dict(body=' '), dict(body=None),
+            dict(created_at='2026-10-15T03:00:00Z'), dict(created_at='2026-10-16T03:00:00'),
+        ):
+            with self.subTest(fields=fields), \
+                 mock.patch.object(fixer, 'api', side_effect=self.return_github(decision=dict(decision, **fields))), \
+                 mock.patch.object(monitor, 'require_mj_success', return_value='{"state":"suspended"}'):
+                with self.assertRaises(ValueError):
+                    fixer.resume_escalated_repair(self.conn, 12, 77)
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM issue_repair_operator_returns').fetchone()[0], 0)
+
+    def test_operator_return_preserves_active_sessions_and_open_branches(self):
+        job = self.escalated_return()
+        for states in (['running'], ['suspended', 'running']):
+            with self.subTest(states=states), \
+                 mock.patch.object(fixer, 'api', side_effect=self.return_github()), \
+                 mock.patch.object(monitor, 'require_mj_success',
+                                   side_effect=[json.dumps(dict(state=s)) for s in states]) as mj:
+                with self.assertRaisesRegex(ValueError, 'session'):
+                    fixer.resume_escalated_repair(self.conn, 12, 77)
+                self.assertTrue(all(c.args[0][0] == 'sessions' for c in mj.call_args_list))
+        with mock.patch.object(fixer, 'api', side_effect=self.return_github(
+                prs=[dict(head=dict(ref=job['branch']))])), \
+             mock.patch.object(monitor, 'require_mj_success', return_value='{"state":"suspended"}'):
+            with self.assertRaisesRegex(ValueError, 'open PR'):
+                fixer.resume_escalated_repair(self.conn, 12, 77)
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM issue_repair_operator_returns').fetchone()[0], 0)
+
+    def test_operator_return_respects_terminal_state_and_capacity(self):
+        job = self.escalated_return()
+        for update in ("status='running'", 'cleanup_done=0', 'session_id=NULL',
+                       "target_branch='stabilize/old'", 'repair_pr_number=30', 'retry_pr_number=30',
+                       "report_json='{}'"):
+            self.conn.execute('SAVEPOINT return_case')
+            self.conn.execute('UPDATE issue_repairs SET '+update+' WHERE id=?', (job['id'],))
+            with self.subTest(update=update), mock.patch.object(fixer, 'api') as api:
+                with self.assertRaises(ValueError):
+                    fixer.resume_escalated_repair(self.conn, 12, 77)
+                api.assert_not_called()
+            self.conn.execute('ROLLBACK TO return_case')
+            self.conn.execute('RELEASE return_case')
+        with mock.patch.object(fixer, 'occupied_slots', return_value=1), \
+             mock.patch.object(fixer, 'concurrency_limit', return_value=1), \
+             mock.patch.object(fixer, 'api') as api:
+            with self.assertRaisesRegex(ValueError, 'concurrency'):
+                fixer.resume_escalated_repair(self.conn, 12, 77)
+            api.assert_not_called()
+
+    def test_operator_return_is_atomic_and_operator_cli_omits_private_state(self):
+        import triage
+        job = self.escalated_return()
+        self.conn.execute("CREATE TEMP TRIGGER refuse_return BEFORE UPDATE ON issue_repairs "
+                          "WHEN NEW.status='running' BEGIN SELECT RAISE(ABORT,'test refusal'); END")
+        with mock.patch.object(fixer, 'api', side_effect=self.return_github()), \
+             mock.patch.object(monitor, 'require_mj_success', return_value='{"state":"suspended"}'):
+            import sqlite3
+            with self.assertRaises(sqlite3.IntegrityError):
+                fixer.resume_escalated_repair(self.conn, 12, 77)
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM issue_repair_operator_returns').fetchone()[0], 0)
+        self.assertEqual(dict(self.conn.execute('SELECT * FROM issue_repairs WHERE id=?', (job['id'],)).fetchone()), dict(job))
+        self.conn.execute('DROP TRIGGER refuse_return')
+        with mock.patch.object(triage, 'lock') as lock, \
+             mock.patch.object(fixer, 'api', side_effect=self.return_github()), \
+             mock.patch.object(monitor, 'require_mj_success', return_value='{"state":"suspended"}'), \
+             mock.patch.object(monitor, 'record_heartbeat') as heartbeat, \
+             mock.patch('builtins.print') as output:
+            lock.return_value.__enter__.return_value = True
+            self.assertEqual(monitor.resume_escalated_issue(12, 77), 0)
+        lock.assert_called_once_with(monitor.LOCK_PATH)
+        heartbeat.assert_not_called()
+        receipt = json.loads(output.call_args.args[0])
+        self.assertEqual(set(receipt), {'issue','job_id','session_id','branch','status','decision_comment_id','recovery_queued'})
+        self.assertEqual(receipt['session_id'], 'original')
+        self.assertTrue(receipt['recovery_queued'])
+
+    def test_operator_return_cli_requires_explicit_paired_identifiers(self):
+        from contextlib import redirect_stderr
+        from io import StringIO
+        with mock.patch('sys.argv', ['monitor.py','--resume-escalated-issue','12','--decision-comment','77']):
+            args = monitor.parse_args()
+        self.assertEqual((args.resume_escalated_issue, args.decision_comment), (12,77))
+        for argv in (['--resume-escalated-issue','12'], ['--decision-comment','77'],
+                     ['--resume-escalated-issue','0','--decision-comment','77'],
+                     ['--check','--resume-escalated-issue','12','--decision-comment','77']):
+            with self.subTest(argv=argv), mock.patch('sys.argv',['monitor.py',*argv]), redirect_stderr(StringIO()):
+                with self.assertRaises(SystemExit):
+                    monitor.parse_args()
+
+    def test_operator_return_bounds_decision_excerpt_without_losing_claim_instructions(self):
+        import hashlib
+        job = self.escalated_return()
+        body = 'a' * 64000 + '\nImplementation contract at the end'
+        decision = dict(id=77, user=dict(login=fixer.ESCALATION_ASSIGNEE, type='User'),
+                        issue_url=f'https://api.github.com/repos/{monitor.REPO_NAME}/issues/12',
+                        html_url=job['issue_url']+'#issuecomment-77',
+                        created_at='2026-10-16T03:00:00Z', body=body)
+        with mock.patch.object(fixer, 'api', side_effect=self.return_github(decision=decision)), \
+             mock.patch.object(monitor, 'require_mj_success', return_value='{"state":"suspended"}'):
+            resumed, _ = fixer.resume_escalated_repair(self.conn, 12, 77)
+        prompt = resumed['prompt']
+        self.assertTrue(fixer.prompt_fits(prompt))
+        self.assertIn('Retain the human assignment exactly', prompt)
+        self.assertIn(job['branch'], prompt)
+        self.assertIn('Read the selected decision in full on GitHub', prompt)
+        selected, _ = json.JSONDecoder().raw_decode(prompt[prompt.index('{"url":'):])
+        self.assertTrue(selected['implementation_decision']['truncated'])
+        self.assertEqual(len(selected['implementation_decision']['text']), 6000)
+        digest = self.conn.execute('SELECT decision_body_sha256 FROM issue_repair_operator_returns').fetchone()[0]
+        self.assertEqual(digest, hashlib.sha256(body.encode()).hexdigest())
+
+    def test_operator_return_busy_lock_does_not_open_or_migrate_database(self):
+        import triage
+        with mock.patch.object(triage, 'lock') as lock, \
+             mock.patch.object(monitor, 'connect_db') as connect, \
+             mock.patch.object(monitor, 'record_heartbeat') as heartbeat:
+            lock.return_value.__enter__.return_value = False
+            with self.assertRaisesRegex(RuntimeError, 'busy'):
+                monitor.resume_escalated_issue(12, 77)
+        connect.assert_not_called()
+        heartbeat.assert_not_called()
+
     def triaged_repair(self):
         import triage
         triage.ensure_schema(self.conn)
