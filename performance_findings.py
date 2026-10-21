@@ -278,6 +278,17 @@ def api(repository, endpoint):
     return json.loads(monitor.run_gh(['api', f'repos/{repository}/{endpoint}'], timeout=30))
 
 
+def record_missing_measurement(conn, repository, workflow, run, reason):
+    jobs = api(repository, f'actions/runs/{run["id"]}/jobs?per_page=100')
+    evidence = {'reason': reason, 'workflow_conclusion': run['conclusion'],
+        'harness_sha': run['head_sha'],
+        'jobs': [{'name': j['name'], 'conclusion': j['conclusion'],
+                  'failed_steps': [s['name'] for s in j.get('steps', []) if s.get('conclusion') == 'failure']}
+                 for j in jobs['jobs'] if j['conclusion'] not in ('success', 'skipped')][:10]}
+    record(conn, repository, workflow, run, 'coverage', [('measurement-coverage', 'coverage', evidence)],
+           [], {'complete': False, 'missing_measurement': True})
+
+
 def ingest(conn, source, run):
     repository, branch, workflow, adapter = source
     if (run.get('head_repository', {}).get('full_name') != repository or
@@ -293,14 +304,8 @@ def ingest(conn, source, run):
         (a['name'] == expected if adapter == 'bifrost' else
          a['name'].startswith('usagebench-') and a['name'].endswith('-' + str(run['id'])))]
     if not selected:
-        jobs = api(repository, f'actions/runs/{run["id"]}/jobs?per_page=100')
-        evidence = {'reason': 'No benchmark report artifact: no performance conclusion is possible',
-            'workflow_conclusion': run['conclusion'], 'harness_sha': run['head_sha'],
-            'jobs': [{'name': j['name'], 'conclusion': j['conclusion'],
-                      'failed_steps': [s['name'] for s in j.get('steps', []) if s.get('conclusion') == 'failure']}
-                     for j in jobs['jobs'] if j['conclusion'] not in ('success', 'skipped')][:10]}
-        record(conn, repository, workflow, run, 'coverage', [('measurement-coverage', 'coverage', evidence)],
-               [], {'complete': False, 'missing_measurement': True})
+        record_missing_measurement(conn, repository, workflow, run,
+            'No benchmark report artifact: no performance conclusion is possible')
         return
     if len(selected) != 1:
         raise ValueError('ambiguous benchmark artifact')
@@ -313,6 +318,23 @@ def ingest(conn, source, run):
     if artifact.get('digest') and artifact['digest'] != 'sha256:' + hashlib.sha256(raw).hexdigest():
         raise ValueError('benchmark artifact digest mismatch')
     members = read_archive(raw)
+    if adapter == 'bifrost':
+        # The workflow uploads raw results even if it fails before comparison
+        # and provenance generation. That is missing measurement, not a broken
+        # import to retry forever. Ambiguous members remain invalid evidence.
+        names = [PurePosixPath(name).name for name in members]
+        populations = [sum(n.startswith('run-') and n.endswith('.json') for n in names),
+                       names.count(f'compare-{run["id"]}.json'),
+                       names.count('full-performance-provenance.json')]
+        if any(count > 1 for count in populations):
+            raise ValueError('missing or ambiguous benchmark report')
+        if 0 in populations:
+            current = api(repository, f'actions/runs/{run["id"]}')
+            if current['run_attempt'] != run['run_attempt'] or current['status'] != 'completed':
+                raise ValueError('benchmark run attempt changed during intake')
+            record_missing_measurement(conn, repository, workflow, run,
+                'Benchmark report, comparison or provenance is missing: no performance conclusion is possible')
+            return
     context, candidates, passing, summary = (bifrost_report if adapter == 'bifrost' else usagebench_report)(members, run)
     # A rerun can supersede artifacts while they are being read. Do not mix attempts.
     current = api(repository, f'actions/runs/{run["id"]}')

@@ -1215,8 +1215,13 @@ provenance; read bounded JSON ZIP members without extracting or executing them.
 The shared `monitor.run_gh(binary=True)` retains App authentication and renewal
 while preserving archive bytes and excluding binary bodies from errors.
 `performance_runs` checkpoints intake/errors; failed imports retry independently,
-and unseen runs may advance past a bad import. `performance_findings` retains
-scenario/case identity, baseline/configuration context, original and latest run,
+and unseen runs may advance past a bad import.
+An authenticated Bifrost artifact that lacks its report, comparison or provenance
+records missing measurement coverage, including failed workflow steps, rather
+than retrying a parsing error forever. Ambiguous members, malformed complete
+reports and provenance mismatches remain invalid evidence. Recheck the attempt
+before recording partial-artifact coverage; it never proves a regression or pass.
+`performance_findings` retains scenario/case identity, baseline/configuration context, original and latest run,
 harness and actual engine revisions, compact measurements and triage ownership.
 Repeated same-head observations share an investigation. Explicit comparable
 passes retire only their cases; missing/partial output and baseline changes do

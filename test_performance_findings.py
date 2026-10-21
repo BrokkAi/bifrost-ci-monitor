@@ -170,6 +170,79 @@ class DurableFindings(TestCase):
             with self.assertRaises(ValueError):p.ingest(self.conn, p.SOURCES[0], r)
         api.assert_not_called()
 
+    def test_partial_bifrost_artifact_records_coverage_without_retiring_measured_failures(self):
+        self.record(run(8))
+        r = run(9)
+        all_members = bifrost_members(r)
+        for missing in ('comparison', 'provenance', 'report'):
+            members = dict(all_members)
+            key = {'comparison': 'compare-9.json', 'provenance': 'full-performance-provenance.json',
+                   'report': 'run-timestamp.json'}[missing]
+            del members[key]
+            self.ingest_members(r, members)
+        rows = p.observations(self.conn)
+        self.assertEqual(sorted(row['kind'] for row in rows), ['coverage', 'regression'])
+        coverage = next(row for row in rows if row['kind'] == 'coverage')
+        evidence = json.loads(coverage['evidence_json'])
+        self.assertIn('missing', evidence['reason'])
+        self.assertEqual(evidence['jobs'][0]['failed_steps'], ['Native benchmark'])
+        self.assertNotIn('candidate_median_ms', evidence)
+        receipt = self.conn.execute('SELECT status,error_class,summary_json FROM performance_runs '
+            'WHERE run_id=9').fetchone()
+        self.assertEqual(receipt['status'], 'done')
+        self.assertIsNone(receipt['error_class'])
+        self.assertFalse(json.loads(receipt['summary_json'])['complete'])
+
+    def ingest_members(self, r, members, current=None):
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, 'w') as archive:
+            for name, raw in members.items():
+                archive.writestr(name, raw)
+        raw = out.getvalue()
+        artifact = {'id': 1, 'name': f'benchmark-{r["id"]}', 'expired': False,
+            'size_in_bytes': len(raw), 'created_at': r['run_started_at'],
+            'workflow_run': {'head_sha': r['head_sha']},
+            'digest': 'sha256:' + hashlib.sha256(raw).hexdigest()}
+        self.conn.execute('INSERT OR IGNORE INTO performance_runs VALUES(?,?,?,?,?,?,?,?,?)',
+            (r['head_repository']['full_name'], r['id'], 1, r['created_at'], r['created_at'],
+             r['head_sha'], 'pending', 'ValueError', '{}'))
+        def api(repo, endpoint):
+            if '/artifacts?' in endpoint:
+                return {'total_count': 1, 'artifacts': [artifact]}
+            if '/jobs?' in endpoint:
+                return {'jobs': [{'name': 'Benchmark', 'conclusion': 'failure',
+                    'steps': [{'name': 'Native benchmark', 'conclusion': 'failure'}]}]}
+            return current or r
+        with mock.patch.object(p, 'api', side_effect=api), mock.patch.object(monitor, 'run_gh', return_value=raw):
+            with self.conn:
+                p.ingest(self.conn, p.SOURCES[0], r)
+
+    def test_partial_artifact_from_superseded_attempt_is_not_coverage(self):
+        r = run(9)
+        with self.assertRaisesRegex(ValueError, 'attempt changed'):
+            self.ingest_members(r, {'run-one.json': b'{}'}, current={**r, 'run_attempt': 2})
+        self.assertEqual(p.observations(self.conn), [])
+
+    def test_complete_authenticated_comparison_still_records_measured_regression(self):
+        r = run(9)
+        self.ingest_members(r, bifrost_members(r))
+        row, = p.observations(self.conn)
+        self.assertEqual(row['kind'], 'regression')
+        self.assertEqual(json.loads(row['evidence_json'])['candidate_median_ms'], 200)
+
+    def test_ambiguous_partial_and_bad_complete_artifacts_remain_invalid(self):
+        r = run(9)
+        ambiguous = {'first/run-one.json': b'{}', 'second/run-two.json': b'{}'}
+        with self.assertRaisesRegex(ValueError, 'ambiguous'):
+            self.ingest_members(r, ambiguous)
+        members = bifrost_members(r)
+        proof = json.loads(members['full-performance-provenance.json'])
+        proof['source_sha'] = 'f' * 40
+        members['full-performance-provenance.json'] = json.dumps(proof).encode()
+        with self.assertRaisesRegex(ValueError, 'provenance mismatch'):
+            self.ingest_members(r, members)
+        self.assertEqual(p.observations(self.conn), [])
+
     def test_changed_engine_with_unchanged_harness_gets_fresh_review(self):
         r = run(8, repository='BrokkAi/usagebench')
         with self.conn:p.record(self.conn, p.SOURCES[1][0], 'benchmark.yml', r,
