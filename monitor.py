@@ -1139,6 +1139,13 @@ def update_known_failures(
         with conn:
             conn.execute("DELETE FROM known_failure_errors")
         return True
+    except read_budget.Deferred:
+        if conn.in_transaction:
+            conn.rollback()
+        # Completed runs and pending publication are already checkpointed.
+        # A bounded poll yielding is not a failed upkeep or a recovered error.
+        log("known-failures ledger upkeep deferred until a later tick")
+        return False
     except Exception as exc:
         if conn.in_transaction:
             conn.rollback()

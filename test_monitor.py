@@ -2539,6 +2539,74 @@ class KnownFailureLedgerTests(unittest.TestCase):
         self.assertIn("known-ci-failures", create_args)
         self.assertEqual(gh.call_args_list[2].args[0][:3], ["issue", "pin", "55"])
 
+    def test_deferred_upkeep_retains_committed_runs_and_retries_unfinished_run(self):
+        now = dt.datetime.now(dt.timezone.utc)
+        items = [self.run_item(101, 'a' * 40), self.run_item(102, 'b' * 40)]
+        for index, item in enumerate(items):
+            item['createdAt'] = (now - dt.timedelta(seconds=1 - index)).isoformat()
+        completed = []
+
+        def process(conn, workflow, item):
+            if item['databaseId'] == 102 and not completed:
+                conn.execute("INSERT INTO known_failure_state VALUES ('unfinished', 'temporary')")
+                raise monitor.read_budget.Deferred('GitHub command will continue next tick')
+            with conn:
+                conn.execute(
+                    "INSERT INTO known_failure_runs "
+                    "(workflow,run_id,sha,url,conclusion,processed_at) VALUES (?,?,?,?,?,?)",
+                    (workflow, item['databaseId'], item['headSha'], item['url'],
+                     item['conclusion'], now.isoformat()),
+                )
+
+        with (
+            mock.patch.object(monitor, 'FAILURE_LEDGER_WORKFLOWS', [('CI', 'push')]),
+            mock.patch.object(monitor, '_known_failure_runs', return_value=items),
+            mock.patch.object(monitor, '_process_known_failure_run', side_effect=process) as run,
+            mock.patch.object(monitor, 'refresh_known_failure_link_states'),
+            mock.patch.object(monitor, '_sync_known_failure_issue'),
+            mock.patch.object(monitor, 'slack_send') as slack,
+            mock.patch.object(monitor, 'log') as log,
+        ):
+            self.assertFalse(monitor.update_known_failures(self.conn, self.transport, now=now))
+            self.assertEqual([r[0] for r in self.conn.execute('SELECT run_id FROM known_failure_runs')], [101])
+            self.assertIsNone(monitor._known_failure_state(self.conn, 'unfinished'))
+            self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM known_failure_errors').fetchone()[0], 0)
+            slack.assert_not_called()
+            self.assertFalse(any('failed' in str(c) for c in log.call_args_list))
+            completed.append(101)
+            self.assertTrue(monitor.update_known_failures(
+                self.conn, self.transport, now=now + dt.timedelta(minutes=5)))
+            self.assertEqual([c.args[2]['databaseId'] for c in run.call_args_list], [101, 102, 102])
+
+    def test_deferred_cached_publication_preserves_real_errors_and_pending_body(self):
+        now = dt.datetime.now(dt.timezone.utc)
+        monitor._set_known_failure_state(self.conn, 'last_upkeep_at', now.isoformat())
+        monitor._set_known_failure_state(self.conn, 'issue_pending_body', 'cached ledger view')
+        monitor._record_known_failure_error(self.conn, self.transport, 'github_command_failed', 'HTTP 503')
+        with (
+            mock.patch.object(monitor, '_sync_known_failure_issue',
+                              side_effect=monitor.read_budget.Deferred('budget exhausted')),
+            mock.patch.object(monitor, 'slack_send') as slack,
+            mock.patch.object(monitor, 'log'),
+        ):
+            self.assertFalse(monitor.update_known_failures(self.conn, self.transport, now=now))
+            self.assertEqual(monitor._known_failure_state(self.conn, 'issue_pending_body'), 'cached ledger view')
+            self.assertEqual([tuple(r) for r in self.conn.execute(
+                'SELECT reason,failure_count,last_error FROM known_failure_errors')],
+                [('github_command_failed', 1, 'HTTP 503')])
+            slack.assert_not_called()
+
+    def test_upkeep_command_failure_still_records_an_error(self):
+        with (
+            mock.patch.object(monitor, '_known_failure_runs',
+                              side_effect=monitor.CommandError('HTTP 503')),
+            mock.patch.object(monitor, 'log'),
+        ):
+            self.assertFalse(monitor.update_known_failures(self.conn, self.transport))
+        self.assertEqual([tuple(r) for r in self.conn.execute(
+            'SELECT reason,failure_count,last_error FROM known_failure_errors')],
+            [('github_command_failed', 1, 'HTTP 503')])
+
     def test_repeated_ledger_upkeep_error_notifies_once_per_reason(self):
         with mock.patch.object(monitor, "slack_send", return_value=(True, None)) as slack:
             for index in range(4):
