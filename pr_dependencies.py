@@ -335,10 +335,14 @@ class Graph:
         return str(node.data.get('state')).lower() == 'open'
 
     def _absorb(self, number, node, related):
-        """Drop edges to closed unmerged work that this open PR carries.
+        """Drop edges to closed, unlanded work that this open PR carries.
 
         Closing a PR never lands its head, so an edge to it could only block
-        forever. The descendant contains that work, stacked or not, and its
+        forever. GitHub also marks a PR merged once its head reaches its base
+        branch; when that base is this open PR's own branch (a fold), the head
+        is still unlanded and is absorbed the same way. Any other merged flag
+        keeps its edge until the head lands. The descendant
+        contains that work, stacked or not, and its
         batch tests the full tree like any other change, including a head the
         queue rejected earlier. The descendant inherits the closed PR's own
         prerequisites, so absorbed work never skips them. A stacked PR is
@@ -361,7 +365,12 @@ class Graph:
                 continue
             # A reviewed supersession record for this exact head is explicit
             # operator authority and keeps its own fail-closed checks.
-            if (str(prior.data.get('state')).lower() == 'closed' and not self._merged(prior.data)
+            # A merged flag elsewhere (a campaign branch, or an indirect merge
+            # whose head is not yet in master) still fences descendants; only a
+            # PR merged into this PR's own head branch was folded into it.
+            folded = ((prior.base_repo.casefold(), prior.base) == (node.repo.casefold(), node.branch))
+            if (str(prior.data.get('state')).lower() == 'closed'
+                    and (not self._merged(prior.data) or folded)
                     and (parent, captured_head) not in self.supersessions
                     and not self.landed(captured_head, number)
                     and self.ancestor(captured_head, node.head)):
