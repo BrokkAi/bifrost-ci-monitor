@@ -735,9 +735,13 @@ withdrawn or closed-unmerged prerequisites block descendants while unrelated
 work proceeds.
 A repair unblocks descendants after they contain the new eligible prerequisite
 head. Absorption is the exception for closed work: an open PR drops its edge to a
-closed unmerged PR (rejected heads included) when it contains that captured head
+closed PR (rejected heads included) when it contains that captured head
 and the head has not landed, whether or not it is stacked on the closed PR's
-branch. Its batch tests the full tree; `Graph.absorbed` records the edge. A
+branch. A fold counts too: when a PR's head is pushed onto the branch of the open
+PR it was stacked on, GitHub marks it merged into that branch, and that open PR
+absorbs it. Any other merged flag, such as a merge into a campaign branch or an
+indirect merge whose head is not yet in master, keeps its edge until the head
+lands; other descendants of a folded PR wait for its carrier to land. Its batch tests the full tree; `Graph.absorbed` records the edge. A
 reviewed supersession record for that exact closed head takes precedence. The
 absorbing PR inherits the closed PR's captured and base-branch prerequisites, so
 absorbed work never skips them. The supervisor never retargets a stacked PR

@@ -1132,6 +1132,37 @@ class DependencyTests(TestCase):
         master = self.git('rev-parse', 'master')
         self.assertTrue(all(self.ancestor(dep['head_sha'], master) for dep in payload['dependencies']))
 
+    def test_pr_merged_into_its_prerequisite_branch_is_absorbed_by_that_prerequisite(self):
+        """#6376 on 2026-10-22: folded into #6338, GitHub marked it merged there."""
+        self.patch(automerge, 'SUPERVISOR_RUNNING', False)
+        self.items = {}
+        old_head = self.add_pr(6338, 'typed-members', self.base)
+        self.add_pr(6376, 'receiver-seeds', old_head, base='typed-members')
+        automerge.dependency_graph(self.conn, promote=False)  # captures #6376 -> #6338
+        self.git('checkout', '-q', 'master')
+        self.commit('master-change', 'master')
+        self.git('checkout', '-q', 'receiver-seeds')
+        self.git('merge', '-q', '--no-ff', '-m', 'merge master', 'master')
+        folded = self.git('rev-parse', 'HEAD')
+        self.git('branch', '-f', 'typed-members', folded)
+        self.items[6338]['head']['sha'] = folded
+        # GitHub merges a PR whose head lands in its base branch, here #6338's
+        # branch rather than master, so its head is still not landed.
+        self.items[6376].update(state='closed', merged_at='now')
+        self.add_pr(6384, 'next-step', folded, base='typed-members')
+        graph = automerge.dependency_graph(self.conn, promote=False)
+        self.assertNotIn(6338, graph.problems)
+        self.assertEqual({dep.number for dep in graph.absorbed[6338]}, {6376})
+        self.assertEqual(graph.dependencies[6338], ())
+        # #6376 was folded into #6338, not into #6384, so #6384 keeps that edge
+        # and waits until #6338 lands it, like any merged-but-unlanded head.
+        self.assertIn(6376, {dep.number for dep in graph.dependencies[6384]})
+        self.assertEqual([p.number for p in self.selected()], [6338])
+        self.git('checkout', '-q', 'master')
+        self.git('merge', '-q', '--no-ff', '-m', 'land 6338', folded)
+        self.items[6338].update(state='closed', merged_at='now')
+        self.assertEqual([p.number for p in self.selected()], [6384])
+
     def test_landed_inherited_prerequisites_do_not_retarget_unlanded_absorbed_work(self):
         """PR #5110 on 2026-10-20: retargeted while closed base #4775 was unlanded."""
         self.patch(automerge, 'SUPERVISOR_RUNNING', False)
