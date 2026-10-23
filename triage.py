@@ -321,6 +321,10 @@ context before attributing slowdown to code. Group related cases by cause, searc
 closed tickets, and publish measured impact, exact source/baseline/case identity and a useful
 next diagnostic step. Missing coverage means no performance measurement: inspect failed job
 logs and distinguish actual product/compiler/harness defects from infrastructure interruption.
+Before attributing a timeout to a budget, trace the reported failure status through the
+pinned caller to the actual tool and its deadline. A remaining per-attempt timeout is not
+the total request budget; do not subtract it from another operation's budget to infer
+readiness time. Keep unmeasured timing breakdowns explicit hypotheses.
 Expected failures, unsupported cases and incomplete output are not newly demonstrated regressions.
 Without a prior comparable pass, describe an observed defect, not a proven new regression.
 Existing performance tickets may carry performance-regression instead of buildfailure; search
@@ -388,9 +392,11 @@ JSON object (no prose after it). The schema is:
 {{"findings":[{{"failure_ids":[1,2],"outcome":"product|infrastructure|resolved",
 "diagnosis":"concise cause or observed failure",
 "evidence":"specific log/run/commit evidence and uncertainty",
-"issue":{{"title":"specific actionable title","body":"Markdown: evidence, impact, next steps",
+"issue":{{"repository":"{monitor.REPO_NAME}","title":"specific actionable title","body":"Markdown: evidence, impact, next steps",
 "existing_number":null}}}}]}}
 Use an integer existing_number for a matching existing issue, null for a new issue.
+Set issue.repository explicitly: Bifrost defects use {monitor.REPO_NAME}; a UsageBench
+harness or ground-truth defect uses BrokkAi/usagebench only for UsageBench observations.
 Product requires an issue object; infrastructure and resolved require issue:null.
 Every supplied failure_id must appear at least once and at most once per finding.
 Only master CI step-level observations may appear in several findings, all of them product;
