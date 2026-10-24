@@ -45,6 +45,10 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   session per work item, rejected-repair retries, report validation and cleanup.
 - `agent_recovery.py`: shared native cancellation and context-reset steps for
   failed triage/fixer turns; each supervisor checkpoints through its own tables.
+- `health_check_delivery.py`: the existing workstation health timer's bounded
+  submission retries. Reuse one request ID after HTTP 409/503 refusals or an
+  ambiguous transport failure; stop after acceptance. This does not schedule
+  checks, replay downtime, restart sessions, or limit agent work.
 - `session_policy.py`: future merger/fixer Opus/high launches and straightforward
   DeepSeek Flash/high delegation; existing sessions retain their launch policy.
 - `triage.py`: observation-scoped investigations, validated report publication,

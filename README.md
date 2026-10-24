@@ -33,6 +33,17 @@ This repository's `master` accepts direct commits and pushes. The protected
 `master` discussed below belongs to **bifrost-dev**, where agent changes land
 through pull requests.
 
+The existing workstation health-check timer submits through
+`health_check_delivery.send_check`, which wraps `monitor.send_session_message`.
+Its submitter keeps the same `ci-agent-health-YYYYMMDDHH` request ID through
+brief HTTP 409/503 refusals or transport failures, waiting 5, 10 and 20 seconds
+between attempts within the submitter's existing 50-second process timeout.
+Acceptance ends retries, including after a lost response returns the original
+receipt. Exhausted attempts remain visible in the timer's journal; the next
+scheduled tick proceeds normally. Keep the
+existing schedule and submitter in place; this helper creates no timer and
+does not replay downtime or resume a stopped session.
+
 ## Initial setup
 
 Install Python 3.11 or later, Node.js 18 or later, Git, GitHub CLI (`gh`), Mjolnir (`mj`), Podman,
