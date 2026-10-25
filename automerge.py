@@ -722,10 +722,11 @@ def deliver_github_write(row: sqlite3.Row | dict[str, Any], *, conn: sqlite3.Con
         if detail.get('base', {}).get('ref') != payload['base_ref']:
             return  # A later discovery owns a changed dependency relationship.
         master = target_sha(payload.get('target_ref', BASE_BRANCH))
+        # A landed prerequisite need not be in this head: discovery releases a
+        # descendant cut from an earlier head of a prerequisite that changed.
         for dep in payload['dependencies']:
-            if (not compare_commit_ancestry(dep['head_sha'], master)
-                    or not compare_commit_ancestry(dep['head_sha'], head)):
-                raise AutomergeError(f"PR #{number} promotion prerequisite #{dep['number']} is not in target/head",
+            if not compare_commit_ancestry(dep['head_sha'], master):
+                raise AutomergeError(f"PR #{number} promotion prerequisite #{dep['number']} is not in target",
                                      reason='dependency_promotion_pending')
         github_api_write(f'pulls/{number}', 'PATCH', {'base': payload.get('target_ref', BASE_BRANCH)})
         confirmed = gh_json(['api', f'repos/{REPO_NAME}/pulls/{number}'])

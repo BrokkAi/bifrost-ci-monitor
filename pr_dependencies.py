@@ -500,10 +500,21 @@ class Graph:
                     self.problems[number] = f'unresolved prerequisite PR #{parent}'
                     deps.append(dependency)
                     continue
-                required = captured_head if self.landed(captured_head, number) else prior.head
-                if not self.ancestor(required, node.head):
+                # A head in the target reaches the batch through its captured
+                # base, so this PR need not contain it. The stored head can be a
+                # newer one this PR never had: a prerequisite that changed and
+                # then landed at that head would otherwise block it forever.
+                # Proof from a campaign gate tip alone relies on that immutable
+                # snapshot being this PR's head, so it still requires the head.
+                if self.landed(captured_head, number):
+                    if not (self.ancestor(captured_head, self.target(number)[1])
+                            or self.ancestor(captured_head, node.head)):
+                        self.problems[number] = f'PR #{parent} changed; its current head is absent from this PR'
+                    deps.append(dependency)
+                    continue
+                if not self.ancestor(prior.head, node.head):
                     self.problems[number] = f'PR #{parent} changed; its current head is absent from this PR'
-                deps.append(Dependency(parent, required))
+                deps.append(Dependency(parent, prior.head))
             self.dependencies[number] = tuple(dict.fromkeys(deps))
             pending.extend(d.number for d in self.dependencies[number])
             pending.extend(removed)

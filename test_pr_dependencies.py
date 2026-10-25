@@ -632,6 +632,89 @@ class DependencyTests(TestCase):
         automerge.report_dependency_blocks(self.conn, transport)
         self.assertNotIn(automerge.DEPENDENCY_BLOCKED_LABEL, automerge._labels(self.items[20]))
 
+    def blocked_reason(self, number):
+        return self.conn.execute('SELECT blocked_reason FROM automerge_pr_inventory WHERE number=?',
+                                 (number,)).fetchone()[0]
+
+    def test_prerequisite_that_changed_and_then_landed_releases_its_descendant(self):
+        # Bifrost #6013 was cut from #5887's earlier head after that head had
+        # been replaced. The stored edge names the replacement, which #6013
+        # never contained, and it stayed blocked after #5887 landed.
+        old = self.add_pr(50, 'prerequisite', self.base)
+        self.selected()  # Observe the earlier head in the prerequisite's history.
+        self.git('checkout', '-q', 'prerequisite')
+        new = self.commit('repair', 'repaired prerequisite')
+        self.items[50]['head']['sha'] = new
+        self.add_pr(60, 'descendant', old)
+        self.assertNotIn(60, [p.number for p in self.selected()])
+        self.assertEqual(self.blocked_reason(60), 'PR #50 changed; its current head is absent from this PR')
+        self.land(new)
+        self.items[50].update(state='closed', merged_at='2026-10-20T12:56:46Z')
+        self.assertIn(60, [p.number for p in self.selected()])
+        self.assertNotIn(60, [p['number'] for p in automerge.DEPENDENCY_BLOCKS])
+        self.assertIsNone(self.blocked_reason(60))
+
+    def test_rewritten_prerequisite_that_landed_releases_descendant_carrying_old_work(self):
+        # The descendant keeps an earlier head that the landed head replaced.
+        # Merging master would not remove that work either; its batch tests it.
+        old = self.add_pr(50, 'prerequisite', self.base)
+        self.add_pr(60, 'descendant', old)
+        self.selected()
+        self.git('checkout', '-q', '-B', 'prerequisite', self.base)
+        new = self.commit('rewrite', 'rewritten prerequisite')
+        self.items[50]['head']['sha'] = new
+        self.assertNotIn(60, [p.number for p in self.selected()])
+        self.land(new)
+        self.items[50].update(state='closed', merged_at='2026-10-20T12:56:46Z')
+        self.assertFalse(self.ancestor(old, self.git('rev-parse', 'master')))
+        self.assertIn(60, [p.number for p in self.selected()])
+        self.assertIsNone(self.blocked_reason(60))
+
+    def test_stacked_descendant_of_changed_then_landed_prerequisite_is_promoted(self):
+        old = self.add_pr(50, 'prerequisite', self.base)
+        self.add_pr(60, 'descendant', old, base='prerequisite')
+        self.selected()
+        self.git('checkout', '-q', 'prerequisite')
+        new = self.commit('repair', 'repaired prerequisite')
+        self.items[50]['head']['sha'] = new
+        self.assertNotIn(60, [p.number for p in self.selected()])
+        self.land(new)
+        self.items[50].update(state='closed', merged_at='2026-10-20T12:56:46Z')
+        self.assertIn(60, [p.number for p in self.selected()])
+        intent = self.conn.execute("SELECT * FROM automerge_github_outbox "
+                                   "WHERE kind='promote_dependency' AND number=60").fetchone()
+        self.assertIsNotNone(intent)
+        automerge.deliver_github_write(intent, conn=self.conn)
+        self.assertEqual(self.items[60]['base']['ref'], 'master')
+
+    def test_gate_tip_proof_still_requires_the_gate_source_to_contain_the_head(self):
+        # Only master proves landing independently. A gate source that no
+        # longer holds its snapshot cannot use the snapshot as proof.
+        self.items.clear()
+        old = self.add_pr(50, 'repair', self.base, base='stabilize/test')
+        self.git('checkout', '-qb', 'other', old)
+        replaced = self.commit('other', 'dependent work')
+        self.selected()  # Observe the earlier prerequisite head.
+        self.git('checkout', '-q', '-B', 'repair', self.base)
+        repaired = self.commit('repair-fixed', 'fixed')
+        self.items[50]['head']['sha'] = repaired
+        self.campaign(tip=repaired)
+        self.items[50].update(state='closed', merged=True, merged_at='now')
+        self.git('branch', 'stabilize-gate/test/push', repaired)
+        self.items[60] = copy.deepcopy(self.items[50])
+        self.items[60].update(number=60, state='open', merged=False, merged_at=None)
+        self.items[60]['head'].update(ref='stabilize-gate/test/push', sha=repaired)
+        self.items[60]['base']['ref'] = 'master'
+        with self.conn:
+            self.conn.execute("INSERT INTO stabilize_gate_merges VALUES "
+                              "('test','push',?,'stabilize-gate/test/push',60,'open','now','now')", (repaired,))
+        self.assertEqual([p.number for p in self.selected()], [60])
+        self.git('branch', '-f', 'stabilize-gate/test/push', replaced)
+        self.items[60]['head']['sha'] = replaced
+        for _ in range(2):
+            self.assertNotIn(60, [p.number for p in self.selected()])
+        self.assertEqual(self.blocked_reason(60), 'PR #50 changed; its current head is absent from this PR')
+
     def test_pending_legacy_dependency_notice_is_retired_without_slack_on_retry(self):
         identifier = 'dependency-20-' + self.y
         reason = 'dependency_blocked-legacy'

@@ -742,7 +742,12 @@ rechecks, retries, direct landing, and `--land-now`. Changed, draft, rejected,
 withdrawn or closed-unmerged prerequisites block descendants while unrelated
 work proceeds.
 A repair unblocks descendants after they contain the new eligible prerequisite
-head. Absorption is the exception for closed work: an open PR drops its edge to a
+head. A recorded prerequisite head in the target is satisfied whether or not the
+descendant contains it, so a prerequisite that changed and then landed releases a
+descendant cut from its earlier head; that batch tests any work it carries, and
+promotion needs only target ancestry. Proof from a campaign gate tip alone still
+requires the gate source to contain the head.
+Absorption is the exception for closed work: an open PR drops its edge to a
 closed PR (rejected heads included) when it contains that captured head
 and the head has not landed, whether or not it is stacked on the closed PR's
 branch. A fold counts too: when a PR's head is pushed onto the branch of the open
