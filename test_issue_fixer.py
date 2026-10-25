@@ -970,6 +970,10 @@ class IssueFixerTests(TestCase):
         self.assertIn("Do not try assigning mergemarshall[bot]", prompt)
         self.assertIn('committed Git changes and applicable local test evidence', prompt)
         self.assertIn('a link alone never justifies deferral', prompt)
+        self.assertIn(f"repair `{job['id']}` and this branch", prompt)
+        self.assertIn(f"<!-- mergemarshall-fixer:{job['id']} -->", prompt)
+        self.assertIn('repair record, not a Mjolnir session', prompt)
+        self.assertIn('only when verified from session metadata', prompt)
 
     def test_retry_prompt_uses_same_pr_and_draft_before_pushing(self):
         job = self.job(retry=pr(rejected=True))

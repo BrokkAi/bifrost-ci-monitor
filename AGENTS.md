@@ -216,6 +216,10 @@ A merge batch ID is not its mj session ID. Resolve it through
 `automerge_batches.session_id` in `monitor.DB_PATH` or match the batch's exact
 persisted title in `mj sessions`. Page transcripts with `next_after_seq`.
 Transcript cursors and `mj events` cursors are different sequence spaces.
+Likewise, `issue_repairs.id`, its branch suffix and the `mergemarshall-fixer`
+claim marker identify a repair record. They are not native session IDs; use
+`issue_repairs.session_id` for Mjolnir lookups. Claim comments must distinguish
+these identities and include a native session ID only when it is verified.
 Read the agent's own output before reporting findings. For tool activity,
 project only safe summary text/status; raw bodies, inputs and presentation
 fields can contain connection tokens. `api-info` reports a credential file's

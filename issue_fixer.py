@@ -443,8 +443,12 @@ design, build, commit and PR rules. Before investigation or code changes, refres
 the issue with gh, including its full body, comments, labels and assignees.
 {ownership}
 {claim}
-Post a claim comment naming MergeMarshall, this session{claim_target}, including
-the exact marker `<!-- mergemarshall-fixer:{job['id']} -->`. Re-read ownership after
+Post a claim comment naming MergeMarshall, repair `{job['id']}`{claim_target}, including
+the exact marker `<!-- mergemarshall-fixer:{job['id']} -->`.
+That marker and the branch suffix identify the repair record, not a Mjolnir session.
+Never label the repair ID as a session ID or use it for a native session lookup.
+Include your actual Mjolnir session ID only when verified from session metadata;
+otherwise say that the native session ID is unavailable. Re-read ownership after
 claiming; if another person claimed concurrently, stand down. If claiming fails,
 report blocked and do not start repair work. Recheck ownership before publishing.
 
