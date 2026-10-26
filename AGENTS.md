@@ -225,7 +225,7 @@ project only safe summary text/status; raw bodies, inputs and presentation
 fields can contain connection tokens. `api-info` reports a credential file's
 path; never read or print that file's contents.
 
-For authorized steering, `mj message --session SESSION_ID 'guidance'` uses the
+For steering, `mj message --session SESSION_ID 'guidance'` uses the
 same route as `send_message`. Automation uses `monitor.send_session_message`
 with a persisted request ID through `/sessions/SESSION_ID/message`; the CLI
 generates a fresh ID per invocation, so it is unsuitable for ambiguous retries.
