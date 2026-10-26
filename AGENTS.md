@@ -1375,9 +1375,14 @@ current source/CI facts and reuse existing evidence without repeating builds.
 Old in-flight reports lacking outcome must classify
 their existing findings in a correction turn before any issue write, using their
 captured evidence rather than repeating investigation.
-Skip findings fixed/superseded during investigation. A resolved finding can
-retire only its unchanged captured commit/steps/run; a later failure reopens
-the ledger. `--reconcile-resolved` reconciles historical completed reports
+Skip findings whose master ledger row closed during investigation. A newer red
+run that moves an open row to another commit or step set does not withdraw a
+product finding: its issue still publishes and links to the open row unless
+the row already names an open issue, while diagnosis and `triage_outcome` stay
+with the exact captured observation and the newer run gets its own
+investigation. Campaign, local and performance observations keep exact
+matching. A resolved finding can retire only its unchanged captured
+commit/steps/run; a later failure reopens the ledger. `--reconcile-resolved` reconciles historical completed reports
 without a new agent. `--retry-launch` first requires no exact-title session.
 
 Bot transport messages use persisted cursors and stable-ID deduplication;

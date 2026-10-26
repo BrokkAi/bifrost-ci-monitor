@@ -271,6 +271,20 @@ def current_observation(conn, observation):
     return row if row and row["status"] == "open" and fingerprint(row) == observation["fingerprint"] else None
 
 
+def open_observation(conn, observation):
+    """Return the master ledger row while it stays open, even at a newer commit.
+
+    A later red run of the same job changes the fingerprint but does not show
+    that a diagnosed product cause was fixed, so only a closed row withdraws
+    the finding's issue. Other observation kinds keep their exact identity.
+    """
+    if any(observation.get(k) for k in ('performance_finding_id', 'stabilize_campaign_id', 'local_finding_id')):
+        return current_observation(conn, observation)
+    row = conn.execute(f"SELECT * FROM known_failures WHERE {WHERE_KEY}",
+                       tuple(observation[k] for k in KEY)).fetchone()
+    return row if row and row["status"] == "open" else None
+
+
 def gh_api(endpoint: str, *, method: str = "GET", payload=None, pages=False, repository=None):
     args = ["api", f"repos/{repository or monitor.REPO_NAME}/{endpoint}", "--method", method]
     if pages:
@@ -1020,6 +1034,7 @@ def publish(conn, job) -> None:
     if prepared:
         cache_report(conn, job, report)
     publication_errors = []
+    published = withdrawn = 0
     # The fixer can investigate concurrently; serialize ticket ownership decisions.
     with lock(monitor.LOCK_PATH) as acquired:
         if not acquired:
@@ -1036,7 +1051,7 @@ def publish(conn, job) -> None:
             if not shared.intersection(finding['failure_ids']) and all(conn.execute('SELECT 1 FROM triage_observations WHERE fingerprint=? AND job_id=?',
                                 (o['fingerprint'], job['id'])).fetchone() for o in captured):
                 continue
-            active = [(observations[n], current_observation(conn, observations[n])) for n in finding["failure_ids"]]
+            active = [(observations[n], open_observation(conn, observations[n])) for n in finding["failure_ids"]]
             active = [(o, row) for o, row in active if row is not None]
             if finding['outcome'] == 'infrastructure':
                 publish_infrastructure_slack(conn, job, report, finding)
@@ -1089,8 +1104,20 @@ def publish(conn, job) -> None:
                                      ((finding["diagnosis"] + " Evidence: " + finding["evidence"])[:500],
                                       f"triage session {job['session_id']}", finding['outcome'], url, url, monitor.utc_now(),
                                       *(o[k] for k in KEY)))
+                    elif url and open_observation(conn, o) is not None:
+                        # A newer run moved the row. Link the issue for the fixer's
+                        # dossier unless the row already names an open issue; the
+                        # diagnosis and outcome stay with the captured run.
+                        conn.execute(f"UPDATE known_failures SET triage_issue_url=?,triage_issue_state='OPEN',"
+                                     f"updated_at=? WHERE status='open' AND (triage_issue_url IS NULL "
+                                     f"OR triage_issue_state IS NOT 'OPEN') AND {WHERE_KEY}",
+                                     (url, monitor.utc_now(), *(o[k] for k in KEY)))
                 conn.execute('INSERT INTO triage_finding_receipts(job_id,group_index,completed_at) '
                              'VALUES (?,?,?)', (job['id'], index, monitor.utc_now()))
+                if url:
+                    published += 1
+                elif finding['outcome'] == 'product' and finding['issue']:
+                    withdrawn += 1
         if publication_errors:
             with conn:
                 conn.execute('UPDATE triage_jobs SET last_error=? WHERE id=?',
@@ -1102,7 +1129,8 @@ def publish(conn, job) -> None:
                          (monitor.utc_now(), job["id"]))
     deliver_product_announcements(conn, job_id=job['id'])
     monitor._sync_known_failure_issue(conn)
-    monitor.log(f"triage {job['id']}: published findings")
+    monitor.log(f"triage {job['id']}: completed; {published} issue(s) published, "
+                f"{withdrawn} product finding(s) withdrawn with no open observation")
 
 
 def cleanup(conn) -> None:

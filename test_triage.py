@@ -1246,20 +1246,53 @@ class TriageTests(TestCase):
             self.conn.execute("UPDATE known_failures SET last_seen_sha=?", ("b" * 40,))
         self.assertEqual(len(triage.pending(self.conn)), 1)
 
-    def test_fixed_and_superseded_observations_are_not_published_or_diagnosed(self):
-        for status, sha in (("fixed", "a" * 40), ("open", "b" * 40)):
-            with self.subTest(status=status):
+    def test_fixed_observations_are_not_published_or_diagnosed(self):
+        for sha in ("a" * 40, "b" * 40):
+            with self.subTest(sha=sha):
                 self.conn.execute("DELETE FROM known_failures")
                 self.conn.execute("DELETE FROM triage_jobs")
                 self.conn.execute("DELETE FROM triage_observations")
                 self.add_failure()
                 self.make_job()
                 with self.conn:
-                    self.conn.execute("UPDATE known_failures SET status=?,last_seen_sha=?", (status, sha))
+                    self.conn.execute("UPDATE known_failures SET status='fixed',last_seen_sha=?", (sha,))
                 triage.publish(self.conn, self.job())
                 self.assertEqual(self.github.calls, [])
                 self.slack.assert_not_called()
                 self.assertIsNone(self.conn.execute("SELECT diagnosis FROM known_failures").fetchone()[0])
+
+    def test_product_finding_publishes_while_a_newer_red_run_keeps_its_row_open(self):
+        # A newer failing commit supersedes the observation but does not show the
+        # diagnosed cause was fixed. Before, every busy master job dropped its ticket.
+        self.add_failure()
+        self.make_job()
+        with self.conn:
+            self.conn.execute("UPDATE known_failures SET last_seen_sha=?,last_seen_run_id=2,"
+                              "last_seen_failed_steps_json=?,triage_issue_url=?,triage_issue_state='CLOSED'",
+                              ("b" * 40, json.dumps(["Cargo nextest", "Complete runner"]),
+                               "https://github.com/BrokkAi/bifrost-dev/issues/7"))
+        triage.publish(self.conn, self.job())
+        self.assertEqual([issue["title"] for issue in self.github.issues.values()], ["Fix missing import"])
+        row = self.conn.execute("SELECT * FROM known_failures").fetchone()
+        self.assertTrue(row["triage_issue_url"].endswith(f"/issues/{next(iter(self.github.issues))}"))
+        self.assertEqual(row["triage_issue_state"], "OPEN")
+        # The diagnosis and outcome describe the captured run, not the newer one.
+        self.assertIsNone(row["diagnosis"])
+        self.assertIsNone(row["triage_outcome"])
+        self.assertEqual(self.job()["status"], "completed")
+        # The newer run is still a separate observation for the next investigation.
+        self.assertEqual(len(triage.pending(self.conn)), 1)
+
+    def test_superseded_publication_keeps_a_newer_link_to_an_open_issue(self):
+        self.add_failure()
+        self.make_job()
+        newer = "https://github.com/BrokkAi/bifrost-dev/issues/9"
+        with self.conn:
+            self.conn.execute("UPDATE known_failures SET last_seen_sha=?,triage_issue_url=?,"
+                              "triage_issue_state='OPEN'", ("b" * 40, newer))
+        triage.publish(self.conn, self.job())
+        self.assertEqual(len(self.github.issues), 1)
+        self.assertEqual(self.conn.execute("SELECT triage_issue_url FROM known_failures").fetchone()[0], newer)
 
     def test_observation_changed_during_publication_is_not_overwritten(self):
         self.add_failure()
@@ -1274,7 +1307,8 @@ class TriageTests(TestCase):
             triage.publish(self.conn, self.job())
         row = self.conn.execute("SELECT * FROM known_failures").fetchone()
         self.assertEqual(row["diagnosis"], "newer diagnosis")
-        self.assertIsNone(row["triage_issue_url"])
+        # The row is still open, so the published issue is linked for the fixer.
+        self.assertTrue(row["triage_issue_url"].endswith(f"/issues/{next(iter(self.github.issues))}"))
         self.assertEqual(len(triage.pending(self.conn)), 1)
 
     def test_lost_issue_create_response_is_recovered_after_restart(self):
