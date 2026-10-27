@@ -194,7 +194,10 @@ class Probe:
                 self.add('ledger_upkeep_failing', row['reason'], row['last_error'])
 
     def ledger_pending(self):
-        if self.conn.execute("SELECT 1 FROM known_failure_state WHERE key='issue_pending_body' AND value IS NOT NULL").fetchone():
+        # The monitor keeps an empty placeholder row when nothing is pending
+        # (monitor._sync_known_failure_issue); only a prepared body is pending.
+        if self.conn.execute("SELECT 1 FROM known_failure_state WHERE key='issue_pending_body' "
+                             "AND value IS NOT NULL AND value <> ''").fetchone():
             self.add('ledger_view_pending', 'ledger', 'issue view publication pending', 1800)
 
     def performance(self):

@@ -199,6 +199,9 @@ class HealthProbeTests(unittest.TestCase):
         self.conn.execute('DELETE FROM known_failure_state')
         self.conn.commit()
         self.assertFalse({'ledger_upkeep_failing', 'ledger_view_pending'} & self.kinds())
+        # The monitor's empty placeholder means nothing is pending.
+        self.insert('known_failure_state', key='issue_pending_body', value='')
+        self.assertNotIn('ledger_view_pending', self.kinds())
 
     def test_performance(self):
         self.insert('performance_runs', repository='repo', run_id=1, attempt=1, status='pending', error_class='PermissionError')
