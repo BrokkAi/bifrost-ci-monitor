@@ -307,6 +307,21 @@ class Probe:
                 self.add('merge_admission_stall', lane, 'lane free with eligible work', 600 if lane == 'immediate' else 900,
                          f'{lane} lane free; cached eligible PRs: {", ".join(map(str, sorted(numbers)[:10]))}')
 
+    def publications(self):
+        """Triage publication times per Bifrost issue; older rows lack receipts."""
+        tables = {r[0] for r in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {'triage_publications', 'triage_finding_receipts'} <= tables:
+            return {}
+        columns = {r[1] for r in self.conn.execute('PRAGMA table_info(triage_publications)')}
+        # UsageBench findings can publish to another repository with colliding numbers.
+        where, params = ('WHERE p.repository = ?', (monitor.REPO_NAME,)) if 'repository' in columns else ('', ())
+        times = {}
+        for issue, completed in self.conn.execute(
+                'SELECT p.issue_number, r.completed_at FROM triage_publications p '
+                f'JOIN triage_finding_receipts r USING (job_id, group_index) {where}', params):
+            times.setdefault(issue, []).append(parsed(completed))
+        return times
+
     def fixer_admission(self):
         limit = issue_fixer.concurrency_limit()  # Reads env/config only; no writes or service calls.
         repairs = self.rows('issue_repairs', 'id,issue_number,status,created_at,json_extract(report_json,\'$.outcome\') AS outcome')
@@ -316,6 +331,7 @@ class Probe:
         latest = {}
         for row in sorted(repairs, key=lambda r: (r['created_at'], r['id'])):
             latest[row['issue_number']] = row['outcome']
+        published = self.publications()
         issues = set()
         for row in self.rows('known_failures', 'status,triage_outcome,first_seen_at,triage_issue_url,linked_issue_url,linked_pr_state'):
             url = row['triage_issue_url'] or row['linked_issue_url'] or ''
@@ -323,8 +339,15 @@ class Probe:
             if not match or row['status'] != 'open' or row['triage_outcome'] == 'infrastructure':
                 continue
             issue = int(match[1])
+            if not row['first_seen_at']:
+                continue
+            # A step-level row can stay open across unrelated causes for weeks, so
+            # age the issue from its first publication in this ledger episode.
+            # Triage republishes often; a later publication must not reset the clock.
+            first_seen = parsed(row['first_seen_at'])
+            start = min((t for t in published.get(issue, ()) if t >= first_seen), default=first_seen)
             if (issue not in active and latest.get(issue) not in {'submitted', 'deferred', 'resolved', 'infrastructure', 'claimed_elsewhere', 'escalated'}
-                    and row['linked_pr_state'] != 'MERGED' and row['first_seen_at'] and self.age(row['first_seen_at']) > 7200):
+                    and row['linked_pr_state'] != 'MERGED' and (self.now - start).total_seconds() > 7200):
                 issues.add(issue)
         for issue in sorted(issues):
             self.add('fixer_admission_stall', issue, 'free fixer capacity with unhandled issue', 900)

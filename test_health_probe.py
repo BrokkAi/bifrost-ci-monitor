@@ -301,6 +301,29 @@ class HealthProbeTests(unittest.TestCase):
         self.update('known_failures', triage_outcome=None, first_seen_at=NOW.isoformat())
         self.assertNotIn('fixer_admission_stall', self.kinds())
 
+    def publish(self, job, issue, at, repository=None):
+        self.insert('triage_publications', job_id=job, group_index=0, issue_number=issue,
+                    **({'repository': repository} if repository else {}))
+        self.insert('triage_finding_receipts', job_id=job, group_index=0, completed_at=at.isoformat())
+
+    def test_fixer_admission_ages_from_first_publication_in_episode(self):
+        # Issue #7410: a new issue linked to a step row open since weeks earlier.
+        self.insert('known_failures', identity='Cargo clippy', first_seen_at=(NOW - timedelta(days=20)).isoformat(),
+                    triage_issue_url='https://github.com/BrokkAi/bifrost-dev/issues/12')
+        self.publish('new', 12, NOW - timedelta(minutes=10))
+        self.assertNotIn('fixer_admission_stall', self.kinds())
+        # A republication does not reset the clock: the earliest one in the episode counts.
+        self.publish('first', 12, NOW - timedelta(hours=3))
+        self.assertIn('fixer_admission_stall', self.kinds())
+
+    def test_fixer_admission_ignores_other_publications(self):
+        self.insert('known_failures', identity='failure', first_seen_at=(NOW - timedelta(hours=3)).isoformat(),
+                    triage_issue_url='https://github.com/BrokkAi/bifrost-dev/issues/12')
+        # Before this ledger episode, or in another repository: the row's first sighting applies.
+        self.publish('earlier', 12, NOW - timedelta(days=5))
+        self.publish('usagebench', 12, NOW - timedelta(minutes=10), repository='BrokkAi/usagebench')
+        self.assertIn('fixer_admission_stall', self.kinds())
+
     def test_merge_handoff(self):
         self.batch(ready_json=json.dumps(dict(id='receipt', head='a' * 40)))
         self.assertIn('merge_handoff_unconsumed', self.kinds())
