@@ -554,6 +554,12 @@ The CI daemon has `[subagents.straightforward]` set to `deepseek-flash`/`high`,
 no global `[subagents.subtle]`, and `deepseek = true` plus
 `bedrock-claude = true` under `eligible_profiles`. Bedrock Claude eligibility
 retains Sonnet availability after a merger's provider failover to Flash.
+The Claude profile also sets `ANTHROPIC_CUSTOM_MODEL_OPTION` to
+`us.anthropic.claude-sonnet-5-5` so target-side startup selectors expose the
+exact helper model; `ANTHROPIC_MODEL` remains the Opus default. Host model
+discovery can retain a different catalog from a new container. Verify a real
+high-effort turn on `bedrock-podman` after changing helper model settings;
+successful registration alone does not prove startup or inference succeeded.
 Straightforward-only delegation requires Mjolnir 2.47.0 or later; 2.46.0
 rejects these launches before creating a session.
 Merger launches explicitly override both task models/efforts. Fixer launches

@@ -70,6 +70,13 @@ On mj 2.47 or later, configure `[subagents.straightforward]` with
 and enable `deepseek = true` and `bedrock-claude = true` under
 `[subagents.eligible_profiles]`. The latter also permits Sonnet delegation
 after the merger's same-session failover to Flash.
+Under `[profiles.bedrock-claude.environment]`, set
+`ANTHROPIC_CUSTOM_MODEL_OPTION = "us.anthropic.claude-sonnet-5-5"` and
+`ANTHROPIC_CUSTOM_MODEL_OPTION_NAME = "Sonnet 5.5"`. This exposes the approved
+helper ID in the container's model selector while preserving the profile's
+Opus default. Back up `config.toml` before editing, compare `mj doctor --json`
+before and after, and verify a completed Sonnet/high turn on `bedrock-podman`.
+Host `mj models` results can be cached independently of target startup choices.
 Keep `max_concurrent = 16` under `[subagents]`. Merger launches explicitly set
 both task choices; fixer launches set only straightforward. Keep the global
 subtle choice unset so fixers do not inherit it. Triage uses `deepseek-flash` with
