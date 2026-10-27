@@ -46,6 +46,10 @@ class HealthProbeTests(unittest.TestCase):
         for name in ('monitor', 'merger', 'triage', 'stabilize'):
             self.insert('entrypoint_heartbeats', entry_point=name, last_finished_at=NOW.isoformat(), last_outcome='ok')
         self.sessions_file = self.root / 'sessions.json'
+        self.mj_db = self.root / 'mj.sqlite3'
+        with contextlib.closing(sqlite3.connect(self.mj_db)) as mj:
+            mj.execute('CREATE TABLE api_events (seq INTEGER PRIMARY KEY, session_id TEXT, recorded_at_ms INTEGER, body TEXT)')
+            mj.commit()
         self.sessions_file.write_text('{"sessions": []}')
         patch = mock.patch.object(hp.subprocess, 'run', return_value=mock.Mock(returncode=0, stdout='{}'))
         self.mj = patch.start()
@@ -79,7 +83,7 @@ class HealthProbeTests(unittest.TestCase):
         self.insert('triage_jobs', id='triage', status='running', observations_json='[]', **values)
 
     def result(self):
-        return hp.Probe(self.path, now=NOW, sessions_json=self.sessions_file).run()
+        return hp.Probe(self.path, now=NOW, sessions_json=self.sessions_file, mj_db=self.mj_db).run()
 
     def kinds(self):
         result = self.result()
@@ -223,6 +227,35 @@ class HealthProbeTests(unittest.TestCase):
         self.assertNotIn('suspend_failing', self.kinds())
         self.update('automerge_batches', status='running', phase='building', terminal_status=None, suspend_verify_failures=3)
         self.assertNotIn('suspend_failing', self.kinds())
+
+    def fault(self, seq, session, message, minutes_ago, reason='lifecycle_failed'):
+        body = json.dumps(dict(type='session_fault', data=dict(reason=reason, message=message, command_id=None)))
+        with contextlib.closing(sqlite3.connect(self.mj_db)) as mj:
+            mj.execute('INSERT INTO api_events VALUES (?,?,?,?)',
+                       (seq, session, int((NOW - timedelta(minutes=minutes_ago)).timestamp() * 1000), body))
+            mj.commit()
+
+    def test_session_faults(self):
+        # Three subagents failed startup and were closed; their rows look ordinary afterwards.
+        offer = 'this agent does not offer us.anthropic.claude-sonnet-5-5 as a model'
+        for i, sid in enumerate(('a' * 32, 'b' * 32, 'c' * 32)):
+            self.fault(10 + i, sid, offer, 30)
+        self.fault(1, 'd' * 32, 'old fault', 180)  # outside the two-hour window
+        findings = [r for r in self.result()['findings'] if r['kind'] == 'session_fault']
+        self.assertEqual(len(findings), 1)
+        self.assertIn('3 session(s)', findings[0]['summary'])
+        # Suspension faults of a stuck terminal batch belong to suspend_failing.
+        self.batch(status='completed', phase='terminal', terminal_status='aborted',
+                   suspend_pending=1, suspend_verify_failures=3, session_id='e' * 32)
+        self.fault(20, 'e' * 32, 'the suspension did not finish; the daemon log records the reason under reference lifecycle-643abc2149', 5)
+        self.assertEqual([r['fingerprint'] for r in self.result()['findings'] if r['kind'] == 'session_fault'],
+                         [findings[0]['fingerprint']])
+        # Reference IDs in a repeated message keep one fingerprint.
+        self.fault(30, 'f' * 32, 'the suspension did not finish; the daemon log records the reason under reference suspension-fb15', 5)
+        self.fault(31, '1' * 32, 'the suspension did not finish; the daemon log records the reason under reference 3165916-2962', 4)
+        suspension = [r for r in self.result()['findings'] if r['kind'] == 'session_fault' and 'suspension' in r['cause']]
+        self.assertEqual(len(suspension), 1)
+        self.assertIn('2 session(s)', suspension[0]['summary'])
 
     def test_campaign(self):
         self.insert('stabilize_campaigns', id='campaign', status='paused', pause_reason='dispatch refused')
@@ -413,14 +446,14 @@ class HealthProbeTests(unittest.TestCase):
     def test_cli_and_subprocess_allowlist(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            code = hp.main(['--db', str(self.path), '--sessions-json', str(self.sessions_file), '--now', NOW.isoformat()])
+            code = hp.main(['--db', str(self.path), '--sessions-json', str(self.sessions_file), '--now', NOW.isoformat(), '--mj-db', str(self.mj_db)])
         self.assertEqual(code, 0)
         result = json.loads(output.getvalue())
         self.assertEqual(set(result), {'format', 'probed_at', 'findings', 'check_errors'})
         self.assertEqual(result['format'], 1)
         self.assertEqual(result['probed_at'], NOW.isoformat())
         self.mj.return_value.stdout = '{"sessions": []}'
-        hp.Probe(self.path, now=NOW).run()
+        hp.Probe(self.path, now=NOW, mj_db=self.mj_db).run()
         for call in self.mj.call_args_list:
             self.assertIn(call.args[0][1:], [['api-info', '--json'], ['sessions', '--workspace', 'CI', '--json']])
             self.assertLessEqual(call.kwargs['timeout'], 15)

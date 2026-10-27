@@ -22,6 +22,7 @@ BATCH_ACTIVE = {'launching', 'running', 'finishing'}
 REPAIR_ACTIVE = {'selected', 'launching', 'running', 'finishing'}
 TRIAGE_ACTIVE = {'queued', 'launching', 'running', 'publishing'}
 UTC = timezone.utc
+FAULT_WINDOW_SECONDS = 7200
 
 
 def safe(value):
@@ -45,6 +46,11 @@ def parsed(value):
     return result.replace(tzinfo=UTC) if result.tzinfo is None else result.astimezone(UTC)
 
 
+def default_mj_db():
+    data = os.environ.get('MJ_DATA_DIR') or Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local/share')) / 'mjolnir'
+    return Path(data) / 'mj.sqlite3'
+
+
 def open_readonly(path):
     conn = sqlite3.connect(f'file:{quote(str(Path(path).absolute()), safe="/")}?mode=ro', uri=True, timeout=5)
     conn.row_factory = sqlite3.Row
@@ -53,8 +59,9 @@ def open_readonly(path):
 
 
 class Probe:
-    def __init__(self, db, *, now=None, sessions_json=None):
+    def __init__(self, db, *, now=None, sessions_json=None, mj_db=None):
         self.db = Path(db)
+        self.mj_db = Path(mj_db) if mj_db else default_mj_db()
         self.now = now or datetime.now(UTC)
         self.sessions_json = sessions_json
         self.findings = []
@@ -222,6 +229,36 @@ class Probe:
                 self.add('suspend_failing', row['batch_id'], 'terminal suspension verification failed',
                          summary=f'{row["batch_id"]}: terminal suspension unverified after '
                                  f'{row["suspend_verify_failures"]} attempts')
+
+    def session_faults(self):
+        # Mjolnir's durable event log keeps typed faults after the session row
+        # looks ordinary again, e.g. a subagent that could not start with its
+        # requested model and was closed by its parent.
+        covered = {r['session_id'] for r in self.rows(
+            'automerge_batches', 'session_id,status,terminal_status,phase,suspend_pending')
+            if r['session_id'] and r['suspend_pending'] and not self.batch_live(r)}  # suspend_failing owns these
+        mj = open_readonly(self.mj_db)
+        try:
+            since = int((self.now.timestamp() - FAULT_WINDOW_SECONDS) * 1000)
+            rows = mj.execute("""SELECT session_id, recorded_at_ms,
+                    json_extract(body, '$.data.reason') AS reason, json_extract(body, '$.data.message') AS message
+                FROM api_events WHERE seq > (SELECT max(seq) FROM api_events) - 50000
+                AND json_extract(body, '$.type') = 'session_fault' AND recorded_at_ms > ?""", (since,)).fetchall()
+        finally:
+            mj.close()
+        groups = {}
+        for row in rows:
+            if row['session_id'] in covered:
+                continue
+            message = re.sub(r'\breference \S+', 'reference <ref>', str(row['message'] or 'session fault'))
+            group = groups.setdefault((str(row['reason'] or 'unknown'), message), dict(sessions=set(), latest=0))
+            group['sessions'].add(str(row['session_id']))
+            group['latest'] = max(group['latest'], row['recorded_at_ms'] or 0)
+        for (reason, message), group in sorted(groups.items()):
+            latest = datetime.fromtimestamp(group['latest'] / 1000, UTC).strftime('%H:%M')
+            ids = ', '.join(sorted(sid[:8] for sid in group['sessions'])[:3])
+            self.add('session_fault', reason, message, summary=(
+                f'{len(group["sessions"])} session(s) faulted in the last 2 h ({ids}; latest {latest} UTC): {message}'))
 
     def campaigns(self):
         rows = self.rows('stabilize_campaigns', 'id,status,pause_reason')
@@ -398,6 +435,7 @@ class Probe:
                     ('ci_blocked', self.ci_blocked), ('outbox', self.outbox), ('supervisor_actions', self.actions),
                     ('ledger_errors', self.ledger_errors), ('ledger_pending', self.ledger_pending),
                     ('performance_intake', self.performance), ('suspension', self.suspension),
+                    ('session_faults', self.session_faults),
                     ('campaigns', self.campaigns), ('merger_admission', self.admission),
                     ('fixer_admission', self.fixer_admission), ('merge_handoff', self.merge_handoff),
                     ('fixer_handoff', self.fixer_handoff)]
@@ -424,8 +462,10 @@ def main(argv=None):
     parser.add_argument('--db', type=Path, default=monitor.DB_PATH)
     parser.add_argument('--sessions-json', type=Path)
     parser.add_argument('--now', type=parsed)
+    parser.add_argument('--mj-db', type=Path, help="Mjolnir's database (default: its data directory)")
     args = parser.parse_args(argv)
-    print(json.dumps(Probe(args.db, now=args.now, sessions_json=args.sessions_json).run(), sort_keys=True))
+    print(json.dumps(Probe(args.db, now=args.now, sessions_json=args.sessions_json, mj_db=args.mj_db).run(),
+                     sort_keys=True))
     return 0
 
 

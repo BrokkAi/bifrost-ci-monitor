@@ -51,8 +51,10 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   checks, replay downtime, restart sessions, or limit agent work.
 - `health_probe.py` and `health_trigger.py`: event-driven health checkups. The
   probe runs on the CI host, reads SQLite read-only plus `mj api-info`/`mj
-  sessions`, and makes no GitHub calls. It reports durable error state (heartbeats,
-  native session errors, blocked recovery, blocked notices, failing outbox and
+  sessions` and recent `session_fault` events in Mjolnir's own database, and makes
+  no GitHub calls. It reports durable error state (heartbeats, native session
+  errors, faults such as subagents that failed to start, blocked recovery,
+  blocked notices, failing outbox and
   supervisor actions, ledger/intake errors, stuck terminal suspension, paused
   campaigns, disk) and stalls (repeated fixer work, a free merge lane or fixer
   slot with eligible cached work, unconsumed handoffs). Each finding has a stable
