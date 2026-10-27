@@ -147,8 +147,9 @@ class Probe:
             sid = row['session_id']
             session = self.sessions.get(sid)
             if session and session.get('has_error'):
+                # A failed session is also not running; one finding per incident.
                 self.add('session_error', sid, 'native session has_error')
-            if not session or session.get('state') != 'running' or session.get('lifecycle') != 'live':
+            elif not session or session.get('state') != 'running' or session.get('lifecycle') != 'live':
                 self.add('session_not_running', sid, 'native session missing or not running/live', 1800)
 
     def jobs(self, table, active, kind):

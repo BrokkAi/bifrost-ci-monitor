@@ -124,8 +124,10 @@ class HealthProbeTests(unittest.TestCase):
         self.repair(session_id='native')
         self.job(session_id='native')
         self.assertIn('session_not_running', self.kinds())
-        self.sessions_file.write_text(json.dumps({'sessions': [dict(id='native', state='suspended', lifecycle='suspended', has_error=True)]}))
-        self.assertTrue({'session_error', 'session_not_running'} <= self.kinds())
+        # A failed session reports session_error only, not a second finding.
+        self.sessions_file.write_text(json.dumps({'sessions': [dict(id='native', state='error', lifecycle='failed', has_error=True)]}))
+        self.assertIn('session_error', self.kinds())
+        self.assertNotIn('session_not_running', self.kinds())
         self.sessions_file.write_text(json.dumps({'sessions': [dict(id='native', state='running', lifecycle='live', has_error=False)]}))
         self.assertFalse({'session_error', 'session_not_running'} & self.kinds())
         self.sessions_file.write_text('{"sessions": []}')
