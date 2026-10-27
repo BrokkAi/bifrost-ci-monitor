@@ -179,6 +179,25 @@ class FailoverTests(unittest.TestCase):
         self.assertIn('There are no subtle subagents', guidance)
         self.assertNotIn('Luna', guidance)
 
+    def test_sonnet_policy_survives_same_session_provider_failover(self):
+        with self.conn:
+            self.conn.execute("UPDATE automerge_batches SET "
+                              "agent_configuration='opus-high-dsf-high-sonnet-high'")
+        self.trigger()
+        self.native.side_effect = [None, self.operation(), self.operation()]
+        self.submit.side_effect = read_budget.Deferred('poll budget ended')
+        self.session.return_value = {'id': 'session', 'profile_id': f.PROFILE}
+        f.advance(a, self.conn, self.row())
+        self.assertEqual(self.value()['stage'], 'completed')
+        self.assertEqual(self.row()['agent_configuration'], 'flash-dsf-high-sonnet-high')
+        guidance = a._validation_guidance(BASE_SHA, subagents=a._batch_subagents(self.row()),
+                                         configuration=a._batch_configuration(self.row()))
+        self.assertIn('DeepSeek Flash/high', guidance)
+        self.assertIn('Sonnet/high', guidance)
+        self.assertIn('task_type (straightforward or subtle)', guidance)
+        self.assertNotIn('There are no subtle subagents', guidance)
+        self.assertNotIn('Luna', guidance)
+
     def test_no_second_move_when_acceptance_is_unknown_or_native_move_failed(self):
         self.trigger()
         value = self.value()

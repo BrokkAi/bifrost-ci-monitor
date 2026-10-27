@@ -63,8 +63,9 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   (re-sent after 12 hours if still present). Shadow mode notifies an evaluation
   session; live mode starts the health checkup. Findings never authorize
   remediation; output excludes prompts, recovery text and tokens.
-- `session_policy.py`: future merger/fixer Opus/high launches and straightforward
-  DeepSeek Flash/high delegation; existing sessions retain their launch policy.
+- `session_policy.py`: future merger/fixer Opus/high launches, straightforward
+  DeepSeek Flash/high delegation, and merger-only Sonnet/high subtle delegation;
+  existing sessions retain their launch policy.
 - `triage.py`: observation-scoped investigations, validated report publication,
   deduplicated failure issues and retirement of exact resolved observations.
 - `automerge.py`: queue selection, batch/direct/operator state machines,
@@ -536,22 +537,28 @@ tests. Already-confirmed GitHub landing can still be reconciled.
 
 Every new integration and issue-fixer session uses Opus (`opus`) at high effort
 on `bedrock-podman`, with Mjolnir straightforward subagents using DeepSeek Flash
-(`deepseek-flash`) at high effort. There are no subtle subagents. This applies
-regardless of source count or lane, including speculative successors. Persist
-`opus-high-dsf-high` in `automerge_batches.agent_configuration`; rebuild,
+(`deepseek-flash`) at high effort. New merger sessions also use Sonnet 5.5
+(`us.anthropic.claude-sonnet-5-5`) at high effort for subtle tasks; fixers keep
+straightforward delegation only. This applies regardless of source count or
+lane, including speculative successors. Persist
+`opus-high-dsf-high-sonnet-high` in `automerge_batches.agent_configuration`; rebuild,
 exclusion, recovery and promotion retain it. Existing live rows keep their
-`single-pr`, `multi-pr`, `flash-none`, `flash-luna` or `flash-max` policy and prompt
+`opus-high-dsf-high`, `flash-dsf-high`, `single-pr`, `multi-pr`, `flash-none`,
+`flash-luna` or `flash-max` policy and prompt
 delegation guidance. Do not Move or reconfigure active sessions for this change.
 After exact-title lookup establishes absence and a new launch is allowed, a
-legacy row creating a session also checkpoints `opus-high-dsf-high`. Adoption of
+legacy row creating a session also checkpoints `opus-high-dsf-high-sonnet-high`. Adoption of
 an existing session keeps its persisted configuration. Historical schema defaults
 remain `multi-pr` for old rows.
 The CI daemon has `[subagents.straightforward]` set to `deepseek-flash`/`high`,
-no `[subagents.subtle]`, and `deepseek = true` under `eligible_profiles`.
+no global `[subagents.subtle]`, and `deepseek = true` plus
+`bedrock-claude = true` under `eligible_profiles`. Bedrock Claude eligibility
+retains Sonnet availability after a merger's provider failover to Flash.
 Straightforward-only delegation requires Mjolnir 2.47.0 or later; 2.46.0
 rejects these launches before creating a session.
-Launches explicitly override straightforward model/effort; omitting a subtle
-override would otherwise inherit the global subtle choice. Triage remains
+Merger launches explicitly override both task models/efforts. Fixer launches
+override only straightforward; keeping the global subtle choice unset prevents
+them from inheriting it. Triage remains
 DeepSeek Flash with `--subagents none`.
 Opus merger sessions retain Bedrock failover:
 Two distinct consecutive agent messages beginning `API Error: 503` and naming
@@ -563,8 +570,9 @@ Read to the transcript tail before acting, independently of Slack delivery.
 Move operation and continuation. Profile-only in-place Move retains the target,
 mounts, resource allocation, Git directory, logs, caches and recorded delegation.
 Confirm Flash configuration before queuing the normal durable continuation;
-persist `flash-dsf-high` for retained straightforward Flash/high delegation on
-new Opus sessions, or `flash-luna` for legacy Luna delegation (`flash-none` for
+persist `flash-dsf-high-sonnet-high` for retained Flash/high and Sonnet/high
+delegation on new mergers, `flash-dsf-high` for existing Flash-only sessions,
+or `flash-luna` for legacy Luna delegation (`flash-none` for
 an operator Move that disabled subagents). Native Move owns cancellation/recovery;
 observe its
 read-only journal after a CLI timeout, without idleness or new work deadlines.
@@ -969,11 +977,12 @@ environment conventions, without rerunning ci-impact. Select useful targeted or
 broad/grouped checks from the diff, dependencies, interactions, conflict
 resolutions, existing results, and specific unresolved concerns.
 
-For new merger and fixer sessions, delegate only straightforward work with a
-clear method to DeepSeek Flash/high. Keep ambiguous diagnosis, design choices,
-subtle correctness decisions, integration and final assessment with the Opus
-primary; no subtle task type is available. Use bounded tasks and explicit file
-ownership. Existing sessions retain their recorded delegation policy.
+For new merger sessions, delegate work with a clear method to DeepSeek Flash/high
+as `straightforward`, and ambiguous diagnosis or correctness review to Sonnet/high
+as `subtle`. The Opus primary reviews the results and owns integration and final
+assessment. Fixers retain straightforward-only Flash/high delegation, with subtle
+decisions owned by their primary. Use bounded tasks and explicit file ownership.
+Existing sessions retain their recorded delegation policy.
 The primary combines and assesses the work. Builds are expensive: normally
 consolidate changes and validation through the primary. Subagents propose the
 smallest useful check and build only when assigned a check that resolves a

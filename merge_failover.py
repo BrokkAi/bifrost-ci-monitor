@@ -248,7 +248,11 @@ def advance(a, conn, row):
                       'Changing providers alone does not require new tests.\n\n' +
                       str(latest['pending_prompt'] or ''))
             def checkpoint():
-                configuration = (session_policy.FAILOVER_CONFIGURATION
+                configuration = (session_policy.MERGER_FAILOVER_CONFIGURATION
+                                 if latest['agent_configuration'] in {
+                                     session_policy.MERGER_CONFIGURATION,
+                                     session_policy.MERGER_FAILOVER_CONFIGURATION,
+                                 } else session_policy.FAILOVER_CONFIGURATION
                                  if latest['agent_configuration'] in {
                                      session_policy.CONFIGURATION, session_policy.FAILOVER_CONFIGURATION,
                                  } else 'flash-luna')

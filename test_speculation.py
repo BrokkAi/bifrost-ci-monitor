@@ -178,7 +178,7 @@ class StateTests(unittest.TestCase):
                                     predecessor_id=self.parent,
                                     predecessor_candidate={})
         row = self.row(identifier)
-        self.assertEqual(row['agent_configuration'], 'opus-high-dsf-high')
+        self.assertEqual(row['agent_configuration'], 'opus-high-dsf-high-sonnet-high')
         self.assertTrue(a._batch_subagents(row))
         argv = a.new_session_argv(row, '/tmp/prompt')
         for flag, value in (('--model', 'opus'), ('--target', 'bedrock-podman'),
@@ -186,21 +186,22 @@ class StateTests(unittest.TestCase):
                             ('--subagent-straightforward', 'deepseek-flash'),
                             ('--subagent-straightforward-effort', 'high')):
             self.assertEqual(argv[argv.index(flag) + 1], value)
-        self.assertFalse(any(arg.startswith('--subagent-subtle') for arg in argv))
+        self.assertEqual(argv[argv.index('--subagent-subtle') + 1], 'us.anthropic.claude-sonnet-5-5')
+        self.assertEqual(argv[argv.index('--subagent-subtle-effort') + 1], 'high')
 
     def test_single_pr_successor_recovery_retains_opus_straightforward_policy(self):
         s.invalidate(a, self.conn, self.row())
         row = self.row()
-        self.assertEqual(row['agent_configuration'], 'opus-high-dsf-high')
+        self.assertEqual(row['agent_configuration'], 'opus-high-dsf-high-sonnet-high')
         argv = a.new_session_argv(row, '/tmp/prompt')
         self.assertEqual(argv[argv.index('--model') + 1], 'opus')
         self.assertEqual(argv[argv.index('--subagents') + 1], 'mjolnir')
         self.assertEqual(argv[argv.index('--effort') + 1], 'high')
         with mock.patch.object(a, 'skills_connection_prompt', return_value=''):
             prompt = s.reset_brief(a, self.conn, row, json.loads(row['recovery_json']))
-        self.assertIn('There are no subtle subagents', prompt)
+        self.assertIn('Sonnet/high', prompt)
         self.assertNotIn('Luna', prompt)
-        self.assertNotIn('delegate independent', prompt)
+        self.assertIn('delegate independent investigations', prompt)
 
     def register(self, identifier, head):
         row = self.row(identifier)

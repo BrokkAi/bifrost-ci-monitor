@@ -53,9 +53,11 @@ Bifrost's CI impact classifier. The web dashboard (below) also needs `uv` and
 `npm` to install its dependencies and build its UI.
 Configure Mjolnir's `CI` workspace, `bifrost` bundle, and the `podman` and
 `bedrock-podman` targets before enabling cron. Every new integration and fixer
-session uses Opus (`opus`) at high effort on `bedrock-podman`, with straightforward
-DeepSeek Flash (`deepseek-flash`) subagents at high effort and no subtle
-subagents, including campaign batches and speculative successors. Each batch
+session uses Opus (`opus`) at high effort on `bedrock-podman`. Merger sessions,
+including campaign batches and speculative successors, use DeepSeek Flash
+(`deepseek-flash`)/high for straightforward subagents and Sonnet 5.5
+(`us.anthropic.claude-sonnet-5-5`)/high for subtle subagents. Fixers retain
+straightforward Flash/high subagents only. Each batch
 retains its configuration through membership changes and recovery. Existing live
 sessions keep their model and delegation settings. Opus merger sessions still move
 automatically to DeepSeek Flash after two consecutive Bedrock 503 provider
@@ -63,12 +65,14 @@ errors, retaining the session, container, work, validation evidence and
 delegation. Successful agent or tool progress resets the error count. A threaded
 notice confirms the switch. Native Move failures or uncertain acceptance produce
 an actionable alert; the original session and recovery state remain available.
-On mj 2.46, configure `[subagents.straightforward]` with
+On mj 2.47 or later, configure `[subagents.straightforward]` with
 `model = "deepseek-flash"` and `effort = "high"`, remove `[subagents.subtle]`,
-and enable `deepseek = true` under `[subagents.eligible_profiles]`.
-Keep `max_concurrent = 16` under `[subagents]`. Launches explicitly set the
-straightforward choice; an omitted subtle override inherits the global setting,
-so removing that global choice is required. Triage uses `deepseek-flash` with
+and enable `deepseek = true` and `bedrock-claude = true` under
+`[subagents.eligible_profiles]`. The latter also permits Sonnet delegation
+after the merger's same-session failover to Flash.
+Keep `max_concurrent = 16` under `[subagents]`. Merger launches explicitly set
+both task choices; fixer launches set only straightforward. Keep the global
+subtle choice unset so fixers do not inherit it. Triage uses `deepseek-flash` with
 no subagents. Apply model preferences to future launches; do not Move active
 sessions to apply them.
 

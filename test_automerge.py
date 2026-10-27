@@ -17,6 +17,7 @@ from unittest import TestCase, mock
 import automerge
 import monitor
 import speculation
+import session_policy
 
 
 BASE_SHA = "a" * 40
@@ -909,13 +910,15 @@ class IdentityAndPromptTests(TestCase):
             "--model", "opus", "--effort", "high", "--subagents", "mjolnir",
             "--subagent-straightforward", "deepseek-flash",
             "--subagent-straightforward-effort", "high",
+            "--subagent-subtle", "us.anthropic.claude-sonnet-5-5",
+            "--subagent-subtle-effort", "high",
             "--at", BASE_SHA, "--branch", "mergemarshall/batch-batch-test",
             "--title", "Bifrost automerge batch batch-test",
             "--prompt-file", "/tmp/prompt", "--json",
         ])
         conn.close()
 
-    def test_single_pr_launch_uses_opus_with_straightforward_flash_subagents(self):
+    def test_single_pr_launch_uses_flash_and_sonnet_subagents(self):
         conn = make_db(phase="building", session_id=None, status="launching", ci_mode="async")
         self.addCleanup(conn.close)
         prompts = []
@@ -928,7 +931,8 @@ class IdentityAndPromptTests(TestCase):
             self.assertEqual(argv[argv.index("--effort") + 1], "high")
             self.assertEqual(argv[argv.index("--subagent-straightforward") + 1], "deepseek-flash")
             self.assertEqual(argv[argv.index("--subagent-straightforward-effort") + 1], "high")
-            self.assertNotIn("--subagent-subtle", argv)
+            self.assertEqual(argv[argv.index("--subagent-subtle") + 1], "us.anthropic.claude-sonnet-5-5")
+            self.assertEqual(argv[argv.index("--subagent-subtle-effort") + 1], "high")
             self.assertNotIn("--subagent-model", argv)
             self.assertNotIn("--subagent-effort", argv)
             return subprocess.CompletedProcess(argv, 0, '{"session_id":"flash-session"}', '')
@@ -938,35 +942,37 @@ class IdentityAndPromptTests(TestCase):
               mock.patch.object(monitor, "mj_command", side_effect=launch)):
             self.assertEqual(automerge.launch_batch_session(row_for(conn), [pull()], conn=conn),
                              "flash-session")
-        self.assertIn("There are no subtle subagents", prompts[0])
+        self.assertIn("Sonnet/high", prompts[0])
+        self.assertIn("task_type (straightforward or subtle)", prompts[0])
         self.assertIn("DeepSeek Flash/high", prompts[0])
         self.assertNotIn("Luna", prompts[0])
-        self.assertNotIn("delegate independent", prompts[0])
+        self.assertIn("delegate independent investigations", prompts[0])
         self.assertIn("ambiguous diagnosis", prompts[0])
 
     def test_new_launches_checkpoint_opus_policy_for_all_lanes_and_legacy_policies(self):
         for target in ('master', 'stabilize/test'):
             for count in (1, 3):
-                for configuration in ('opus-high-dsf-high', 'flash-dsf-high', 'flash-max', 'single-pr', 'multi-pr', 'flash-none', 'flash-luna'):
+                for configuration in (session_policy.MERGER_CONFIGURATION, session_policy.MERGER_FAILOVER_CONFIGURATION, 'opus-high-dsf-high', 'flash-dsf-high', 'flash-max', 'single-pr', 'multi-pr', 'flash-none', 'flash-luna'):
                     with self.subTest(target=target, count=count, configuration=configuration):
                         pulls = [dataclasses.replace(pull(n), target_ref=target) for n in range(1, count + 1)]
                         conn = make_db(pulls=pulls, session_id=None, status='launching', ci_mode='async')
                         self.addCleanup(conn.close)
-                        self.assertEqual(row_for(conn)['agent_configuration'], 'opus-high-dsf-high')
+                        self.assertEqual(row_for(conn)['agent_configuration'], session_policy.MERGER_CONFIGURATION)
                         self.assertEqual(automerge.batch_target(row_for(conn)), target)
                         with conn:
                             conn.execute("UPDATE automerge_batches SET agent_configuration=?, launch_attempted=1",
                                          (configuration,))
                         def launch(argv, **kwargs):
-                            self.assertEqual(row_for(conn)['agent_configuration'], 'opus-high-dsf-high')
+                            self.assertEqual(row_for(conn)['agent_configuration'], session_policy.MERGER_CONFIGURATION)
                             for flag, value in (('--model', 'opus'), ('--target', 'bedrock-podman'),
                                                 ('--effort', 'high'), ('--subagents', 'mjolnir'),
                                                 ('--subagent-straightforward', 'deepseek-flash'),
                                                 ('--subagent-straightforward-effort', 'high')):
                                 self.assertEqual(argv[argv.index(flag) + 1], value)
-                            self.assertFalse(any(arg.startswith('--subagent-subtle') for arg in argv))
+                            self.assertEqual(argv[argv.index('--subagent-subtle') + 1], 'us.anthropic.claude-sonnet-5-5')
+                            self.assertEqual(argv[argv.index('--subagent-subtle-effort') + 1], 'high')
                             prompt = Path(argv[argv.index('--prompt-file') + 1]).read_text()
-                            self.assertIn('There are no subtle subagents', prompt)
+                            self.assertIn('Sonnet/high', prompt)
                             self.assertNotIn('Luna', prompt)
                             return subprocess.CompletedProcess(argv, 0, '{"session_id":"flash-session"}', '')
                         with (mock.patch.object(automerge, 'lookup_batch_session', return_value=None),
@@ -988,13 +994,30 @@ class IdentityAndPromptTests(TestCase):
         self.assertIn('Luna', prompt)
         self.assertEqual(row_for(conn)['agent_configuration'], 'multi-pr')
 
+    def test_existing_flash_only_batches_keep_their_recovery_guidance(self):
+        for configuration in ('opus-high-dsf-high', 'flash-dsf-high'):
+            with self.subTest(configuration=configuration):
+                conn = make_db(ci_mode='async')
+                self.addCleanup(conn.close)
+                with conn:
+                    conn.execute('UPDATE automerge_batches SET agent_configuration=?',
+                                 (configuration,))
+                speculation.invalidate(automerge, conn, row_for(conn))
+                row = row_for(conn)
+                with mock.patch.object(automerge, 'skills_connection_prompt', return_value=''):
+                    prompt = speculation.reset_brief(automerge, conn, row,
+                                                     json.loads(row['recovery_json']))
+                self.assertEqual(row['agent_configuration'], configuration)
+                self.assertIn('There are no subtle subagents', prompt)
+                self.assertNotIn('Sonnet', prompt)
+
     @unchanged_queue()
     def test_configuration_survives_rebuild_without_new_arrivals(self):
         for initial in ([pull()], [pull(), pull(8, HEAD_TWO)]):
             with self.subTest(initial_count=len(initial)):
                 conn = make_db(ci_mode="async", pulls=initial)
                 self.addCleanup(conn.close)
-                expected = "opus-high-dsf-high"
+                expected = session_policy.MERGER_CONFIGURATION
                 additions = initial + [pull(9, HEAD_THREE)]
                 with (mock.patch.object(automerge, "_recheck_sources", side_effect=lambda pulls, **kw: (pulls, [])),
                       mock.patch.object(automerge, "select_eligible_pull_requests", return_value=additions) as scan):
@@ -1004,7 +1027,7 @@ class IdentityAndPromptTests(TestCase):
                 self.assertEqual(rebuilt['expansion_count'], 0)
                 self.assertEqual(rebuilt['agent_configuration'], expected)
                 self.assertTrue(automerge._batch_subagents(rebuilt))
-                self.assertIn("There are no subtle subagents", rebuilt['pending_prompt'])
+                self.assertIn("Sonnet/high", rebuilt['pending_prompt'])
                 self.assertNotIn("Luna", rebuilt['pending_prompt'])
                 scan.assert_not_called()
                 with (mock.patch.object(automerge, "_recheck_sources", side_effect=lambda pulls, **kw: (pulls, [])),

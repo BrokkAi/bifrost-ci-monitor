@@ -1641,7 +1641,7 @@ def create_batch(
             (
                 identifier,
                 kind,
-                session_policy.CONFIGURATION,
+                session_policy.MERGER_CONFIGURATION,
                 source,
                 int(any(pull.priority for pull in pulls)),
                 status,
@@ -1841,7 +1841,8 @@ def _batch_configuration(row: sqlite3.Row | dict[str, Any]) -> str:
     # or shrink, so never derive a live session's configuration from its PR list.
     configuration = row["agent_configuration"] if "agent_configuration" in row.keys() else "multi-pr"
     if configuration not in {"single-pr", "multi-pr", "flash-none", "flash-luna", "flash-max",
-                              session_policy.CONFIGURATION, session_policy.FAILOVER_CONFIGURATION}:
+                              session_policy.CONFIGURATION, session_policy.FAILOVER_CONFIGURATION,
+                              session_policy.MERGER_CONFIGURATION, session_policy.MERGER_FAILOVER_CONFIGURATION}:
         raise AutomergeError(f"unknown agent configuration: {configuration}",
                              reason="database_state_invalid")
     return configuration
@@ -1850,6 +1851,7 @@ def _batch_configuration(row: sqlite3.Row | dict[str, Any]) -> str:
 def _batch_subagents(row: sqlite3.Row | dict[str, Any]) -> bool:
     return _batch_configuration(row) in {
         "multi-pr", "flash-luna", session_policy.CONFIGURATION, session_policy.FAILOVER_CONFIGURATION,
+        session_policy.MERGER_CONFIGURATION, session_policy.MERGER_FAILOVER_CONFIGURATION,
     }
 
 
@@ -1867,6 +1869,9 @@ def _validation_guidance(
     mode = (impact or {}).get("mode", "unknown")
     straightforward_only = configuration in {
         session_policy.CONFIGURATION, session_policy.FAILOVER_CONFIGURATION,
+    }
+    sonnet_subtle = configuration in {
+        session_policy.MERGER_CONFIGURATION, session_policy.MERGER_FAILOVER_CONFIGURATION,
     }
     if mode == "docs":
         return (
@@ -1889,7 +1894,8 @@ def _validation_guidance(
         "unresolved concerns; broad or grouped checks are appropriate when warranted. "
         "Workflow definitions supply commands; choose checks to resolve those concerns. "
         + QUICK_POLICY_GUIDANCE + "\n\n"
-        + ((session_policy.DELEGATION_GUIDANCE if straightforward_only
+        + ((session_policy.MERGER_DELEGATION_GUIDANCE if sonnet_subtle else
+            session_policy.DELEGATION_GUIDANCE if straightforward_only
             else MERGE_DELEGATION_GUIDANCE) if subagents else
            "Subagents are disabled for this batch. Perform investigation, edits, "
            "review, and validation yourself. Builds are expensive; avoid duplicate "
@@ -2048,7 +2054,7 @@ def build_prompt(
     known_failures_context: str = "",
     validation_impact: dict[str, Any] | None = None,
     subagents: bool = True,
-    configuration: str = session_policy.CONFIGURATION,
+    configuration: str = session_policy.MERGER_CONFIGURATION,
     target_ref: str = BASE_BRANCH,
 ) -> str:
     if target_ref != BASE_BRANCH or _validate_ci_mode(ci_mode) == "async":
@@ -2134,7 +2140,7 @@ def build_async_prompt(
     known_failures_context: str = "",
     validation_impact: dict[str, Any] | None = None,
     subagents: bool = True,
-    configuration: str = session_policy.CONFIGURATION,
+    configuration: str = session_policy.MERGER_CONFIGURATION,
 ) -> str:
     pr_list = "\n".join(
         f"{index}. PR #{pull.number}: {pull.title}\n"
@@ -2194,7 +2200,7 @@ def new_session_argv(
         "--memory-gib", str(monitor.MJ_MEMORY_GIB),
         "--model", AUTOMERGE_MODEL,
         "--effort", AUTOMERGE_EFFORT,
-        *session_policy.subagent_args(),
+        *session_policy.merger_subagent_args(),
         "--at", str(row["base_sha"]),
         "--branch", str(row["branch"]),
         "--title", str(row["title"]),
@@ -2298,7 +2304,7 @@ def launch_batch_session(
         ci_mode=_batch_ci_mode(row), target_ref=batch_target(row),
         known_failures_context=_known_failures_prompt(conn) if conn is not None else "",
         validation_impact=impact,
-        subagents=True, configuration=session_policy.CONFIGURATION,
+        subagents=True, configuration=session_policy.MERGER_CONFIGURATION,
     )
     prompt += "\n\n" + batch_speculation_guidance(row) + skills_connection_prompt(row)
     with tempfile.NamedTemporaryFile(
@@ -2319,7 +2325,7 @@ def launch_batch_session(
                 conn.execute(
                     "UPDATE automerge_batches SET agent_configuration = ?, launch_attempted = 1, "
                     "launch_attempted_at = ?, validation_impact_json = ? WHERE batch_id = ?",
-                    (session_policy.CONFIGURATION, utc_now(), json.dumps(impact), row["batch_id"]),
+                    (session_policy.MERGER_CONFIGURATION, utc_now(), json.dumps(impact), row["batch_id"]),
                 )
         result = monitor.mj_command(new_session_argv(row, prompt_path), timeout=180)
     except monitor.MjError as exc:
