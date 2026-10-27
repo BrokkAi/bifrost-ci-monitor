@@ -1769,7 +1769,8 @@ class TriageTests(TestCase):
         def command(args, **kwargs):
             calls.append(args)
             if args[0] == 'sessions':
-                return json.dumps({'state': 'error', 'error': 'worker bootstrap failed: clone failed'})
+                return json.dumps({'state': 'error', 'error': 'worker bootstrap failed: clone failed',
+                                   'background_tasks': [], 'subagents': {'mode': 'none'}})
             if args[0] == 'resume':
                 raise failure
             if args[0] == 'transcript':
@@ -1811,6 +1812,10 @@ class TriageTests(TestCase):
             self.assertFalse(triage.agent_recovery.unstarted_bootstrap_failure(
                 'session', recovery, monitor.MjError('ambiguous resume transport failure')))
             native.assert_not_called()
+        with mock.patch.object(monitor, 'require_mj_success', return_value=json.dumps({
+                'state': 'error', 'error': 'worker bootstrap failed: clone failed',
+                'background_tasks': [{'id': 'preserved-task'}]})):
+            self.assertFalse(triage.agent_recovery.unstarted_bootstrap_failure('session', recovery, failure))
 
     def test_quota_and_input_require_action_without_resetting_or_repeated_notices(self):
         self.add_failure()

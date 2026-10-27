@@ -21,8 +21,10 @@ def unstarted_bootstrap_failure(session, recovery, error):
 
         state = mj(['sessions', '--session', session, '--json'])
         if (state.get('state') != 'error' or 'worker bootstrap failed' not in str(state.get('error', '')).lower()
-                or state.get('background_tasks') or state.get('subagents')):
+                or state.get('background_tasks')):
             return False
+        # The native `subagents` field describes configuration, even with no
+        # children. Any actual delegation would appear in the tool transcript.
         for role in ('agent', 'tool'):
             page = mj(['transcript', '--session', session, '--role', role, '--after-seq', '0', '--json'])
             if page.get('items') != []:
