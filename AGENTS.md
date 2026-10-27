@@ -49,6 +49,20 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   submission retries. Reuse one request ID after HTTP 409/503 refusals or an
   ambiguous transport failure; stop after acceptance. This does not schedule
   checks, replay downtime, restart sessions, or limit agent work.
+- `health_probe.py` and `health_trigger.py`: event-driven health checkups. The
+  probe runs on the CI host, reads SQLite read-only plus `mj api-info`/`mj
+  sessions`, and makes no GitHub calls. It reports durable error state (heartbeats,
+  native session errors, blocked recovery, blocked notices, failing outbox and
+  supervisor actions, ledger/intake errors, stuck terminal suspension, paused
+  campaigns, disk) and stalls (repeated fixer work, a free merge lane or fixer
+  slot with eligible cached work, unconsumed handoffs). Each finding has a stable
+  fingerprint over a normalized cause. A workstation cron job runs the probe over
+  SSH every 15 minutes and keeps first-seen state locally. A finding seen on two
+  consecutive probes and past its own persistence period sends one message per
+  episode through `health_check_delivery`, using a fingerprint-derived request ID
+  (re-sent after 12 hours if still present). Shadow mode notifies an evaluation
+  session; live mode starts the health checkup. Findings never authorize
+  remediation; output excludes prompts, recovery text and tokens.
 - `session_policy.py`: future merger/fixer Opus/high launches and straightforward
   DeepSeek Flash/high delegation; existing sessions retain their launch policy.
 - `triage.py`: observation-scoped investigations, validated report publication,
