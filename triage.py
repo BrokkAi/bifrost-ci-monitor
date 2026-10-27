@@ -144,7 +144,8 @@ def branch_observations(conn) -> list[dict]:
 def claimed_fingerprints(conn) -> set[str]:
     # Cached publications own their observations even while GitHub/Slack is down.
     return {o['fingerprint'] for job in conn.execute(
-        "SELECT observations_json FROM triage_jobs WHERE status!='completed'")
+        "SELECT observations_json FROM triage_jobs WHERE status!='completed' AND NOT "
+        "(status='failed' AND coalesce(json_extract(recovery_json,'$.stage'),'')='launch_failed')")
         for o in json.loads(job['observations_json'])}
 
 
@@ -598,6 +599,20 @@ def collect_report(conn, job) -> None:
     except Exception as exc:
         current = conn.execute('SELECT * FROM triage_jobs WHERE id=?', (job['id'],)).fetchone()
         recovery = json.loads(current['recovery_json'])
+        if (not current['report_json'] and not current['report_after_seq']
+                and agent_recovery.unstarted_bootstrap_failure(current['session_id'], recovery, exc)):
+            # Preserve the failed native session and its full launch evidence.
+            # Only the never-started investigation releases its observations;
+            # ordinary admission starts another investigation while retaining
+            # the original session, checkout and diagnostics.
+            recovery['stage'] = 'launch_failed'
+            with conn:
+                conn.execute("UPDATE triage_jobs SET status='failed',finished_at=?,"
+                             "cleanup_done=1,recovery_json=?,last_error=? WHERE id=?",
+                             (monitor.utc_now(), json.dumps(recovery), str(exc), current['id']))
+            monitor.log(f"triage {job['id']}: initial bootstrap failed; native session preserved, "
+                        "unclassified observations released for normal admission")
+            return
         if not recovery:
             recovery = dict(id=uuid.uuid4().hex, turn_id=None, outcome='supervision', stage='running')
         recovery.setdefault('failed_step', recovery['stage'] if recovery['stage'] != 'running' else 'supervision')

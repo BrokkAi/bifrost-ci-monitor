@@ -474,6 +474,14 @@ and recover in the original session/checkout through `agent_recovery.py`, sharin
 triage's native cancellation, typed clear and durable-divider controls. Preserve
 HEAD, source edits, worktrees, caches and logs; restart with the bounded original
 issue prompt and instructions to reconcile saved progress and reuse validation.
+Triage may retire a failed initial bootstrap as `failed` with recovery stage
+`launch_failed` only after
+native resume explicitly confirms that no checkpoint exists, native state still
+reports the bootstrap error, and both agent and tool transcripts contain no work.
+It retains the original session, checkout, diagnostics and observations; no
+observation is classified or resolved. Normal admission can investigate those
+unclassified observations in another job. Unavailable evidence or any recorded
+work keeps the original same-session recovery path.
 `report_after_seq` fences pre-reset reports. Both recovery columns migrate
 additively in `connect_db`. Recovery is silent while progressing; quota/input
 blocks and failed supervision/recovery alert once per episode without making

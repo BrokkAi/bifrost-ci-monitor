@@ -8,6 +8,30 @@ import monitor
 import speculation
 
 
+def unstarted_bootstrap_failure(session, recovery, error):
+    """Prove a failed initial launch has no agent work or resumable checkpoint."""
+    message = str(error).lower()
+    if (recovery.get('stage') != 'stop' or recovery.get('turn_id') is not None
+            or not all(marker in message for marker in
+                       ('mj resume', 'no checkpoint to resume from', 'worker bootstrap failed'))):
+        return False
+    try:
+        def mj(args):
+            return json.loads(monitor.require_mj_success(args, timeout=30))
+
+        state = mj(['sessions', '--session', session, '--json'])
+        if (state.get('state') != 'error' or 'worker bootstrap failed' not in str(state.get('error', '')).lower()
+                or state.get('background_tasks') or state.get('subagents')):
+            return False
+        for role in ('agent', 'tool'):
+            page = mj(['transcript', '--session', session, '--role', role, '--after-seq', '0', '--json'])
+            if page.get('items') != []:
+                return False
+    except (monitor.MjError, ValueError, TypeError, AttributeError):
+        return False  # Unavailable evidence cannot release claimed observations.
+    return True
+
+
 def advance(session, recovery, *, prefix, checkpoint):
     """Advance a durable reset without inspecting session idleness."""
     stage = recovery['stage']

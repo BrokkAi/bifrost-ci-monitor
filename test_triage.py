@@ -1754,6 +1754,64 @@ class TriageTests(TestCase):
         ])
         interrupt.assert_not_called()
 
+    def test_failed_bootstrap_releases_observations_and_preserves_failed_session(self):
+        self.add_failure()
+        self.make_job(status='running')
+        with self.conn:
+            self.conn.execute("UPDATE triage_jobs SET report_json=NULL WHERE id='job'")
+        observations = self.job()['observations_json']
+        self.patch(monitor, 'wait_once', return_value=monitor.TurnResult('error', 'error', turn_id=None))
+        triage.collect_report(self.conn, self.job())
+        failure = monitor.MjError('mj resume --session exited 1: no checkpoint to resume from; '
+                                  'worker bootstrap failed: clone failed')
+        calls = []
+
+        def command(args, **kwargs):
+            calls.append(args)
+            if args[0] == 'sessions':
+                return json.dumps({'state': 'error', 'error': 'worker bootstrap failed: clone failed'})
+            if args[0] == 'resume':
+                raise failure
+            if args[0] == 'transcript':
+                return '{"items":[]}'
+            self.fail('unexpected native mutation: ' + args[0])
+
+        self.patch(monitor, 'require_mj_success', side_effect=command)
+        triage.collect_report(self.conn, self.job())
+        self.reopen()
+        failed = self.job()
+        self.assertEqual(failed['status'], 'failed')
+        self.assertEqual(failed['session_id'], 'session')
+        self.assertEqual(failed['observations_json'], observations)
+        self.assertIsNone(failed['report_json'])
+        self.assertEqual(failed['cleanup_done'], 1)
+        self.assertEqual(self.recovery()['stage'], 'launch_failed')
+        self.assertEqual(len(triage.pending(self.conn)), 1)
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM triage_observations').fetchone()[0], 0)
+        self.assertEqual([a[0] for a in calls], ['sessions', 'resume', 'sessions', 'transcript', 'transcript'])
+        self.slack.assert_not_called()
+
+    def test_bootstrap_replacement_refuses_recorded_agent_or_tool_work(self):
+        failure = monitor.MjError('mj resume --session exited 1: no checkpoint to resume from; '
+                                  'worker bootstrap failed: clone failed')
+        recovery = dict(stage='stop', turn_id=None)
+        for role in ['agent', 'tool']:
+            with self.subTest(role=role):
+                def command(args, **kwargs):
+                    if args[0] == 'sessions':
+                        return '{"state":"error","error":"worker bootstrap failed: clone failed"}'
+                    self.assertEqual(args[0], 'transcript')
+                    return json.dumps({'items': [{'seq': 1}] if args[args.index('--role') + 1] == role else []})
+
+                with mock.patch.object(monitor, 'require_mj_success', side_effect=command):
+                    self.assertFalse(triage.agent_recovery.unstarted_bootstrap_failure('session', recovery, failure))
+        with mock.patch.object(monitor, 'require_mj_success') as native:
+            self.assertFalse(triage.agent_recovery.unstarted_bootstrap_failure(
+                'session', dict(stage='stop', turn_id=14), failure))
+            self.assertFalse(triage.agent_recovery.unstarted_bootstrap_failure(
+                'session', recovery, monitor.MjError('ambiguous resume transport failure')))
+            native.assert_not_called()
+
     def test_quota_and_input_require_action_without_resetting_or_repeated_notices(self):
         self.add_failure()
         native = self.patch(monitor, 'require_mj_success')
