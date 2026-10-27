@@ -18,7 +18,9 @@ def advance(session, recovery, *, prefix, checkpoint):
 
     if stage == 'stop':
         state = mj(['sessions', '--session', session, '--json'])
-        if str(state.get('state', '')).lower() in {'stopped', 'suspended', 'lost', 'failed'}:
+        # Native worker failures are reported as "error". Worker-only cleanup
+        # commands cannot run until that same session has been resumed.
+        if str(state.get('state', '')).lower() in {'stopped', 'suspended', 'lost', 'failed', 'error'}:
             mj(['resume', '--session', session, '--queue', 'discard', '--json'])
             return
         mj(['clear-queue', '--session', session, '--json'])

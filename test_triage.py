@@ -1727,6 +1727,33 @@ class TriageTests(TestCase):
                          [['sessions', '--session', 'session', '--json'],
                           ['resume', '--session', 'session', '--queue', 'discard', '--json']])
 
+    def test_recovery_resumes_native_error_before_worker_commands(self):
+        self.start_recovery()
+        identity = self.recovery()['id']
+        def command(args, **kwargs):
+            if args[0] == 'sessions':
+                return json.dumps({
+                    'state': 'error', 'has_error': True,
+                    'activity_state': {'state': 'unknown', 'last_known': {'state': 'idle'}},
+                })
+            if args[0] == 'resume':
+                return '{}'
+            raise monitor.MjError('409 Conflict: session has no live worker')
+
+        native = self.patch(monitor, 'require_mj_success', side_effect=command)
+        interrupt = self.patch(monitor, 'interrupt_turn')
+        triage.collect_report(self.conn, self.job())
+        self.reopen()
+        self.assertEqual(self.recovery()['id'], identity)
+        self.assertEqual(self.recovery()['stage'], 'stop')
+        self.assertEqual(self.job()['session_id'], 'session')
+        self.assertEqual(self.job()['report_after_seq'], 0)
+        self.assertEqual([call.args[0] for call in native.call_args_list], [
+            ['sessions', '--session', 'session', '--json'],
+            ['resume', '--session', 'session', '--queue', 'discard', '--json'],
+        ])
+        interrupt.assert_not_called()
+
     def test_quota_and_input_require_action_without_resetting_or_repeated_notices(self):
         self.add_failure()
         native = self.patch(monitor, 'require_mj_success')
