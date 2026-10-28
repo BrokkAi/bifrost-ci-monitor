@@ -192,9 +192,21 @@ class Probe:
                 self.add('outbox_failing', row['intent_id'], f'{row["kind"]}: {row["last_error"] or "delivery failed"}', entity_is_hash=True)
 
     def actions(self):
-        for row in self.rows('automerge_supervisor_actions', 'action_id,status,attempts,lock_failures,last_error'):
-            if row['status'] in {'pending', 'running'} and row['last_error'] and max(row['attempts'], row['lock_failures']) >= 3:
-                self.add('supervisor_action_failing', row['action_id'], row['last_error'])
+        # Mirror supervisor.py: a real error schedules next_attempt_at and alerts;
+        # a deferral (read budget, history fetch) leaves it untouched and is not
+        # an error. `attempts` counts deferrals too, so it cannot tell them apart.
+        for row in self.rows('automerge_supervisor_actions',
+                             'action_id,status,attempts,lock_failures,last_error,next_attempt_at'):
+            if row['status'] not in {'pending', 'running'} or not row['last_error']:
+                continue
+            if row['lock_failures'] >= 3 or (row['next_attempt_at'] or 0) > 0 and row['attempts'] >= 3:
+                self.add('supervisor_action_failing', row['action_id'], row['last_error'], entity_is_hash=True)
+            elif row['attempts'] >= 3:
+                # Only deferring is normal; deferring for two hours means its
+                # fetch or observation never completes.
+                self.add('supervisor_action_deferred', row['action_id'], 'action only deferring', 7200,
+                         f'{row["action_id"][:12]}: deferred {row["attempts"]} times, latest: {row["last_error"]}',
+                         entity_is_hash=True)
 
     def ledger_errors(self):
         for row in self.rows('known_failure_errors', 'reason,failure_count,last_error,updated_at'):

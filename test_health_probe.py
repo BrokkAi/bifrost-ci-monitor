@@ -188,14 +188,31 @@ class HealthProbeTests(unittest.TestCase):
         self.assertEqual({r['entity'] for r in findings}, {'a' * 64, 'b' * 64})
 
     def test_supervisor_actions(self):
-        self.insert('automerge_supervisor_actions', action_id='action', attempts=3, last_error='auth')
-        self.assertIn('supervisor_action_failing', self.kinds())
+        action = 'a' * 64  # real action IDs are 64-hex hashes and must not be scrubbed
+        self.insert('automerge_supervisor_actions', action_id=action, attempts=3, last_error='auth',
+                    next_attempt_at=1e9)
+        failing = [r for r in self.result()['findings'] if r['kind'] == 'supervisor_action_failing']
+        self.assertEqual([r['entity'] for r in failing], [action])
         self.update('automerge_supervisor_actions', attempts=0, lock_failures=3)
         self.assertIn('supervisor_action_failing', self.kinds())
         self.update('automerge_supervisor_actions', lock_failures=2)
         self.assertNotIn('supervisor_action_failing', self.kinds())
         self.update('automerge_supervisor_actions', attempts=3, status='complete')
         self.assertNotIn('supervisor_action_failing', self.kinds())
+
+    def test_supervisor_action_deferrals_are_not_failures(self):
+        # A live successor's advance_batch deferred 25 times while history fetched.
+        self.insert('automerge_supervisor_actions', action_id='b' * 64, attempts=25, next_attempt_at=0,
+                    last_error='fetching commit history for ancestry checks')
+        result = self.result()['findings']
+        self.assertNotIn('supervisor_action_failing', {r['kind'] for r in result})
+        deferred = [r for r in result if r['kind'] == 'supervisor_action_deferred']
+        self.assertEqual(len(deferred), 1)
+        self.assertEqual(deferred[0]['persist_seconds'], 7200)
+        # The deferral message changes between ticks; the episode keeps one fingerprint.
+        self.update('automerge_supervisor_actions', attempts=26, last_error='Mjolnir command will continue next tick')
+        again = [r for r in self.result()['findings'] if r['kind'] == 'supervisor_action_deferred']
+        self.assertEqual(again[0]['fingerprint'], deferred[0]['fingerprint'])
 
     def test_ledger(self):
         self.insert('known_failure_errors', reason='upkeep', failure_count=3, last_error='ValueError')
