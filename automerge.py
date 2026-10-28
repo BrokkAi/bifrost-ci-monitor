@@ -2824,6 +2824,19 @@ def check_pending_suspensions(
                         )
                     request_suspend(conn, transport, batch_id, session_id)
         except (monitor.MjError, ValueError) as exc:
+            if session_was_destroyed(exc):
+                # An operator or health agent destroyed the session (for
+                # example one whose conflicted checkout could not checkpoint).
+                # Nothing remains to suspend, so terminal cleanup is complete.
+                with conn:
+                    conn.execute(
+                        "UPDATE automerge_batches SET suspend_pending = 0, "
+                        "suspend_verify_failures = 0, suspend_retry_after = 0 WHERE batch_id = ?",
+                        (batch_id,),
+                    )
+                monitor.log(f"batch {batch_id}: session {session_id} no longer exists; "
+                            "terminal cleanup complete")
+                continue
             failures = int(row["suspend_verify_failures"] or 0) + 1
             with conn:
                 conn.execute(
@@ -2835,6 +2848,13 @@ def check_pending_suspensions(
                 notify_blocked_once(
                     conn, transport, batch_id, "mj_suspend_verify_failed", str(exc)
                 )
+
+
+def session_was_destroyed(exc: Exception) -> bool:
+    """Mjolnir deletes a destroyed session's record, so lookups answer 404."""
+    text = str(exc).lower()
+    return (isinstance(exc, monitor.MjError) and exc.reason != "daemon_unreachable"
+            and "404" in text and "unknown session" in text)
 
 
 def _all_batch_pulls(row: sqlite3.Row | dict[str, Any]) -> list[PullRequest]:

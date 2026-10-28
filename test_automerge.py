@@ -3822,6 +3822,33 @@ class LaunchAndLifecycleTests(TestCase):
                 self.assertEqual(suspend.call_count, 2)
             conn.close()
 
+    def test_destroyed_terminal_session_completes_pending_suspension(self):
+        conn = make_db(phase="terminal")
+        with conn:
+            conn.execute("UPDATE automerge_batches SET status='completed', session_id='gone', "
+                         "suspend_pending=1, suspend_verify_failures=9, suspend_retry_after=5")
+        transport = monitor.SlackTransport("webhook", webhook="x")
+        missing = monitor.MjError("mj sessions --session exited 1: Error: the Mjolnir API answered "
+                                  "404 Not Found: unknown session", reason="mj_command_failed")
+        with (mock.patch.object(monitor, "require_mj_success", side_effect=missing),
+              mock.patch.object(automerge, "notify_blocked_once") as notify):
+            automerge.check_pending_suspensions(conn, transport)
+        row = conn.execute("SELECT suspend_pending,suspend_verify_failures,suspend_retry_after "
+                           "FROM automerge_batches").fetchone()
+        self.assertEqual(tuple(row), (0, 0, 0))
+        notify.assert_not_called()
+        # Other lookup failures (including an unreachable daemon) keep verifying.
+        with conn:
+            conn.execute("UPDATE automerge_batches SET suspend_pending=1, suspend_verify_failures=2")
+        for error in (monitor.MjError("mj sessions --session exited 1: connection refused",
+                                      reason="daemon_unreachable"),
+                      monitor.MjError("mj sessions --session exited 1: 500 Internal Server Error")):
+            with (mock.patch.object(monitor, "require_mj_success", side_effect=error),
+                  mock.patch.object(automerge, "notify_blocked_once")):
+                automerge.check_pending_suspensions(conn, transport)
+            self.assertEqual(conn.execute("SELECT suspend_pending FROM automerge_batches").fetchone()[0], 1)
+        conn.close()
+
     def test_phase_and_integration_pr_fields_migrate_additively(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "activity.db"
