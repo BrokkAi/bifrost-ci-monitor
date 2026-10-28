@@ -434,8 +434,10 @@ continues on each poll and clears the checkpoint after confirmed suspension.
 This applies only to terminal cleanup; active session lifecycle and scheduling
 are unchanged. Native checkpoint refusals for unresolved Git conflicts retain
 the original index, merge state, files and environment for a native tool repair.
-A terminal session that no longer exists (destroyed, so Mjolnir answers 404
-unknown session) completes cleanup; other lookup failures keep verifying.
+A terminal session that no longer exists completes cleanup: after a destroy,
+Mjolnir 2.49 returns only the archived index entry (`status: archived`, no live
+`state`), and other versions answer 404 unknown session. Other lookup failures
+keep verifying.
 Triage publication also coordinates with the fixer lock before deciding
 whether an issue should be created. A GitHub command failure for one finding
 leaves it pending while other independent findings publish and checkpoint.

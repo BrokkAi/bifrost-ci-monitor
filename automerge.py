@@ -2786,7 +2786,7 @@ def check_pending_suspensions(
             session = json.loads(raw)
             if not isinstance(session, dict):
                 raise monitor.MjError("mj sessions returned an unexpected response")
-            if monitor.session_is_stopped(session):
+            if monitor.session_is_stopped(session) or session_is_archived(session):
                 with conn:
                     conn.execute(
                         "UPDATE automerge_batches SET suspend_pending = 0, "
@@ -2848,6 +2848,11 @@ def check_pending_suspensions(
                 notify_blocked_once(
                     conn, transport, batch_id, "mj_suspend_verify_failed", str(exc)
                 )
+
+
+def session_is_archived(session: dict[str, Any]) -> bool:
+    """A destroyed session leaves only its archived index entry, with no live state."""
+    return "state" not in session and str(session.get("status", "")).lower() == "archived"
 
 
 def session_was_destroyed(exc: Exception) -> bool:

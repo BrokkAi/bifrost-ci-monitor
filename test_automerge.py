@@ -3837,6 +3837,24 @@ class LaunchAndLifecycleTests(TestCase):
                            "FROM automerge_batches").fetchone()
         self.assertEqual(tuple(row), (0, 0, 0))
         notify.assert_not_called()
+        # mj 2.49 instead answers with the archived index entry, which has no live state.
+        with conn:
+            conn.execute("UPDATE automerge_batches SET suspend_pending=1, suspend_verify_failures=9")
+        archived = json.dumps({"mjolnir_session_id": "gone", "status": "archived", "tool": "mjolnir"})
+        with (mock.patch.object(monitor, "require_mj_success", return_value=archived),
+              mock.patch.object(automerge, "request_suspend") as suspend):
+            automerge.check_pending_suspensions(conn, transport)
+        suspend.assert_not_called()
+        self.assertEqual(conn.execute("SELECT suspend_pending FROM automerge_batches").fetchone()[0], 0)
+        # A live session still reports state and keeps verifying.
+        with conn:
+            conn.execute("UPDATE automerge_batches SET suspend_pending=1, suspend_verify_failures=0")
+        with mock.patch.object(monitor, "require_mj_success",
+                               return_value=json.dumps({"state": "running", "status": "archived"})):
+            automerge.check_pending_suspensions(conn, transport)
+        self.assertEqual(conn.execute("SELECT suspend_pending FROM automerge_batches").fetchone()[0], 1)
+        with conn:
+            conn.execute("UPDATE automerge_batches SET suspend_pending=1, suspend_verify_failures=2")
         # Other lookup failures (including an unreachable daemon) keep verifying.
         with conn:
             conn.execute("UPDATE automerge_batches SET suspend_pending=1, suspend_verify_failures=2")
