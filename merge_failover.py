@@ -155,7 +155,8 @@ def matching_move(value, operation):
 def model_value(value):
     if isinstance(value, dict):
         if value.get('id', value.get('key')) == 'model' or value.get('category') == 'model':
-            return value.get('current_value', value.get('value'))
+            # mj 2.49 `set-config --json` reports the selection as `current`.
+            return value.get('current_value', value.get('current', value.get('value')))
         for child in value.values():
             if isinstance(child, (dict, list)):
                 found = model_value(child)

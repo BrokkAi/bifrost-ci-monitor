@@ -250,6 +250,19 @@ class FailoverTests(unittest.TestCase):
         f.advance(a, self.conn, self.row())
         self.assertEqual(self.value()['stage'], 'completed')
 
+    def test_mj_current_model_field_confirms_configuration(self):
+        self.trigger()
+        self.native.return_value = self.operation()
+        self.session.return_value = {'id': 'session', 'profile_id': f.PROFILE}
+        self.command.return_value = json.dumps({'config_options': [
+            {'key': 'model', 'label': 'model', 'current': f.MODEL,
+             'choices': [{'value': f.MODEL, 'name': f.MODEL}, {'value': 'deepseek-v4-pro', 'name': 'deepseek-v4-pro'}]},
+            {'key': 'effort', 'label': 'effort', 'current': 'high', 'choices': []}]})
+        f.advance(a, self.conn, self.row())
+        self.assertEqual(self.value()['stage'], 'completed')
+        self.assertTrue(self.value()['continuation_queued'])
+        self.assertEqual(self.command.call_count, 1)
+
     def test_continuation_and_failover_checkpoint_roll_back_together(self):
         self.trigger()
         self.native.return_value = self.operation()
