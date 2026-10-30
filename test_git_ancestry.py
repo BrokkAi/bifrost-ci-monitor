@@ -94,6 +94,44 @@ class GitReads(unittest.TestCase):
         with mock.patch.object(other_cache, 'command', side_effect=AssertionError('recomputed pair')):
             self.assertFalse(other_cache.ancestor(other, second, self.fail))
 
+    def test_fetch_indexes_accumulated_packs_without_removing_objects(self):
+        # Long-lived filtered caches accumulate thousands of small fetch packs.
+        # A shared index avoids reopening each index on every presence probe.
+        self.warm([self.base])
+        pack_dir = self.cache.git_dir / 'objects/pack'
+        original_packs = set(pack_dir.glob('*.pack'))
+        self.put('later.rs', 'later')
+        later = self.commit('later')
+        self.warm([later])
+        self.assertTrue(original_packs.issubset(set(pack_dir.glob('*.pack'))))
+        self.assertGreaterEqual(len(list(pack_dir.glob('*.pack'))), 2)
+        self.assertTrue((pack_dir / 'multi-pack-index').is_file())
+        self.assertEqual(self.cache.command('multi-pack-index', 'verify').returncode, 0)
+        self.assertEqual(self.cache.missing([self.base, later]), [])
+
+    def test_index_maintenance_failure_keeps_successful_fetch_receipt(self):
+        real_run = subprocess.run
+        for failure in [subprocess.CompletedProcess([], 1),
+                        subprocess.TimeoutExpired('index maintenance', 1)]:
+            with self.subTest(failure=failure):
+                job = {'id': 'index-failure', 'repository': str(self.repo),
+                       'heads': [self.base], 'started': 0}
+                request = self.cache.directory / 'index-failure.request.json'
+                g.atomic_json(request, job)
+
+                def run(args, **kwargs):
+                    if args[-2:] == ['multi-pack-index', 'write']:
+                        if isinstance(failure, Exception):
+                            raise failure
+                        return failure
+                    return real_run(args, **kwargs)
+
+                with mock.patch.object(g.subprocess, 'run', side_effect=run):
+                    g.fetch_worker(request)
+                receipt = json.loads((self.cache.directory / 'index-failure.json').read_text())
+                self.assertEqual(receipt, {'ok': True, 'unavailable': []})
+                self.assertEqual(self.cache.missing([self.base]), [])
+
     def test_reachability_matches_git_across_merge_and_divergent_history(self):
         self.git('checkout', '-qb', 'feature')
         self.put('feature.rs', 'feature')

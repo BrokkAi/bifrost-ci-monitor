@@ -114,6 +114,24 @@ class HealthProbeTests(unittest.TestCase):
         self.mj.return_value.returncode = 1
         self.assertIn('mj_daemon_unavailable', self.kinds())
 
+    def test_failover_configuration_loop_without_session_or_action_errors(self):
+        self.batch()
+        self.insert('automerge_provider_failovers', batch_id='batch', session_id='native',
+                    state_json=json.dumps({'stage': 'configuring', 'prompt': 'PRIVATE'}))
+        findings = self.result()['findings']
+        finding = next(r for r in findings if r['kind'] == 'merge_failover_pending')
+        self.assertEqual(finding['entity'], 'batch')
+        self.assertEqual(finding['persist_seconds'], 900)
+        self.assertNotIn('PRIVATE', json.dumps(findings))
+        self.update('automerge_provider_failovers', state_json='{"stage":"continuing"}')
+        self.assertIn('merge_failover_pending', self.kinds())
+        for stage in ('observing', 'moving', 'completed'):
+            self.update('automerge_provider_failovers', state_json=json.dumps({'stage': stage}))
+            self.assertNotIn('merge_failover_pending', self.kinds())
+        self.update('automerge_provider_failovers', state_json='{"stage":"configuring"}')
+        self.update('automerge_batches', status='completed', terminal_status='merged', phase='terminal')
+        self.assertNotIn('merge_failover_pending', self.kinds())
+
     def test_heartbeats(self):
         self.update('entrypoint_heartbeats', last_finished_at=(NOW - timedelta(minutes=16)).isoformat(),
                     last_skipped_at=NOW.isoformat(), last_outcome='error', last_error='ValueError')

@@ -179,6 +179,20 @@ class Probe:
             if row['batch_id'] in live:
                 self.add('merge_blocked', row['batch_id'], row['reason'])
 
+    def merge_failover(self):
+        live = {r['batch_id'] for r in self.batches() if self.batch_live(r)}
+        for row in self.rows('automerge_provider_failovers', 'batch_id,state_json'):
+            if row['batch_id'] not in live:
+                continue
+            stage = json.loads(row['state_json'] or '{}').get('stage')
+            # Configuration is confirmed on the next tick, then continuation
+            # is queued. A successful but incompatible set-config response can
+            # loop here without an action error or a failed native session.
+            # Persistence is observational, never an agent work deadline.
+            if stage in {'configuring', 'continuing'}:
+                self.add('merge_failover_pending', row['batch_id'],
+                         f'provider failover {stage}', 900)
+
     def ci_blocked(self):
         columns = {r[1] for r in self.conn.execute('PRAGMA table_info(blocked_notifications)')}
         stamp = next((c for c in ('created_at', 'updated_at') if c in columns), None)
@@ -444,6 +458,7 @@ class Probe:
         if self.conn is not None:
             try:
                 checks = [('heartbeats', self.heartbeats), ('merge_blocked', self.merge_blocked),
+                    ('merge_failover', self.merge_failover),
                     ('ci_blocked', self.ci_blocked), ('outbox', self.outbox), ('supervisor_actions', self.actions),
                     ('ledger_errors', self.ledger_errors), ('ledger_pending', self.ledger_pending),
                     ('performance_intake', self.performance), ('suspension', self.suspension),

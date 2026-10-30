@@ -54,7 +54,7 @@ Cron executes `monitor.py` straight from this working tree every five minutes
   sessions` and recent `session_fault` events in Mjolnir's own database, and makes
   no GitHub calls. It reports durable error state (heartbeats, native session
   errors, faults such as subagents that failed to start, blocked recovery,
-  blocked notices, failing outbox and
+  blocked notices, provider failover stuck configuring/continuing, failing outbox and
   supervisor actions, ledger/intake errors, stuck terminal suspension, paused
   campaigns, disk) and stalls (repeated fixer work, a free merge lane or fixer
   slot with eligible cached work, unconsumed handoffs). Each finding has a stable
@@ -300,7 +300,10 @@ All commit-derived reads, including skill-service verification, use that cache.
 Fetch branch and PR refs together with full history and filtered blobs; fetch
 detached historical tips in batches only when still missing. This bare cache uses
 `fetch`, never `pull`, and never changes agent checkouts. Fetch workers maintain
-Git commit-graphs so repeated immutable ancestry comparisons stay inexpensive.
+Git commit-graphs and a multi-pack index so immutable ancestry and object-presence
+reads stay inexpensive as filtered fetch packs accumulate. Index maintenance
+runs under the existing fetch lock and retains every pack; failure does not
+invalidate a completed fetch or establish missing objects.
 Queue ancestry reads reuse a complete `rev-list` walk per immutable descendant
 within a cache client, keeping at most four walks in memory. Positive object
 presence is remembered by type; missing objects are never remembered. Failed,

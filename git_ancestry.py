@@ -445,6 +445,11 @@ def fetch_worker(request):
                                                           b"couldn't find remote ref")):
                                 unavailable.append(head)
             ok = all(run(['cat-file', '-e', h + '^{' + kind + '}']).returncode == 0 for h in job['heads'])
+            if ok:
+                # Filtered fetches retain many small packs and promisor markers.
+                # Index them together under the fetch lock, preserving objects.
+                # Maintenance failure does not invalidate the completed fetch.
+                run(['multi-pack-index', 'write'])
     except (OSError, subprocess.TimeoutExpired):
         pass
     finally:
